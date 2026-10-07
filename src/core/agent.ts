@@ -378,8 +378,27 @@ export class Agent {
       // 用 onNotice 而非 onStatus：后者只更新状态栏，用户很容易忽略，
       // 于是「程序突然停了」而不知道为什么。
       this.events.onStatus("已达工具调用上限", `共 ${roundLimit} 轮`);
+
+      // 统计本轮工具调用，让轮次去向可见 ——
+      // 「40 轮」与屏幕上能看到的工具行数不成正比：一轮可以包含多个调用，
+      // 而且输出区只显示最近若干屏，用户无法据此核验，只能靠猜。
+      const toolUsage = new Map<string, number>();
+      for (const message of turn) {
+        for (const call of message.toolCalls ?? []) {
+          toolUsage.set(call.name, (toolUsage.get(call.name) ?? 0) + 1);
+        }
+      }
+      const totalCalls = [...toolUsage.values()].reduce((a, b) => a + b, 0);
+      const usageText = [...toolUsage.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([name, count]) => `${name} ×${count}`)
+        .join("、");
+
       this.events.onNotice?.(
         `已达工具调用上限（共 ${roundLimit} 轮）而中止本轮。\n` +
+          (usageText
+            ? `· 本轮共 ${totalCalls} 次工具调用：${usageText}\n`
+            : "") +
           `· 若模型在反复做同一件事，通常早已被重复调用检测提前中止\n` +
           `· 想调大上限：编辑 ${getConfigPath()} 里的 maxToolRounds（当前 ${this.config.maxToolRounds}）\n` +
           `· 或把任务拆成更小的步骤，每步单独提一次`,
