@@ -96,29 +96,54 @@ fi
 
 step "计算新版本号"
 
-case "$BUMP" in
-  patch|minor|major)
-    if [ "$DRY_RUN" = "1" ]; then
-      # 演练模式不修改文件：直接算给用户看
-      NEW_VERSION=$(node -e "
-        const [maj, min, pat] = require('./package.json').version.split('.').map(Number);
-        const kind = process.argv[1];
-        console.log(kind === 'major' ? (maj+1)+'.0.0'
-                  : kind === 'minor' ? maj+'.'+(min+1)+'.0'
-                  : maj+'.'+min+'.'+(pat+1));
-      " "$BUMP")
-    else
-      npm version "$BUMP" --no-git-tag-version >/dev/null
-      NEW_VERSION=$(node -p "require('./package.json').version")
-    fi
-    ;;
-  *)
-    NEW_VERSION="$BUMP"
-    if [ "$DRY_RUN" != "1" ]; then
-      npm version "$NEW_VERSION" --no-git-tag-version >/dev/null
-    fi
-    ;;
-esac
+# 线上最新版（带时间戳绕开 CDN 缓存）
+PUBLISHED=$(curl -s "https://registry.npmjs.org/$PACKAGE?t=$(date +%s%N)" 2>/dev/null | node -e "
+  let s = '';
+  process.stdin.on('data', d => s += d).on('end', () => {
+    try { process.stdout.write(JSON.parse(s)['dist-tags']?.latest ?? ''); } catch { /* 忽略 */ }
+  });" 2>/dev/null || printf '')
+
+# 若本地 package.json 的版本**领先于**线上，说明上次发布停在了
+# 「已改版本号、但还没推送」这一步（例如在确认环节被取消，
+# 或在 npm publish 之前中断）。此时必须直接发布该版本，
+# 否则它会被永久跳过 —— npm 的版本号只能前进，补不回一个已越过的号。
+NEEDS_BUMP=1
+# 注意演练模式也要走这段：它只读远端信息、不改任何文件，
+# 而「会不会被 +1」正是演练最需要提前看到的结论。
+if [ -n "$PUBLISHED" ] && [ "$CURRENT" != "$PUBLISHED" ]; then
+  if [ "$(printf '%s\n%s\n' "$CURRENT" "$PUBLISHED" | sort -V | tail -1)" = "$CURRENT" ]; then
+    NEEDS_BUMP=0
+    NEW_VERSION="$CURRENT"
+    warn "线上最新为 $PUBLISHED，而本地 package.json 已是 $CURRENT"
+    info "检测到此前改过版本号但未发布，本次直接发布 $CURRENT（不再 +1）"
+  fi
+fi
+
+if [ "$NEEDS_BUMP" = "1" ]; then
+  case "$BUMP" in
+    patch|minor|major)
+      if [ "$DRY_RUN" = "1" ]; then
+        # 演练模式不修改文件：直接算给用户看
+        NEW_VERSION=$(node -e "
+          const [maj, min, pat] = require('./package.json').version.split('.').map(Number);
+          const kind = process.argv[1];
+          console.log(kind === 'major' ? (maj+1)+'.0.0'
+                    : kind === 'minor' ? maj+'.'+(min+1)+'.0'
+                    : maj+'.'+min+'.'+(pat+1));
+        " "$BUMP")
+      else
+        npm version "$BUMP" --no-git-tag-version >/dev/null
+        NEW_VERSION=$(node -p "require('./package.json').version")
+      fi
+      ;;
+    *)
+      NEW_VERSION="$BUMP"
+      if [ "$DRY_RUN" != "1" ]; then
+        npm version "$NEW_VERSION" --no-git-tag-version >/dev/null
+      fi
+      ;;
+  esac
+fi
 
 ok "$CURRENT → $C_BOLD$NEW_VERSION$C_RESET"
 
