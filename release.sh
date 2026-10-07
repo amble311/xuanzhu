@@ -248,17 +248,43 @@ else
   if [ "$SYNCED" != "1" ]; then
     warn "registry 尚未同步，跳过更新；稍后可执行：npm i -g $PACKAGE@latest"
   else
-    if npm i -g "$PACKAGE@$NEW_VERSION" >/dev/null 2>&1; then
-      ok "已安装 $PACKAGE@$NEW_VERSION"
-    else
+    # 先清掉历史安装中断留下的暂存目录（形如 .<包名>-XXXXXX）。
+    # npm 在安装前需要删除它们，而某些环境装有 safe-delete 之类的保护机制：
+    # 目录体量大（几千个文件）时会被拒绝删除，安装随即失败 ——
+    # 表现为「发布成功但本机没更新」，且错误容易被静默吞掉、难以排查。
+    GLOBAL_ROOT=$(npm root -g 2>/dev/null || printf '')
+    if [ -n "$GLOBAL_ROOT" ] && [ -d "$GLOBAL_ROOT" ]; then
+      node -e "
+        const fs = require('fs'); const path = require('path');
+        let removed = 0;
+        try {
+          for (const entry of fs.readdirSync(process.argv[1])) {
+            if (entry.startsWith('.$PACKAGE-')) {
+              fs.rmSync(path.join(process.argv[1], entry), { recursive: true, force: true });
+              removed++;
+            }
+          }
+        } catch { /* 无权限等情况下忽略 */ }
+        if (removed > 0) process.stdout.write('  已清理 ' + removed + ' 个残留暂存目录\n');
+      " "$GLOBAL_ROOT" || true
+    fi
+
+    INSTALL_ERR=$(npm i -g "$PACKAGE@$NEW_VERSION" 2>&1) && INSTALL_OK=1 || INSTALL_OK=0
+    if [ "$INSTALL_OK" != "1" ]; then
       # 元数据缓存偶尔滞后，用 tarball 直连绕过
       info "常规安装失败，尝试 tarball 直连…"
-      if npm i -g "https://registry.npmjs.org/$PACKAGE/-/$PACKAGE-$NEW_VERSION.tgz" >/dev/null 2>&1; then
-        ok "已通过 tarball 安装 $NEW_VERSION"
-      else
-        warn "本机安装失败，请手工执行：npm i -g $PACKAGE@latest"
-      fi
+      INSTALL_ERR=$(npm i -g "https://registry.npmjs.org/$PACKAGE/-/$PACKAGE-$NEW_VERSION.tgz" 2>&1) \
+        && INSTALL_OK=1 || INSTALL_OK=0
     fi
+
+    if [ "$INSTALL_OK" = "1" ]; then
+      ok "已安装 $PACKAGE@$NEW_VERSION"
+    else
+      # 失败必须把原因显示出来，否则「本机没更新」无从排查
+      warn "本机安装失败，请手工执行：npm i -g $PACKAGE@latest"
+      printf '%s\n' "$INSTALL_ERR" | tail -6 | sed 's/^/      /'
+    fi
+
     if command -v "$BIN_NAME" >/dev/null 2>&1; then
       ok "$($BIN_NAME --version 2>&1 | tail -1)"
     fi
