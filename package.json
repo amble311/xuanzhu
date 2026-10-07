@@ -1,14 +1,15 @@
 {
   "name": "xuanzhu",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "玄猪（XuanZhu）— 专为终端打造的 AI 编码 Agent",
   "keywords": [
     "ai",
     "agent",
-    "terminal",
-    "tui",
     "cli",
-    "coding-assistant"
+    "tui",
+    "coding-assistant",
+    "llm",
+    "terminal"
   ],
   "license": "MIT",
   "author": "amble311",
@@ -20,15 +21,6 @@
   "bugs": {
     "url": "https://github.com/amble311/xuanzhu/issues"
   },
-  "keywords": [
-    "ai",
-    "agent",
-    "cli",
-    "tui",
-    "coding-assistant",
-    "llm",
-    "terminal"
-  ],
   "main": "./dist/cli.js",
   "bin": {
     "xzh": "bin/xzh.js"
