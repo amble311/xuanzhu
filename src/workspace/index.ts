@@ -51,6 +51,46 @@ const RULES_TEMPLATE = `# 项目规则
 - 代码风格：
 `;
 
+/** 项目根目录下通用的项目说明文件（CodeBuddy / Claude Code / Cursor 等都读它） */
+const AGENTS_FILE = "AGENTS.md";
+
+/** 读取文本文件并 trim；不存在或全为空白时返回 null */
+function readTextFile(file: string): string | null {
+  try {
+    if (!fs.existsSync(file)) return null;
+    return fs.readFileSync(file, "utf8").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** 从 AGENTS.md 引入初始规则时，加在文件头的来源与同步说明 */
+const RULES_FROM_AGENTS_HEADER = `# 项目规则
+
+> 本文件内容会作为「项目级指令」追加到玄猪的系统提示词中，
+> 用于约定本项目的编码规范、目录结构、构建与测试命令等。
+> 留空或删除本文件即表示不使用项目规则。
+>
+> 📌 以下内容取自本项目根目录的 \`AGENTS.md\`，是**初始化时的一次性快照**。
+> 之后修改 \`AGENTS.md\` **不会**自动同步到这里 —— 若希望两处一致请手动同步，
+> 或者干脆只在此文件中维护。`;
+
+/**
+ * 生成 `.xuanzhu/rules.md` 的初始内容。
+ *
+ * 玄猪只读取 `rules.md` 一个来源（避免多份规则互相冲突、也难以判断优先级）。
+ * 但很多项目根目录已经有 `AGENTS.md`，因此**在初始化时**把它的内容拿来当初始规则，
+ * 用户不必为了用玄猪再维护第二份文档。
+ *
+ * 取的是快照而非运行时读取：这样规则来源始终唯一、行为可预测，
+ * 且 AGENTS.md 改动不会在用户不知情时影响玄猪的行为（文件头已写明这一点）。
+ */
+function buildRulesTemplate(root: string): string {
+  const agents = readTextFile(path.join(root, AGENTS_FILE));
+  if (!agents) return RULES_TEMPLATE;
+  return `${RULES_FROM_AGENTS_HEADER}\n\n${agents}\n`;
+}
+
 function buildPaths(root: string): ProjectPaths {
   const dir = path.join(root, PROJECT_DIR_NAME);
   const memoryDir = path.join(dir, "memory");
@@ -83,7 +123,7 @@ export function ensureProjectDir(cwd: string): {
     // 否则用户会以为「项目规则已启用」而实际没有这个文件。
     try {
       if (!fs.existsSync(paths.rulesFile)) {
-        fs.writeFileSync(paths.rulesFile, RULES_TEMPLATE, "utf8");
+        fs.writeFileSync(paths.rulesFile, buildRulesTemplate(paths.root), "utf8");
       }
     } catch {
       // 忽略：无写权限等情况下不影响启动
@@ -92,7 +132,7 @@ export function ensureProjectDir(cwd: string): {
   }
   try {
     fs.mkdirSync(paths.memoryDir, { recursive: true });
-    fs.writeFileSync(paths.rulesFile, RULES_TEMPLATE, "utf8");
+    fs.writeFileSync(paths.rulesFile, buildRulesTemplate(paths.root), "utf8");
     return { paths, created: true };
   } catch {
     return { paths, created: false };
@@ -101,14 +141,7 @@ export function ensureProjectDir(cwd: string): {
 
 /** 读取项目规则（不存在或为空时返回 null） */
 export function loadProjectRules(cwd: string): string | null {
-  const { rulesFile } = resolveProjectPaths(cwd);
-  try {
-    if (!fs.existsSync(rulesFile)) return null;
-    const content = fs.readFileSync(rulesFile, "utf8").trim();
-    return content || null;
-  } catch {
-    return null;
-  }
+  return readTextFile(resolveProjectPaths(cwd).rulesFile);
 }
 
 /** 当日日志文件路径：<项目>/.xuanzhu/memory/YYYY-MM-DD.md */
