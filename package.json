@@ -1,0 +1,63 @@
+{
+  "name": "xuanzhu",
+  "version": "0.1.3",
+  "description": "玄猪（XuanZhu）— 专为终端打造的 AI 编码 Agent",
+  "keywords": [
+    "ai",
+    "agent",
+    "terminal",
+    "tui",
+    "cli",
+    "coding-assistant"
+  ],
+  "license": "MIT",
+  "author": "amble311",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amble311/xuanzhu.git"
+  },
+  "homepage": "https://github.com/amble311/xuanzhu#readme",
+  "bugs": {
+    "url": "https://github.com/amble311/xuanzhu/issues"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "cli",
+    "tui",
+    "coding-assistant",
+    "llm",
+    "terminal"
+  ],
+  "main": "./dist/cli.js",
+  "bin": {
+    "xzh": "bin/xzh.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "dev": "node esbuild.js --watch",
+    "typecheck": "tsc --noEmit",
+    "start": "node bin/xzh.js",
+    "clean": "rm -rf dist",
+    "prepare": "node esbuild.js --production"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0",
+    "@google/generative-ai": "^0.21.0",
+    "openai": "^4.28.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.2.5",
+    "esbuild": "^0.25.8",
+    "typescript": "^5.4.3"
+  }
+}

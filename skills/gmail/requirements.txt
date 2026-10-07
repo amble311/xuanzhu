@@ -1,0 +1,38 @@
+# Gmail CLI Python Dependencies
+# Pinned versions for security and reproducibility
+#
+# SECURITY NOTE:
+# For production deployments with hash verification:
+#   1. Run: ./generate-hashes.sh
+#   2. Use the generated requirements-locked.txt
+#   3. Install with: pip install --require-hashes -r requirements-locked.txt
+#
+# The install.sh script will automatically use hash verification
+# if requirements-locked.txt exists and contains valid hashes.
+
+# Google API Client - Core library for Gmail API
+# Provides the API client for accessing Gmail services
+google-api-python-client==2.108.0
+
+# Google Auth HTTPLib2 - HTTP transport for Google APIs
+# Required for making authenticated HTTP requests
+google-auth-httplib2==0.1.1
+
+# Google Auth OAuthLib - OAuth2 authentication
+# Handles OAuth2 flow for user authorization
+google-auth-oauthlib==1.1.0
+
+# Google Auth - Core authentication library
+# Base authentication functionality (explicit pin though installed as dependency)
+google-auth==2.23.4
+
+# Cryptography - Security operations
+# Used for secure credential storage and encryption
+# NOTE: Version 42.0.0+ contains security fixes for CVE-2023-49083 and others
+cryptography>=42.0.0
+
+# Security Best Practices:
+# - Run 'pip-audit' to check for known vulnerabilities
+# - Update dependencies regularly and regenerate hashes
+# - Use virtual environments for isolation
+# - For maximum security, use requirements-locked.txt with hash verification
