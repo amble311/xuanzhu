@@ -485,6 +485,20 @@ npm run typecheck   # 类型检查
 node bin/xzh.js     # 本地运行
 ```
 
+## 致谢
+
+本项目站在前人的开源工作上，特别感谢：
+
+- **[CodeBuddy](https://github.com/olasunkanmi-SE/codebuddy)** —— 作者
+  [Oyinlola Olasunkanmi Raymond](https://github.com/olasunkanmi-SE)。
+  玄猪由该项目改造而来（移除编辑器依赖、改为纯粹的终端形态），
+  并依 MIT 许可**保留其原始版权声明**。
+- **[Playwright](https://github.com/microsoft/playwright)** —— 由 Microsoft 开源。
+  内置的 `playwright` 技能基于它实现浏览器自动化与端到端测试。
+
+同时也感谢所有直接与间接依赖的开源项目，以及 npm 生态中的众多工具
+（完整清单见 `package.json`）。
+
 ## License
 
 MIT
