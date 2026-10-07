@@ -76,10 +76,10 @@ interface InputLayout {
 export function restoreTerminalSafely(): void {
   try {
     process.stdout.write(
-      // 还原键盘协议、关闭括号粘贴与鼠标上报、恢复自动换行，再退出备用屏
-      "\x1b[<u" +
+      // 关闭括号粘贴与鼠标上报、恢复自动换行，并把 modifyOtherKeys 还原为终端初始设置，
+      // 再退出备用屏幕
+      "\x1b[?2004l" +
         "\x1b[>4m" +
-        "\x1b[?2004l" +
         "\x1b[?1000l\x1b[?1006l\x1b[?7h" +
         ansi.reset +
         cursor.show +
@@ -320,10 +320,9 @@ export class TuiApp {
     }
     process.stdin.pause();
     process.stdout.write(
-      // 关闭括号粘贴与鼠标上报、恢复自动换行，并把键盘协议还原为终端初始设置，
+      // 关闭括号粘贴与鼠标上报、恢复自动换行，并把 modifyOtherKeys 还原为终端初始设置，
       // 再退出备用屏幕
       "\x1b[?2004l" +
-        "\x1b[<u" +
         "\x1b[>4m" +
         "\x1b[?1000l\x1b[?1006l\x1b[?7h" +
         ansi.reset +
@@ -333,31 +332,29 @@ export class TuiApp {
   }
 
   /**
-   * 请求终端上报「修饰键 + Enter」等按键。
+   * 请求终端上报「修饰键 + Enter」等按键（`\x1b[>4;2m` = xterm modifyOtherKeys level 2）。
    *
-   * 分两条协议，按终端能力叠加：
+   * ⚠️ 曾经在这里**额外叠加** kitty 键盘协议（`\x1b[>1u`），想借此让 xterm.js 类终端
+   * 也能上送 Shift+Enter。实测这是有害的：部分终端收到 `>1u` 后**只处理 `u` 系列序列、
+   * 放弃 `~` 系列**，导致原本好用的 modifyOtherKeys（`CSI 27;<mod>;13~`）失效 ——
+   * 表现为 Ctrl+Enter 与 Shift+Enter **双双失灵**，而 Alt+Enter 仍可用
+   * （它走终端原生的 `ESC CR` 编码，不依赖任何协议）。
    *
-   * 1. **kitty 键盘协议**（`\x1b[>1u`，progressive enhancement）：只让**有歧义的按键**
-   *    （Shift/Ctrl+Enter、Ctrl+字母等）改用转义码上报，普通输入完全不受影响，
-   *    因此可以无条件启用 —— 支持的终端才响应，其余直接忽略。
-   *    这是 VS Code / CodeBuddy 这类基于 xterm.js 的终端里，Shift+Enter
-   *    唯一有机会被区分出来的途径。
+   * 因此这里只保留单一协议，不再叠加。
    *
-   * 2. **xterm modifyOtherKeys**（`\x1b[>4;2m`）：供不支持 kitty 协议的老终端使用。
-   *    但 kitty / Ghostty 会把它映射成「所有按键都用转义码上报」（连普通字母都变成
-   *    `CSI <code>u`），反而破坏输入，故这两类终端跳过。
+   * kitty / Ghostty 把这条 xterm 兼容序列映射到自家的 progressive enhancement 协议上
+   * （level 2 等价于「所有按键都用转义码上报」，连普通字母都会变成 `CSI <code>u`），
+   * 启用后反而会破坏输入，因此这两类终端跳过——它们本身就会直接上送 `CSI 13;2u`。
+   * 不识别该序列的终端（如 xterm.js）会直接忽略，无副作用。
    */
   private extendedKeyRequest(): string {
     const term = process.env.TERM ?? "";
     const program = process.env.TERM_PROGRAM ?? "";
-    const isKittyLike =
-      Boolean(process.env.KITTY_WINDOW_ID) ||
-      /kitty|ghostty/i.test(term) ||
-      /kitty|ghostty/i.test(program);
-
-    let request = "\x1b[>1u";
-    if (!isKittyLike) request += "\x1b[>4;2m";
-    return request;
+    if (process.env.KITTY_WINDOW_ID) return "";
+    if (/kitty|ghostty/i.test(term) || /kitty|ghostty/i.test(program)) {
+      return "";
+    }
+    return "\x1b[>4;2m";
   }
 
   private shutdown(): void {
@@ -1356,7 +1353,7 @@ export class TuiApp {
       `  /intent [on|off] 切换意图分析（on：每条消息先做意图分析再处理，写入配置）`,
       `  /exit          退出玄猪`,
       `${ansi.bold}快捷键${ansi.reset}`,
-      `  Enter 提交 · ${ansi.bold}Alt+Enter${ansi.reset} 换行（Ctrl+J 亦可；Shift/Ctrl+Enter 视终端而定）`,
+      `  Enter 提交 · Ctrl+Enter / Shift+Enter 换行（Ctrl+J、Alt+Enter 亦可）`,
       `  ↑/↓ 历史 · Ctrl+A/Ctrl+E 行首/行尾 · PgUp/PgDn 翻页 · Shift+↑/↓ 逐行`,
       `  Home/End 跳到最早/最新`,
       `  ${ansi.gray}鼠标${ansi.reset}：默认交还终端 —— 右键菜单、框选复制、中键粘贴都可用；` +
@@ -1367,9 +1364,8 @@ export class TuiApp {
       `  Ctrl+C 中断任务 / 清空输入 / 退出（空闲且输入为空时退出）`,
       `  Ctrl+D 结束本轮正在进行的对话 · 任何情况下都不会退出玄猪`,
       `  Ctrl+L 清屏`,
-      `  注：VS Code / CodeBuddy 等内置终端把 Shift/Ctrl+Enter 编成与 Enter 相同的字节，`,
-      `      这类环境请用 ${ansi.bold}Alt+Enter${ansi.reset} 或 Ctrl+J；支持 kitty 键盘协议的终端`,
-      `      （kitty / Ghostty / WezTerm / 新版 VS Code）可直接用 Shift+Enter。`,
+      `  注：若 Ctrl/Shift+Enter 无效（部分 IDE 内置终端会把二者编成与 Enter 相同的字节），`,
+      `      请改用 ${ansi.bold}Alt+Enter${ansi.reset} 或 Ctrl+J —— 它们走终端原生编码，各终端通用。`,
       `${ansi.bold}右侧终端${ansi.reset}`,
       `  Enter 执行命令 · ↑/↓ 命令历史 · Ctrl+C / Ctrl+D 中断运行中的命令 · Ctrl+L 清空`,
       `  PgUp/PgDn / Shift+↑↓ / Home/End 回看历史输出（滚动不影响正在运行的命令）`,
