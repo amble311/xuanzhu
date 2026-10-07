@@ -612,8 +612,16 @@ export class Agent {
   }
 
   /**
-   * 判断只读工具的调用是否触及工作区之外或敏感路径。
+   * 判断只读工具的调用是否触及**凭据类文件**。
    * 命中时 runTool 会强制要求用户确认（即使在自动批准模式下）。
+   *
+   * 这里刻意**不**按「是否在工作区内」判定：那样会把「看一眼自己 home 下的
+   * `~/.gitconfig`」或「读 /etc 下的配置」也算作危险操作，对刚上手的人是纯骚扰，
+   * 而它们并无实际风险 —— 既然用户选择了自动批准，就不该被这类无关确认打断。
+   *
+   * 真正值得拦一次的只有凭据文件：它们一旦被读进上下文，就会随请求发送给
+   * 模型服务商（`~/.xzh/config.json` 里就存着明文 apiKey）。这类读取极少发生，
+   * 因此不会影响正常体验。
    */
   private touchesSensitivePath(toolName: string, rawArgs: string): boolean {
     if (!READ_TOOLS.has(toolName)) return false;
@@ -628,12 +636,10 @@ export class Agent {
     }
     if (!target) return false;
 
-    const abs = path.resolve(this.cwd, expandHome(target));
-    const rel = path.relative(this.cwd, abs);
-    // rel 为空字符串表示就是 cwd 自身；以 .. 开头或跨盘则为越界
-    if (rel && (rel.startsWith("..") || path.isAbsolute(rel))) return true;
-
-    return SENSITIVE_PATH_PATTERN.test(abs);
+    // 解析成绝对路径后再匹配，以便正确处理 ~ 与 ../ 这类写法
+    return SENSITIVE_PATH_PATTERN.test(
+      path.resolve(this.cwd, expandHome(target)),
+    );
   }
 
   private async runTool(
@@ -646,12 +652,13 @@ export class Agent {
     }
 
     // 确认策略：
-    //  1. autoApprove（**默认开启**）下所有工具直接执行 —— 包括执行命令与写文件。
-    //     用户主动选择「全自动」意味着接受相应风险，不应再用逐项确认打断他。
-    //     （danger 字段此时仍用于确认框的醒目标记与未开启自动批准时的判定。）
-    //  2. 唯一例外：读取类工具触及工作区之外、或命中敏感路径（~/.ssh、.env、
-    //     ~/.xzh/config.json 等）时强制确认。它防的是「凭据被读进上下文、转手
-    //     发给模型服务商」，与「是否信任模型执行命令」是两回事，且极少触发。
+    //  1. autoApprove（**默认开启**，新用户开箱即用）下所有工具直接执行 ——
+    //     包括执行命令、写文件、读取工作区外的文件。用户选择「全自动」
+    //     意味着接受相应风险，不应再用逐项确认打断他 —— 那正是新手最先遇到的
+    //     体验问题。（danger 字段此时仍用于确认框的醒目标记。）
+    //  2. 唯一例外：读取**凭据类文件**（~/.ssh、.env、~/.xzh/config.json 等）
+    //     时确认一次。它防的是「凭据被读进上下文、转手发给模型服务商」，
+    //     与「是否信任模型执行命令」是两回事，且极少触发，不构成骚扰。
     //  3. 未开启自动批准时，声明了 requiresConfirmation 的工具逐项确认。
     const needsConfirm =
       this.touchesSensitivePath(tool.name, call.arguments) ||
