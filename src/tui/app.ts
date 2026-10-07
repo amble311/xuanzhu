@@ -76,8 +76,10 @@ interface InputLayout {
 export function restoreTerminalSafely(): void {
   try {
     process.stdout.write(
-      // 还原 modifyOtherKeys、关闭鼠标上报、恢复自动换行，再退出备用屏
-      "\x1b[>4m" +
+      // 还原键盘协议、关闭括号粘贴与鼠标上报、恢复自动换行，再退出备用屏
+      "\x1b[<u" +
+        "\x1b[>4m" +
+        "\x1b[?2004l" +
         "\x1b[?1000l\x1b[?1006l\x1b[?7h" +
         ansi.reset +
         cursor.show +
@@ -130,11 +132,14 @@ export class TuiApp {
   /**
    * 是否捕获鼠标（滚轮 + 拖拽）。
    *
-   * 开启时终端不再处理原生「拖拽选择」，这正是「TUI 里选不中文字」的原因 ——
-   * 关闭后可用鼠标原生选择与复制，代价是滚轮不再滚动输出区。
-   * 用 `/mouse` 切换。
+   * **默认关闭**：开启后终端会把**所有**鼠标事件交给应用，包括右键 ——
+   * 于是右键菜单、原生拖拽选择、中键粘贴全部失效，而终端层面无法做到
+   * 「只捕获滚轮、放行右键」。相比之下滚动有 `PgUp`/`PgDn` 与鼠标滚轮之外的
+   * 更重要的键位可用，因此默认把原生鼠标行为还给用户。
+   *
+   * 需要滚轮滚动输出区时执行 `/mouse` 开启（此时可用 Shift+拖拽临时选择）。
    */
-  private mouseCapture = true;
+  private mouseCapture = false;
   /** 最近一次对话在输出区中的起始行号（含用户提问），供 /copy last 使用 */
   private lastAnswerStart = 0;
   private streamingPreview = "";
@@ -262,8 +267,11 @@ export class TuiApp {
         // 注意这会禁用终端的原生拖拽选择 —— 需要选择文本时用 `/mouse` 临时关闭，
         // 或在任何终端里按住 Shift 拖拽（多数终端会用 Shift 绕过应用级鼠标捕获）。
         (this.mouseCapture ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1000l\x1b[?1006l") +
-        // 请求上报带修饰键的 Enter 等按键（xterm modifyOtherKeys level 2）：
-        // 多数终端默认把 Shift+Enter 与 Enter 编成同一个 `\r`，无法区分
+        // 启用括号粘贴：终端会把粘贴内容包在 ESC[200~ … ESC[201~ 之间，
+        // 我们据此整段插入 —— 否则多行内容里的换行会被逐个当成「提交」，
+        // 粘贴一大段文本就会连发好几条消息。
+        "\x1b[?2004h" +
+        // 请求上报带修饰键的 Enter 等按键
         this.extendedKeyRequest(),
     );
     if (process.stdin.isTTY) {
@@ -312,8 +320,11 @@ export class TuiApp {
     }
     process.stdin.pause();
     process.stdout.write(
-      // 关闭鼠标上报、恢复自动换行，并把 modifyOtherKeys 还原为终端初始设置，再退出备用屏幕
-      "\x1b[>4m" +
+      // 关闭括号粘贴与鼠标上报、恢复自动换行，并把键盘协议还原为终端初始设置，
+      // 再退出备用屏幕
+      "\x1b[?2004l" +
+        "\x1b[<u" +
+        "\x1b[>4m" +
         "\x1b[?1000l\x1b[?1006l\x1b[?7h" +
         ansi.reset +
         cursor.show +
@@ -322,21 +333,31 @@ export class TuiApp {
   }
 
   /**
-   * 请求终端上报「修饰键 + Enter」(`\x1b[>4;2m` = xterm modifyOtherKeys level 2)。
+   * 请求终端上报「修饰键 + Enter」等按键。
    *
-   * kitty / Ghostty 把这条 xterm 兼容序列映射到自家的 progressive enhancement 协议上
-   * （level 2 等价于「所有按键都用转义码上报」，连普通字母都会变成 `CSI <code>u`），
-   * 启用后反而会破坏输入，因此这两类终端跳过——需要 Shift+Enter 时请在终端侧配置。
-   * 不识别该序列的终端（如 xterm.js）会直接忽略，无副作用。
+   * 分两条协议，按终端能力叠加：
+   *
+   * 1. **kitty 键盘协议**（`\x1b[>1u`，progressive enhancement）：只让**有歧义的按键**
+   *    （Shift/Ctrl+Enter、Ctrl+字母等）改用转义码上报，普通输入完全不受影响，
+   *    因此可以无条件启用 —— 支持的终端才响应，其余直接忽略。
+   *    这是 VS Code / CodeBuddy 这类基于 xterm.js 的终端里，Shift+Enter
+   *    唯一有机会被区分出来的途径。
+   *
+   * 2. **xterm modifyOtherKeys**（`\x1b[>4;2m`）：供不支持 kitty 协议的老终端使用。
+   *    但 kitty / Ghostty 会把它映射成「所有按键都用转义码上报」（连普通字母都变成
+   *    `CSI <code>u`），反而破坏输入，故这两类终端跳过。
    */
   private extendedKeyRequest(): string {
     const term = process.env.TERM ?? "";
     const program = process.env.TERM_PROGRAM ?? "";
-    if (process.env.KITTY_WINDOW_ID) return "";
-    if (/kitty|ghostty/i.test(term) || /kitty|ghostty/i.test(program)) {
-      return "";
-    }
-    return "\x1b[>4;2m";
+    const isKittyLike =
+      Boolean(process.env.KITTY_WINDOW_ID) ||
+      /kitty|ghostty/i.test(term) ||
+      /kitty|ghostty/i.test(program);
+
+    let request = "\x1b[>1u";
+    if (!isKittyLike) request += "\x1b[>4;2m";
+    return request;
   }
 
   private shutdown(): void {
@@ -493,6 +514,17 @@ export class TuiApp {
   private readKey(): string | null {
     const buf = this.keyBuffer;
     if (buf.length === 0) return null;
+
+    // 括号粘贴（bracketed paste）：终端把粘贴内容包在 \x1b[200~ … \x1b[201~ 之间。
+    // 必须整段取出交给 handleKey 一次性插入 —— 否则其中的换行会被当成「提交」，
+    // 粘贴一大段文本就会连发好几条消息。内容可能分多次到达，未收全时返回 null 等待。
+    if (buf.startsWith("\x1b[200~")) {
+      const end = buf.indexOf("\x1b[201~", 6);
+      if (end === -1) return null;
+      this.keyBuffer = buf.slice(end + 6);
+      return buf.slice(0, end + 6);
+    }
+
     if (buf[0] === "\x1b") {
       // 完整 CSI 序列（final byte 位于 0x40–0x7E）
       const csi = /^\x1b\[[0-9:;<=>?]*[@-~]/.exec(buf);
@@ -523,6 +555,18 @@ export class TuiApp {
   }
 
   private handleKey(rawKey: string): void {
+    // 括号粘贴：整段一次性插入输入框（保留其中的换行），不逐字走按键逻辑 ——
+    // 逐字处理会让内容里的回车触发「提交」，也会把粘贴的转义码当控制键执行。
+    if (rawKey.startsWith("\x1b[200~") && rawKey.endsWith("\x1b[201~")) {
+      const pasted = rawKey
+        .slice(6, rawKey.length - 6)
+        .replace(/\r\n?/g, "\n")
+        // 去掉残留的控制字符，避免粘贴内容里的光标移动指令干扰渲染
+        .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+      if (pasted) this.insertText(pasted);
+      return;
+    }
+
     // 归一化终端的扩展按键序列（Ctrl/Shift+Enter、modifyOtherKeys 下的 Ctrl+字母等）
     const key = normalizeKey(rawKey);
     if (this.pendingConfirm) {
@@ -1217,9 +1261,11 @@ export class TuiApp {
     this.lines.push(
       this.mouseCapture
         ? `${ansi.gray}鼠标捕获：${ansi.reset}开 ${ansi.gray}— 滚轮可滚动输出区。` +
-            `要选中文本请按住 ${ansi.reset}Shift${ansi.gray} 拖拽，或输入 ${ansi.reset}/mouse${ansi.gray} 临时关闭。${ansi.reset}`
+            `但右键菜单与原生框选会被接管，要选文本请按住 ${ansi.reset}Shift${ansi.gray} 拖拽。` +
+            `再输入 ${ansi.reset}/mouse${ansi.gray} 关闭。${ansi.reset}`
         : `${ansi.gray}鼠标捕获：${ansi.reset}${ansi.brightGreen}关${ansi.reset}` +
-            `${ansi.gray} — 现在可以直接用鼠标框选复制；滚轮不再滚动。再输入 ${ansi.reset}/mouse${ansi.gray} 恢复。${ansi.reset}`,
+            `${ansi.gray} — 鼠标全部功能可用（右键菜单、框选复制、滚轮由终端处理）。` +
+            `滚动输出区请用 ${ansi.reset}PgUp/PgDn${ansi.gray}，或用 ${ansi.reset}/mouse${ansi.gray} 换回滚轮。${ansi.reset}`,
     );
   }
 
@@ -1310,18 +1356,20 @@ export class TuiApp {
       `  /intent [on|off] 切换意图分析（on：每条消息先做意图分析再处理，写入配置）`,
       `  /exit          退出玄猪`,
       `${ansi.bold}快捷键${ansi.reset}`,
-      `  Enter 提交 · Ctrl+Enter / Shift+Enter 换行（Ctrl+J 亦可）`,
+      `  Enter 提交 · ${ansi.bold}Alt+Enter${ansi.reset} 换行（Ctrl+J 亦可；Shift/Ctrl+Enter 视终端而定）`,
       `  ↑/↓ 历史 · Ctrl+A/Ctrl+E 行首/行尾 · PgUp/PgDn 翻页 · Shift+↑/↓ 逐行`,
       `  Home/End 跳到最早/最新`,
-      `  鼠标滚轮按指针所在栏滚动（左栏对话 / 右栏终端），滚动时状态栏显示 ↑N`,
-      `  ${ansi.yellow}选中复制${ansi.reset}：应用捕获鼠标后原生拖拽会被禁用。请${ansi.bold}按住 Shift 拖拽${ansi.reset}临时绕过，`,
-      `      或用 ${ansi.reset}/mouse${ansi.gray} 关闭捕获后用鼠标直接框选；也可用 ${ansi.reset}/copy${ansi.gray} 复制输出区。${ansi.reset}`,
+      `  ${ansi.gray}鼠标${ansi.reset}：默认交还终端 —— 右键菜单、框选复制、中键粘贴都可用；` +
+        `滚动输出区用 ${ansi.reset}PgUp/PgDn${ansi.gray}。`,
+      `      输入 ${ansi.reset}/mouse${ansi.gray} 可改为让玄猪接管滚轮（此时用 ${ansi.reset}Shift+拖拽${ansi.gray} 选择文本）。${ansi.reset}`,
+      `  ${ansi.gray}粘贴${ansi.reset}：支持多行整段粘贴（不会逐行提交）；也可用 ${ansi.reset}/copy${ansi.gray} 复制输出区。${ansi.reset}`,
       `  Shift+Tab 切换焦点（对话 ⇄ 右侧终端）· 鼠标点击亦可`,
       `  Ctrl+C 中断任务 / 清空输入 / 退出（空闲且输入为空时退出）`,
       `  Ctrl+D 结束本轮正在进行的对话 · 任何情况下都不会退出玄猪`,
       `  Ctrl+L 清屏`,
-      `  注：多数 IDE 内置终端（含 VS Code / CodeBuddy）默认把 Ctrl/Shift+Enter 编成与 Enter`,
-      `      相同的字节，需在 IDE 里把这两个键绑定为发送 ESC[13;5u / ESC[13;2u（见 README）。`,
+      `  注：VS Code / CodeBuddy 等内置终端把 Shift/Ctrl+Enter 编成与 Enter 相同的字节，`,
+      `      这类环境请用 ${ansi.bold}Alt+Enter${ansi.reset} 或 Ctrl+J；支持 kitty 键盘协议的终端`,
+      `      （kitty / Ghostty / WezTerm / 新版 VS Code）可直接用 Shift+Enter。`,
       `${ansi.bold}右侧终端${ansi.reset}`,
       `  Enter 执行命令 · ↑/↓ 命令历史 · Ctrl+C / Ctrl+D 中断运行中的命令 · Ctrl+L 清空`,
       `  PgUp/PgDn / Shift+↑↓ / Home/End 回看历史输出（滚动不影响正在运行的命令）`,
