@@ -168,7 +168,7 @@ XZH_HOME=/path/to/dir xzh          # 改用 /path/to/dir/config.json
     { "id": "openai/gpt-4o", "provider": "openai", "model": "gpt-4o", "weight": 6 }
   ],
   "temperature": 0.2,
-  "maxToolRounds": 40,
+  "maxToolRounds": 100,
   "autoApprove": true,
   "intent": { "enabled": false },
   "providers": {

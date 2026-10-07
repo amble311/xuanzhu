@@ -124,7 +124,10 @@ export const DEFAULT_CONFIG: XuanZhuConfig = {
   models: [],
   intent: { enabled: false },
   providers: {},
-  maxToolRounds: 40,
+  // 单轮对话内允许的工具调用轮数。默认 100：真实的重构类任务
+  // （读模块 → 重写 → 反复跑测试）很容易超过 40 轮，而失控风险已由
+  // 「连续相同调用检测」兜住，因此可以放宽。
+  maxToolRounds: 100,
   autoApprove: true,
   temperature: 0.2,
 };

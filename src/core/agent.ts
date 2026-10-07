@@ -20,7 +20,7 @@ import { friendlyError } from "../llm/http";
 import type { ChatMessage, LLMProvider, ToolCall } from "../llm/types";
 import { executeTool, findTool, getToolSpecs, type ExecuteToolResult } from "../tools";
 import type { ConfirmRequest, ToolContext } from "../tools/types";
-import { expandHome } from "../utils/paths";
+import { expandHome, getConfigPath } from "../utils/paths";
 import { loadProjectRules, readProjectMemory } from "../workspace";
 import { buildSystemPrompt } from "./prompt";
 import * as path from "path";
@@ -47,6 +47,12 @@ export interface AgentEvents {
   onToolEnd: (call: ToolCall, result: ExecuteToolResult) => void;
   /** 状态变化（思考中 / 调用工具等） */
   onStatus: (status: string, detail?: string) => void;
+  /**
+   * 工具轮次配额用尽时询问是否继续；返回 true 则追加一轮配额。
+   *
+   * 未提供时（非交互场景）行为与以前一致：直接收尾。
+   */
+  onRoundLimit?: (used: number) => Promise<boolean>;
   /** 向输出区推送信息（工具内部日志等） */
   onNotice?: (message: string) => void;
   /** 意图分析完成（analysis 为分析结果，original 为用户原始消息） */
@@ -267,8 +273,27 @@ export class Agent {
     let lastToolSignature = "";
     let identicalToolCalls = 0;
 
+    // 轮次配额的当前上限。用尽时先询问用户是否继续，而不是硬性中断 ——
+    // 真实的大型重构（读完一个模块、重写、反复跑测试）很容易超过默认轮数，
+    // 直接停掉会让任务断在半路。只有用户明确不再继续才收尾。
+    let roundLimit = maxRounds;
+
     try {
-      for (let round = 0; round < maxRounds; round++) {
+      for (let round = 0; ; round++) {
+        if (round >= roundLimit) {
+          if (signal?.aborted) {
+            commitPartialTurn();
+            this.events.onStatus("已中断");
+            return;
+          }
+          // 没有提供询问回调时（非交互场景）行为与以前一致：直接收尾
+          const canContinue = this.events.onRoundLimit
+            ? await this.events.onRoundLimit(round)
+            : false;
+          if (!canContinue) break;
+          roundLimit += maxRounds;
+        }
+
         if (signal?.aborted) {
           commitPartialTurn();
           this.events.onStatus("已中断");
@@ -347,15 +372,17 @@ export class Agent {
         }
       }
 
-      // 达到工具轮次上限：工具已经真实执行过（有副作用），本轮记录要保留下来
+      // 达到工具轮次上限（用户选择不再继续）：工具已经真实执行过（有副作用），
+      // 本轮记录要保留下来。
       commitTurn();
       // 用 onNotice 而非 onStatus：后者只更新状态栏，用户很容易忽略，
       // 于是「程序突然停了」而不知道为什么。
-      this.events.onStatus("已达工具调用上限", `最多 ${maxRounds} 轮`);
+      this.events.onStatus("已达工具调用上限", `共 ${roundLimit} 轮`);
       this.events.onNotice?.(
-        `已达工具调用上限（${maxRounds} 轮）而中止本轮。\n` +
-          `· 若模型在反复做同一件事，本轮通常早已被重复调用检测提前中止\n` +
-          `· 否则可用 xzh config 调大 maxToolRounds，或把任务拆成更小的步骤`,
+        `已达工具调用上限（共 ${roundLimit} 轮）而中止本轮。\n` +
+          `· 若模型在反复做同一件事，通常早已被重复调用检测提前中止\n` +
+          `· 想调大上限：编辑 ${getConfigPath()} 里的 maxToolRounds（当前 ${this.config.maxToolRounds}）\n` +
+          `· 或把任务拆成更小的步骤，每步单独提一次`,
       );
     } catch (err) {
       // 中断也可能以异常形式到达（provider 在 abort 时 reject）

@@ -199,6 +199,19 @@ export class TuiApp {
       onIntent: (analysis, original) => this.handleIntent(analysis, original),
       onModelChange: (info) => this.handleModelChange(info),
       confirm: (request) => this.requestConfirm(request),
+      // 轮次配额用尽时问一次，而不是硬性中断 —— 真实的重构任务常常超过默认轮数，
+      // 直接停掉会让工作断在半路。复用同一套确认弹窗（y 继续 / n 结束）。
+      onRoundLimit: (used) =>
+        this.requestConfirm({
+          tool: "round_limit",
+          title: `已调用 ${used} 轮工具，是否继续？`,
+          detail:
+            `本轮对话已执行 ${used} 轮工具调用（达到当前上限），任务可能尚未完成。\n\n` +
+            `· 按 y 继续：再追加 ${this.options.config.maxToolRounds} 轮\n` +
+            `· 按 n 结束：保留已有进展，本轮到此为止\n\n` +
+            `想永久调整上限：编辑配置文件的 maxToolRounds 字段。`,
+          danger: false,
+        }),
     };
     this.agent = new Agent(
       options.provider,
