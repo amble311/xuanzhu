@@ -485,6 +485,30 @@ npm run typecheck   # 类型检查
 node bin/xzh.js     # 本地运行
 ```
 
+### 发布新版本
+
+```bash
+./release.sh                         # 版本尾号 +1（0.1.4 → 0.1.5）
+./release.sh minor                   # 0.1.4 → 0.2.0
+./release.sh 1.0.0                   # 指定版本
+XZH_RELEASE_DRY_RUN=1 ./release.sh   # 先演练一遍，不做任何写入
+```
+
+脚本会依次完成：**版本号 +1 → `npm publish` → 等待 registry 同步 → 提交并推送 GitHub
+→ 更新本机全局安装**。
+
+之所以需要脚本，是因为这条链路有几个反直觉的地方：`npm publish` 返回成功**不等于**
+registry 已可见（npm 有 staging 阶段，期间 `npm view` / `npm install` 会报 `notarget`），
+而版本号、GitHub 提交、npm 包三者又必须保持一致。脚本把它们串起来并自动等待与重试。
+
+| 环境变量 | 作用 |
+| --- | --- |
+| `XZH_RELEASE_DRY_RUN=1` | 只演练，不改版本、不发布、不推送 |
+| `XZH_RELEASE_YES=1` | 跳过发布前的确认提示 |
+| `XZH_RELEASE_SKIP_GIT=1` | 不推送 GitHub |
+| `XZH_RELEASE_SKIP_LOCAL=1` | 不更新本机全局安装 |
+| `XZH_RELEASE_WAIT=<秒>` | 等待 registry 同步的上限（默认 300） |
+
 ## 致谢
 
 本项目站在前人的开源工作上，特别感谢：
