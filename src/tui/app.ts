@@ -44,6 +44,13 @@ export interface TuiAppOptions {
    */
   intentEnabled?: boolean;
   autoApprove: boolean;
+  /**
+   * 启动时先显示在输出区的提示（多行字符串）。
+   *
+   * 用于「上次运行疑似异常退出」这类必须在界面里看到的信息 ——
+   * 直接写 stdout 的话，会被随后进入的备用屏覆盖掉。
+   */
+  startupNotice?: string;
 }
 
 interface PendingConfirm {
@@ -204,6 +211,12 @@ export class TuiApp {
 
   async start(): Promise<void> {
     this.enterTerminal();
+    if (this.options.startupNotice) {
+      for (const line of this.options.startupNotice.split("\n")) {
+        this.lines.push(line);
+      }
+      this.lines.push("");
+    }
     if (this.projectDirCreated) {
       this.lines.push(
         `${ansi.green}✓ 已初始化项目目录 ${this.projectDirCreated}${ansi.reset}`,

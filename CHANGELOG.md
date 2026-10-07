@@ -4,6 +4,25 @@
 
 ## [未发布]
 
+### 修复
+
+- **本地推理引擎的「上下文超限」没被识别**：`isContextLengthError()` 原先只匹配
+  `context length` / `context window` / `maximum context`，而 **llama.cpp / llama-server /
+  Ollama 用的是 `context size`** —— 于是本地模型超限被当成普通调用失败：
+  降权 + 切换模型，而新模型拿到同样长的内容必然同样失败，白白把权重耗光。
+  现已补入 `context size`、`exceeds the available context`、`input length exceeds`、
+  `n_ctx` 等本地推理常见措辞。
+- **失控输出会把内存吃光，导致进程被系统杀掉**（表现为界面毫无征兆地消失）：
+  `streamAssistant` 的 `text += chunk.text` 与意图分析同理，**都没有上限**。
+  本地推理引擎在上下文错乱或陷入重复时会持续吐 token，累积的字符串最终触发 OOM。
+  现限制单次回复最多累积 `MAX_RESPONSE_CHARS = 1_000_000` 字符，超出即停止消费流并提示。
+- **异常退出时拿不到任何线索**：TUI 在备用屏中，未捕获异常或被 OOM Killer 杀掉后
+  界面直接消失，用户只看到「突然终止」。新增 `src/utils/crash.ts` 的**会话标记 + 崩溃日志**
+  机制：启动写 `~/.xzh/session.lock`、正常退出删除、崩溃写 `~/.xzh/crash.log`；
+  下次启动若发现标记残留，就在**界面内**提示上次异常退出并附日志尾部
+  （直接写 stdout 会被备用屏覆盖，故通过新增的 `startupNotice` 通道注入输出区）。
+  这条路径不依赖崩溃当时能否输出，连 OOM 这种来不及执行 JS 的终止也能被下次启动发现。
+
 ### 变更
 
 - **上下文窗口一律显示完整数字**（`128000`），不再用 `128k` / `1M` 缩写 ——

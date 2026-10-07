@@ -236,7 +236,11 @@ export function isContextLengthError(error: unknown): boolean {
   if (status !== undefined && (status < 400 || status >= 500)) return false;
 
   const code = asString(err?.code) || asString(err?.error?.code);
-  if (/context[_ ]?length|max[_ ]?tokens?_exceeded|token[_ ]?limit/i.test(code)) {
+  if (
+    /context[_ ]?length|context[_ ]?size|max[_ ]?tokens?_exceeded|token[_ ]?limit/i.test(
+      code,
+    )
+  ) {
     return true;
   }
 
@@ -248,15 +252,28 @@ export function isContextLengthError(error: unknown): boolean {
   ).toLowerCase();
 
   return [
-    "context length",
+    // ── 云端 API ──
+    "context length", // OpenAI / vLLM / LM Studio
     "context_length",
     "maximum context",
     "context window",
-    "prompt is too long",
+    "prompt is too long", // Anthropic
     "exceed context limit",
-    "exceeds the maximum number of tokens",
+    "exceeds the maximum number of tokens", // Gemini
     "reduce the length",
     "too many tokens",
+    // ── 本地推理（llama.cpp / llama-server / Ollama 等）──
+    // 这些用的措辞是 "context size" 而不是 "context length"，
+    // 早期只匹配后者，导致本地模型超限时被当成普通故障：降权 + 切换模型，
+    // 而换模型后再发同样长的内容必然同样失败，白白把权重耗光。
+    "context size",
+    "context_size",
+    "exceeds the available context",
+    "input length exceeds",
+    "exceeds the context",
+    "n_ctx",
+    "n_keep",
+    // ── 兜底 ──
     "too long",
   ].some((pattern) => text.includes(pattern));
 }

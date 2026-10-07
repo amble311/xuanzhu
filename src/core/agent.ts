@@ -78,6 +78,17 @@ const MAX_HISTORY_MESSAGES = 400;
  * 而估算本身已经留了 20% 余量 —— 大幅收敛能保证一次就过，避免反复失败。
  */
 const CONTEXT_RETRY_BUDGET_RATIO = 0.5;
+
+/**
+ * 单次回复允许累积的最大字符数（约 100 万字符）。
+ *
+ * 正常情况下远达不到 —— 这是防御**失控输出**：本地推理引擎（llama.cpp / Ollama 等）
+ * 在上下文错乱或陷入重复时会持续不断地吐 token，而流式累积
+ * （`text += chunk.text`）本身没有任何上限，最终会把内存吃光，
+ * 进程被系统 OOM Killer 直接杀掉 —— 表现就是界面毫无征兆地消失。
+ * 本地模型与玄猪跑在同一台机器上，这类风险比云端 API 高得多。
+ */
+const MAX_RESPONSE_CHARS = 1_000_000;
 /** 单次请求内因模型调用失败而切换模型的最大次数 */
 const MAX_MODEL_SWITCHES = 3;
 
@@ -338,7 +349,11 @@ export class Agent {
         signal,
       });
       for await (const chunk of stream) {
-        if (chunk.type === "text") text += chunk.text;
+        if (chunk.type === "text") {
+          text += chunk.text;
+          // 与主回复同样的失控保护：分析请求也不该把内存吃光
+          if (text.length > MAX_RESPONSE_CHARS) break;
+        }
       }
     } catch (err) {
       if (signal?.aborted) return null;
@@ -395,6 +410,14 @@ export class Agent {
           case "text":
             text += chunk.text;
             this.events.onText(chunk.text);
+            if (text.length > MAX_RESPONSE_CHARS) {
+              // 停止消费流（for-await 会自动关闭生成器），避免内存被无限增长吃光
+              this.events.onNotice?.(
+                `模型输出超过 ${MAX_RESPONSE_CHARS} 字符，已强制中断 —— ` +
+                  `这通常意味着模型陷入了重复输出，建议检查上下文或换个提示。`,
+              );
+              return { text, toolCalls };
+            }
             break;
           case "reasoning":
             this.events.onReasoning?.(chunk.text);

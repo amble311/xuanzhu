@@ -25,6 +25,12 @@ import {
   migrateLegacyConfigDir,
 } from "../utils/paths";
 import { VERSION } from "../utils/version";
+import {
+  crashLogPath,
+  markSessionEnd,
+  markSessionStart,
+  recordCrash,
+} from "../utils/crash";
 import { configCommand } from "./commands/config";
 import { modelCommand } from "./commands/model";
 import { setupCommand } from "./commands/setup";
@@ -42,18 +48,24 @@ process.stderr.on("error", () => undefined);
 // 输出不换行、光标隐藏等）。SIGINT 由 TUI 自己处理，这里不接管。
 for (const signal of ["SIGTERM", "SIGHUP"] as const) {
   process.on(signal, () => {
+    markSessionEnd(); // 用户/系统主动结束，不算崩溃
     restoreTerminalSafely();
     process.exit(0);
   });
 }
 process.on("uncaughtException", (err) => {
+  // 记日志：TUI 在备用屏里，界面消失后 stderr 容易被忽略，日志才是可追溯的
+  recordCrash("未捕获异常", err);
   restoreTerminalSafely();
   process.stderr.write(`\n未捕获异常：${err?.stack ?? String(err)}\n`);
+  process.stderr.write(`详情已写入 ${crashLogPath()}\n`);
   process.exit(1);
 });
 process.on("unhandledRejection", (reason) => {
+  recordCrash("未处理的 Promise 拒绝", reason);
   restoreTerminalSafely();
   process.stderr.write(`\n未处理的 Promise 拒绝：${String(reason)}\n`);
+  process.stderr.write(`详情已写入 ${crashLogPath()}\n`);
   process.exit(1);
 });
 
@@ -253,9 +265,47 @@ async function startChat(
         ? intentOverride
         : config.intent?.enabled === true,
     autoApprove: config.autoApprove,
+    startupNotice: buildStartupNotice(),
   });
 
   await app.start();
+  // 走到这里说明 TUI 是正常退出的，清掉会话标记与旧日志，
+  // 这样下次启动若发现标记还在，就一定是异常退出。
+  markSessionEnd();
+}
+
+/**
+ * 构造 TUI 的启动提示：上次是否异常退出。
+ *
+ * 判断依据是「会话标记」——正常退出会删除它，所以只要还残留，
+ * 就说明上次是崩溃或被强制终止。这条路径**不依赖崩溃当时能否输出**，
+ * 连内存不足被系统直接杀掉（来不及执行任何 JS）也能在下次启动时被发现。
+ */
+function buildStartupNotice(): string | undefined {
+  const previous = markSessionStart(VERSION);
+  if (!previous) return undefined;
+
+  const when = previous.startedAt ? `（开始于 ${previous.startedAt}）` : "";
+  const lines = [
+    `${ansi.yellow}⚠ 上次运行疑似异常退出${when}${ansi.reset}`,
+  ];
+
+  if (previous.crashLog) {
+    lines.push(`${ansi.gray}  最后的记录：${ansi.reset}`);
+    for (const line of previous.crashLog.trim().split("\n").slice(-10)) {
+      lines.push(`${ansi.gray}    ${line}${ansi.reset}`);
+    }
+  } else {
+    lines.push(
+      `${ansi.gray}  未留下日志 —— 多为进程被强制终止（例如内存不足被系统杀掉）${ansi.reset}`,
+    );
+  }
+
+  lines.push(
+    `${ansi.gray}  完整日志：${crashLogPath()}${ansi.reset}`,
+    "",
+  );
+  return lines.join("\n");
 }
 
 function printHelp(): void {
