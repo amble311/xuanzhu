@@ -89,6 +89,19 @@ const CONTEXT_RETRY_BUDGET_RATIO = 0.5;
  * 本地模型与玄猪跑在同一台机器上，这类风险比云端 API 高得多。
  */
 const MAX_RESPONSE_CHARS = 1_000_000;
+
+/**
+ * 连续「完全相同的工具调用」次数上限。
+ *
+ * 本地模型很容易陷入「反复调用同一个工具、拿到相同结果」的死循环 ——
+ * 尤其是上下文被裁剪之后，它看不到自己刚才做过什么，于是一遍遍重试。
+ * 后果是：白烧 token、上下文加速膨胀，最终撞上 maxToolRounds 戛然而止，
+ * 用户看到的就是「重复几次之后程序突然停了」。
+ *
+ * 这里主动及早止损，并把决定权交回用户（而不是默默转到轮次上限）。
+ * 阈值取 4：正常的重试（比如先失败再改参数）不会被误杀。
+ */
+const MAX_IDENTICAL_TOOL_CALLS = 4;
 /** 单次请求内因模型调用失败而切换模型的最大次数 */
 const MAX_MODEL_SWITCHES = 3;
 
@@ -249,6 +262,11 @@ export class Agent {
       }
     };
 
+    // 死循环检测的跨轮状态：记录上一次的工具调用签名与连续出现次数。
+    // 必须放在轮次循环之外 —— 模型陷入循环时，往往每轮只调一次同一个工具。
+    let lastToolSignature = "";
+    let identicalToolCalls = 0;
+
     try {
       for (let round = 0; round < maxRounds; round++) {
         if (signal?.aborted) {
@@ -291,6 +309,28 @@ export class Agent {
         }
 
         for (const call of toolCalls) {
+          // 死循环检测：同一个工具 + 同一组参数连续出现多次即判定为卡住
+          const signature = `${call.name}:${call.arguments}`;
+          if (signature === lastToolSignature) {
+            identicalToolCalls++;
+          } else {
+            lastToolSignature = signature;
+            identicalToolCalls = 1;
+          }
+          if (identicalToolCalls >= MAX_IDENTICAL_TOOL_CALLS) {
+            commitTurn();
+            this.events.onStatus("已中止", "检测到重复调用");
+            this.events.onNotice?.(
+              `检测到连续 ${identicalToolCalls} 次完全相同的工具调用` +
+                `（${call.name}），已判定为陷入循环并中止本轮。\n` +
+                `· 常见原因：模型看不到此前的工具结果，或任务描述不够具体\n` +
+                `· 可以补充更明确的要求，或直接告诉它「不要重复调用 ${call.name}」\n` +
+                `· 若上下文过大导致历史被裁剪，可调大该模型的上下文窗口：` +
+                `xzh model context <id> <大小>`,
+            );
+            return;
+          }
+
           const result = await this.runTool(call, signal);
           turn.push({
             role: "tool",
@@ -309,7 +349,14 @@ export class Agent {
 
       // 达到工具轮次上限：工具已经真实执行过（有副作用），本轮记录要保留下来
       commitTurn();
+      // 用 onNotice 而非 onStatus：后者只更新状态栏，用户很容易忽略，
+      // 于是「程序突然停了」而不知道为什么。
       this.events.onStatus("已达工具调用上限", `最多 ${maxRounds} 轮`);
+      this.events.onNotice?.(
+        `已达工具调用上限（${maxRounds} 轮）而中止本轮。\n` +
+          `· 若模型在反复做同一件事，本轮通常早已被重复调用检测提前中止\n` +
+          `· 否则可用 xzh config 调大 maxToolRounds，或把任务拆成更小的步骤`,
+      );
     } catch (err) {
       // 中断也可能以异常形式到达（provider 在 abort 时 reject）
       commitPartialTurn();
