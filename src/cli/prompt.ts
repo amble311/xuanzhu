@@ -103,20 +103,40 @@ async function promptSelectInteractive<T>(
   let typed = "";
 
   const menuRows = options.length;
-  const totalRows = menuRows + 1; // 选项 + 提示行
 
+  const hintText = (): string =>
+    typed
+      ? `${ansi.gray}↑/↓ 选择 · ${ansi.reset}编号 ${ansi.brightCyan}${typed}${ansi.reset}${ansi.gray} · Enter 确认 · Esc 取消${ansi.reset}`
+      : `${ansi.gray}↑/↓ 选择 · 数字直达 · Enter 确认 · Esc 取消${ansi.reset}`;
+
+  /** 输出菜单（每行都以 \x1b[2K 起手，避免长短不一时残留） */
   const paint = (): void => {
     for (let i = 0; i < options.length; i++) {
       process.stdout.write(renderOptionRow(options[i], i, cursor));
     }
-    const hint = typed
-      ? `${ansi.gray}↑/↓ 选择 · ${ansi.reset}编号 ${ansi.brightCyan}${typed}${ansi.reset}${ansi.gray} · Enter 确认 · Esc 取消${ansi.reset}`
-      : `${ansi.gray}↑/↓ 选择 · 数字直达 · Enter 确认 · Esc 取消${ansi.reset}`;
-    process.stdout.write(`\x1b[2K${hint}`);
+  };
+
+  /**
+   * 把光标移回菜单首行并重绘。
+   *
+   * 上移量必须是**选项行数**：paint() 输出 N 行菜单 + 1 行提示后光标停在
+   * 提示行末尾，回到第 1 个选项正好 N 行。此前写成 N+1，多退了一行 ——
+   * 于是每次都从标题行开始重画，末尾提示行逐次往下堆积（屏幕上会看到
+   * 「↑/↓ 选择…」重复很多遍），第一行也被标题残留干扰。
+   *
+   * `\x1b[J` 紧跟在移动之后，一次清掉光标以下的全部旧内容再重画。
+   * 这比「每行自带 \x1b[2K」更可靠 —— 提示行的长度会随输入编号变化，
+   * 若只覆盖不清除，短内容盖不住长内容就会留下半截残影。
+   */
+  const redraw = (): void => {
+    process.stdout.write(`\x1b[${menuRows}A\x1b[J`);
+    paint();
+    process.stdout.write(hintText());
   };
 
   process.stdout.write(`\n${ansi.bold}${label}${ansi.reset}\n`);
   paint();
+  process.stdout.write(hintText());
 
   const stdin = process.stdin;
   const wasRaw = Boolean(stdin.isRaw);
@@ -135,10 +155,9 @@ async function promptSelectInteractive<T>(
       if (picked >= 0 && picked < options.length) {
         finish(options[picked].value);
       } else if (typed) {
-        // 编号越界：不清场，提示后让用户重来
+        // 编号越界：清掉编号让用户重来，不清场
         typed = "";
-        process.stdout.write(`\x1b[${totalRows}A`);
-        paint();
+        redraw();
       } else {
         finish(options[cursor].value);
       }
@@ -188,10 +207,7 @@ async function promptSelectInteractive<T>(
         }
       }
 
-      if (handled) {
-        process.stdout.write(`\x1b[${totalRows}A`);
-        paint();
-      }
+      if (handled) redraw();
     };
 
     stdin.setRawMode(true);
