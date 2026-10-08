@@ -232,10 +232,26 @@ fi
 
 step "验证"
 
-if command -v xzh >/dev/null 2>&1; then
-  ok "命令可用：$(command -v xzh)"
+# 先看**本次安装位置**里有没有可执行文件，而不是直接用 `command -v xzh`：
+# 后者可能命中 PATH 上遗留的旧安装（或另一个 prefix），于是
+#   - 明明这次装到了别的目录，却报告「命令可用」；
+#   - 也看不出该往 PATH 里加哪一条。
+# 只有确认新装的这份能被 shell 找到才算真正可用。
+INSTALLED_BIN=""
+if [ -n "$GLOBAL_PREFIX" ] && [ -x "$GLOBAL_PREFIX/bin/xzh" ]; then
+  INSTALLED_BIN="$GLOBAL_PREFIX/bin/xzh"
+elif command -v xzh >/dev/null 2>&1; then
+  INSTALLED_BIN="$(command -v xzh)"
+fi
+
+if [ -z "$INSTALLED_BIN" ]; then
+  warn "未找到 xzh 可执行文件，安装可能未成功。"
+elif [ "$(command -v xzh 2>/dev/null)" = "$INSTALLED_BIN" ]; then
+  ok "命令可用：$INSTALLED_BIN"
+  printf '%s    版本：%s%s\n' "$DIM" "$("$INSTALLED_BIN" --version 2>/dev/null | tail -1)" "$RESET"
 else
-  warn "xzh 尚未出现在当前 shell 的 PATH 中。"
+  ok "已安装到：$INSTALLED_BIN"
+  warn "它不在当前 shell 的 PATH 中。"
   if [ -n "$GLOBAL_PREFIX" ]; then
     printf '%s    把下面一行加入 shell 配置（~/.bashrc 或 ~/.zshrc）后重开终端：%s\n' "$DIM" "$RESET"
     printf '%s      export PATH="%s/bin:$PATH"%s\n' "$DIM" "$GLOBAL_PREFIX" "$RESET"

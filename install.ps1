@@ -177,16 +177,27 @@ if ($env:XZH_DRY_RUN -eq '1') {
 
 Write-Step '验证'
 
+# 先定位**本次安装**的可执行文件（npm 全局目录下的 xzh.cmd），而不是直接
+# Get-Command —— 下面会刷新 PATH，Path 上若遗留旧安装就总能命中，
+# 于是「装到别的 prefix」也会报告成功，用户重开窗口后才发现命令不对。
+$globalPrefix = (& npm prefix -g 2>$null | Select-Object -First 1)
+$installedExe = if ($globalPrefix) { Join-Path $globalPrefix 'xzh.cmd' } else { $null }
+if ($installedExe -and -not (Test-Path $installedExe)) { $installedExe = $null }
+
 # 刷新本会话 PATH，让刚装好的命令立刻可见（无需重开窗口即可确认）
 $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 $env:Path = "$machinePath;$userPath"
 
-$cmd = Get-Command xzh -ErrorAction SilentlyContinue
-if ($cmd) {
-    Write-Ok "命令可用：$($cmd.Source)"
+if (-not $installedExe) {
+    Write-Warn '未找到 xzh 可执行文件，安装可能未成功。'
+} elseif (Get-Command xzh -ErrorAction SilentlyContinue) {
+    Write-Ok "命令可用：$((Get-Command xzh).Source)"
+    $ver = (& xzh --version 2>$null | Select-Object -Last 1)
+    if ($ver) { Write-Host "    版本：$ver" -ForegroundColor DarkGray }
 } else {
-    Write-Warn 'xzh 尚未出现在当前会话的 PATH 中，请新开一个 PowerShell 窗口后重试。'
+    Write-Ok "已安装到：$installedExe"
+    Write-Warn "它不在当前 PATH 中，请把 $globalPrefix 加入 PATH 后重开窗口。"
 }
 
 # ──────────────────────────── 完成 ────────────────────────────
