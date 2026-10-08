@@ -1,6 +1,6 @@
 # 玄猪 XuanZhu
 
-[English](README.en.md) | **中文**
+[English](docs/README.en.md) | **中文**
 
 > 专为终端打造的 AI 编码 Agent —— 一条 `xzh` 命令，把 AI 编程助手带进你的终端。
 
