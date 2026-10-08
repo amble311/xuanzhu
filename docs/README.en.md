@@ -1,6 +1,6 @@
 # XuanZhu 玄猪
 
-**English** | [中文](../README.md)
+**English** | [中文](https://github.com/amble311/xuanzhu/blob/main/README.md)
 
 > An AI coding agent built for the terminal — one `xzh` command brings an AI programming assistant into your terminal.
 
@@ -469,7 +469,7 @@ src/
 └── utils/    ANSI and path utilities
 ```
 
-See [docs/ARCHITECTURE.md](ARCHITECTURE.md) for details.
+See [docs/ARCHITECTURE.md](https://github.com/amble311/xuanzhu/blob/main/docs/ARCHITECTURE.md) for details.
 
 ## Development
 

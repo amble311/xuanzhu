@@ -1,6 +1,6 @@
 # 玄猪 XuanZhu
 
-[English](docs/README.en.md) | **中文**
+[English](https://github.com/amble311/xuanzhu/blob/main/docs/README.en.md) | **中文**
 
 > 专为终端打造的 AI 编码 Agent —— 一条 `xzh` 命令，把 AI 编程助手带进你的终端。
 
@@ -513,7 +513,7 @@ src/
 └── utils/    ANSI 与路径工具
 ```
 
-详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+详见 [docs/ARCHITECTURE.md](https://github.com/amble311/xuanzhu/blob/main/docs/ARCHITECTURE.md)。
 
 ## 开发
 
