@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "child_process";
+import { spawn, spawnSync, type ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -12,12 +12,72 @@ const MAX_PARTIAL = 8192;
 const KILL_GRACE_MS = 1200;
 
 /**
+ * `script` 的可用性与调用形式（探测一次后缓存）。
+ *
+ * `script` 的作用是**给子进程分配一个 PTY**，让程序以为自己运行在真实终端里。
+ * 不这么做时，命令只能看到管道，于是：
+ *   - 颜色、进度条、`\r` 刷新的动画被自动关闭（程序检测到非 TTY 就降级输出）；
+ *   - **交互式提示失效** —— `npm init`、`read -p`、y/n 确认这类要么直接报错，
+ *     要么等待输入而用户输不进去（看起来就是"卡住了"）。
+ *
+ * 平台差异：util-linux 用 `-qec "<cmd>" /dev/null`；BSD/macOS 的 script 没有 `-e`，
+ * 用 `-q /dev/null <shell> -c "<cmd>"`。两者都把命令作为**单个 argv** 传入，
+ * 因此不必担心命令里的引号被 shell 二次解释。
+ *
+ * 探测失败（未安装 / 不支持）时返回 null，调用方回退为直接 spawn。
+ */
+let scriptPlan: "linux" | "bsd" | null | undefined;
+
+function detectScript(): "linux" | "bsd" | null {
+  if (scriptPlan !== undefined) return scriptPlan;
+  scriptPlan = null;
+  try {
+    const found = spawnSync("script", ["--version"], { timeout: 2000, stdio: "ignore" });
+    if (found.status === 0) {
+      scriptPlan = "linux"; // util-linux
+    } else {
+      // BSD/macOS 的 script 没有 --version，用 -h 判断存在性即可
+      const fallback = spawnSync("script", ["-h"], { timeout: 2000, stdio: "ignore" });
+      scriptPlan = fallback.error ? null : "bsd";
+    }
+  } catch {
+    scriptPlan = null;
+  }
+  return scriptPlan;
+}
+
+/** 组装实际要执行的 [命令, 参数]，优先经 `script` 包装以获得 PTY */
+function buildSpawnPlan(
+  shell: string,
+  cmd: string,
+): { file: string; args: string[] } {
+  const kind = detectScript();
+  if (kind === "linux") {
+    return { file: "script", args: ["-qec", cmd, "/dev/null"] };
+  }
+  if (kind === "bsd") {
+    return { file: "script", args: ["-q", "/dev/null", shell, "-c", cmd] };
+  }
+  return { file: shell, args: ["-c", cmd] }; // 无 script：退回原行为
+}
+
+/**
  * 右侧终端面板：在项目目录下执行 shell 命令并收集输出。
  *
- * 实现说明：为支持可靠中断（Ctrl+C）且不引入原生依赖，每条命令使用独立的
- * `spawn(shell, ["-c", cmd])`，而不是持久 PTY。因此：
- * - 不支持 vim / htop / less 这类需要 TTY 的全屏交互程序；
- * - `export` 的环境变量不会跨命令保留；
+ * 实现说明：为支持可靠中断（Ctrl+C）且**不引入原生依赖**（node-pty 需要编译，
+ * 会让 `npm i -g xuanzhu` 在 Windows 上经常失败，也会让包体积增加数 MB），
+ * 这里没有用真正的 PTY，而是：
+ *
+ * 1. 每条命令经系统自带的 `script` 包装后启动 —— 它会给子进程分配一个 PTY，
+ *    让程序以为自己运行在真实终端里。因此**颜色、进度条、交互式提示都正常**。
+ *    没有 `script` 时自动退回直接 spawn。
+ * 2. 命令运行期间，终端面板里的按键会**转发给子进程**（见 write），
+ *    所以 `npm init` 的提问、y/n 确认这类提示可以正常应答。
+ *
+ * 仍然做不到的：
+ * - **全屏交互程序**（vim / htop / less）—— 输入虽能送达，但没有真正的
+ *   屏幕刷新与窗口尺寸协商，界面会错乱；
+ * - `export` 的环境变量不跨命令保留（每条命令是独立进程）；
  * - `cd` 由本类维护（见 handleCd），使面板具备"当前目录"语义。
  */
 export class ShellPanel {
@@ -98,18 +158,22 @@ export class ShellPanel {
     );
 
     const shell = process.env.SHELL || "/bin/bash";
+    const launch = buildSpawnPlan(shell, cmd);
     let child: ChildProcess;
     try {
-      child = spawn(shell, ["-c", cmd], {
+      child = spawn(launch.file, launch.args, {
         cwd: this.cwd,
         env: {
           ...process.env,
           TERM: "xterm-256color",
-          // 让支持的程序在管道下仍输出颜色
+          // 让支持的程序在无 PTY 时也输出颜色（有 script 包装时其实已具备 TTY，
+          // 这两项只作为退化路径的补充）
           CLICOLOR_FORCE: "1",
           FORCE_COLOR: "1",
         },
-        stdio: ["ignore", "pipe", "pipe"],
+        // stdin 必须可写：命令运行时按键要转发给子进程，否则
+        // `npm init` 这类交互式提示会「等输入而用户输不进去」，看起来像卡死。
+        stdio: ["pipe", "pipe", "pipe"],
         // 独立进程组：中断时可以向整组发信号，避免留下孤儿进程
         detached: true,
       });
@@ -150,6 +214,23 @@ export class ShellPanel {
   }
 
   /** 中断正在运行的命令（先 SIGINT，超时后 SIGKILL 整组） */
+  /**
+   * 把按键转发给正在运行的命令。
+   *
+   * 交互式提示（`npm init` 的提问、y/n 确认、`read -p`）必须靠这条通路才能应答 ——
+   * 此前按键只在本地命令行缓冲区里编辑，子进程永远收不到，
+   * 于是程序在等输入、用户却输不进去，观感就是「命令卡住了」。
+   */
+  write(data: string): void {
+    const child = this.running;
+    if (!child?.stdin || child.stdin.destroyed) return;
+    try {
+      child.stdin.write(data);
+    } catch {
+      // 进程刚退出时写入会抛错，忽略即可
+    }
+  }
+
   interrupt(): void {
     const child = this.running;
     if (!child || child.pid === undefined) return;

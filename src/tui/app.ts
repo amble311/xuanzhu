@@ -880,12 +880,22 @@ export class TuiApp {
 
   /** 终端面板聚焦时的按键处理 */
   private handleTermKey(key: string): void {
+    // 有命令正在运行时，按键**全部转发给子进程** —— 这是应答交互式提示的唯一途径
+    // （`npm init` 的提问、y/n 确认、`read -p` 等）。此前按键只在本地命令行缓冲区里
+    // 编辑，子进程永远收不到，于是「程序在等输入、用户却输不进去」，看起来像卡死。
+    // Ctrl+C / Ctrl+D 例外：保留为中断命令。
+    if (this.term.isRunning()) {
+      if (key === "\x03" || key === "\x04") {
+        this.term.interrupt();
+        this.scheduleRender();
+        return;
+      }
+      this.term.write(key);
+      return;
+    }
+
     switch (key) {
-      case "\x04": // Ctrl+D：直接中断正在运行的命令（任何情况下都不会退出玄猪）
-        if (this.term.isRunning()) {
-          this.term.interrupt();
-          this.scheduleRender();
-        }
+      case "\x04": // Ctrl+D：没有命令运行时无动作（不会退出玄猪）
         return;
       case "\x03": // Ctrl+C：中断命令 / 清空输入 / 回到对话
         if (this.term.isRunning()) {
