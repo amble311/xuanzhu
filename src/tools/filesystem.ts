@@ -246,9 +246,35 @@ export const editFileTool: ToolDefinition = {
 
     const original = fs.readFileSync(target, "utf8");
     if (!original.includes(search)) {
+      // 空白差异是这类失败最常见的原因：模型凭记忆写的片段常常
+      // 缩进多/少几个空格，或把制表符写成空格，肉眼几乎一样但匹配不上。
+      // 这里做一次「压缩全部空白后」的比对来区分两种情形，
+      // 否则用户只看到「未找到」，会反复重试同一个 search。
+      const squeeze = (s: string) => s.replace(/\s+/g, " ").trim();
+
+      // 情形 A：照抄了 read_file 的行号前缀。read_file 的每一行都以
+      // `行号:` 开头，模型有时把整段连同行号一起写进 search —— 文件里当然没有。
+      const digitPrefix = /^\s*\d+\s*[:|]/m.test(search);
+
+      // 情形 B：只是空白（缩进 / 制表符 / 换行）不一致 —— 压缩空白后能对上
+      const onlyWhitespace =
+        !digitPrefix && squeeze(original).includes(squeeze(search));
+
+      let hint = "";
+      if (digitPrefix) {
+        hint =
+          "\n注意：search 里似乎带了行号（形如 `123:`）。read_file 输出的行号只是显示用，" +
+          "文件里并不存在 —— 请去掉行号前缀，只保留代码本身。";
+      } else if (onlyWhitespace) {
+        hint =
+          "\n注意：忽略空白后能找到相似内容 —— 很可能只是缩进（空格/制表符）或换行不一致。" +
+          "请重新 read_file 该区域，用文件里**原样**的空白重写 search。";
+      }
       return {
         ok: false,
-        content: `错误：在 ${target} 中未找到匹配文本。请先用 read_file 确认内容（注意缩进与换行需完全一致）。`,
+        content:
+          `错误：在 ${target} 中未找到匹配文本。请先用 read_file 确认内容（注意缩进与换行需完全一致）。` +
+          hint,
       };
     }
 
