@@ -450,13 +450,18 @@ export class TuiApp {
     // 失败时把原因显示出来。工具在 content 里写了可操作的提示
     //（如「未找到匹配文本，请先用 read_file 确认内容」），
     // 而失败时通常没有 summary —— 于是界面上只剩「失败」两个字，
-    // 用户既不知道原因也无从下手。这里最多附 6 行，够覆盖绝大多数错误。
+    // 用户既不知道原因也无从下手。
+    //
+    // 取「前 3 行 + 后 3 行」而不是只取开头：两类工具的失败信息位置相反 ——
+    // 文件类工具把结论写在第一行；而 `bash` 的 content 是命令输出，
+    // 报错与堆栈大多在**末尾**（开头往往只是些正常的启动日志）。
     if (!result.ok && !result.denied && result.content?.trim()) {
-      const lines = sanitizeControl(result.content)
-        .trim()
-        .split("\n")
-        .slice(0, 6);
-      for (const line of lines) {
+      const all = sanitizeControl(result.content).trim().split("\n");
+      const picked =
+        all.length <= 6
+          ? all
+          : [...all.slice(0, 3), `…（省略 ${all.length - 6} 行）`, ...all.slice(-3)];
+      for (const line of picked) {
         this.lines.push(`    ${ansi.gray}${line.slice(0, 120)}${ansi.reset}`);
       }
     }
