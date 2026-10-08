@@ -1478,18 +1478,34 @@ export class TuiApp {
    *   /copy all        全部
    */
   private copyOutput(arg: string): void {
-    const trimmed = arg.trim().toLowerCase();
-    const total = this.lines.length;
+    let trimmed = arg.trim().toLowerCase();
+
+    // `/copy term …` 复制**右侧终端**的输出。
+    //
+    // 存在的意义：终端原生的 Shift+拖选是「矩形选择」，而界面分两栏 ——
+    // 一旦拖过中缝就会把另一栏的文字一起带走。命令式复制按**栏**取内容，
+    // 从根上避开了这个问题；两个区域各有一条通路。
+    let source = this.lines;
+    let areaLabel = "";
+    if (trimmed === "term" || trimmed.startsWith("term ")) {
+      source = this.term.visibleLines();
+      areaLabel = "终端输出 ";
+      trimmed = trimmed.slice(4).trim();
+    }
+    const total = source.length;
 
     let selected: string[];
     let label: string;
 
     if (trimmed === "all") {
-      selected = this.lines.slice();
+      selected = source.slice();
       label = "全部";
     } else if (trimmed === "last") {
-      selected = this.lines.slice(Math.min(this.lastAnswerStart, total));
-      label = "最近一次对话";
+      selected =
+        source === this.lines
+          ? this.lines.slice(Math.min(this.lastAnswerStart, total))
+          : source.slice(-30);
+      label = source === this.lines ? "最近一次对话" : "最近 30 行";
     } else if (/^\d+-\d+$/.test(trimmed)) {
       const [fromText, toText] = trimmed.split("-");
       const from = Math.max(1, Number(fromText));
@@ -1497,23 +1513,26 @@ export class TuiApp {
       if (from > to) {
         this.lines.push(
           `${ansi.yellow}行号范围无效：${trimmed}${ansi.reset}` +
-            `${ansi.gray}（输出区当前 ${total} 行）${ansi.reset}`,
+            `${ansi.gray}（${areaLabel || "输出区"}当前 ${total} 行）${ansi.reset}`,
         );
         return;
       }
-      selected = this.lines.slice(from - 1, to);
+      selected = source.slice(from - 1, to);
       label = `第 ${from}-${to} 行`;
     } else {
       const count = /^\d+$/.test(trimmed) ? Number(trimmed) : 30;
-      selected = this.lines.slice(-Math.max(1, count));
+      selected = source.slice(-Math.max(1, count));
       label = `最近 ${Math.min(Math.max(1, count), total)} 行`;
     }
+    label = areaLabel + label;
 
     // sanitizeControl 会剥掉颜色与其余控制字符，剪贴板里只留纯文本
     const plain = sanitizeControl(selected.join("\n")).trim();
     if (!plain) {
       const extra =
-        trimmed === "last" && total === 0 ? "，尚未进行过对话" : "";
+        trimmed === "last" && total === 0 && source === this.lines
+          ? "，尚未进行过对话"
+          : "";
       this.lines.push(
         `${ansi.yellow}没有可复制的内容${ansi.reset}` +
           `${ansi.gray}（输出区当前 ${total} 行${extra}）。${ansi.reset}`,
@@ -1537,8 +1556,9 @@ export class TuiApp {
       `${ansi.bold}玄猪 内置命令${ansi.reset}`,
       `  /help          显示本帮助`,
       `  /clear         清空屏幕`,
-      `  /copy [N|A-B|last|all]  复制输出区到系统剪贴板（默认最近 30 行）`,
-      `  /mouse         切换鼠标捕获：关闭后可用鼠标直接框选复制`,
+      `  /copy [N|A-B|last|all]  复制左侧对话到系统剪贴板（默认最近 30 行）`,
+      `  /copy term [N|A-B|all]  复制右侧终端输出（按栏取内容，不会串栏）`,
+      `  /mouse         切换鼠标捕获：开启后可在输出区拖拽选择（按整行）`,
       `  /reset         重置对话上下文`,
       `  /cwd           显示当前工作目录`,
       `  /switch <目录> 切换当前对话的项目目录`,
@@ -1553,6 +1573,7 @@ export class TuiApp {
       `  Home/End 跳到最早/最新`,
       `  ${ansi.gray}鼠标${ansi.reset}：滚轮滚动输出区；${ansi.bold}在输出区拖拽即可选中并复制${ansi.reset}${ansi.gray}（松开写入剪贴板）。${ansi.reset}`,
       `      想用终端原生框选/右键菜单：${ansi.reset}Shift+拖拽${ansi.gray} 绕过，或 ${ansi.reset}/mouse${ansi.gray} 交还鼠标（滚动改用 PgUp/PgDn）。${ansi.reset}`,
+      `      ⚠ 拖选是矩形选择，跨过中缝会把另一栏一起带走 ——` + `跨栏内容请改用 ${ansi.reset}/copy${ansi.gray}（左栏）或 ${ansi.reset}/copy term${ansi.gray}（右栏）。${ansi.reset}`,
       `  ${ansi.gray}粘贴${ansi.reset}：支持多行整段粘贴（不会逐行提交）；也可用 ${ansi.reset}/copy${ansi.gray} 复制输出区。${ansi.reset}`,
       `  Shift+Tab 切换焦点（对话 ⇄ 右侧终端）· 鼠标点击亦可`,
       `  Ctrl+C 中断任务 / 清空输入 / 退出（空闲且输入为空时退出）`,
