@@ -423,9 +423,24 @@ In the output area, **hold the left button and drag** across the lines you want;
 | --- | --- |
 | **Drag in the output area** | Selection implemented by XuanZhu itself (whole lines). Releasing copies; no key press needed and it does not require `/mouse` |
 | Hold **Shift** and drag | Uses the **terminal's native** selection (most terminals let Shift bypass application-level capture); use this when you need character precision |
-| `/copy [N\|A-B\|last\|all]` | Copy the output area on demand. Supports `/copy 100` (last 100 lines), `/copy 100-200` (line range), `/copy last` (the most recent conversation), `/copy all` (everything) |
+| `/copy [N\|A-B\|last\|all]` | Copy the **left conversation pane** on demand. Supports `/copy 100` (last 100 lines), `/copy 100-200` (line range), `/copy last` (the most recent conversation), `/copy all` (everything) |
+| `/copy term [N\|A-B\|all]` | Copy the **right terminal pane's** output (last 30 lines by default) |
 | `/mouse` | Hands the mouse **entirely back to the terminal** (switching to native selection and the right-click menu; scrolling the output area then uses `PgUp`/`PgDn`). The change is written back to the config |
 
+> **Why a multi-line drag mixes the two panes** — the terminal's native selection is a
+> **rectangular** selection: it only knows "from column X to column Y" and **cannot see
+> the application's split panes**. Dragging from the left pane into the right (or back)
+> therefore picks up text from both, because they share the same screen rows. This is a
+> protocol-level limitation the application cannot intervene in.
+>
+> To copy **one pane** only, use the command forms (`/copy` for the left pane,
+> `/copy term` for the right) — they take content per pane and can never mix. XuanZhu's
+> own drag-selection (with `/mouse` enabled) is likewise confined to the left pane.
+>
+> Conversely, if you want the terminal's native selection and context menu: hold `Shift`
+> while dragging to bypass capture temporarily, or use `/mouse` to turn capture off
+> (scrolling the output area then uses `PgUp`/`PgDn`).
+>
 > **Why drag-selection is implemented in-house**: in the terminal protocol, `?1000h` is an **all-or-nothing switch** — once enabled, the terminal hands every mouse event to the program and native selection stops working; once disabled, the wheel is useless too (XuanZhu runs on the **alternate screen**, where the terminal has no scrollback history). Since the events are already in the program's hands, XuanZhu records the selection itself and writes it to the clipboard, so "scroll with the wheel" and "select and copy" coexist.
 >
 > Selection works by **whole lines**: long lines in the output area wrap, and the text contains ANSI colors and wide characters, so character-level mapping costs far more than it is worth — and in practice what you want to copy is a whole passage. What gets copied is the **original logical line** (not the wrapped rendering), so long lines are not cut off.
