@@ -567,8 +567,8 @@ function syncActiveFields(config: XuanZhuConfig): void {
   config.model = active ? active.model : "";
 }
 
-async function chooseProvider(): Promise<string> {
-  // 末项「返回」返回空串，调用方据此中止（否则用户进了新增流程就只能一路走完）
+async function chooseProvider(): Promise<string | undefined> {
+  // 末项「返回」返回空串、Esc/Ctrl+C 返回 undefined，两者都表示中止
   return promptSelect(
     "选择 AI 服务商：",
     [
@@ -587,7 +587,7 @@ async function chooseModel(
   providerId: string,
   models: string[],
   config: XuanZhuConfig,
-): Promise<string> {
+): Promise<string | undefined> {
   const current = config.providers[providerId]?.model;
   if (models.length > 0) {
     const options = [
@@ -728,7 +728,7 @@ function resolveModelKey(config: XuanZhuConfig, key: string): string | null {
 async function chooseFromList(
   models: ModelEntry[],
   label: string,
-): Promise<string> {
+): Promise<string | undefined> {
   const sorted = models.slice().sort((a, b) => b.weight - a.weight);
   const chosen = await promptSelect(
     label,
