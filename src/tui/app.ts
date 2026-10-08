@@ -149,6 +149,27 @@ export class TuiApp {
   private lastLeftWidth = 0;
   /** 上次渲染的物理行数，用于「视口锚定」（见 render） */
   private lastPhysicalCount = 0;
+
+  /**
+   * 上一次渲染中，每个物理行来自哪一条逻辑行（`this.lines` 的索引，-1 表示流式预览）。
+   * 由 `physicalLines()` 填充，供鼠标拖拽选择反查用。
+   */
+  private lastPhysicalMap: number[] = [];
+  /**
+   * 上一次渲染中，屏幕行（0-based，整屏）→ `this.lines` 索引。
+   * undefined 表示该屏幕行不是输出区内容（页头 / 输入区 / 右侧终端）。
+   */
+  private screenToLogical: (number | undefined)[] = [];
+  /**
+   * 鼠标选择状态：以 `this.lines` 的逻辑行索引表示。
+   *
+   * 只按**行**选择而非精确到字符 —— 输出区里的长行会折行、还含 ANSI 颜色与宽字符，
+   * 做字符级映射的复杂度远高于收益；而实际使用中要复制的基本都是整段内容。
+   */
+  private selectionAnchor?: number;
+  private selectionHead?: number;
+  /** 是否正在拖拽选择（用于区分「单击」与「拖选」） */
+  private dragging = false;
   private lastTermPhysicalCount = 0;
 
   /** 终端面板的输入行（与左侧对话输入相互独立） */
@@ -238,12 +259,12 @@ export class TuiApp {
       this.lines.push("");
     }
 
-    // 接管鼠标时提示一次怎么选文本。否则用户只会看到「选不中」，
-    // 不知道要按住 Shift —— 这个绕过方式是最实用的，但很难被自己发现。
+    // 接管鼠标时提示一次操作方式。拖拽选择是玄猪自己实现的，
+    // 用户不看说明很难发现；同时说明 Shift 绕过可以拿到终端原生选择。
     if (this.mouseCapture) {
       this.lines.push(
-        `${ansi.gray}鼠标已接管：滚轮可滚动输出区。要选中文本，请按住 ${ansi.reset}Shift${ansi.gray} 拖拽。${ansi.reset}`,
-        `${ansi.gray}想恢复原生选择与右键菜单：输入 ${ansi.reset}/mouse${ansi.gray}。${ansi.reset}`,
+        `${ansi.gray}鼠标已接管：滚轮滚动输出区，${ansi.reset}在输出区拖拽即可选中并复制${ansi.gray}（松开生效）。${ansi.reset}`,
+        `${ansi.gray}想用终端原生的框选与右键菜单：按住 ${ansi.reset}Shift${ansi.gray} 拖拽，或输入 ${ansi.reset}/mouse${ansi.gray}。${ansi.reset}`,
         "",
       );
     }
@@ -723,12 +744,22 @@ export class TuiApp {
   private handleMouse(match: RegExpExecArray): void {
     const button = Number(match[1]);
     const column = Number(match[2]);
+    const row = Number(match[3]);
     const pressed = match[4] === "M";
     const termWidth = this.resolveTermWidth(process.stdout.columns || 80);
     const inTerm =
       this.lastLeftWidth > 0 &&
       termWidth > 0 &&
       column > this.lastLeftWidth + 1;
+
+    if (process.env.XZH_DEBUG_KEYS) {
+      this.logRawKeys(
+        `MOUSE btn=${button} col=${column} row=${row} ` +
+          `${pressed ? "press" : "release"} inTerm=${inTerm} ` +
+          `logical=${this.logicalAtScreenRow(row)} mapLen=${this.screenToLogical.length} ` +
+          `anchor=${this.selectionAnchor} head=${this.selectionHead} drag=${this.dragging}`,
+      );
+    }
 
     // 滚轮必须先于「左键单击」判断：
     // 滚轮的按钮码为 64(上翻)/65(下翻)，其低位与左键同为 0，
@@ -745,13 +776,87 @@ export class TuiApp {
       return;
     }
 
-    // 左键按下（排除拖拽的移动标志位）：焦点跟随鼠标点击的栏目
+    // 左键按下（排除拖拽的移动标志位）
     if (pressed && (button & 3) === 0 && (button & 32) === 0) {
+      // 在左栏输出区按下 → 开始框选（这样「滚轮滚动」与「选中文本」可以并存，
+      // 既不用 /mouse 切换，也不用 Shift 绕过）
+      const logical = this.logicalAtScreenRow(row);
+      if (!inTerm && logical !== undefined) {
+        this.selectionAnchor = logical;
+        this.selectionHead = logical;
+        this.dragging = false;
+        this.scheduleRender();
+        return;
+      }
+      // 否则仍按原逻辑：焦点跟随点击的栏目
       if (inTerm !== this.termFocus) {
         this.termFocus = inTerm;
         this.scheduleRender();
       }
+      return;
     }
+
+    // 拖拽移动（button 带 32 标志）：扩展选区
+    if (pressed && (button & 32) === 32 && this.selectionAnchor !== undefined) {
+      const logical = this.logicalAtScreenRow(row);
+      if (logical !== undefined && logical !== this.selectionHead) {
+        this.selectionHead = logical;
+        this.dragging = true;
+        this.scheduleRender();
+      }
+      return;
+    }
+
+    // 松开左键：结束选择。真的拖过才复制，单纯点击则取消选区
+    if (!pressed && this.selectionAnchor !== undefined) {
+      if (this.dragging) this.finishSelection();
+      else this.clearSelection();
+    }
+  }
+
+  /** 屏幕行（1-based）→ `this.lines` 的逻辑行索引；不在输出区时为 undefined */
+  private logicalAtScreenRow(row: number): number | undefined {
+    return this.screenToLogical[row - 1];
+  }
+
+  /** 清除选区 */
+  private clearSelection(): void {
+    if (this.selectionAnchor === undefined) return;
+    this.selectionAnchor = undefined;
+    this.selectionHead = undefined;
+    this.dragging = false;
+    this.scheduleRender();
+  }
+
+  /**
+   * 结束框选：把选中行写进系统剪贴板（OSC 52）。
+   *
+   * 复制的是 `this.lines` 里的**原始逻辑行**（而非屏幕上折行后的样子），
+   * 因此长行不会被"截成几段"，比手动选择更完整。
+   */
+  private finishSelection(): void {
+    const from = Math.min(this.selectionAnchor!, this.selectionHead!);
+    const to = Math.max(this.selectionAnchor!, this.selectionHead!);
+    const count = to - from + 1;
+    const plain = sanitizeControl(this.lines.slice(from, to + 1).join("\n")).trim();
+
+    this.selectionAnchor = undefined;
+    this.selectionHead = undefined;
+    this.dragging = false;
+
+    if (!plain) {
+      this.scheduleRender();
+      return;
+    }
+
+    const payload = Buffer.from(plain, "utf8").toString("base64");
+    process.stdout.write(`\x1b]52;c;${payload}\x07`);
+    this.lines.push(
+      `${ansi.green}✓ 已复制 ${count} 行到剪贴板${ansi.reset}` +
+        `${ansi.gray}（拖拽选择）。若粘贴出来是空的，说明本终端禁用了 OSC 52，` +
+        `请改用 ${ansi.reset}/copy${ansi.gray} 或 Shift+拖拽。${ansi.reset}`,
+    );
+    this.scheduleRender();
   }
 
   /** Shift+Tab：在对话输入与右侧终端之间切换焦点 */
@@ -1408,9 +1513,8 @@ export class TuiApp {
       `  Enter 提交 · ${ansi.bold}Alt+Enter${ansi.reset} 换行（Ctrl/Shift+Enter 视终端而定）`,
       `  ↑/↓ 历史 · Ctrl+A/Ctrl+E 行首/行尾 · PgUp/PgDn 翻页 · Shift+↑/↓ 逐行`,
       `  Home/End 跳到最早/最新`,
-      `  ${ansi.gray}鼠标${ansi.reset}：默认交还终端 —— 右键菜单、框选复制、中键粘贴都可用；` +
-        `滚动输出区用 ${ansi.reset}PgUp/PgDn${ansi.gray}。`,
-      `      输入 ${ansi.reset}/mouse${ansi.gray} 可改为让玄猪接管滚轮（此时用 ${ansi.reset}Shift+拖拽${ansi.gray} 选择文本）。${ansi.reset}`,
+      `  ${ansi.gray}鼠标${ansi.reset}：滚轮滚动输出区；${ansi.bold}在输出区拖拽即可选中并复制${ansi.reset}${ansi.gray}（松开写入剪贴板）。${ansi.reset}`,
+      `      想用终端原生框选/右键菜单：${ansi.reset}Shift+拖拽${ansi.gray} 绕过，或 ${ansi.reset}/mouse${ansi.gray} 交还鼠标（滚动改用 PgUp/PgDn）。${ansi.reset}`,
       `  ${ansi.gray}粘贴${ansi.reset}：支持多行整段粘贴（不会逐行提交）；也可用 ${ansi.reset}/copy${ansi.gray} 复制输出区。${ansi.reset}`,
       `  Shift+Tab 切换焦点（对话 ⇄ 右侧终端）· 鼠标点击亦可`,
       `  Ctrl+C 中断任务 / 清空输入 / 退出（空闲且输入为空时退出）`,
@@ -1518,6 +1622,38 @@ export class TuiApp {
     while (visible.length < outputRows) visible.unshift("");
 
     const bodyRows = rows - 1;
+
+    // 记录「屏幕行(0-based 整屏) → 逻辑行」映射，供鼠标拖拽选择反查。
+    // visible 前面可能被补过空行（unshift），用 pad 校正偏移。
+    const pad = Math.max(0, outputRows - (end - start));
+    const physicalMap = this.lastPhysicalMap;
+    this.screenToLogical = [];
+    for (let i = 0; i < bodyRows; i++) {
+      const offset = i - headerRows;
+      if (offset < 0 || offset >= outputRows) {
+        this.screenToLogical.push(undefined);
+        continue;
+      }
+      const phys = start + offset - pad;
+      const logical =
+        phys >= 0 && phys < physicalMap.length ? physicalMap[phys] : -1;
+      // -1 表示流式预览（尚未进入 this.lines），不可选中
+      this.screenToLogical.push(logical >= 0 ? logical : undefined);
+    }
+
+    // 选区高亮：给选中的物理行套反色，否则用户看不出拖拽选了什么
+    if (this.selectionAnchor !== undefined && this.selectionHead !== undefined) {
+      const selFrom = Math.min(this.selectionAnchor, this.selectionHead);
+      const selTo = Math.max(this.selectionAnchor, this.selectionHead);
+      for (let k = 0; k < visible.length; k++) {
+        const phys = start + k - pad;
+        if (phys < 0 || phys >= physicalMap.length) continue;
+        const logical = physicalMap[phys];
+        if (logical >= selFrom && logical <= selTo) {
+          visible[k] = `${ansi.inverse}${visible[k]}${ansi.reset}`;
+        }
+      }
+    }
     const panel =
       termWidth > 0
         ? this.buildTermPanel(termWidth, bodyRows)
@@ -1645,12 +1781,21 @@ export class TuiApp {
 
   private physicalLines(width: number): string[] {
     const result: string[] = [];
-    for (const line of this.lines) {
-      result.push(...wrapText(line, width));
+    // 同时记录每个物理行来自哪一条逻辑行（this.lines 的索引），
+    // 供鼠标拖拽选择时反查 —— 屏幕上的一行未必对应一条逻辑行（长行会折行）。
+    const map: number[] = [];
+    for (let index = 0; index < this.lines.length; index++) {
+      const wrapped = wrapText(this.lines[index], width);
+      result.push(...wrapped);
+      for (let i = 0; i < wrapped.length; i++) map.push(index);
     }
     if (this.streamingPreview) {
-      result.push(...wrapText(this.streamingPreview, width));
+      const wrapped = wrapText(this.streamingPreview, width);
+      result.push(...wrapped);
+      // 流式预览尚未进入 this.lines，标记为 -1：它不可被选中复制
+      for (let i = 0; i < wrapped.length; i++) map.push(-1);
     }
+    this.lastPhysicalMap = map;
     return result;
   }
 
@@ -1674,7 +1819,16 @@ export class TuiApp {
       this.termScroll > 0
         ? `${ansi.brightYellow}⇡${this.termScroll}${ansi.reset}${ansi.bgBlue} `
         : "";
-    const right = ` ${autoMark}${intentMark}${focusMark}${scrollMark}${termScrollMark}${this.modelLabel}${weightMark} │ ${this.statusText}${this.statusDetail ? " · " + this.statusDetail : ""} `;
+    // 拖拽选择中：提示已选行数与「松开即复制」，否则用户不知道这一步会发生什么
+    const selectionMark =
+      this.dragging &&
+      this.selectionAnchor !== undefined &&
+      this.selectionHead !== undefined
+        ? `${ansi.brightYellow}已选 ${
+            Math.abs(this.selectionHead - this.selectionAnchor) + 1
+          } 行（松开复制）${ansi.reset}${ansi.bgBlue} `
+        : "";
+    const right = ` ${autoMark}${intentMark}${focusMark}${selectionMark}${scrollMark}${termScrollMark}${this.modelLabel}${weightMark} │ ${this.statusText}${this.statusDetail ? " · " + this.statusDetail : ""} `;
     const middle = ` ${this.cwd} `;
     const elapsed = this.busy ? `${ansi.brightYellow}● 运行中${ansi.reset}${ansi.bgBlue}` : "";
     // elapsed 的显示宽度必须计入保留宽度，否则 busy 时状态栏必然超宽并走兜底截断
