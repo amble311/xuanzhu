@@ -80,7 +80,7 @@ export function restoreTerminalSafely(): void {
       // 再退出备用屏幕
       "\x1b[?2004l" +
         "\x1b[>4m" +
-        "\x1b[?1000l\x1b[?1006l\x1b[?7h" +
+        "\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?7h" +
         ansi.reset +
         cursor.show +
         screen.exitAlt,
@@ -299,7 +299,12 @@ export class TuiApp {
         // 启用鼠标上报（含滚轮），并采用 SGR 扩展坐标。
         // 注意这会禁用终端的原生拖拽选择 —— 需要选择文本时用 `/mouse` 临时关闭，
         // 或在任何终端里按住 Shift 拖拽（多数终端会用 Shift 绕过应用级鼠标捕获）。
-        (this.mouseCapture ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1000l\x1b[?1006l") +
+        // ?1000h 只上报「按下 / 释放」，**不含拖拽移动**；
+        // ?1002h（按钮事件追踪）才会在按住左键拖动时持续上报 —— 框选依赖它。
+        // ?1006h 让坐标使用 SGR 扩展格式（可表示超过 223 的行列）。
+        (this.mouseCapture
+          ? "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
+          : "\x1b[?1000l\x1b[?1002l\x1b[?1006l") +
         // 启用括号粘贴：终端会把粘贴内容包在 ESC[200~ … ESC[201~ 之间，
         // 我们据此整段插入 —— 否则多行内容里的换行会被逐个当成「提交」，
         // 粘贴一大段文本就会连发好几条消息。
@@ -357,7 +362,7 @@ export class TuiApp {
       // 再退出备用屏幕
       "\x1b[?2004l" +
         "\x1b[>4m" +
-        "\x1b[?1000l\x1b[?1006l\x1b[?7h" +
+        "\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?7h" +
         ansi.reset +
         cursor.show +
         screen.exitAlt,
@@ -840,8 +845,9 @@ export class TuiApp {
     const count = to - from + 1;
     const plain = sanitizeControl(this.lines.slice(from, to + 1).join("\n")).trim();
 
-    this.selectionAnchor = undefined;
-    this.selectionHead = undefined;
+    // 只结束拖拽状态，**保留选区高亮** —— 否则松开后什么都没了，
+    // 而剪贴板又看不见，用户会以为「白选了一场」。
+    // 选区会在下次按下时被新选区替换。
     this.dragging = false;
 
     if (!plain) {
@@ -853,7 +859,7 @@ export class TuiApp {
     process.stdout.write(`\x1b]52;c;${payload}\x07`);
     this.lines.push(
       `${ansi.green}✓ 已复制 ${count} 行到剪贴板${ansi.reset}` +
-        `${ansi.gray}（拖拽选择）。若粘贴出来是空的，说明本终端禁用了 OSC 52，` +
+        `${ansi.gray}（选中处仍保持高亮）。若粘贴出来是空的，说明本终端禁用了 OSC 52，` +
         `请改用 ${ansi.reset}/copy${ansi.gray} 或 Shift+拖拽。${ansi.reset}`,
     );
     this.scheduleRender();
@@ -1410,7 +1416,9 @@ export class TuiApp {
       // 写盘失败不影响本次会话内的切换效果
     }
     process.stdout.write(
-      this.mouseCapture ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1000l\x1b[?1006l",
+      this.mouseCapture
+        ? "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
+        : "\x1b[?1000l\x1b[?1002l\x1b[?1006l",
     );
     this.lines.push(
       this.mouseCapture
@@ -1819,14 +1827,12 @@ export class TuiApp {
       this.termScroll > 0
         ? `${ansi.brightYellow}⇡${this.termScroll}${ansi.reset}${ansi.bgBlue} `
         : "";
-    // 拖拽选择中：提示已选行数与「松开即复制」，否则用户不知道这一步会发生什么
+    // 选区提示：拖拽中标注「松开复制」，松开后选区仍保留（便于确认选了什么）
     const selectionMark =
-      this.dragging &&
-      this.selectionAnchor !== undefined &&
-      this.selectionHead !== undefined
+      this.selectionAnchor !== undefined && this.selectionHead !== undefined
         ? `${ansi.brightYellow}已选 ${
             Math.abs(this.selectionHead - this.selectionAnchor) + 1
-          } 行（松开复制）${ansi.reset}${ansi.bgBlue} `
+          } 行${this.dragging ? "（松开复制）" : "（已复制）"}${ansi.reset}${ansi.bgBlue} `
         : "";
     const right = ` ${autoMark}${intentMark}${focusMark}${selectionMark}${scrollMark}${termScrollMark}${this.modelLabel}${weightMark} │ ${this.statusText}${this.statusDetail ? " · " + this.statusDetail : ""} `;
     const middle = ` ${this.cwd} `;
