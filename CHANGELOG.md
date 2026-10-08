@@ -4,6 +4,20 @@
 
 ## [未发布]
 
+### 修复
+
+- **0.2.0 的严重回归：`Alt+Enter` 换行完全失效**（`Ctrl/Shift+Enter` 则表现为
+  「直接发送」——那些终端本就把修饰键编成了普通 `\r`）。
+  起因是移除 `Ctrl+J` 时删掉了 `handleKey` 里的 `case "\x0a"`：当时判断
+  「`\x0a` 会落到 `default`，而 `default` 要求 `≥ 0x20`，所以等于无操作」，看似干净，
+  **却漏了 `normalizeKey` 会把 `Alt+Enter` 的 `ESC CR` 也归一化成 `"\n"`** ——
+  而 `"\n"` 与 `\x0a` 是**同一个字符**。于是 Alt+Enter 一起被那个「不插入」的分支吃掉了。
+  现在：
+  - 在 `normalizeKey` **之前**拦截裸的 `\x0a`（Ctrl+J），确保它不再绑定动作；
+  - 重新加入 `case "\n"` → 插入换行，承接 `Alt+Enter` 与
+    `Ctrl/Shift+Enter` 经 modifyOtherKeys / kitty 协议上报的序列。
+  两者因此得以区分：Ctrl+J 是裸 `\x0a`，而带修饰的 Enter 必然经过归一化。
+
 ## [0.2.0] — 2026-10-08
 
 ### 变更

@@ -659,6 +659,15 @@ export class TuiApp {
     }
 
     // 归一化终端的扩展按键序列（Ctrl/Shift+Enter、modifyOtherKeys 下的 Ctrl+字母等）
+    // Ctrl+J（裸的 \x0a）不绑定任何动作 —— 换行已有 Alt+Enter / Ctrl+Enter
+    // 这类带修饰的按键，不再保留这个等价按键。
+    //
+    // ⚠ 必须在 normalizeKey **之前**判断：normalizeKey 会把 Alt+Enter 的
+    // `ESC CR` 也归一化成 "\n"，而 "\n" 与 Ctrl+J 是**同一个字符** ——
+    // 在归一化之后再判断，就无法区分「按了 Ctrl+J」和「按了 Alt+Enter」了。
+    // （此前删掉 case "\x0a" 时漏了这一点，把 Alt+Enter 一起弄失效了。）
+    if (rawKey === "\x0a") return;
+
     const key = normalizeKey(rawKey);
     if (this.pendingConfirm) {
       this.handleConfirmKey(key);
@@ -706,6 +715,13 @@ export class TuiApp {
         return;
       case "\r": // Enter
         void this.submit();
+        return;
+      // 换行：Alt+Enter 的 `ESC CR`、以及 Ctrl/Shift+Enter 经
+      // modifyOtherKeys / kitty 协议上报的序列，都由 normalizeKey 归一到 "\n"。
+      // 注意 "\n" 与 Ctrl+J 是同字符 —— 后者已在 handleKey 入口处拦截，
+      // 因此走到这里的一定是带修饰的 Enter。
+      case "\n":
+        this.insertText("\n");
         return;
       case "\x7f":
       case "\b":
