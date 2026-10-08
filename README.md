@@ -454,6 +454,27 @@ kitty / Ghostty 会把该 xterm 兼容序列映射成「所有按键都用转义
 > `/copy` 依赖终端支持 OSC 52。少数终端（如默认配置的 GNOME Terminal）出于安全会忽略该序列，
 > 此时粘贴出来是空的，请改用 Shift 拖拽。
 
+### 换行键为何有时不生效
+
+玄猪通过终端协议请求「带修饰键的 Enter」（默认为 xterm 的 `modifyOtherKeys`），
+但**部分终端并不实现它**——最典型是基于 xterm.js 的 IDE 内置终端（VS Code / CodeBuddy）。
+这类终端会把 `Ctrl+Enter`、`Shift+Enter` 编成与普通 `Enter` **完全相同的字节**，
+程序无从区分，因此无法把它们当作换行。
+
+`Alt+Enter`（以及 `Ctrl+J`）走的是终端原生编码，**任何终端都可用**，是可靠的备选。
+
+想弄清你的终端到底发了什么、或试用另一种上报协议：
+
+```bash
+# 诊断：把终端送来的原始字节记到 ~/.xzh/keys.log
+XZH_DEBUG_KEYS=1 xzh
+# 按几下 Ctrl+Enter / Shift+Enter，退出后查看
+cat ~/.xzh/keys.log
+
+# 备选协议：改用 kitty 键盘协议上报修饰键（部分终端据此可用 Shift+Enter）
+XZH_KITTY_KEYS=1 xzh
+```
+
 默认开启自动批准（`autoApprove: true`），所有工具——包括写文件与执行命令——都会直接执行、不再询问；
 执行 `/auto off` 可切换为逐项确认，设置会持久保存到配置文件。
 

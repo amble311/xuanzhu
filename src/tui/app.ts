@@ -12,7 +12,7 @@ import { friendlyError } from "../llm/http";
 import type { LLMProvider, ToolCall } from "../llm/types";
 import type { ExecuteToolResult } from "../tools";
 import type { ConfirmRequest } from "../tools/types";
-import { expandHome } from "../utils/paths";
+import { expandHome, getConfigDir } from "../utils/paths";
 import { VERSION } from "../utils/version";
 import { ensureProjectDir } from "../workspace";
 import {
@@ -350,6 +350,15 @@ export class TuiApp {
   private extendedKeyRequest(): string {
     const term = process.env.TERM ?? "";
     const program = process.env.TERM_PROGRAM ?? "";
+
+    // 手动改用 kitty 键盘协议：给「modifyOtherKeys 不生效」的终端一条出路
+    // （典型是基于 xterm.js 的 IDE 内置终端）。
+    // 它只让**有歧义的按键**改发转义码，普通输入不受影响。
+    // 之所以不默认开启，是因为 0.1.6 曾无条件叠加它，结果在部分终端上
+    // **挤掉了原本可用的 modifyOtherKeys**（详见上面的说明）。
+    // 用 `XZH_KITTY_KEYS=1 xzh` 可试用；若 Ctrl/Shift+Enter 从此正常，就是它了。
+    if (process.env.XZH_KITTY_KEYS) return "\x1b[>1u";
+
     if (process.env.KITTY_WINDOW_ID) return "";
     if (/kitty|ghostty/i.test(term) || /kitty|ghostty/i.test(program)) {
       return "";
@@ -470,8 +479,35 @@ export class TuiApp {
   // ------------------------------------------------------------------ 输入
 
   private handleData(chunk: string): void {
+    if (process.env.XZH_DEBUG_KEYS) this.logRawKeys(chunk);
     this.keyBuffer += chunk;
     this.drainKeys();
+  }
+
+  /**
+   * 把终端送来的原始字节追加到 `<全局目录>/keys.log`。
+   *
+   * 仅用于排查「某个组合键在玄猪里没反应」这类问题，根因通常在**终端侧**：
+   * 有的终端把 Ctrl+Enter 与 Enter 编成完全相同的字节，程序无从区分。
+   *
+   * 用法：`XZH_DEBUG_KEYS=1 xzh` 启动，按几下目标键再退出，然后看该文件。
+   */
+  private logRawKeys(chunk: string): void {
+    const hex = [...chunk]
+      .map((c) => c.codePointAt(0)!.toString(16).padStart(2, "0"))
+      .join(" ");
+    const readable = chunk
+      .replace(/\x1b/g, "\\e")
+      .replace(/\r/g, "\\r")
+      .replace(/\n/g, "\\n");
+    try {
+      fs.appendFileSync(
+        path.join(getConfigDir(), "keys.log"),
+        `${new Date().toISOString()}  hex=[${hex}]  raw=${JSON.stringify(readable)}\n`,
+      );
+    } catch {
+      // 写不了日志不影响使用
+    }
   }
 
   /**
