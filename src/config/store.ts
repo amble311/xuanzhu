@@ -126,6 +126,17 @@ export interface XuanZhuConfig {
    * 两种取舍各有偏好，因此保留配置项，用 `/mouse` 切换并会写回这里。
    */
   mouseCapture?: boolean;
+  /**
+   * 读取凭据类文件时是否要求确认（`.env`、`~/.ssh`、`~/.xzh/config.json`、
+   * `*.pem`、`id_rsa` 等）。
+   *
+   * false（默认）：**完全自动放行** —— 与其他工具一致，不再打断。
+   * true：读取这类路径时确认一次。防的是「凭据被读进上下文、转手发给模型服务商」
+   *   （`~/.xzh/config.json` 里就存着明文 API Key），与「是否信任模型执行命令」
+   *   是两个问题。默认关闭是因为绝大多数使用场景并不涉及这些路径，
+   *   而每次都弹确认对「全自动」的预期是一种破坏。
+   */
+  confirmSensitiveRead?: boolean;
   /** 采样温度 */
   temperature: number;
   /** 追加到系统提示词的额外内容 */
@@ -151,6 +162,9 @@ export const DEFAULT_CONFIG: XuanZhuConfig = {
   // 默认接管鼠标：滚轮滚动输出区，且拖拽即可选中复制（选择由玄猪自己实现，
   // 所以不再以「失去原生选择」为代价）。想用终端原生选择则改为 false。
   mouseCapture: true,
+  // 默认不拦凭据读取：autoApprove 为 true 时应当「完全自动放行」，
+  // 否则「自动批准」的语义会被一个罕见的例外破坏。
+  confirmSensitiveRead: false,
   temperature: 0.2,
 };
 
@@ -206,6 +220,8 @@ function mergeConfig(partial: Partial<XuanZhuConfig>): XuanZhuConfig {
     maxToolRounds: partial.maxToolRounds ?? DEFAULT_CONFIG.maxToolRounds,
     autoApprove: partial.autoApprove ?? DEFAULT_CONFIG.autoApprove,
     mouseCapture: partial.mouseCapture ?? DEFAULT_CONFIG.mouseCapture,
+    confirmSensitiveRead:
+      partial.confirmSensitiveRead ?? DEFAULT_CONFIG.confirmSensitiveRead,
     temperature: partial.temperature ?? DEFAULT_CONFIG.temperature,
   };
 }

@@ -698,16 +698,17 @@ export class Agent {
     }
 
     // 确认策略：
-    //  1. autoApprove（**默认开启**，新用户开箱即用）下所有工具直接执行 ——
-    //     包括执行命令、写文件、读取工作区外的文件。用户选择「全自动」
-    //     意味着接受相应风险，不应再用逐项确认打断他 —— 那正是新手最先遇到的
-    //     体验问题。（danger 字段此时仍用于确认框的醒目标记。）
-    //  2. 唯一例外：读取**凭据类文件**（~/.ssh、.env、~/.xzh/config.json 等）
-    //     时确认一次。它防的是「凭据被读进上下文、转手发给模型服务商」，
-    //     与「是否信任模型执行命令」是两回事，且极少触发，不构成骚扰。
+    //  1. autoApprove（**默认开启**）下所有工具直接执行 —— 包括执行命令、写文件、
+    //     读取工作区外的文件。用户选择「全自动」意味着接受相应风险，
+    //     不应再用逐项确认打断他（danger 字段仍用于确认框的醒目标记）。
+    //  2. 读取**凭据类文件**（~/.ssh、.env、~/.xzh/config.json 等）默认也不拦。
+    //     想恢复这道防线时把 `confirmSensitiveRead` 设为 true —— 它防的是
+    //     「凭据被读进上下文、转手发给模型服务商」，与「是否信任模型执行命令」
+    //     是两个问题，但默认关闭以免破坏「自动放行」的预期。
     //  3. 未开启自动批准时，声明了 requiresConfirmation 的工具逐项确认。
     const needsConfirm =
-      this.touchesSensitivePath(tool.name, call.arguments) ||
+      (this.config.confirmSensitiveRead === true &&
+        this.touchesSensitivePath(tool.name, call.arguments)) ||
       (Boolean(tool.requiresConfirmation) && !this.config.autoApprove);
 
     if (needsConfirm) {
