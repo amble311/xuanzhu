@@ -64,31 +64,35 @@ function readTextFile(file: string): string | null {
   }
 }
 
-/** 从 AGENTS.md 引入初始规则时，加在文件头的来源与同步说明 */
+/** 项目根存在 AGENTS.md 时，rules.md 写入的「引用式」内容 */
 const RULES_FROM_AGENTS_HEADER = `# 项目规则
 
-> 本文件内容会作为「项目级指令」追加到玄猪的系统提示词中，
-> 用于约定本项目的编码规范、目录结构、构建与测试命令等。
+> 本文件内容会作为「项目级指令」追加到玄猪的系统提示词中。
 > 留空或删除本文件即表示不使用项目规则。
->
-> 📌 以下内容取自本项目根目录的 \`AGENTS.md\`，是**初始化时的一次性快照**。
-> 之后修改 \`AGENTS.md\` **不会**自动同步到这里 —— 若希望两处一致请手动同步，
-> 或者干脆只在此文件中维护。`;
+
+## 必须遵守
+
+本项目根目录下的 \`AGENTS.md\` 记录了本项目的完整约定（技术栈、常用命令、代码规范、
+目录结构等）。**你必须严格按照 \`AGENTS.md\` 执行。**
+
+在开始任何工作之前，先读取项目根目录的 \`AGENTS.md\`。若它在会话过程中被修改，
+请重新读取以获取最新内容 —— 它始终是本项目约定的唯一来源。`;
 
 /**
  * 生成 `.xuanzhu/rules.md` 的初始内容。
  *
- * 玄猪只读取 `rules.md` 一个来源（避免多份规则互相冲突、也难以判断优先级）。
- * 但很多项目根目录已经有 `AGENTS.md`，因此**在初始化时**把它的内容拿来当初始规则，
- * 用户不必为了用玄猪再维护第二份文档。
+ * 若项目根目录已有 `AGENTS.md`，**不复制它的内容**，而是写入一条
+ * 「必须遵循 AGENTS.md」的指令。
  *
- * 取的是快照而非运行时读取：这样规则来源始终唯一、行为可预测，
- * 且 AGENTS.md 改动不会在用户不知情时影响玄猪的行为（文件头已写明这一点）。
+ * 之所以用引用而非复制：复制会形成**快照**，之后 `AGENTS.md` 的改动不会同步过来，
+ * 模型会一直按旧规则工作，而且用户无从察觉。写成引用后，`AGENTS.md` 始终是
+ * 唯一真实来源 —— 用户改完它，模型下次读取（它有 `read_file` 工具）即可看到最新内容。
+ *
+ * 没有 `AGENTS.md` 时用默认模板，引导用户在自己的 rules.md 里填写。
  */
 function buildRulesTemplate(root: string): string {
-  const agents = readTextFile(path.join(root, AGENTS_FILE));
-  if (!agents) return RULES_TEMPLATE;
-  return `${RULES_FROM_AGENTS_HEADER}\n\n${agents}\n`;
+  if (readTextFile(path.join(root, AGENTS_FILE)) === null) return RULES_TEMPLATE;
+  return `${RULES_FROM_AGENTS_HEADER}\n`;
 }
 
 function buildPaths(root: string): ProjectPaths {
