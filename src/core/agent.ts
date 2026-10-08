@@ -273,6 +273,16 @@ export class Agent {
     let lastToolSignature = "";
     let identicalToolCalls = 0;
 
+    // 本轮已成功执行过的调用（签名 → 次数）。
+    //
+    // 用途是**让模型能够自我修正**：本地模型在长任务里经常「丢失自己的计划」——
+    // 它记得某一步做过（会说「✅ 已测试」），却把开头的「我来逐个测试…」重新说一遍，
+    // 于是从头再来一轮。根因是上下文被裁剪后它看不到自己刚做了什么。
+    // 单纯中止只是停下，问题并没有解决；这里改为在重复发生时把**既成事实**
+    // 明确写进工具结果，模型看到「这是你第 N 次调用、参数与结果都相同、
+    // 本轮已做过这些」就能接着往下走，而不是重新规划。
+    const completedSignatures = new Map<string, number>();
+
     // 轮次配额的当前上限。用尽时先询问用户是否继续，而不是硬性中断 ——
     // 真实的大型重构（读完一个模块、重写、反复跑测试）很容易超过默认轮数，
     // 直接停掉会让任务断在半路。只有用户明确不再继续才收尾。
@@ -348,18 +358,41 @@ export class Agent {
             this.events.onNotice?.(
               `检测到连续 ${identicalToolCalls} 次完全相同的工具调用` +
                 `（${call.name}），已判定为陷入循环并中止本轮。\n` +
-                `· 常见原因：模型看不到此前的工具结果，或任务描述不够具体\n` +
-                `· 可以补充更明确的要求，或直接告诉它「不要重复调用 ${call.name}」\n` +
+                `· 中途已把「这一步已完成」写入工具结果提醒过模型，但它没有纠正过来 ——\n` +
+                `  这通常意味着上下文被裁得太多，它**看不到自己刚做过什么**\n` +
                 `· 若上下文过大导致历史被裁剪，可调大该模型的上下文窗口：` +
-                `xzh model context <id> <大小>`,
+                `xzh model context <id> <大小>\n` +
+                `· 也可以补充更明确的要求，或直接说「不要重复调用 ${call.name}」`,
             );
             return;
           }
 
           const result = await this.runTool(call, signal);
+          if (result.ok) {
+            completedSignatures.set(
+              signature,
+              (completedSignatures.get(signature) ?? 0) + 1,
+            );
+          }
+
+          // 重复到第 2 次就提醒 —— 早于中止阈值（4），先给它一次自我纠正的机会。
+          // 只提醒「成功过的」调用：失败重试（改参数、重跑命令）是正常行为，不该干预。
+          let toolContent = result.content;
+          if (identicalToolCalls >= 2 && result.ok) {
+            const done = [...completedSignatures.entries()]
+              .map(([sig, n]) => `${sig.split(":")[0]}×${n}`)
+              .join("、");
+            toolContent +=
+              `\n\n[系统提醒] 这是连续第 ${identicalToolCalls} 次调用 \`${call.name}\`，` +
+              `参数与返回结果都与上一次完全相同 —— **这一步已经完成了，不要重复**。\n` +
+              `本轮已成功执行的调用：${done}\n` +
+              `请直接进行下一个未完成的部分；若任务本身已完成，请直接给出总结。`;
+            this.events.onStatus("提醒重复", `${call.name} ×${identicalToolCalls}`);
+          }
+
           turn.push({
             role: "tool",
-            content: result.content,
+            content: toolContent,
             toolCallId: call.id,
             name: call.name,
           });
