@@ -299,8 +299,8 @@ The first time you run `xzh` in a project, it creates `.xuanzhu/` at the project
 
 Memory is maintained by XuanZhu itself:
 
-- At startup it reads `MEMORY.md` into the prompt so XuanZhu understands the project background from the beginning
-- When it needs more history it calls `memory_read`; after doing substantive work it calls `memory_write` to record conclusions
+- At startup it reads `MEMORY.md` **and the current day's log** into the prompt (an excerpt of each), so XuanZhu understands the project background from the beginning
+- When it needs more history it calls `memory_read`; **after completing each piece of substantive work** it must call `memory_write` to record the conclusion (technical decisions, project conventions, pitfalls hit, important findings). This requirement also appears under "Core principles" in the system prompt, which explicitly asks it to **write memory before producing the final answer** — the earlier wording ("may call") was too weak and in practice almost never triggered
 - `.xuanzhu` is **always** located under the current project path, with **no upward search**: working in `/a/b/c` uses only `/a/b/c/.xuanzhu`, and an existing `.xuanzhu` in `/a` or `/a/b` is never reused
 - **At startup** and **when `/switch` changes directory**, if that directory has no `.xuanzhu` yet, it is created automatically
 - Each project directory therefore has its own memory and rules; `~/.xzh` is purely the **global config directory** (config.json / session / logs / skills) and does not participate in project memory

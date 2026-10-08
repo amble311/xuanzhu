@@ -15,6 +15,11 @@ export function buildSystemPrompt(
 3. 主动验证：完成代码修改后，尽量使用 bash 运行测试、构建或类型检查来验证结果。
 4. 简洁沟通：用中文回复，直接给出结论与关键信息，避免冗长客套。
 5. 工具优先：需要查找文件用 glob，搜索内容用 grep，不要靠猜路径。
+6. 收尾时沉淀记忆：**在给出本轮最终答复之前**，先判断这次是否产出了跨会话仍有价值的内容
+   （确定的技术方案、项目约定、踩过的坑与解法、重要发现、用户的偏好要求）。
+   只要有，就**必须先调用 memory_write 记录，再结束本轮**。
+   不要留到"下次再说"——本轮结束后上下文就没了，这些结论会永久丢失。
+   琐碎的过程细节、临时路径、工具报错不必记录。
 
 ## 工具使用规范
 - read_file：读取文件（带行号），修改前必读
@@ -54,15 +59,28 @@ export function buildSystemPrompt(
 
 const MEMORY_EXCERPT_CHARS = 1500;
 
-/** 生成「项目记忆」段落：说明记忆工具用法，并附上长期记忆节选 */
+/**
+ * 生成「项目记忆」段落：说明记忆工具用法，并附上已有内容。
+ *
+ * 措辞刻意用「必须 / 应当」而不是「可」—— 这里最容易出的问题不是模型不知道
+ * 有这个工具，而是它**认为可以跳过**。实测中「可调用读写记忆」几乎从不触发，
+ * 改成明确要求「每完成一件实质工作就必须写」之后才会真正落盘。
+ * 同时在核心原则里也加了一条，因为那一段位置更靠前、权重更高。
+ */
 function buildMemorySection(
   memory?: { longTerm: string; recentDaily: string } | null,
 ): string {
   let section =
     "\n\n## 项目记忆\n" +
-    "本项目在 `.xuanzhu/memory/` 中保存跨会话记忆（长期记忆 MEMORY.md + 每日日志）。\n" +
-    "- 处理需要项目背景的任务前，可调用 `memory_read` 了解此前积累的结论与约定。\n" +
-    "- 完成实质工作后，调用 `memory_write` 记录值得跨会话保留的信息。";
+    "本项目在 `.xuanzhu/memory/` 中保存跨会话记忆（长期记忆 `MEMORY.md` + 按日期的日志）：\n" +
+    "- **`memory_read`**：读取此前积累的结论与约定。开始一项需要项目背景的任务前**应当先读**，" +
+    "避免重复摸索、重复踩坑。\n" +
+    "- **`memory_write`**：写入值得跨会话保留的信息。**每完成一件实质工作都必须写**，例如：" +
+    "确定的技术方案、项目约定、用户的偏好与要求、踩过的坑及其解法、重要发现。\n" +
+    "- 范围选择：`scope=long` 写长期记忆（稳定结论与约定）；`scope=daily`（默认）写当日日志" +
+    "（过程记录、当天的进展）。\n" +
+    "- **不要记录**：临时路径、一次性命令输出、工具报错、纯探索过程 —— 它们对后续会话没有价值，" +
+    "写进去只会挤占后续会话的上下文。";
 
   const longTerm = memory?.longTerm?.trim();
   if (longTerm) {
@@ -71,6 +89,17 @@ function buildMemorySection(
         ? `${longTerm.slice(0, MEMORY_EXCERPT_CHARS)}\n…（已截断，可用 memory_read 查看完整内容）`
         : longTerm;
     section += `\n\n### 现有长期记忆（节选）\n${excerpt}`;
+  }
+
+  // 当天的日志此前被读取却从未使用（字段一直白白加载）。附上它有两个用处：
+  // 让模型知道今天已经记过什么（避免重复写），以及给当天的会话一个连贯的起点。
+  const daily = memory?.recentDaily?.trim();
+  if (daily) {
+    const excerpt =
+      daily.length > MEMORY_EXCERPT_CHARS
+        ? `${daily.slice(-MEMORY_EXCERPT_CHARS)}\n…（已截断，可用 memory_read 查看完整内容）`
+        : daily;
+    section += `\n\n### 今日日志（节选）\n${excerpt}`;
   }
 
   return section;
