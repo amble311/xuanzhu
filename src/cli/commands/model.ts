@@ -23,7 +23,7 @@ import {
 } from "../../llm";
 import { ansi } from "../../utils/ansi";
 import { getConfigPath } from "../../utils/paths";
-import { promptInput, promptSelect } from "../prompt";
+import { promptConfirm, promptInput, promptSelect } from "../prompt";
 
 /**
  * `xzh model`                    交互式管理多个模型（新增 / 删除 / 调整权重 / 查看全部）
@@ -82,6 +82,11 @@ async function addModel(args: string[]): Promise<void> {
   const existingModels = materializeModels(config);
 
   const providerId = args[0] ?? (await chooseProvider());
+  // 在服务商列表里选了「返回」：静默回到菜单，不报错
+  if (!providerId) {
+    process.stdout.write(`${ansi.gray}已取消。${ansi.reset}\n`);
+    return;
+  }
   const meta = findProvider(providerId);
   if (!meta) {
     process.stdout.write(
@@ -93,6 +98,11 @@ async function addModel(args: string[]): Promise<void> {
   }
 
   const model = args[1] ?? (await chooseModel(meta.id, meta.models, config));
+  // 在模型列表里选了「返回」
+  if (!model) {
+    process.stdout.write(`${ansi.gray}已取消。${ansi.reset}\n`);
+    return;
+  }
   const weightText = args[2];
   let weight: number | undefined;
   if (weightText !== undefined) {
@@ -162,7 +172,11 @@ async function removeModelCommand(args: string[]): Promise<void> {
     return;
   }
 
-  const key = args[0] ?? (await chooseFromList(models, "选择要删除的模型："));
+  const key = args[0] || (await chooseFromList(models, "选择要删除的模型："));
+  if (!key) {
+    process.stdout.write(`${ansi.gray}已取消。${ansi.reset}\n`);
+    return;
+  }
   const id = resolveModelKey(config, key);
   const removed = id ? removeModel(config, id) : null;
   if (!removed) {
@@ -192,7 +206,11 @@ async function setWeightCommand(args: string[]): Promise<void> {
     return;
   }
 
-  const key = args[0] ?? (await chooseFromList(models, "选择要调整权重的模型："));
+  const key = args[0] || (await chooseFromList(models, "选择要调整权重的模型："));
+  if (!key) {
+    process.stdout.write(`${ansi.gray}已取消。${ansi.reset}\n`);
+    return;
+  }
   const id = resolveModelKey(config, key);
   const target = id ? models.find((entry) => entry.id === id) : undefined;
   if (!target) {
@@ -247,7 +265,12 @@ async function setContextCommand(args: string[]): Promise<void> {
     return;
   }
 
-  const key = args[0] ?? (await chooseFromList(models, "选择要设置上下文窗口的模型："));
+  const key =
+    args[0] || (await chooseFromList(models, "选择要设置上下文窗口的模型："));
+  if (!key) {
+    process.stdout.write(`${ansi.gray}已取消。${ansi.reset}\n`);
+    return;
+  }
   const id = resolveModelKey(config, key);
   const target = id ? models.find((entry) => entry.id === id) : undefined;
   if (!target) {
@@ -284,13 +307,24 @@ async function setContextCommand(args: string[]): Promise<void> {
 }
 
 /** 把全部模型权重恢复为默认值 */
-function resetWeights(): void {
+async function resetWeights(): Promise<void> {
   const config = loadConfig();
   const models = effectiveModels(config);
   if (models.length === 0) {
     process.stdout.write(`${ansi.yellow}尚未配置任何模型。${ansi.reset}\n`);
     return;
   }
+
+  // 这条操作会改动**所有**模型的权重，先确认一次。
+  // 顺带也提供了「返回」的机会 —— 菜单里其余动作都能中途取消，它不该是例外。
+  const confirmed = await promptConfirm(
+    `将把 ${models.length} 个模型的权重全部重置为 ${DEFAULT_MODEL_WEIGHT}，继续？`,
+  );
+  if (!confirmed) {
+    process.stdout.write(`${ansi.gray}已取消。${ansi.reset}\n`);
+    return;
+  }
+
   resetModelWeights(config);
   syncActiveFields(config);
   saveConfig(config);
@@ -388,7 +422,9 @@ async function interactiveMenu(): Promise<void> {
       "请选择操作：",
       [
         { label: "新增模型", value: "add", hint: "add" },
-        { label: "查看所有可用模型", value: "all", hint: "all" },
+        // 只列**已配置**的模型。内置模型清单（22 个）在命令行用 `xzh model all` 查看，
+        // 放进交互菜单会把这里刷成一大片、盖住真正需要操作的条目。
+        { label: "查看已配置的模型", value: "list", hint: "list" },
         { label: "删除模型", value: "remove", hint: "remove" },
         { label: "调整调用权重", value: "weight", hint: "weight" },
         { label: "调整上下文窗口", value: "context", hint: "context" },
@@ -406,8 +442,8 @@ async function interactiveMenu(): Promise<void> {
       case "add":
         await addModel([]);
         break;
-      case "all":
-        listAvailableModels();
+      case "list":
+        printModelTable(config);
         break;
       case "remove":
         await removeModelCommand([]);
@@ -419,7 +455,7 @@ async function interactiveMenu(): Promise<void> {
         await setContextCommand([]);
         break;
       case "reset":
-        resetWeights();
+        await resetWeights();
         break;
       default:
         process.stdout.write(`\n${ansi.gray}已退出模型管理。${ansi.reset}\n`);
@@ -532,13 +568,17 @@ function syncActiveFields(config: XuanZhuConfig): void {
 }
 
 async function chooseProvider(): Promise<string> {
+  // 末项「返回」返回空串，调用方据此中止（否则用户进了新增流程就只能一路走完）
   return promptSelect(
     "选择 AI 服务商：",
-    PROVIDERS.map((provider) => ({
-      label: provider.label,
-      value: provider.id,
-      hint: provider.id,
-    })),
+    [
+      ...PROVIDERS.map((provider) => ({
+        label: provider.label,
+        value: provider.id,
+        hint: provider.id,
+      })),
+      { label: "返回", value: "" },
+    ],
     0,
   );
 }
@@ -553,6 +593,7 @@ async function chooseModel(
     const options = [
       ...models.map((model) => ({ label: model, value: model })),
       { label: "手动输入模型名", value: "__custom__" },
+      { label: "返回", value: "" },
     ];
     const defaultIndex = current ? Math.max(0, models.indexOf(current)) : 0;
     const selected = await promptSelect(
@@ -560,7 +601,7 @@ async function chooseModel(
       options,
       defaultIndex,
     );
-    if (selected !== "__custom__") return selected;
+    if (selected !== "__custom__") return selected; // 空串即「返回」，由调用方处理
   }
   const input = await promptInput("请输入模型名称", current);
   return input;
@@ -677,17 +718,31 @@ function resolveModelKey(config: XuanZhuConfig, key: string): string | null {
   return null;
 }
 
+/**
+ * 让用户从已配置的模型里挑一个。
+ *
+ * 列表末尾始终附一个「返回」，选中即返回空字符串 —— 调用方据此中止操作。
+ * 没有它的话，用户一旦进入某个子操作（删除 / 调权重 / 调上下文）就只能硬着头皮选一个，
+ * 想放弃只能 Ctrl+C 退出整个进程。
+ */
 async function chooseFromList(
   models: ModelEntry[],
   label: string,
 ): Promise<string> {
   const sorted = models.slice().sort((a, b) => b.weight - a.weight);
-  return promptSelect(
+  const chosen = await promptSelect(
     label,
-    sorted.map((entry) => ({
-      label: `${entry.id}  权重 ${entry.weight}`,
-      value: entry.id,
-    })),
+    [
+      ...sorted.map((entry) => ({
+        label:
+          `${entry.id}  权重 ${entry.weight}  ctx ${formatContextWindow(
+            entry.contextWindow ?? inferContextWindow(entry.model),
+          )}`,
+        value: entry.id,
+      })),
+      { label: "返回", value: "" },
+    ],
     0,
   );
+  return chosen;
 }
