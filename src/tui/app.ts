@@ -237,6 +237,16 @@ export class TuiApp {
       }
       this.lines.push("");
     }
+
+    // 接管鼠标时提示一次怎么选文本。否则用户只会看到「选不中」，
+    // 不知道要按住 Shift —— 这个绕过方式是最实用的，但很难被自己发现。
+    if (this.mouseCapture) {
+      this.lines.push(
+        `${ansi.gray}鼠标已接管：滚轮可滚动输出区。要选中文本，请按住 ${ansi.reset}Shift${ansi.gray} 拖拽。${ansi.reset}`,
+        `${ansi.gray}想恢复原生选择与右键菜单：输入 ${ansi.reset}/mouse${ansi.gray}。${ansi.reset}`,
+        "",
+      );
+    }
     if (this.projectDirCreated) {
       this.lines.push(
         `${ansi.green}✓ 已初始化项目目录 ${this.projectDirCreated}${ansi.reset}`,
