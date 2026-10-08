@@ -109,6 +109,18 @@ export interface XuanZhuConfig {
    * false：写文件 / 编辑文件 / 执行命令前需用户确认。
    */
   autoApprove: boolean;
+  /**
+   * 是否让玄猪接管鼠标（滚轮滚动输出区）。
+   *
+   * false（默认）：鼠标交还终端 —— 右键菜单、框选复制、中键粘贴都可用，
+   *   滚动输出区用 `PgUp` / `PgDn`。
+   * true：滚轮可滚动输出区，但终端不再做原生选择，需按 **Shift 拖拽** 才能选中文本。
+   *
+   * 两者在终端层面**无法完美并存** —— `?1000h` 是整体开关，没有「只捕获滚轮」的选项；
+   * 而玄猪工作在备用屏上，不捕获时终端也没有回滚历史可滚。
+   * 所以这个开关让用户一次选好，不必反复执行 `/mouse`。
+   */
+  mouseCapture?: boolean;
   /** 采样温度 */
   temperature: number;
   /** 追加到系统提示词的额外内容 */
@@ -131,6 +143,9 @@ export const DEFAULT_CONFIG: XuanZhuConfig = {
   // 因此放宽是安全的。
   maxToolRounds: 200,
   autoApprove: true,
+  // 默认不接管鼠标：优先保证原生选择、右键菜单与中键粘贴可用，
+  // 滚动输出区交给 PgUp/PgDn。需要滚轮的用户在配置里改成 true。
+  mouseCapture: false,
   temperature: 0.2,
 };
 
@@ -185,6 +200,7 @@ function mergeConfig(partial: Partial<XuanZhuConfig>): XuanZhuConfig {
     providers: { ...DEFAULT_CONFIG.providers, ...(partial.providers ?? {}) },
     maxToolRounds: partial.maxToolRounds ?? DEFAULT_CONFIG.maxToolRounds,
     autoApprove: partial.autoApprove ?? DEFAULT_CONFIG.autoApprove,
+    mouseCapture: partial.mouseCapture ?? DEFAULT_CONFIG.mouseCapture,
     temperature: partial.temperature ?? DEFAULT_CONFIG.temperature,
   };
 }

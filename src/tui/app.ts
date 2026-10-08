@@ -130,16 +130,16 @@ export class TuiApp {
   private projectDirCreated?: string;
   private needsRender = false;
   /**
-   * 是否捕获鼠标（滚轮 + 拖拽）。
+   * 是否捕获鼠标（滚轮滚动输出区）。
    *
-   * **默认关闭**：开启后终端会把**所有**鼠标事件交给应用，包括右键 ——
-   * 于是右键菜单、原生拖拽选择、中键粘贴全部失效，而终端层面无法做到
-   * 「只捕获滚轮、放行右键」。相比之下滚动有 `PgUp`/`PgDn` 与鼠标滚轮之外的
-   * 更重要的键位可用，因此默认把原生鼠标行为还给用户。
+   * 初始值来自配置项 `mouseCapture`（默认 false），因此**不需要每次用 `/mouse` 切换**；
+   * 用 `/mouse` 切换后也会写回配置，下次启动保持。
    *
-   * 需要滚轮滚动输出区时执行 `/mouse` 开启（此时可用 Shift+拖拽临时选择）。
+   * 两者的取舍在终端层面无法两全：`?1000h` 是整体开关，没有「只捕获滚轮」的选项；
+   * 而玄猪工作在备用屏上，不捕获时终端也没有回滚历史可滚。
+   * 开启时仍可用 **Shift+拖拽** 做原生选择（多数终端会用 Shift 绕过应用级捕获）。
    */
-  private mouseCapture = false;
+  private mouseCapture: boolean;
   /** 最近一次对话在输出区中的起始行号（含用户提问），供 /copy last 使用 */
   private lastAnswerStart = 0;
   private streamingPreview = "";
@@ -172,6 +172,8 @@ export class TuiApp {
     this.options = options;
     this.cwd = options.cwd;
     this.autoApprove = options.autoApprove;
+    // 从配置读取初始鼠标行为，避免每次启动都要 /mouse 切换
+    this.mouseCapture = options.config.mouseCapture === true;
     this.intentEnabled =
       options.intentEnabled ?? options.config.intent?.enabled === true;
     // 同步到配置对象（内存中）：Agent 读取的是 config.intent.enabled。
@@ -648,9 +650,6 @@ export class TuiApp {
         return;
       case "\r": // Enter
         void this.submit();
-        return;
-      case "\x0a": // Ctrl+J 换行
-        this.insertText("\n");
         return;
       case "\x7f":
       case "\b":
@@ -1288,6 +1287,13 @@ export class TuiApp {
    */
   private toggleMouseCapture(): void {
     this.mouseCapture = !this.mouseCapture;
+    // 写回配置：一次切换即永久生效，不必每次启动都敲 /mouse
+    this.options.config.mouseCapture = this.mouseCapture;
+    try {
+      saveConfig(this.options.config);
+    } catch {
+      // 写盘失败不影响本次会话内的切换效果
+    }
     process.stdout.write(
       this.mouseCapture ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1000l\x1b[?1006l",
     );
@@ -1389,7 +1395,7 @@ export class TuiApp {
       `  /intent [on|off] 切换意图分析（on：每条消息先做意图分析再处理，写入配置）`,
       `  /exit          退出玄猪`,
       `${ansi.bold}快捷键${ansi.reset}`,
-      `  Enter 提交 · Ctrl+Enter / Shift+Enter 换行（Ctrl+J、Alt+Enter 亦可）`,
+      `  Enter 提交 · ${ansi.bold}Alt+Enter${ansi.reset} 换行（Ctrl/Shift+Enter 视终端而定）`,
       `  ↑/↓ 历史 · Ctrl+A/Ctrl+E 行首/行尾 · PgUp/PgDn 翻页 · Shift+↑/↓ 逐行`,
       `  Home/End 跳到最早/最新`,
       `  ${ansi.gray}鼠标${ansi.reset}：默认交还终端 —— 右键菜单、框选复制、中键粘贴都可用；` +
@@ -1400,8 +1406,8 @@ export class TuiApp {
       `  Ctrl+C 中断任务 / 清空输入 / 退出（空闲且输入为空时退出）`,
       `  Ctrl+D 结束本轮正在进行的对话 · 任何情况下都不会退出玄猪`,
       `  Ctrl+L 清屏`,
-      `  注：若 Ctrl/Shift+Enter 无效（部分 IDE 内置终端会把二者编成与 Enter 相同的字节），`,
-      `      请改用 ${ansi.bold}Alt+Enter${ansi.reset} 或 Ctrl+J —— 它们走终端原生编码，各终端通用。`,
+      `  注：${ansi.bold}Alt+Enter${ansi.reset} 走终端原生编码，各终端通用；`,
+      `      Ctrl/Shift+Enter 需要终端支持扩展键盘协议，部分终端（尤其 IDE 内置）不支持。`,
       `${ansi.bold}右侧终端${ansi.reset}`,
       `  Enter 执行命令 · ↑/↓ 命令历史 · Ctrl+C / Ctrl+D 中断运行中的命令 · Ctrl+L 清空`,
       `  PgUp/PgDn / Shift+↑↓ / Home/End 回看历史输出（滚动不影响正在运行的命令）`,
@@ -1826,7 +1832,7 @@ function normalizeModifiedKey(code: number, mods: number): string | null {
  * - `CSI 27 ; <mod> ; 13 ~`：xterm `modifyOtherKeys` 下的 Shift / Ctrl+Enter。
  *
  * 另外，处于上报模式的终端会把 Ctrl+字母也改成转义码，这里一并还原成控制字符，
- * 保证 Ctrl+C / Ctrl+A / Ctrl+E / Ctrl+J / Ctrl+L 等既有快捷键不受影响。
+ * 保证 Ctrl+C / Ctrl+A / Ctrl+E / Ctrl+L 等既有快捷键不受影响。
  */
 function normalizeKey(key: string): string {
   // ESC + Enter：部分终端（Ctrl+Enter / Alt+Enter）沿用该传统编码
