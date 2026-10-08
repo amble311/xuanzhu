@@ -108,6 +108,14 @@ const MAX_RESPONSE_CHARS = 1_000_000;
  * 阈值取 4：正常的重试（比如先失败再改参数）不会被误杀。
  */
 const MAX_IDENTICAL_TOOL_CALLS = 4;
+
+/**
+ * 检测到死循环后，允许发起几次「自我修正」再中止。
+ *
+ * 取 1：先给它一次机会分析原因、换方案。成功的话任务能继续，
+ * 失败（再次累计到阈值）才中止 —— 不至于让同一次卡顿反复消耗轮次。
+ */
+const MAX_SELF_CORRECTIONS = 1;
 /** 单次请求内因模型调用失败而切换模型的最大次数 */
 const MAX_MODEL_SWITCHES = 3;
 
@@ -283,6 +291,12 @@ export class Agent {
     // 本轮已做过这些」就能接着往下走，而不是重新规划。
     const completedSignatures = new Map<string, number>();
 
+    // 已经用掉几次「自我修正」。检测到死循环时不会立刻中止，而是**主动发起一轮
+    // 元对话**：把「你在重复、任务没有推进」明确告诉模型，要求它分析原因并换方案。
+    // 只有修正之后仍然重复，才判定为无法自愈并中止 —— 直接中止只是止损，
+    // 问题并没有被解决，重新问一次还会再来一遍。
+    let selfCorrections = 0;
+
     // 轮次配额的当前上限。用尽时先询问用户是否继续，而不是硬性中断 ——
     // 真实的大型重构（读完一个模块、重写、反复跑测试）很容易超过默认轮数，
     // 直接停掉会让任务断在半路。只有用户明确不再继续才收尾。
@@ -353,16 +367,55 @@ export class Agent {
             identicalToolCalls = 1;
           }
           if (identicalToolCalls >= MAX_IDENTICAL_TOOL_CALLS) {
+            // 第一步：发起一次自我修正，而不是直接中止。
+            if (selfCorrections < MAX_SELF_CORRECTIONS) {
+              selfCorrections++;
+              const repeats = identicalToolCalls;
+              // 重置计数，让修正后的新方案有一个干净的判断起点；
+              // 若它依旧重复，会重新累计到阈值，那时才中止。
+              identicalToolCalls = 0;
+              lastToolSignature = "";
+
+              // assistant 消息里带了 tool_calls，因此**每个 call 都必须有对应的
+              // tool 结果**，否则角色序列非法、下一次请求会被服务端拒绝。
+              // 这次调用我们不执行，但要补一条说明它被跳过。
+              turn.push({
+                role: "tool",
+                content: `[系统] 本次调用已跳过：它与前面 ${repeats} 次完全相同。`,
+                toolCallId: call.id,
+                name: call.name,
+              });
+              turn.push({
+                role: "user",
+                content:
+                  `[系统检测] 你连续 ${repeats} 次调用了 \`${call.name}\`（参数完全相同），` +
+                  `但任务并没有因此推进。\n\n` +
+                  `请先停下来分析，不要继续调用工具：\n` +
+                  `1. 这个调用为什么没有推进任务？它的返回值里是不是**已经**有你需要的全部信息？\n` +
+                  `2. 任务目前实际完成到哪一步了？把已经做完的部分列出来。\n` +
+                  `3. 接下来应该做什么**不同**的事？\n\n` +
+                  `分析完就按新方案继续，不要再做同一个调用。`,
+              });
+
+              this.events.onStatus("自我修正", `分析 ${call.name} 的重复`);
+              this.events.onNotice?.(
+                `检测到连续 ${repeats} 次重复调用（${call.name}），` +
+                  `已请求模型自行分析原因并调整方案。`,
+              );
+              // 跳出工具循环 → 下一轮由模型来响应这条指令
+              break;
+            }
+
+            // 第二步：修正过仍然重复，说明它无法自愈，这时才中止。
             commitTurn();
-            this.events.onStatus("已中止", "检测到重复调用");
+            this.events.onStatus("已中止", "重复调用且自我修正无效");
             this.events.onNotice?.(
-              `检测到连续 ${identicalToolCalls} 次完全相同的工具调用` +
-                `（${call.name}），已判定为陷入循环并中止本轮。\n` +
-                `· 中途已把「这一步已完成」写入工具结果提醒过模型，但它没有纠正过来 ——\n` +
-                `  这通常意味着上下文被裁得太多，它**看不到自己刚做过什么**\n` +
-                `· 若上下文过大导致历史被裁剪，可调大该模型的上下文窗口：` +
-                `xzh model context <id> <大小>\n` +
-                `· 也可以补充更明确的要求，或直接说「不要重复调用 ${call.name}」`,
+              `检测到再次连续 ${identicalToolCalls} 次完全相同的工具调用` +
+                `（${call.name}）。此前已请求过自我修正，但它没有调整过来，` +
+                `故中止本轮。\n` +
+                `· 这通常意味着上下文被裁得太多、它看不到自己刚做过什么\n` +
+                `· 可调大该模型的上下文窗口：xzh model context <id> <大小>\n` +
+                `· 也可以把任务拆小，或直接说「不要重复调用 ${call.name}」`,
             );
             return;
           }
