@@ -175,6 +175,31 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
+# ──────────────────── 3.5 收尾 CHANGELOG ────────────────────
+#
+# 把顶部的「## [未发布]」标记成本次发布的版本号，并在其上插入新的空段 ——
+# 否则每次发布都会留下一个孤儿 [未发布]，攒几轮后就分不清哪些改动属于哪个版本了。
+step "更新 CHANGELOG"
+
+if [ -f CHANGELOG.md ] && grep -q '^## \[未发布\]' CHANGELOG.md; then
+  node -e "
+    const fs = require('fs');
+    const file = process.argv[1];
+    const version = process.argv[2];
+    const today = new Date().toISOString().slice(0, 10);
+    let src = fs.readFileSync(file, 'utf8');
+    src = src.replace(
+      /^## \[未发布\][ \t]*$/m,
+      '## [未发布]\n\n## [' + version + '] — ' + today,
+    );
+    fs.writeFileSync(file, src);
+    process.stdout.write('  ' + version + ' 已写入 CHANGELOG（新增 [未发布] 段供下次使用）\n');
+  " CHANGELOG.md "$NEW_VERSION"
+  ok "CHANGELOG 已标记为 $NEW_VERSION"
+else
+  warn "CHANGELOG.md 中没有 [未发布] 段，已跳过"
+fi
+
 # ──────────────────────── 4. 发布到 npm ────────────────────────
 
 step "发布到 npm"
