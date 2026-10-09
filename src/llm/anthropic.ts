@@ -13,6 +13,7 @@ import type {
   ToolSpec,
   Usage,
 } from "./types";
+import { IMAGE_FALLBACK_TEXT, normalizeAnthropicMediaType } from "./vision";
 
 export interface AnthropicConfig {
   id: string;
@@ -193,6 +194,25 @@ function toAnthropicMessages(messages: ChatMessage[]): {
     }
 
     if (message.role === "user") {
+      // 带图片时改用 content block 数组（纯文本仍走字符串，保持与旧行为一致）
+      if (message.images && message.images.length > 0) {
+        const blocks: ContentBlockParam[] = [
+          { type: "text", text: message.content || IMAGE_FALLBACK_TEXT },
+        ];
+        for (const image of message.images) {
+          blocks.push({
+            type: "image",
+            source: {
+              type: "base64",
+              // Anthropic 只认 png / jpeg / gif / webp，其余格式会被拒绝
+              media_type: normalizeAnthropicMediaType(image.mimeType),
+              data: image.data,
+            },
+          });
+        }
+        result.push({ role: "user", content: blocks });
+        continue;
+      }
       result.push({ role: "user", content: message.content });
       continue;
     }

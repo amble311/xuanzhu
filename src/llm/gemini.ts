@@ -8,6 +8,7 @@ import {
   type Tool,
 } from "@google/generative-ai";
 import { delay, isRetryableError } from "./http";
+import { IMAGE_FALLBACK_TEXT } from "./vision";
 import type {
   ChatMessage,
   ChatOptions,
@@ -185,6 +186,19 @@ function toGeminiContents(messages: ChatMessage[]): {
     }
 
     if (message.role === "user") {
+      // 带图片时追加 inlineData 分片（纯文本仍是单个 text part，保持与旧行为一致）
+      if (message.images && message.images.length > 0) {
+        const parts: Part[] = [
+          { text: message.content || IMAGE_FALLBACK_TEXT },
+        ];
+        for (const image of message.images) {
+          parts.push({
+            inlineData: { mimeType: image.mimeType, data: image.data },
+          });
+        }
+        contents.push({ role: "user", parts });
+        continue;
+      }
       contents.push({ role: "user", parts: [{ text: message.content }] });
       continue;
     }

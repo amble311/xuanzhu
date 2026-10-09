@@ -9,17 +9,20 @@ import { OpenAICompatProvider } from "./openai-compat";
 import type { LLMProvider } from "./types";
 
 export * from "./types";
+export * from "./vision";
 export {
   friendlyError,
   isConfigError,
   isContextLengthError,
   isRetryableError,
+  isVisionUnsupportedError,
 } from "./http";
 export {
   DEFAULT_CONTEXT_WINDOW,
   estimateMessageTokens,
   estimateTokens,
   formatContextWindow,
+  IMAGE_TOKENS_ESTIMATE,
   inferContextWindow,
   INPUT_BUDGET_RATIO,
   isSystemPromptTight,
@@ -27,6 +30,8 @@ export {
   resolveConversationBudget,
   sliceToTokenBudget,
   squeezeStaleToolOutput,
+  stripAllImages,
+  stripStaleImages,
   trimMessagesToBudget,
 } from "./context";
 

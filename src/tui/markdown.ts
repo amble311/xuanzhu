@@ -23,11 +23,26 @@ export class MarkdownRenderer {
     return lines;
   }
 
-  /** 窥视当前尚未完成的行（用于流式实时显示，不改变状态） */
+  /**
+   * 窥视当前尚未完成的行（用于流式实时显示）。
+   *
+   * 用与落定**完全相同**的规则渲染，否则同一行会先以原始 Markdown 出现在屏幕上
+   * （例如看到 `**加粗**` 的星号、引用行的 `>`），落定的一瞬间又突然换一种样子，
+   * 看起来就像"标记渲染错了"。
+   *
+   * 唯一的区别是**不改动代码块状态**：预览会把同一行处理两次（预览一次、落定一次），
+   * 若预览就翻转了 `inCodeBlock`，落定时会再翻一次，围栏就错位了。
+   */
   peek(): string {
     if (!this.buffer) return "";
-    if (this.inCodeBlock) return `${ansi.cyan}${this.buffer}${ansi.reset}`;
-    return this.buffer;
+    const savedInCodeBlock = this.inCodeBlock;
+    const savedCodeLang = this.codeLang;
+    try {
+      return this.renderLine(this.buffer);
+    } finally {
+      this.inCodeBlock = savedInCodeBlock;
+      this.codeLang = savedCodeLang;
+    }
   }
 
   /**
@@ -83,13 +98,15 @@ export class MarkdownRenderer {
 
     // 引用
     if (trimmed.startsWith("> ")) {
-      return `${ansi.gray}│ ${trimmed.slice(2)}${ansi.reset}`;
+      // 行内片段结束后要恢复灰色，否则引用块里出现一个 `代码` 就"断色"
+      return `${ansi.gray}│ ${this.renderInline(trimmed.slice(2), ansi.gray)}${ansi.reset}`;
     }
 
     // 列表
     const list = /^(\s*)([-*+]|\d+\.)\s+(.*)$/.exec(line);
     if (list) {
-      return `${list[1]}${ansi.blue}${list[2]}${ansi.reset} ${list[3]}`;
+      // 列表内容同样要处理行内标记：否则 `命令` 会原样显示成带反引号的文本
+      return `${list[1]}${ansi.blue}${list[2]}${ansi.reset} ${this.renderInline(list[3])}`;
     }
 
     // 分隔线
@@ -100,18 +117,25 @@ export class MarkdownRenderer {
     return this.renderInline(line);
   }
 
-  /** 处理行内的 **粗体**、`代码`、行内链接 */
-  private renderInline(line: string): string {
+  /**
+   * 处理行内的 **粗体**、`代码`、行内链接。
+   *
+   * `baseStyle` 是该行所在容器的样式（如引用块的灰色）。行内片段结束时必须**恢复**
+   * 容器样式，而不是一律 `reset` 回默认色 —— 否则「引用块里的一个 `代码`」会让
+   * 它之后的内容掉出灰色，整行看起来一半是引用、一半不是。
+   */
+  private renderInline(line: string, baseStyle = ""): string {
+    const restore = baseStyle ? `${ansi.reset}${baseStyle}` : ansi.reset;
     let result = line;
     // 行内代码
     result = result.replace(
       /`([^`]+)`/g,
-      (_match, code: string) => `${ansi.cyan}${code}${ansi.reset}`,
+      (_match, code: string) => `${ansi.cyan}${code}${restore}`,
     );
     // 粗体
     result = result.replace(
       /\*\*([^*]+)\*\*/g,
-      (_match, text: string) => `${ansi.bold}${text}${ansi.reset}`,
+      (_match, text: string) => `${ansi.bold}${text}${restore}`,
     );
     // 剩余斜体标记去除
     result = result.replace(/(^|\s)\*([^*\s][^*]*)\*(?=\s|$)/g, "$1$2");

@@ -25,19 +25,31 @@ src/
 │   ├── agent.ts         多轮工具调用循环、历史管理、模型失败降级
 │   └── prompt.ts        系统提示词
 ├── llm/                 LLM 抽象层（与 SDK 解耦）
-│   ├── types.ts         ChatMessage / ToolSpec / StreamChunk / LLMProvider
+│   ├── types.ts         ChatMessage（含 images）/ ToolSpec / StreamChunk / LLMProvider
 │   ├── openai-compat.ts OpenAI 兼容协议实现（含流式 tool_calls 累加）
 │   ├── anthropic.ts     Anthropic Claude 实现（含 tool_use 流）
 │   ├── gemini.ts        Google Gemini 实现（含 function calling）
+│   ├── context.ts       token 估算、历史裁剪、图片降级
+│   ├── http.ts          非复用连接 Agent、瞬时错误判定与友好化
+│   ├── vision.ts        模型是否支持图片输入的推断与标注
 │   └── index.ts         Provider 注册表、校验、工厂
 ├── tools/               终端工具集
-│   ├── types.ts         ToolDefinition / ToolResult / ToolContext
+│   ├── types.ts         ToolDefinition / ToolResult / ToolContext / TodoStore / SubAgentInput
 │   ├── filesystem.ts    read_file / list_dir / glob / grep / write_file / edit_file
 │   ├── bash.ts          bash
 │   ├── skills.ts        list_skills / load_skill
-│   └── index.ts         TOOLS 注册表与统一执行入口
+│   ├── memory.ts        memory_read / memory_write / memory_compact
+│   ├── todo.ts          todo_write（任务列表）
+│   ├── agent.ts         task（派生子代理，参数 subagent_name）
+│   └── index.ts         TOOLS 注册表、统一执行入口与子代理工具集
+├── subagents/           子代理注册表（定义各自的工具白名单与系统提示词）
+│   ├── types.ts         SubAgentDefinition / SubAgentContext
+│   ├── code-explorer.ts code-explorer —— 只读代码库探索子代理
+│   └── index.ts         SUBAGENTS 注册表与查找（新增子代理只需改这里）
 ├── skills/              技能发现与加载（内置技能位于仓库 skills/，构建后复制到 dist/skills）
-│   └── index.ts
+│   ├── index.ts         技能发现与加载
+│   ├── dependencies.ts  依赖声明（技能 CLI + 玄猪自身的剪贴板工具）与包管理器安装命令
+│   └── installer.ts     依赖检测 / 安装 / 复核（管道与继承终端两种执行方式）
 ├── tui/                 全屏终端界面（零第三方依赖，纯 ANSI）
 │   ├── app.ts           终端控制、按键处理、焦点管理、渲染、确认对话框
 │   ├── terminal.ts      右侧终端面板（命令执行、输出缓冲、cd 维护）
@@ -46,6 +58,8 @@ src/
 ├── config/store.ts      配置读写（~/.xzh/config.json）与多模型权重
 └── utils/
     ├── ansi.ts          颜色、显示宽度、折行
+    ├── clipboard.ts     读取系统剪贴板图片/文本（Linux/Windows/macOS）+ 图片魔数嗅探
+    ├── concurrency.ts   mapWithConcurrency —— 固定并发度的 worker 池
     └── paths.ts         路径与配置目录
 ```
 
@@ -86,9 +100,15 @@ Agent.run(text) ──► LLMProvider.chat({ messages, tools })
 3. 若无工具调用 → 结束本轮。
 4. 若工具标记了 `requiresConfirmation` 且当前**未开启**自动批准（`autoApprove: false`）→ 请求用户确认；
    默认 `autoApprove: true`，所有工具直接执行。
-5. 执行工具，把结果作为 `role: "tool"` 消息追加。
-6. 回到第 2 步，最多 `maxToolRounds`（默认 40）轮。
-7. 历史超过 60 条时裁剪（保持 tool 消息与其 assistant 消息配对）。
+5. 执行工具，把结果作为 `role: "tool"` 消息追加。工具可读写会话状态：
+   `todo_write` 维护 `Agent.todos`（经 `onTodos` 通知界面），`task` 派生子代理
+   （见「工具系统 → 子代理」）。**连续的 `parallelSafe` 调用会并发执行**
+   （目前只有 `task`），结果仍按原顺序回灌。
+6. 回到第 2 步，最多 `maxToolRounds`（默认 200）轮；用尽时不硬性中断，而是经
+   `onRoundLimit` 询问用户是否追加配额（非交互场景直接收尾）。
+7. 历史按 **token 预算**裁剪（`trimMessagesToBudget()`），先压缩老旧的大块工具输出、
+   再从最老的消息整条丢弃，并保持 tool 消息与其 assistant 消息配对；
+   另有一道 `MAX_HISTORY_MESSAGES`（400 条）的安全网。
 
 工作目录可在启动时指定（`xzh <目录>`），也可在对话中用 `/switch <目录>` 切换。
 `Agent.setCwd()` 会同时更新工具上下文（`ToolContext.cwd`）与系统提示词中的目录信息，
@@ -126,6 +146,54 @@ chat(options: ChatOptions): AsyncIterable<StreamChunk>
 - **错误呈现**：底层异常经 `friendlyError()`（`src/llm/http.ts`）转换为中文提示；
   重试过程通过 `ChatOptions.onRetry` 回调，在界面状态栏展示 "网络中断，正在重试 (n/3)"。
 
+### 图片输入（多模态）
+
+`ChatMessage` 增加可选字段 `images?: ImageAttachment[]`（`{ mimeType, data(base64) }`），
+而**不改** `content: string` —— 字符串 content 被历史裁剪、token 估算、日志、子代理报告等
+大量逻辑依赖，改成多部分联合类型会牵动整条链路；图片只在两处需要特殊处理：
+
+1. **Provider 转换**（`toOpenAIMessage` / `toAnthropicMessages` / `toGeminiContents`）：
+   带图时把 user 消息的 content 换成分片数组，无图时仍是纯字符串（保持旧行为）。
+   各家的包装形式不同：OpenAI `{type:"image_url", image_url:{url:"data:…"}}`、
+   Anthropic `{type:"image", source:{type:"base64", media_type, data}}`（media_type 只认
+   png/jpeg/gif/webp，其余由 `normalizeAnthropicMediaType` 退回 png）、
+   Gemini `{inlineData:{mimeType, data}}`。
+2. **token 估算**（`estimateMessageTokens`）：图片不参与文本分词，按
+   `IMAGE_TOKENS_ESTIMATE`（1600）的固定值保守估算 —— 不解析图片头去算尺寸，因为
+   低估会把请求顶到窗口上限，而高估只是让历史早一点被裁剪。
+
+**旧图片降级**（`stripStaleImages`）：图片以 base64 携带，成本随轮次线性叠加，
+所以每次组装请求时只保留**最后一条**带图片的消息，更早的替换成
+`[图片已省略：image/png]`。
+
+**入站**（TUI → 附件）：终端只能传文本，剪贴板里只有图片时多数终端粘贴时什么都不发，
+因此由 TUI 主动读系统剪贴板（`src/utils/clipboard.ts`，见目录树）。三条通路：
+
+- `Ctrl+V` / `/image` → `readClipboardImage()`（Linux `wl-paste`/`xclip`、Windows PowerShell、
+  macOS `pngpaste`/`osascript`，按序尝试，用魔数嗅探确认确实是图片）；
+- 剪贴板无图片时退化为 `readClipboardText()`，等价于常规文本粘贴；
+- 提交时若某一行**只有一个图片文件路径**（拖拽进来的形态），自动转成附件。
+
+附件在输入框里以 `[图片N]` 占位标记表示，侧表 `pendingImages` 保存实际数据；
+提交时 `takePendingImages()` 按标记取出并清除未被引用的附件 —— 这样光标移动、退格、
+历史回看等既有输入逻辑一行都不用改。
+
+**视觉能力**（`src/llm/vision.ts`）：判定顺序为 **显式 `ModelEntry.vision` → `custom`
+provider 默认支持 → 否定关键词 → 肯定关键词 → 默认不支持**（`xzh model vision <id> on|off`
+可标注，`xzh model add` 也会询问一次）。除 `custom` 外**默认按不支持处理** ——
+粘贴图片时直接拒绝并给出可操作提示，而不是发出去换一个 400 把整轮正文一起作废。
+
+`custom`（任意 OpenAI 兼容端点）之所以例外：它的模型名由用户自填，按名字推断必然失效，
+全部拒绝等于「自定义模型永远用不了图片」。放行之后由**自动降级**兜底：
+
+- `isVisionUnsupportedError()`（`src/llm/http.ts`）识别服务端「不支持图片」的拒绝 ——
+  仅在 4xx 范围内判定，先匹配显式模式（各家措辞差异大），再要求「提到图片」且
+  「提到不支持」同时成立，避免把「图片格式非法」这类错误也当成模型不支持而静默丢图；
+- `streamAssistant` 命中后以 `stripAllImages()` 去掉全部图片**重试一次**
+  （`dropImages` 参数保证不会反复重试），并提示用户 `xzh model vision <id> off` 彻底关闭。
+- 这一步必须放在 `handleModelFailure` **之前**：它不是模型故障，降权与切换模型都没有意义
+  —— 换个模型拿同样的图片再发一次可能同样失败，只会白扣权重。
+
 ## 6. 工具系统
 
 每个工具是一个 `ToolDefinition`：
@@ -137,11 +205,104 @@ interface ToolDefinition {
   parameters: JsonSchema;        // 传给模型的 JSON Schema
   requiresConfirmation?: boolean; // 是否需用户确认
   danger?: boolean;               // 危险操作（仅在确认框中以醒目样式提示）
+  parallelSafe?: boolean;         // 可与其它可并行工具同时执行（默认 false）
   execute(args, ctx): Promise<ToolResult>;
 }
 ```
 
+`parallelSafe` 默认 `false`：多数工具有副作用或互相依赖，必须按顺序跑。只有
+「不共享任何可变状态」的工具才设为 `true` —— 目前仅有 `task`（每个子代理是独立的
+`Agent` 实例，Provider 本身也无请求态，所以并发调用互不干扰）。
+
 新增工具：在 `src/tools/` 实现后加入 `TOOLS` 数组即可，`getToolSpecs()` 会自动生成模型所需的工具声明。
+`findTool()` / `getToolSpecs()` / `executeTool()` 都接受一个可选的工具集合，默认是全部 `TOOLS`
+—— 子代理正是借此拿到受限的工具集（见下）。
+
+### 任务列表（todo_write）
+
+`todo_write` 采用「每次提交**全量**列表」的语义（`{content, status}[]`，状态为
+`pending` / `in_progress` / `completed` / `cancelled`，同时只允许一个 `in_progress`）。
+工具本身无状态，列表挂在 `Agent.todos` 上，通过 `ToolContext.todos`（`TodoStore`）读写；
+写入时 `Agent` 经 `AgentEvents.onTodos` 通知界面，TUI 在**顶部信息区**显示
+`任务 2/5` 与当前进行项（只展开前 3 项，其余以计数压缩，避免挤占头部空间）。
+`Agent.reset()`（`/clear`）会一并清空列表。
+
+### 记忆精简
+
+长期记忆（`MEMORY.md`）是**只追加**的，长期使用会无界增长，而它每次启动都要注入提示词。
+因此设阈值 `config.memoryMaxChars`（默认 `6000`，见 `workspace` 的 `DEFAULT_MEMORY_MAX_CHARS`），
+**达到阈值即自动触发**，不依赖模型主动调用：
+
+1. **自动层**（`compactLongTermMemoryIfNeeded()`，确定性、无需模型参与）：
+   - 未超阈值 → 直接返回 `null`，**不读内容、不改文件**；
+   - 超阈值 → 先去除正文完全相同的重复块（无损），仍超限则从**最旧的块**开始裁剪
+     （最新结论优先保留），仅在确有变化时原子重写文件。
+   - 触发点：`Agent.composeSystemPrompt()`（会话构造 / `setCwd()`）与 `memory_write`
+     （scope=long）写入之后。精简结果经 `Agent.pendingMemoryNotices` 攒起来、
+     在首轮 `run()` 时提示（构造发生在终端接管之前，不能当场写输出区）。
+   - `memoryMaxChars <= 0` = 不限制长度：仍然去重，但不裁剪。
+2. **语义层**（模型参与）：只有当**单条块本身就超限**（裁剪至少要保留一条、删无可删）时，
+   系统提示词才追加「⚠ 长期记忆仍然过长」段落，要求模型 `memory_read` 读全文、
+   再用 `memory_compact` 提交精简后的完整版本（合并同主题、删除已过时条目）。
+
+> 分工的原因：去重与裁剪是确定性的、不该交给模型（也不该等模型「想起来」）；
+> 而「哪些内容已经过时」只有模型能判断，因此保留语义层作为兜底。
+
+### 子代理（task）
+
+`task` 工具派生一个**新的 `Agent` 实例**执行子任务，只把最终答复作为工具结果回灌主对话。
+具体派谁、给什么工具与提示词，全部来自 `src/subagents` 的注册表（`findSubAgent(name)`）。
+
+实现要点（`Agent.spawnSubAgent()`）：
+
+- **上下文隔离**：子代理的正文不进主对话（`onText` 只累积、不渲染），只有最后的报告
+  以 `ToolResult` 返回（超长时按 `MAX_SUBAGENT_REPORT_CHARS` 截断）—— 这是它存在的意义：
+  几十屏的调研过程不挤占主上下文。
+- **受限工具集**：`toolsForSubAgent(definition.toolNames)` 按子代理声明的白名单过滤 `TOOLS`，
+  并**恒排除** `SUBAGENT_FORBIDDEN_TOOLS`（`task` 防无界递归；`todo_write` 与
+  `memory_write` / `memory_compact` 因任务列表与记忆归属主会话）。
+- **独立系统提示词**：由子代理定义自己提供（`definition.systemPrompt()`），
+  而不是主提示词的变体 —— 例如 `code-explorer` 会声明只读并解释探索力度分级。
+- **事件转发**：子代理的工具活动以 `[<子代理名>: <任务说明>]` 前缀走 `onNotice` 显示
+  （并行时输出会交错，前缀里的任务说明用于区分来源）；危险操作确认**转发给主代理**，
+  不因在子代理内而绕过；轮次用尽时 `onRoundLimit` 直接返回 false（子代理无法与用户交互），
+  以已有内容收尾。
+
+**并行执行**（`Agent.run()` 的工具循环）：
+
+- 循环改成 `while (index < toolCalls.length)`：把**连续的、`parallelSafe` 为真的**调用
+  收成一个批次并发执行，其余逐个串行。批内要求签名互不相同（同一消息里并列同一调用
+  没有意义，且会与重复检测的计数语义打架）。
+- 并发通过 `mapWithConcurrency(calls, this.parallelLimit(), ...)`（`src/utils/concurrency.ts`）：
+  worker 池而非 `Promise.all(map)`，避免模型一口气返回 10 个 task 时同时开出 10 条对话流
+  撞上速率限制。结果**按原调用顺序**回灌 —— `tool` 消息必须与 `assistant.tool_calls` 一一对应。
+- 并发上限：`config.maxParallelAgents`（默认 4），经 `parallelLimit()` 夹到 `[1, 16]`；
+  `1` 即退化为串行。
+- 批次内单个调用抛错不影响整批（转为失败结果）；`aborted` 后整批收尾走 `commitPartialTurn()`。
+- **确认串行化**：并行子代理可能同时请求确认，而 TUI 只有一个确认槽。`TuiApp.requestConfirm()`
+  因此把请求串成一条链排队 —— 否则后到的会覆盖先到的 `resolve`，前一个 Promise 永不兑现，
+  整个批次挂死。
+- 死循环检测与自我修正逻辑保持不变；被跳过的调用一律用 `Agent.skipToolCalls()`
+  补齐 `tool` 结果（原先只补当前一条，若一轮含多个调用会留下配不上的 `tool_calls`，
+  下一次请求会被服务端 400 拒绝 —— 顺带修掉了）。
+
+**触发率**（为什么还需要它）：`task` 与其他工具一样**每次请求都会发给模型**（无开关，
+见「工具系统」的 `getToolSpecs()`），但工具描述里写「大范围调研时用它」属于**主观判断** ——
+模型判定不了「多大算大」，实测表现就是全程自己 `read_file`/`grep`、子代理从不被调用。
+因此除把触发条件写成可判定的阈值（「预计要读 3 个以上文件 / 要反复 glob、grep」）之外，
+`Agent.run()` 还维护本轮的只读调研累计量（`EXPLORATION_TOOLS` 的调用次数与输出字符数），
+首次超过阈值（8 次 / 40k 字符）时在该次工具结果**末尾追加**一条 `[系统提醒]`，
+把「可改用子代理」明确摆到模型面前。约束：整轮只提醒一次；本轮已经调用过 `task` 时不再提醒
+（它已经在用了，再提示只会是噪音）。
+
+这是「**确定性触发 + 软引导**」的组合：触发条件是客观的、必然发生，是否采纳仍由模型判断 ——
+比纯提示词可靠，又不像强制路由那样剥夺模型的选择权。
+
+`Agent` 通过构造参数 `AgentOptions { tools?, systemPrompt? }` 支持这两项定制，主代理不传即用默认。
+
+**新增子代理**：在 `src/subagents/` 实现 `SubAgentDefinition`（`name` / `description` /
+`toolNames` / `systemPrompt`）并加进 `SUBAGENTS` 数组。`task` 的 `subagent_name` 枚举、
+工具白名单与提示词都会自动跟随，无需改动 `tools/` 或 `core/`。
 
 ### 技能系统（Skills）
 
@@ -154,7 +315,8 @@ interface ToolDefinition {
   上级目录即使已有 `.xuanzhu` 也不复用。启动与 `/switch` 切换目录时，若该目录下尚无
   `.xuanzhu` 则自动创建，仅承载**项目记忆与项目规则**。细节：
   - `memory/MEMORY.md`（长期记忆）与 `memory/YYYY-MM-DD.md`（每日日志）由 `memory_read` /
-    `memory_write` 工具读写；`Agent.composeSystemPrompt()` 在构造与 `setCwd()` 时读取并注入提示词（节选 1500 字符）。
+    `memory_write` 工具读写，长期记忆还可由 `memory_compact` 整体重写（见「记忆精简」）；
+    `Agent.composeSystemPrompt()` 在构造与 `setCwd()` 时读取并注入提示词（节选 1500 字符）。
   - `rules.md` 内容作为项目规则追加进系统提示词。
 - **使用**：模型通过 `list_skills` 查看可用技能，通过 `load_skill` 加载 `SKILL.md` 全文，
   再借助 `bash` 执行指南中描述的命令。技能指南在对话中持续有效，无需重复加载。
@@ -165,8 +327,27 @@ interface ToolDefinition {
   github / gitlab、jira / linear、aws / kubernetes、数据库、监控与消息类。
 - **依赖自动安装**：`src/skills/dependencies.ts` 以 TS 常量声明每个技能所需的 CLI
   （检测命令、各平台安装命令、postInstall）；`src/skills/installer.ts` 负责检测、安装与安装后复核。
+  同一套机制也承载**玄猪自身的依赖**（`runtimeRequirements()` / `clipboardRequirements()`）——
+  目前是 Linux 读取系统剪贴板所需的 `xclip`（X11）或 `wl-clipboard`（Wayland），
+  按 `WAYLAND_DISPLAY` 二选一（多装一个只是多一份失败面，而 `readClipboardImage()` 本来就会两者都试）。
+  macOS / Windows 有内置通路，不声明任何依赖。
   `load_skill` 在加载前自动确保依赖就绪（缺失时经 `ToolContext.confirm` 请求用户确认一次），
-  `xzh setup` 可一次性预装全部技能依赖，使安装玄猪后无需再单独安装这些 CLI。
+  `xzh setup` 可一次性预装全部依赖。
+
+  **两种执行方式**（`installer.ts`）——这决定了 `sudo` 能不能用：
+
+  | 方式 | stdio | 用途 | 命令里的 sudo |
+  | --- | --- | --- | --- |
+  | `runShell()` | 全部管道 | TUI 内安装、非交互场景 | 走 `[ -t 0 ]` 判定 → 无终端则 `sudo -n` **快速失败**，不会挂住等密码 |
+  | `runShellInteractive()` | `stdio: "inherit"` | `xzh setup`、TUI 挂起后安装系统包 | 有终端 → 普通 `sudo`，正常提示密码 |
+
+  安装命令自身用 `[ -t 0 ]` 在两种模式间自动切换（见 `linuxInstall()`），因此**同一份命令字符串**既能跑管道也能跑交互。
+  Linux 安装命令还会按 `command -v` 自动识别包管理器（apt / dnf / yum / pacman / zypper / apk）。
+
+  TUI 缺剪贴板工具时（`pasteFromClipboard` 拿到 `unavailable`）会弹一次确认框，
+  确认后 `suspendUi()`（退出备用屏 + 关原始模式）→ `runShellInteractive()` →`resumeUi()`
+  （重新接管终端并强制整屏重绘，重置 `lastPhysicalCount` 以免视口锚定算错）。
+  挂起期间 `render()` 直接返回，否则界面输出会与安装输出互相踩踏。
 
 ## 7. 配置
 
@@ -232,6 +413,21 @@ interface ToolDefinition {
   从而避免因折行触发整屏滚动而造成的「内容重复 / 光标错位」。
 - 显示宽度计算支持全角字符（中文占 2 列）。
 - 渲染节流：状态变化合并到 ~16ms 一次重绘，避免闪烁。
+- **Markdown 行渲染**（`src/tui/markdown.ts`）：逐行把模型输出转成带颜色的行，
+  并跨 chunk 跟踪代码块状态。三条容易出错的约束：
+  - **每一物理行必须自洽**：`wrapText()` 折行时在行尾补 `reset`、并在续行**重新打开**
+    仍生效的样式。玄猪是一行一行独立写出的（`cursor.to()` + `\x1b[2K`），**不能假定
+    终端会把上一行的 SGR 状态延续下来** —— 否则一段加粗/颜色跨过折行点后，续行会掉回
+    默认色（表现为「同一句话前半段亮、后半段莫名变灰」）；行尾不封闭还会把样式泄漏到
+    后面的其它行。
+  - **行内标记不得破坏容器样式**：`renderInline(line, baseStyle)` 在行内片段
+    （`` `代码` `` / `**粗体**`）结束时恢复**所在容器的样式**（如引用块的灰色），
+    而不是一律 reset —— 否则引用块里出现一个行内代码，它之后的内容就会「断色」。
+    列表项的内容同样要走 `renderInline`，否则 `` `命令` `` 会原样显示成反引号。
+  - **预览与落定同规**：`peek()`（流式未完成行的预览）使用与 `renderLine()` 相同的
+    渲染规则，只是**不改动**代码块状态（同一行会被处理两次：预览一次、落定一次，
+    预览若翻转了 `inCodeBlock`，落定时会再翻一次导致围栏错位）。否则同一行会先以
+    原始 Markdown（带 `**`、`>` 前缀）显示，落定的一瞬间又突然换个样子。
 - **分栏布局**：左栏自上而下为「顶部固定头部」（品牌、模型、当前目录、提示、分隔线，不参与滚动，
   高度不超过终端高度的 1/3）→ 可滚动对话区 → 输入区（多行，随内容增高）。头部高度受 1/3 限制而
   需要裁剪时，从最下面的信息行开始裁，**末尾分隔线始终保留**（见 `TuiApp.render` 中的 `headerLines`），

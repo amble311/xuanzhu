@@ -62,7 +62,17 @@ export function estimateTokens(text: string): number {
   return Math.ceil(ascii / 3.5) + wide;
 }
 
-/** 估算单条消息的 token 数（正文 + 工具调用） */
+/**
+ * 单张图片的估算 token 数。
+ *
+ * 图片不走文本分词 —— 它作为结构化字段发送，各家的计费方式都基于**尺寸分块**
+ * （OpenAI 高细节图最多约 1445 token，Anthropic 约 (宽×高)/750）。这里不读图片
+ * 尺寸（解析图片头只为估算不值得），统一按偏高的固定值估算：宁可高估、让历史
+ * 早一点被裁剪，也不要低估后撞上窗口上限。
+ */
+export const IMAGE_TOKENS_ESTIMATE = 1_600;
+
+/** 估算单条消息的 token 数（正文 + 工具调用 + 图片） */
 export function estimateMessageTokens(message: ChatMessage): number {
   let tokens = PER_MESSAGE_OVERHEAD + estimateTokens(message.content ?? "");
   if (message.toolCalls) {
@@ -73,7 +83,40 @@ export function estimateMessageTokens(message: ChatMessage): number {
         estimateTokens(call.arguments);
     }
   }
+  if (message.images && message.images.length > 0) {
+    tokens += message.images.length * IMAGE_TOKENS_ESTIMATE;
+  }
   return tokens;
+}
+
+/**
+ * 把**较旧**消息里的图片降级为文本占位。
+ *
+ * 图片以 base64 形式携带，成本随轮次线性叠加：如果每轮的历史都留着原图，
+ * 上下文会被迅速撑爆（而且旧的截图对后续对话几乎没有价值）。
+ * 因此只在请求里保留**最后一条**带图片的消息（也就是本轮刚发的那张），
+ * 更早的一律替换成 `[图片已省略：<mime>]`。
+ */
+export function stripStaleImages(messages: ChatMessage[]): ChatMessage[] {
+  let lastImageIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message?.images && message.images.length > 0) {
+      lastImageIndex = i;
+      break;
+    }
+  }
+  if (lastImageIndex < 0) return messages;
+
+  return messages.map((message, index) => {
+    const images = message.images;
+    if (index >= lastImageIndex || !images || images.length === 0) return message;
+    const kinds = [...new Set(images.map((img) => img.mimeType))].join("、");
+    const note = `\n\n[图片已省略：${kinds}${
+      images.length > 1 ? `，共 ${images.length} 张` : ""
+    }]`;
+    return { ...message, content: `${message.content}${note}`, images: undefined };
+  });
 }
 
 /** 把文本裁剪到不超过 maxTokens（与 estimateTokens 采用同一口径，避免裁完仍超） */
@@ -159,6 +202,26 @@ export function squeezeStaleToolOutput(
     return {
       ...message,
       content: `${head}\n\n…（此处省略 ${omitted} 字符的中间内容）\n\n${tail}`,
+    };
+  });
+}
+
+/**
+ * 移除**所有**消息里的图片（用于「模型不支持图片输入」后的降级重试）。
+ *
+ * 与 `stripStaleImages` 的区别：这里是全删，因为整条链路用不了图片。但仍然留下
+ * 一条占位说明，让模型知道「本轮原本带了图、只是没发过去」，否则它面对
+ * 「请看这张图片」这样的正文只能凭空猜测。
+ */
+export function stripAllImages(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map((message) => {
+    const images = message.images;
+    if (!images || images.length === 0) return message;
+    const kinds = [...new Set(images.map((img) => img.mimeType))].join("、");
+    return {
+      ...message,
+      content: `${message.content}\n\n[图片已省略：${kinds}（当前模型不支持图片输入）]`,
+      images: undefined,
     };
   });
 }

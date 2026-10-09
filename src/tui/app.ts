@@ -9,9 +9,19 @@ import {
 } from "../config/store";
 import { findProvider } from "../llm";
 import { friendlyError } from "../llm/http";
+import { modelSupportsVision, type ImageAttachment } from "../llm";
 import type { LLMProvider, ToolCall } from "../llm/types";
-import type { ExecuteToolResult } from "../tools";
-import type { ConfirmRequest } from "../tools/types";
+import { clipboardRequirements, currentPlatform } from "../skills/dependencies";
+import { isRequirementMet, runShellInteractive } from "../skills/installer";
+import { getToolSpecs, type ExecuteToolResult } from "../tools";
+import type { ConfirmRequest, TodoItem } from "../tools/types";
+import {
+  MAX_CLIPBOARD_IMAGE_BYTES,
+  readClipboardImage,
+  readClipboardText,
+  sniffImageMime,
+  type ClipboardImage,
+} from "../utils/clipboard";
 import { expandHome, getConfigDir } from "../utils/paths";
 import { VERSION } from "../utils/version";
 import { ensureProjectDir } from "../workspace";
@@ -114,6 +124,24 @@ export class TuiApp {
   private scrollOffset = 0;
   private statusText = "就绪";
   private statusDetail = "";
+  /** 当前任务列表（todo_write），显示在顶部信息区 */
+  private todoItems: TodoItem[] = [];
+  /**
+   * 本轮待发送的图片附件，key 为输入框里占位标记 `[图片N]` 中的编号。
+   *
+   * 之所以用「文本占位 + 侧表」而不是给输入框加真正的附件结构：这样光标移动、
+   * 退格删除、历史回看等既有逻辑全都不用改 —— 删掉占位标记，提交时自然就不会
+   * 引用到对应附件（见 takePendingImages）。
+   */
+  private pendingImages = new Map<number, ImageAttachment>();
+  private imageSeq = 0;
+  /**
+   * 界面是否已临时挂起（把终端交还给 shell）。
+   *
+   * 只在需要 sudo 密码的安装期间为 true —— 此时绝不能渲染，否则界面输出会与
+   * 安装命令的输出互相踩踏。
+   */
+  private suspended = false;
   private busy = false;
   private exited = false;
   private autoApprove: boolean;
@@ -124,6 +152,8 @@ export class TuiApp {
   private historyIndex = -1;
 
   private pendingConfirm?: PendingConfirm;
+  /** 确认请求的串行链：并行子代理同时请求确认时排队，避免覆盖导致挂死 */
+  private confirmChain: Promise<void> = Promise.resolve();
   private abortController?: AbortController;
   private keyBuffer = "";
   private escTimer?: NodeJS.Timeout;
@@ -224,6 +254,10 @@ export class TuiApp {
         this.scheduleRender();
       },
       onNotice: (message) => this.handleNotice(message),
+      onTodos: (items) => {
+        this.todoItems = items;
+        this.scheduleRender();
+      },
       onIntent: (analysis, original) => this.handleIntent(analysis, original),
       onModelChange: (info) => this.handleModelChange(info),
       confirm: (request) => this.requestConfirm(request),
@@ -527,11 +561,28 @@ export class TuiApp {
     this.scheduleRender();
   }
 
+  /**
+   * 请求用户确认。
+   *
+   * 确认框只有一个（`pendingConfirm`），而**并行的子代理可能同时请求确认** ——
+   * 若直接覆盖，前一个 Promise 永远不会兑现，对应的子代理就此挂住，
+   * 整个工具批次（`Promise.all`）也跟着卡死。因此这里把请求串成一条链：
+   * 后来的排队等待，前一个答复后才显示。
+   */
   private requestConfirm(request: ConfirmRequest): Promise<boolean> {
-    return new Promise<boolean>((resolve) => {
-      this.pendingConfirm = { request, resolve, selected: true };
-      this.scheduleRender();
-    });
+    const next = this.confirmChain.then(
+      () =>
+        new Promise<boolean>((resolve) => {
+          this.pendingConfirm = { request, resolve, selected: true };
+          this.scheduleRender();
+        }),
+    );
+    // 链本身不能因异常断掉（确认 Promise 不会 reject，这里只是兜底）
+    this.confirmChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
   }
 
   // ------------------------------------------------------------------ 输入
@@ -712,6 +763,11 @@ export class TuiApp {
           this.statusText = "中断中…";
           this.scheduleRender();
         }
+        return;
+      case "\x16": // Ctrl+V：粘贴
+        // 优先把剪贴板里的**图片**作为附件；只有文本时退化为常规文本粘贴
+        // （部分终端不自己处理 Ctrl+V，会把 \x16 原样上送）。
+        void this.pasteFromClipboard();
         return;
       case "\r": // Enter
         void this.submit();
@@ -1137,6 +1193,232 @@ export class TuiApp {
     this.scheduleRender();
   }
 
+  /**
+   * 把**剪贴板里的图片**加为本轮附件；剪贴板只有文本时退化为常规文本粘贴。
+   *
+   * 为什么必须由玄猪主动读取：终端与程序之间只有字节流，粘贴只能传文本，
+   * 剪贴板里只有图片时多数终端在粘贴时**什么都不发送**，程序无从感知。
+   * 因此改为向操作系统索取（Linux：wl-paste / xclip；Windows：PowerShell；
+   * macOS：pngpaste / osascript）。
+   */
+  private async pasteFromClipboard(): Promise<void> {
+    if (this.busy || this.termFocus) return;
+
+    this.statusText = "读取剪贴板";
+    this.statusDetail = "";
+    this.scheduleRender();
+
+    try {
+      const result = await readClipboardImage();
+
+      if (result.kind === "image") {
+        this.attachClipboardImage(result.image);
+        return;
+      }
+
+      // 没有图片（或剪贴板工具缺失）→ 当作普通粘贴：读剪贴板文本
+      const text = await readClipboardText();
+      if (text) {
+        this.insertText(text);
+        return;
+      }
+
+      if (result.kind === "unavailable") {
+        // 缺工具就直接装 —— 而不是只丢一句「请安装 xxx」让用户自己折腾。
+        // 装好后再读一次，成功的话本次粘贴照常完成。
+        if (await this.ensureClipboardTool()) {
+          const retry = await readClipboardImage();
+          if (retry.kind === "image") {
+            this.attachClipboardImage(retry.image);
+            return;
+          }
+        }
+        this.handleNotice(
+          `未能读取剪贴板：${result.detail}\n` +
+            `提示：也可以直接把图片文件拖进终端，把路径贴在输入框里。`,
+        );
+      }
+    } finally {
+      this.statusText = "就绪";
+      this.statusDetail = "";
+      this.scheduleRender();
+    }
+  }
+
+  /**
+   * 缺少剪贴板工具时**主动安装**（Linux 上的 `xclip` / `wl-clipboard`）。
+   *
+   * 安装系统包需要 sudo，而玄猪平时用管道执行命令、sudo 拿不到终端会直接失败 ——
+   * 因此这里临时**挂起界面**（退出备用屏 + 关闭原始模式），把终端让给安装命令，
+   * 让它能正常提示输入密码，装完再恢复界面并强制整屏重绘。
+   *
+   * macOS / Windows 有内置通路，`clipboardRequirements()` 返回空数组，这里直接跳过。
+   */
+  private async ensureClipboardTool(): Promise<boolean> {
+    const requirements = clipboardRequirements();
+    if (requirements.length === 0) return false;
+
+    for (const requirement of requirements) {
+      if (await isRequirementMet(requirement)) return true;
+
+      const command = requirement.install[currentPlatform()];
+      if (!command) continue;
+
+      const approved = await this.requestConfirm({
+        tool: "clipboard_install",
+        title: `需要安装剪贴板工具：${requirement.name}`,
+        detail:
+          `Ctrl+V 粘贴图片需要读取系统剪贴板，当前缺少它。\n\n` +
+          `安装命令：\n  ${command}\n\n` +
+          `按 y 立即安装（会暂时离开界面，以便输入 sudo 密码）；按 n 跳过。`,
+        danger: false,
+      });
+      if (!approved) {
+        this.handleNotice(`已跳过安装。也可以手动执行：\n  ${command}`);
+        return false;
+      }
+
+      this.handleNotice(
+        `正在安装 ${requirement.name} …（可能需要输入 sudo 密码）`,
+      );
+      this.suspendUi();
+      let result: { ok: boolean; output: string; timedOut: boolean };
+      try {
+        result = await runShellInteractive(command);
+      } catch (err) {
+        result = { ok: false, output: String(err), timedOut: false };
+      } finally {
+        this.resumeUi();
+      }
+
+      if (!result.ok) {
+        this.handleNotice(
+          `安装失败${result.timedOut ? "（超时）" : ""}${
+            result.output.trim() ? `：${result.output.trim()}` : ""
+          }\n可手动执行：\n  ${command}`,
+        );
+        return false;
+      }
+      if (await isRequirementMet(requirement)) {
+        this.handleNotice(`✓ ${requirement.name} 安装完成`);
+        return true;
+      }
+      this.handleNotice(
+        `安装命令已执行，但检测仍未通过（可能需要重开终端刷新 PATH）。\n` +
+          `可手动执行：\n  ${command}`,
+      );
+      return false;
+    }
+    return false;
+  }
+
+  /** 临时挂起界面：退出备用屏、关闭原始模式，把终端交还给 shell */
+  private suspendUi(): void {
+    this.suspended = true;
+    this.exitTerminal();
+    process.stdout.write(
+      `${ansi.gray}[玄猪] 正在安装依赖，安装完成后会自动回到界面…${ansi.reset}\n\n`,
+    );
+  }
+
+  /** 恢复界面：重新接管终端并强制整屏重绘 */
+  private resumeUi(): void {
+    this.enterTerminal();
+    this.suspended = false;
+    // 挂起期间终端内容已被安装输出改写，旧的行数记录不再可信 ——
+    // 不重置会让「视口锚定」把滚动位置算错（-1 表示本次渲染跳过锚定）
+    this.lastPhysicalCount = -1;
+    this.lastTermPhysicalCount = -1;
+    this.scheduleRender();
+  }
+
+  /** 校验并登记一张剪贴板图片，同时在输入框插入占位标记 */
+  private attachClipboardImage(image: ClipboardImage): void {
+    if (image.bytes > MAX_CLIPBOARD_IMAGE_BYTES) {
+      this.handleNotice(
+        `图片过大（${formatImageSize(image.bytes)}），超出上限 ` +
+          `${formatImageSize(MAX_CLIPBOARD_IMAGE_BYTES)}，已忽略。`,
+      );
+      return;
+    }
+
+    // 模型不支持视觉时**提前拦住**：真发出去多半是一个 400，把整轮正文一起作废
+    if (!this.currentModelSupportsVision()) {
+      this.handleNotice(
+        `当前模型 ${this.modelLabel} 未标注支持图片输入，未附加图片。\n` +
+          `· 若该模型确实支持视觉：xzh model vision <id> on\n` +
+          `· 或者切换到 glm-4v / qwen-vl / gpt-4o / claude 等支持视觉的模型`,
+      );
+      return;
+    }
+
+    const id = ++this.imageSeq;
+    this.pendingImages.set(id, {
+      mimeType: image.mimeType,
+      data: image.base64,
+    });
+    this.insertText(`[图片${id}]`);
+    this.handleNotice(
+      `已附加图片${id}（${formatImageSize(image.bytes)}，${image.mimeType}）；` +
+        `回车发送，退格删掉占位即可移除。`,
+    );
+  }
+
+  /**
+   * 从输入框文本里取出图片占位标记，返回剥离后的正文与对应附件。
+   *
+   * 未被任何占位引用的附件（用户把标记删掉了）一并丢弃 —— 否则会发出
+   * 一张用户以为已经取消的图片。
+   */
+  private takePendingImages(raw: string): {
+    text: string;
+    images: ImageAttachment[];
+  } {
+    const images: ImageAttachment[] = [];
+    const text = raw
+      .replace(/\[图片(\d+)\]/g, (_match, digits: string) => {
+        const image = this.pendingImages.get(Number(digits));
+        if (image) images.push(image);
+        return "";
+      })
+      // 标记被移除后可能留下连续空格，顺手收敛一下
+      .replace(/[ \t]{2,}/g, " ")
+      .trim();
+
+    this.pendingImages.clear();
+    return { text, images };
+  }
+
+  /**
+   * 把「整行就是一个图片文件路径」的输入转成附件（拖拽文件到终端时最常见）。
+   *
+   * 为什么值得做：拖拽在**所有终端**上都能拿到路径（粘贴路径是纯文本，不依赖任何协议），
+   * 而 Ctrl+V 在部分终端会被终端自己吃掉。只处理「整行就是路径」这一种形态 ——
+   * 一旦行内还有别的文字，更可能是用户想操作这个文件，不该擅自吞掉路径。
+   */
+  private absorbImagePaths(text: string): {
+    text: string;
+    images: ImageAttachment[];
+  } {
+    if (!/\.(png|jpe?g|gif|webp)\b/i.test(text)) return { text, images: [] };
+
+    const images: ImageAttachment[] = [];
+    const kept: string[] = [];
+    for (const line of text.split("\n")) {
+      const file = normalizeDroppedPath(line);
+      const image = file ? readImageFile(file, this.cwd) : null;
+      if (image) images.push(image);
+      else kept.push(line);
+    }
+    return { text: kept.join("\n").trim(), images };
+  }
+
+  /** 当前模型是否支持图片输入（显式配置优先，否则按模型名推断） */
+  private currentModelSupportsVision(): boolean {
+    const entry = this.agent.getActiveModel();
+    return entry ? modelSupportsVision(entry) : false;
+  }
+
   private backspace(): void {
     if (this.inputCursor <= 0) return;
     // 处理代理对
@@ -1214,26 +1496,66 @@ export class TuiApp {
 
   private async submit(): Promise<void> {
     if (this.busy) return;
-    const text = this.input.trim();
-    if (!text) return;
+    const raw = this.input.trim();
+    if (!raw) return;
 
     this.input = "";
     this.inputCursor = 0;
     this.scrollOffset = 0;
-    this.history.push(text);
     this.historyIndex = -1;
 
-    if (text.startsWith("/")) {
-      this.handleCommand(text);
+    if (raw.startsWith("/")) {
+      this.history.push(raw);
+      // 斜杠命令不发送图片；这里清掉侧表，避免留下永远发不出去的孤儿附件
+      this.pendingImages.clear();
+      this.handleCommand(raw);
       return;
     }
+
+    let { text, images } = this.takePendingImages(raw);
+
+    // 拖拽/粘贴进来的图片文件路径也算附件（不依赖任何终端协议，覆盖面最广）
+    const fromPaths = this.absorbImagePaths(text);
+    if (fromPaths.images.length > 0) {
+      text = fromPaths.text;
+      images = [...images, ...fromPaths.images];
+    }
+
+    // 模型不支持视觉时**丢弃图片而不是让请求失败**：整轮 400 会把用户的正文一起作废。
+    // 之所以在这里再查一次而不是只在附加时查：用户可能在附加之后切换了模型。
+    if (images.length > 0 && !this.currentModelSupportsVision()) {
+      this.lines.push(
+        `${ansi.yellow}⚠ 当前模型 ${this.modelLabel} 未标注支持图片输入，已忽略 ${images.length} 张图片。${ansi.reset}`,
+      );
+      this.lines.push(
+        `${ansi.gray}  · 若该模型确实支持视觉：xzh model vision <id> on${ansi.reset}`,
+      );
+      this.lines.push(
+        `${ansi.gray}  · 或改用 glm-4v / qwen-vl / gpt-4o / claude 等支持视觉的模型${ansi.reset}`,
+      );
+      images = [];
+    }
+
+    // 占位标记被删掉、正文也空 —— 没有可发送的内容
+    if (!text && images.length === 0) {
+      this.lines.push(`${ansi.gray}（没有可发送的内容）${ansi.reset}`);
+      this.scheduleRender();
+      return;
+    }
+
+    this.history.push(text || `${images.length} 张图片`);
 
     // 记录本轮在输出区中的起点（从用户提问那行算起），供 /copy last 精确复制整轮对话
     this.lastAnswerStart = this.lines.length;
 
     // 用户输入：绿底块标记 + 亮绿加粗正文，便于在历史记录中一眼定位
     const badge = `${ansi.bgGreen}${ansi.black}${ansi.bold} ❯ ${ansi.reset}`;
-    const [firstLine, ...restLines] = text.split("\n");
+    // 只发图片时正文为空，回显里补一行说明，否则界面上只剩下一个空的 ❯
+    const echoText =
+      images.length > 0
+        ? `${text}${text ? "\n" : ""}[图片 × ${images.length}]`
+        : text;
+    const [firstLine, ...restLines] = echoText.split("\n");
     this.lines.push(
       `${badge} ${ansi.brightGreen}${ansi.bold}${firstLine}${ansi.reset}`,
     );
@@ -1255,7 +1577,11 @@ export class TuiApp {
     const requestModel = { label: this.modelLabel, weight: this.modelWeight };
 
     try {
-      await this.agent.run(text, this.abortController.signal);
+      await this.agent.run(
+        text,
+        this.abortController.signal,
+        images.length > 0 ? images : undefined,
+      );
     } catch (err) {
       const [first, ...rest] = friendlyError(err).split("\n");
       this.lines.push(`${ansi.red}✗ ${first}${ansi.reset}`);
@@ -1291,8 +1617,18 @@ export class TuiApp {
       case "clear":
         this.lines = [];
         break;
+      case "tools":
+        this.printTools();
+        break;
       case "copy":
         this.copyOutput(arg);
+        break;
+      case "image":
+      case "img":
+      case "paste":
+        // 兜底入口：部分终端把 Ctrl+V 自己吃掉（当作文本粘贴），此时 \x16 到不了这里，
+        // 只能靠显式命令读取剪贴板。
+        void this.pasteFromClipboard();
         break;
       case "mouse":
         this.toggleMouseCapture();
@@ -1567,13 +1903,40 @@ export class TuiApp {
     );
   }
 
+  /**
+   * 列出本轮实际发给模型的工具（`/tools`）。
+   *
+   * 用途：当某个工具「好像从来没被调用过」时，先确认它到底有没有发出去。
+   * 玄猪把**全部内置工具**写进每次请求的 tools 字段，没有任何开关 ——
+   * 如果列表里有它，那么用不用就完全取决于模型对工具描述与系统提示词的理解。
+   */
+  private printTools(): void {
+    const specs = getToolSpecs();
+    this.lines.push(
+      `${ansi.bold}发给模型的工具（共 ${specs.length} 个）${ansi.reset}` +
+        `${ansi.gray}（每次请求都会带上，无开关）${ansi.reset}`,
+    );
+    for (const spec of specs) {
+      const brief = spec.description.split("\n")[0].replace(/\*\*/g, "");
+      this.lines.push(
+        `  ${ansi.cyan}${spec.name.padEnd(16)}${ansi.reset} ${ansi.gray}${truncate(brief, 60)}${ansi.reset}`,
+      );
+    }
+    this.lines.push(
+      `${ansi.gray}  是否被调用由模型决定；想强调某个工具，可写进项目规则（.xuanzhu/rules.md）。${ansi.reset}`,
+    );
+    this.scheduleRender();
+  }
+
   private printHelp(): void {
     const help = [
       `${ansi.bold}玄猪 内置命令${ansi.reset}`,
       `  /help          显示本帮助`,
       `  /clear         清空屏幕`,
+      `  /tools         列出本轮发给模型的工具（排查「某个工具似乎没被调用过」）`,
       `  /copy [N|A-B|last|all]  复制左侧对话到系统剪贴板（默认最近 30 行）`,
       `  /copy term [N|A-B|all]  复制右侧终端输出（按栏取内容，不会串栏）`,
+      `  /image         把系统剪贴板里的图片加为本轮附件（同 Ctrl+V；别名 /paste）`,
       `  /mouse         切换鼠标捕获：开启后可在输出区拖拽选择（按整行）`,
       `  /reset         重置对话上下文`,
       `  /cwd           显示当前工作目录`,
@@ -1591,6 +1954,11 @@ export class TuiApp {
       `      想用终端原生框选/右键菜单：${ansi.reset}Shift+拖拽${ansi.gray} 绕过，或 ${ansi.reset}/mouse${ansi.gray} 交还鼠标（滚动改用 PgUp/PgDn）。${ansi.reset}`,
       `      ⚠ 拖选是矩形选择，跨过中缝会把另一栏一起带走 ——` + `跨栏内容请改用 ${ansi.reset}/copy${ansi.gray}（左栏）或 ${ansi.reset}/copy term${ansi.gray}（右栏）。${ansi.reset}`,
       `  ${ansi.gray}粘贴${ansi.reset}：支持多行整段粘贴（不会逐行提交）；也可用 ${ansi.reset}/copy${ansi.gray} 复制输出区。${ansi.reset}`,
+      `  ${ansi.bold}Ctrl+V${ansi.reset} ${ansi.gray}粘贴图片：读取系统剪贴板里的图片作为附件（输入框显示${ansi.reset}[图片N]${ansi.gray}，回车发送）。${ansi.reset}`,
+      `       ${ansi.gray}终端只会传文本，图片拿不到，因此由玄猪主动读剪贴板：${ansi.reset}`,
+      `       ${ansi.gray}Linux 缺 ${ansi.reset}wl-clipboard${ansi.gray}/${ansi.reset}xclip${ansi.gray} 时会询问后自动安装；Windows 用内置 PowerShell；macOS 用 ${ansi.reset}pngpaste${ansi.gray} 或内置 osascript。${ansi.reset}`,
+      `       ${ansi.gray}若本终端把 Ctrl+V 当自己的粘贴键（如 Windows Terminal），改用 ${ansi.reset}/image${ansi.gray}。${ansi.reset}`,
+      `       ${ansi.gray}需要模型支持视觉（glm-4v / qwen-vl / gpt-4o / claude 等）；可用 ${ansi.reset}xzh model vision <id> on${ansi.gray} 手动标注。${ansi.reset}`,
       `  Shift+Tab 切换焦点（对话 ⇄ 右侧终端）· 鼠标点击亦可`,
       `  Ctrl+C 中断任务 / 清空输入 / 退出（空闲且输入为空时退出）`,
       `  Ctrl+D 结束本轮正在进行的对话 · 任何情况下都不会退出玄猪`,
@@ -1625,11 +1993,49 @@ export class TuiApp {
       `${ansi.brightMagenta}${ansi.bold}  玄猪 XuanZhu${ansi.reset} ${ansi.gray}v${VERSION} · 终端 AI 编码 Agent${ansi.reset}`,
       `${ansi.gray}  模型：${ansi.reset}${modelText}${ansi.reset}`,
       `${ansi.gray}  目录：${ansi.reset}${dirText}${ansi.reset}`,
+      ...this.todoHeaderLines(width),
       `${ansi.gray}  输入 ${ansi.reset}${ansi.brightGreen}/help${ansi.reset}${ansi.gray} 查看命令与快捷键${ansi.reset}`,
       `${ansi.gray}  ${ansi.reset}Ctrl+D${ansi.gray} 结束本轮对话（不退出）· ${ansi.reset}Ctrl+C${ansi.gray} 中断/清空/退出${ansi.reset}`,
       `${ansi.gray}  ${ansi.reset}Shift+Tab${ansi.gray} 切终端 · ${ansi.reset}PgUp${ansi.gray}/滚轮回看历史${ansi.reset}`,
     ];
     return { info, divider };
+  }
+
+  /**
+   * 任务列表在顶部信息区的展示行（无任务时返回空数组）。
+   *
+   * 只展开「进行中 + 待办」的前几项，已完成 / 已取消压缩成计数 ——
+   * 信息区高度上限是终端高度的 1/3，全部展开会挤掉模型与目录信息。
+   * 完整清单可由模型通过 todo_write 的返回值（回灌进对话）呈现。
+   */
+  private todoHeaderLines(width: number): string[] {
+    if (this.todoItems.length === 0) return [];
+
+    const done = this.todoItems.filter((item) => item.status === "completed").length;
+    const cancelled = this.todoItems.filter(
+      (item) => item.status === "cancelled",
+    ).length;
+    const total = this.todoItems.length - cancelled;
+    const summary =
+      `任务 ${done}/${total}` + (cancelled > 0 ? ` · 取消 ${cancelled}` : "");
+
+    const lines = [`${ansi.gray}  ${ansi.reset}${ansi.bold}${summary}${ansi.reset}`];
+    const active = this.todoItems.filter(
+      (item) => item.status === "in_progress" || item.status === "pending",
+    );
+    const MAX_ITEMS = 3;
+    for (const item of active.slice(0, MAX_ITEMS)) {
+      const running = item.status === "in_progress";
+      const mark = running
+        ? `${ansi.brightCyan}▸${ansi.reset}`
+        : `${ansi.gray}·${ansi.reset}`;
+      const text = truncate(item.content, Math.max(8, width - 8));
+      lines.push(`  ${mark} ${running ? ansi.bold : ansi.gray}${text}${ansi.reset}`);
+    }
+    if (active.length > MAX_ITEMS) {
+      lines.push(`${ansi.gray}  …还有 ${active.length - MAX_ITEMS} 项${ansi.reset}`);
+    }
+    return lines;
   }
 
   // ------------------------------------------------------------------ 渲染
@@ -1644,7 +2050,8 @@ export class TuiApp {
   }
 
   private render(): void {
-    if (this.exited) return;
+    // 挂起期间（安装命令占着终端）绝不能输出，否则两边的内容会互相踩踏
+    if (this.exited || this.suspended) return;
     // 每帧先裁剪输出区：lines 从不回收会让长会话内存无界增长，
     // 而 render 每帧都要对全部行重折一遍，行数越多越卡。
     this.trimOutputLines();
@@ -2091,6 +2498,51 @@ function normalizeKey(key: string): string {
   }
 
   return key;
+}
+
+/** 把字节数格式化成便于阅读的形式（用于图片体积提示） */
+function formatImageSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * 把「拖拽/粘贴进来的一行」还原成文件路径；不像图片路径时返回 null。
+ *
+ * 终端插入路径的方式五花八门：整体加引号、把空格转义成 `\ `、带 `file://` 前缀。
+ * 这里统一剥掉这些包装，只保留四种**能可靠嗅探**的图片扩展名
+ * （bmp / tiff 不在其中：Anthropic 不接受，强行改 mime 只会把字节发错）。
+ */
+function normalizeDroppedPath(line: string): string | null {
+  let value = line.trim();
+  if (!value) return null;
+
+  // 成对的引号（'…' / "…"）
+  const quoted = /^(['"])(.*)\1$/.exec(value);
+  if (quoted) value = quoted[2];
+
+  if (value.startsWith("file://")) value = value.slice("file://".length);
+  // 拖拽时空格常被反斜杠转义
+  value = value.replace(/\\ /g, " ");
+
+  if (!/\.(png|jpe?g|gif|webp)$/i.test(value)) return null;
+  return value;
+}
+
+/** 读取图片文件为附件；不存在、非图片或过大时返回 null */
+function readImageFile(file: string, cwd: string): ImageAttachment | null {
+  try {
+    const resolved = path.isAbsolute(file) ? file : path.resolve(cwd, expandHome(file));
+    const stat = fs.statSync(resolved);
+    if (!stat.isFile() || stat.size > MAX_CLIPBOARD_IMAGE_BYTES) return null;
+    const data = fs.readFileSync(resolved);
+    const mimeType = sniffImageMime(data);
+    if (!mimeType) return null;
+    return { mimeType, data: data.toString("base64") };
+  } catch {
+    return null;
+  }
 }
 
 function summarizeToolCall(call: ToolCall): string {

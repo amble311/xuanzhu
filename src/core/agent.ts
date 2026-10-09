@@ -10,18 +10,48 @@ import {
 } from "../config/store";
 import {
   createProvider,
+  IMAGE_FALLBACK_TEXT,
   isConfigError,
   isContextLengthError,
   isSystemPromptTight,
+  isVisionUnsupportedError,
   resolveConversationBudget,
+  stripAllImages,
+  stripStaleImages,
   trimMessagesToBudget,
 } from "../llm";
 import { friendlyError } from "../llm/http";
-import type { ChatMessage, LLMProvider, ToolCall } from "../llm/types";
-import { executeTool, findTool, getToolSpecs, type ExecuteToolResult } from "../tools";
-import type { ConfirmRequest, ToolContext } from "../tools/types";
+import type {
+  ChatMessage,
+  ImageAttachment,
+  LLMProvider,
+  ToolCall,
+} from "../llm/types";
+import {
+  executeTool,
+  findTool,
+  getToolSpecs,
+  toolsForSubAgent,
+  type ExecuteToolResult,
+} from "../tools";
+import type {
+  ConfirmRequest,
+  SubAgentInput,
+  TodoItem,
+  TodoStore,
+  ToolContext,
+  ToolDefinition,
+  ToolResult,
+} from "../tools/types";
+import { findSubAgent, subAgentNames } from "../subagents";
+import { mapWithConcurrency } from "../utils/concurrency";
 import { expandHome, getConfigPath } from "../utils/paths";
-import { loadProjectRules, readProjectMemory } from "../workspace";
+import {
+  compactLongTermMemoryIfNeeded,
+  DEFAULT_MEMORY_MAX_CHARS,
+  loadProjectRules,
+  readProjectMemory,
+} from "../workspace";
 import { buildSystemPrompt } from "./prompt";
 import * as path from "path";
 
@@ -64,8 +94,23 @@ export interface AgentEvents {
     weight: number;
     reason: string;
   }) => void;
+  /** 任务列表更新（来自 todo_write） */
+  onTodos?: (items: TodoItem[]) => void;
   /** 请求用户确认危险操作 */
   confirm: (request: ConfirmRequest) => Promise<boolean>;
+}
+
+/**
+ * Agent 的可选项（主要供**子代理**使用）。
+ *
+ * 子代理与主代理共用同一套循环，差别只在两处：可用的工具集合，以及系统提示词
+ * （子代理需要「独立完成并只回报结论」的角色设定）。
+ */
+export interface AgentOptions {
+  /** 可用的工具集合，默认全部内置工具 */
+  tools?: ToolDefinition[];
+  /** 覆盖系统提示词（子代理使用；不传则按项目规则 + 项目记忆生成） */
+  systemPrompt?: string;
 }
 
 /**
@@ -119,6 +164,46 @@ const MAX_SELF_CORRECTIONS = 1;
 /** 单次请求内因模型调用失败而切换模型的最大次数 */
 const MAX_MODEL_SWITCHES = 3;
 
+/**
+ * 只读「调研类」工具。
+ *
+ * 它们的输出会**持续占用上下文**（几十屏的文件内容、搜索结果），正是子代理的适用场景，
+ * 因此单独统计：本轮累积到一定规模时把「可改用子代理」明确摆到模型面前。
+ */
+const EXPLORATION_TOOLS = new Set(["read_file", "list_dir", "glob", "grep"]);
+
+/**
+ * 触发「建议改用子代理」提醒的阈值（满足任一条即触发，且整轮只提醒一次）。
+ *
+ * 为什么需要这道确定性提醒：提示词里写「大范围调研时用子代理」是**主观判断** ——
+ * 模型判定不了「多大算大」，实际表现就是全程自己 read/grep，子代理从不被调用。
+ * 改成按客观累积量触发后，「该用子代理」这件事一定会出现在模型眼前。
+ *
+ * 阈值取得比较宽松（8 次调用 / 累计 40k 字符），避免正常的小规模探索被频繁打断。
+ */
+const EXPLORATION_REMINDER_CALLS = 8;
+const EXPLORATION_REMINDER_CHARS = 40_000;
+
+/**
+ * 子代理回报给主代理的报告长度上限（字符）。
+ *
+ * 报告会作为 `task` 工具结果进入主对话，因此它本质上是一段「要长期占用上下文」的内容。
+ * 正常调研报告远小于此值；设上限是为了兜住失控输出（子代理陷入重复时可能吐几十万字），
+ * 一旦发生，宁可截断报告也不要把主对话挤爆。
+ */
+const MAX_SUBAGENT_REPORT_CHARS = 20_000;
+
+/**
+ * 子代理并发数的**硬上限**。
+ *
+ * `config.maxParallelAgents` 可以调，但再大也不会超过这里 —— 每个并行子代理
+ * 各自持有一条对话流，配置写成 100 只会把服务商打爆并触发 429，反而更慢。
+ */
+const MAX_PARALLEL_AGENTS_CAP = 16;
+
+/** `config.maxParallelAgents` 未设置时的默认并发数 */
+const DEFAULT_PARALLEL_AGENTS = 4;
+
 export class Agent {
   private provider: LLMProvider;
   private readonly config: XuanZhuConfig;
@@ -130,6 +215,19 @@ export class Agent {
   private history: ChatMessage[] = [];
   /** 当前使用的模型条目（多模型权重机制） */
   private activeModel: ModelEntry | null;
+  /** 可用的工具集合；未指定时使用全部内置工具（子代理会传入受限集合） */
+  private readonly tools?: ToolDefinition[];
+  /** 覆盖的系统提示词（子代理使用） */
+  private readonly systemPromptOverride?: string;
+  /** 当前会话的任务列表（todo_write 维护），随会话结束而丢弃 */
+  private todos: TodoItem[] = [];
+  /**
+   * 构造 / 切换目录时自动精简记忆产生的提示。
+   *
+   * 不能当场 emit：构造发生在终端接管之前（见 TuiApp.start 的 enterTerminal），
+   * 那时往输出区写会污染启动画面。因此先攒着，等首轮 run 时再提示。
+   */
+  private pendingMemoryNotices: string[] = [];
 
   constructor(
     provider: LLMProvider,
@@ -137,12 +235,15 @@ export class Agent {
     cwd: string,
     events: AgentEvents,
     activeModel?: ModelEntry | null,
+    options?: AgentOptions,
   ) {
     this.provider = provider;
     this.config = config;
     this.cwd = cwd;
     this.events = events;
     this.activeModel = activeModel ?? pickModel(config);
+    this.tools = options?.tools;
+    this.systemPromptOverride = options?.systemPrompt;
     this.systemPrompt = this.composeSystemPrompt();
   }
 
@@ -153,11 +254,49 @@ export class Agent {
 
   /** 组合系统提示词（含当前工作目录下的项目规则与项目记忆） */
   private composeSystemPrompt(): string {
+    // 子代理使用调用方给定的角色提示词（不注入项目规则与记忆 —— 它只做一件子任务），
+    // 因此也不参与记忆精简：记忆归属主代理。
+    if (this.systemPromptOverride) return this.systemPromptOverride;
+    // 读记忆之前先做一次自动精简，保证注入提示词的是精简后的版本
+    this.autoCompactMemory();
     return buildSystemPrompt(
       this.cwd,
       this.config.systemPromptExtra,
       loadProjectRules(this.cwd),
       readProjectMemory(this.cwd),
+      this.config.memoryMaxChars,
+    );
+  }
+
+  /**
+   * 长期记忆达到阈值即**自动精简**（去重 + 必要时裁剪最旧条目），不依赖模型主动调用。
+   *
+   * 触发点：会话构造、`/switch` 切换目录。之所以放在这两处而不是每轮：记忆文件只有几 KB，
+   * 读一次成本极低，但每轮都读属于无谓开销；而「会话中把记忆写大」的路径已经由
+   * `memory_write`（写入后自动精简）覆盖。
+   *
+   * `memoryMaxChars <= 0` 表示不限制长度，此时仍会去重（去重是无损的）。
+   */
+  private autoCompactMemory(): void {
+    const limit = this.config.memoryMaxChars ?? DEFAULT_MEMORY_MAX_CHARS;
+    const result = compactLongTermMemoryIfNeeded(this.cwd, limit);
+    if (
+      !result ||
+      (result.removedDuplicates === 0 && result.removedOldest === 0)
+    ) {
+      return;
+    }
+
+    const parts: string[] = [];
+    if (result.removedDuplicates > 0) {
+      parts.push(`去除 ${result.removedDuplicates} 条重复记录`);
+    }
+    if (result.removedOldest > 0) {
+      parts.push(`裁剪 ${result.removedOldest} 条最旧记录`);
+    }
+    this.pendingMemoryNotices.push(
+      `长期记忆已自动精简（${parts.join("、")}，${result.before} → ${result.after} 字符）。` +
+        `若需要更彻底的压缩，可让玄猪用 memory_compact 重写为精简版本。`,
     );
   }
 
@@ -167,6 +306,41 @@ export class Agent {
 
   reset(): void {
     this.history = [];
+    // 任务列表属于本轮会话，清空对话时一并清掉，避免界面上残留上一轮的计划
+    if (this.todos.length > 0) {
+      this.todos = [];
+      this.events.onTodos?.([]);
+    }
+  }
+
+  /** 当前任务列表（供界面或测试查询） */
+  getTodos(): TodoItem[] {
+    return this.todos;
+  }
+
+  /**
+   * 任务列表存储：交给 `todo_write` 工具的引用。
+   *
+   * 工具是无状态函数，状态必须挂在 Agent 上；每次写入后同步通知界面刷新。
+   */
+  private todoStore(): TodoStore {
+    return {
+      get: () => this.todos,
+      set: (items) => {
+        // 防御：工具会先校验，但列表也可能被其它调用方直接写入。
+        // 这里只保留第一个 in_progress，其余降级为 pending，保证界面语义一致。
+        let seenRunning = false;
+        this.todos = items.map((item) => {
+          if (item.status !== "in_progress") return item;
+          if (!seenRunning) {
+            seenRunning = true;
+            return item;
+          }
+          return { ...item, status: "pending" as const };
+        });
+        this.events.onTodos?.(this.todos);
+      },
+    };
   }
 
   get messageCount(): number {
@@ -184,9 +358,26 @@ export class Agent {
     this.systemPrompt = this.composeSystemPrompt();
   }
 
-  /** 执行一次用户请求（含多轮工具调用），直到模型给出最终答复 */
-  async run(userInput: string, signal?: AbortSignal): Promise<void> {
+  /**
+   * 执行一次用户请求（含多轮工具调用），直到模型给出最终答复。
+   *
+   * `images` 为用户随本轮消息附带的图片（多模态输入）；只在**本轮**携带，
+   * 历史里的旧图片会在组装请求时降级为文本占位（见 `stripStaleImages`）。
+   */
+  async run(
+    userInput: string,
+    signal?: AbortSignal,
+    images?: ImageAttachment[],
+  ): Promise<void> {
     let content = userInput;
+
+    // 补发构造 / 切换目录期间攒下的提示（构造时终端尚未接管，不能当场写输出区）
+    if (this.pendingMemoryNotices.length > 0) {
+      for (const notice of this.pendingMemoryNotices) {
+        this.events.onNotice?.(notice);
+      }
+      this.pendingMemoryNotices = [];
+    }
 
     // system prompt 自身就可能撑满窗口：项目规则（rules.md）与附加指令
     // （systemPromptExtra）都是全文注入、无长度上限。这种情况下再怎么裁历史也发不出去，
@@ -228,7 +419,15 @@ export class Agent {
     // 这样提交点集中，且完全不受历史裁剪影响 —— 早先两版分别用「起点下标校正」和
     // 「按条数从尾部截断」，前者下标会漂移成负数并抛 Invalid array length 覆盖真实错误，
     // 后者在单轮消息数超过保留窗口时会把整段历史删光。
-    const turn: ChatMessage[] = [{ role: "user", content }];
+    // 只带图片没有正文时补一句兜底文本：部分端点要求 content 至少含一个非空文本块
+    const hasImages = Boolean(images && images.length > 0);
+    const turn: ChatMessage[] = [
+      {
+        role: "user",
+        content: hasImages && !content.trim() ? IMAGE_FALLBACK_TEXT : content,
+        images: hasImages ? images : undefined,
+      },
+    ];
 
     // maxToolRounds 为 0 / 负数时也要至少执行一次，否则用户只会看到「已达上限」而无任何回复
     const maxRounds = Math.max(1, Math.floor(this.config.maxToolRounds) || 1);
@@ -290,6 +489,36 @@ export class Agent {
     // 明确写进工具结果，模型看到「这是你第 N 次调用、参数与结果都相同、
     // 本轮已做过这些」就能接着往下走，而不是重新规划。
     const completedSignatures = new Map<string, number>();
+
+    // 本轮的只读调研累计量，以及「是否已经建议过改用子代理」「是否已经在用子代理」。
+    // 用途见 EXPLORATION_REMINDER_CALLS 的注释：把「该委托」从主观判断变成客观触发。
+    let explorationCalls = 0;
+    let explorationChars = 0;
+    let delegationSuggested = false;
+    let usedSubAgent = false;
+
+    /** 记录一次只读调研；首次超过阈值时返回一段追加到工具结果末尾的提醒 */
+    const explorationReminder = (toolName: string, output: string): string => {
+      if (delegationSuggested || usedSubAgent) return "";
+      if (!EXPLORATION_TOOLS.has(toolName)) return "";
+      explorationCalls++;
+      explorationChars += output.length;
+      if (
+        explorationCalls < EXPLORATION_REMINDER_CALLS &&
+        explorationChars < EXPLORATION_REMINDER_CHARS
+      ) {
+        return "";
+      }
+      delegationSuggested = true;
+      this.events.onStatus("建议改用子代理", `本轮已调研 ${explorationCalls} 次`);
+      return (
+        `\n\n[系统提醒] 本轮你已经做了 ${explorationCalls} 次只读调研（累计约 ` +
+        `${Math.round(explorationChars / 1000)}k 字符），这些内容会一直占用你的上下文窗口。\n` +
+        "· 若接下来还有**互不依赖**的调研任务，请改用 `task` 派生 `code-explorer` 子代理" +
+        "（可一次并列多个、并行执行），只把结论带回来；\n" +
+        "· 若只剩收尾工作，忽略本条即可。"
+      );
+    };
 
     // 已经用掉几次「自我修正」。检测到死循环时不会立刻中止，而是**主动发起一轮
     // 元对话**：把「你在重复、任务没有推进」明确告诉模型，要求它分析原因并换方案。
@@ -357,7 +586,14 @@ export class Agent {
           return;
         }
 
-        for (const call of toolCalls) {
+        // 工具执行：**连续的可并行调用**（目前只有 `task`）会并发执行，其余按顺序串行。
+        // 分批的依据是「是否有副作用、是否共享可变状态」：多个子代理各自是独立的
+        // Agent 实例，并行能立刻缩短多路调研的等待；而写文件 / 执行命令可能互相依赖，
+        // 一旦并行就会乱序甚至冲突，必须保持顺序。
+        let index = 0;
+        while (index < toolCalls.length) {
+          const call = toolCalls[index];
+
           // 死循环检测：同一个工具 + 同一组参数连续出现多次即判定为卡住
           const signature = `${call.name}:${call.arguments}`;
           if (signature === lastToolSignature) {
@@ -378,13 +614,12 @@ export class Agent {
 
               // assistant 消息里带了 tool_calls，因此**每个 call 都必须有对应的
               // tool 结果**，否则角色序列非法、下一次请求会被服务端拒绝。
-              // 这次调用我们不执行，但要补一条说明它被跳过。
-              turn.push({
-                role: "tool",
-                content: `[系统] 本次调用已跳过：它与前面 ${repeats} 次完全相同。`,
-                toolCallId: call.id,
-                name: call.name,
-              });
+              // 这次调用不执行，且**其后所有调用一并跳过**，都要补上说明。
+              this.skipToolCalls(turn, toolCalls, index, (k) =>
+                k === index
+                  ? `[系统] 本次调用已跳过：它与前面 ${repeats} 次完全相同。`
+                  : "[系统] 本次调用已跳过：同一轮内的重复调用触发了自我修正。",
+              );
               turn.push({
                 role: "user",
                 content:
@@ -407,6 +642,13 @@ export class Agent {
             }
 
             // 第二步：修正过仍然重复，说明它无法自愈，这时才中止。
+            // 同样要补齐剩余调用的 tool 结果，保持 assistant.tool_calls 与 tool 消息配对。
+            this.skipToolCalls(
+              turn,
+              toolCalls,
+              index,
+              () => "[系统] 本次调用已跳过：本轮因重复调用而中止。",
+            );
             commitTurn();
             this.events.onStatus("已中止", "重复调用且自我修正无效");
             this.events.onNotice?.(
@@ -420,6 +662,69 @@ export class Agent {
             return;
           }
 
+          // —— 并行批次 ——
+          // 收集连续的「可并行」调用，**批内签名必须互不相同**：同一条消息里并列
+          // 同一个调用两次没有意义，还可能与重复检测的计数语义打架，因此遇到重复
+          // 就结束本批、交给后面的串行路径处理。
+          if (this.isParallelTool(call.name)) {
+            const batch: ToolCall[] = [call];
+            let next = index + 1;
+            while (
+              next < toolCalls.length &&
+              batch.length < this.parallelLimit() &&
+              this.isParallelTool(toolCalls[next].name) &&
+              !batch.some(
+                (item) =>
+                  item.name === toolCalls[next].name &&
+                  item.arguments === toolCalls[next].arguments,
+              )
+            ) {
+              batch.push(toolCalls[next]);
+              next++;
+            }
+
+            if (batch.length > 1) {
+              // 与串行等价的计数推进：批内每个签名都与前一个不同，逐个把计数重置为 1
+              for (let k = 1; k < batch.length; k++) {
+                lastToolSignature = `${batch[k].name}:${batch[k].arguments}`;
+                identicalToolCalls = 1;
+              }
+
+              this.events.onStatus("并行执行", `${batch.length} 个子代理`);
+              const results = await this.runToolBatch(batch, signal);
+
+              // 结果按**原调用顺序**回灌：tool 消息与 tool_calls 必须一一对应
+              for (let k = 0; k < batch.length; k++) {
+                const item = batch[k];
+                const outcome = results[k];
+                if (item.name === "task") usedSubAgent = true;
+                if (outcome.ok) {
+                  const itemSignature = `${item.name}:${item.arguments}`;
+                  completedSignatures.set(
+                    itemSignature,
+                    (completedSignatures.get(itemSignature) ?? 0) + 1,
+                  );
+                }
+                turn.push({
+                  role: "tool",
+                  content: outcome.content,
+                  toolCallId: item.id,
+                  name: item.name,
+                });
+                this.events.onToolEnd(item, outcome);
+              }
+
+              if (signal?.aborted) {
+                commitPartialTurn();
+                this.events.onStatus("已中断");
+                return;
+              }
+              index = next;
+              continue;
+            }
+          }
+
+          // —— 串行执行（其余工具，或可并行调用只剩一个） ——
           const result = await this.runTool(call, signal);
           if (result.ok) {
             completedSignatures.set(
@@ -443,6 +748,9 @@ export class Agent {
             this.events.onStatus("提醒重复", `${call.name} ×${identicalToolCalls}`);
           }
 
+          if (call.name === "task") usedSubAgent = true;
+          toolContent += explorationReminder(call.name, result.content);
+
           turn.push({
             role: "tool",
             content: toolContent,
@@ -455,6 +763,7 @@ export class Agent {
             this.events.onStatus("已中断");
             return;
           }
+          index++;
         }
       }
 
@@ -552,15 +861,19 @@ export class Agent {
     tried: Set<string> = new Set(),
     extra: ChatMessage[] = [],
     budgetRatio = 1,
+    dropImages = false,
   ): Promise<{ text: string; toolCalls: ToolCall[] }> {
     // 记录本次请求已经用过的模型，降级时不再重复尝试同一个
     if (this.activeModel) tried.add(this.activeModel.id);
 
     // extra 是「本轮尚未提交的消息」（见 run）：必须一并发给模型，
     // 否则多轮工具调用时模型看不到自己上一轮的 tool_calls 与工具结果。
+    let conversation = this.buildConversation(extra, budgetRatio);
+    // 上一次因「模型不支持图片」失败 → 这次整条链路都不带图片
+    if (dropImages) conversation = stripAllImages(conversation);
     const messages: ChatMessage[] = [
       { role: "system", content: this.systemPrompt },
-      ...this.buildConversation(extra, budgetRatio),
+      ...conversation,
     ];
 
     let text = "";
@@ -571,7 +884,7 @@ export class Agent {
     try {
       const stream = this.provider.chat({
         messages,
-        tools: getToolSpecs(),
+        tools: getToolSpecs(this.tools),
         temperature: this.config.temperature,
         signal,
         onRetry: (retryAttempt, maxAttempts, error) => {
@@ -637,6 +950,36 @@ export class Agent {
           tried,
           extra,
           CONTEXT_RETRY_BUDGET_RATIO,
+        );
+      }
+
+      // 模型不支持图片输入 → **去掉图片重试一次**，而不是让整轮失败。
+      //
+      // 这条兜底是「自定义端点默认按支持视觉放行」的前提：自定义端点的模型名由用户
+      // 自填，推断无从下手，只能先发出去；真被拒时在这里自动降级，用户的正文不受影响。
+      //
+      // 同样必须放在 handleModelFailure 之前：这不是模型故障，降权与切换模型都没有意义
+      // （换个模型拿同样的图片再发一次可能同样失败，白扣权重）。
+      if (
+        !produced &&
+        !signal?.aborted &&
+        !dropImages &&
+        extra.some((message) => (message.images?.length ?? 0) > 0) &&
+        isVisionUnsupportedError(err)
+      ) {
+        this.events.onStatus("模型不支持图片", "已去掉图片重试");
+        this.events.onNotice?.(
+          `当前模型不支持图片输入（${friendlyError(err).split("\n")[0]}），已去掉图片重试一次。\n` +
+            `· 想彻底避免这次白试：xzh model vision <id> off\n` +
+            `· 或改用 glm-4v / qwen-vl / gpt-4o / claude / gemini 等支持视觉的模型`,
+        );
+        return this.streamAssistant(
+          signal,
+          attempt,
+          tried,
+          extra,
+          budgetRatio,
+          true,
         );
       }
 
@@ -778,7 +1121,7 @@ export class Agent {
     call: ToolCall,
     signal?: AbortSignal,
   ): Promise<ExecuteToolResult> {
-    const tool = findTool(call.name);
+    const tool = findTool(call.name, this.tools);
     if (!tool) {
       return { ok: false, content: `错误：未知工具 "${call.name}"` };
     }
@@ -827,9 +1170,160 @@ export class Agent {
       emit: (message) => this.events.onNotice?.(message),
       confirm: (request) => this.events.confirm(request),
       signal,
+      todos: this.todoStore(),
+      memoryMaxChars: this.config.memoryMaxChars,
+      spawnAgent: (input) => this.spawnSubAgent(input, signal),
     };
 
-    return executeTool(call.name, call.arguments, ctx);
+    return executeTool(call.name, call.arguments, ctx, this.tools);
+  }
+
+  /** 该工具是否可与其它可并行工具同时执行 */
+  private isParallelTool(name: string): boolean {
+    return findTool(name, this.tools)?.parallelSafe === true;
+  }
+
+  /** 并行执行的工具数量上限（配置值经夹取，防止误配置打爆服务商） */
+  private parallelLimit(): number {
+    const raw = Math.floor(
+      this.config.maxParallelAgents ?? DEFAULT_PARALLEL_AGENTS,
+    );
+    if (!Number.isFinite(raw) || raw < 1) return 1;
+    return Math.min(raw, MAX_PARALLEL_AGENTS_CAP);
+  }
+
+  /**
+   * 并发执行一批工具调用，返回的结果**与输入顺序一一对应**。
+   *
+   * 单个调用抛错不影响整批 —— 转成失败结果，其余调用照常完成。
+   */
+  private async runToolBatch(
+    calls: ToolCall[],
+    signal?: AbortSignal,
+  ): Promise<ExecuteToolResult[]> {
+    return mapWithConcurrency(calls, this.parallelLimit(), async (call) => {
+      try {
+        return await this.runTool(call, signal);
+      } catch (err) {
+        return {
+          ok: false,
+          content: `工具执行异常：${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    });
+  }
+
+  /**
+   * 为 `calls[fromIndex..]` 中**未执行**的调用补上「已跳过」的 tool 结果。
+   *
+   * assistant 消息声明了 N 个 tool_call，就必须有 N 条 tool 消息与之对应，
+   * 否则角色序列非法，下一次请求会被服务端直接拒绝（400）。
+   */
+  private skipToolCalls(
+    turn: ChatMessage[],
+    calls: ToolCall[],
+    fromIndex: number,
+    reason: (index: number) => string,
+  ): void {
+    for (let i = fromIndex; i < calls.length; i++) {
+      turn.push({
+        role: "tool",
+        content: reason(i),
+        toolCallId: calls[i].id,
+        name: calls[i].name,
+      });
+    }
+  }
+
+  /**
+   * 派生子代理执行子任务。
+   *
+   * 子代理是**新的 Agent 实例**：独立历史、独立工具循环，只有最终答复回到主对话。
+   * 具体是哪个子代理、能用哪些工具、拿什么系统提示词，全部来自 `src/subagents`
+   * 的注册表（`findSubAgent`）。关键设计：
+   *   - 可用工具由子代理定义的 `toolNames` 白名单 + `toolsForSubAgent` 的禁用项决定，
+   *     **恒不含 `task`** —— 否则可递归派生；
+   *   - 子代理的正文不直接进主对话，而是汇总后作为 `task` 工具的返回值回灌，
+   *     这样几十屏中间内容不会挤占主上下文（这正是子代理存在的意义）；
+   *   - 子代理的工具活动以 `[子代理]` 前缀走 `onNotice` 展示，让用户能看到它在做什么；
+   *   - 危险操作确认**转发给主代理**，不因「在子代理里」而绕过；
+   *   - 轮次用尽时不询问用户（子代理无法交互），直接收尾并返回已有结论。
+   */
+  private async spawnSubAgent(
+    input: SubAgentInput,
+    signal?: AbortSignal,
+  ): Promise<ToolResult> {
+    const definition = findSubAgent(input.subagentName);
+    if (!definition) {
+      return {
+        ok: false,
+        content: `错误：未知子代理 "${input.subagentName}"。可用：${subAgentNames().join("、")}`,
+      };
+    }
+
+    let output = "";
+    // 多个子代理并行时输出会交错，前缀里带上任务说明才能看出「哪一行是谁在说」
+    const tag =
+      input.description.length > 24
+        ? `${input.description.slice(0, 24)}…`
+        : input.description;
+    const label = `[${definition.name}: ${tag}]`;
+
+    const childEvents: AgentEvents = {
+      onText: (delta) => {
+        output += delta;
+      },
+      // 只回显工具名与参数预览（前 120 字符）—— 完整参数可能是一整段文件内容或
+      // 上千字的 prompt，原样打进输出区会刷屏（这里只是给用户看「它在做什么」）。
+      onToolStart: (call) => {
+        const args =
+          call.arguments.length > 120
+            ? `${call.arguments.slice(0, 120)}…`
+            : call.arguments;
+        this.events.onNotice?.(`${label} ${call.name} ${args}`);
+      },
+      onToolEnd: () => undefined,
+      onStatus: (status) => this.events.onStatus(`子代理：${status}`, tag),
+      onNotice: (message) => this.events.onNotice?.(`${label} ${message}`),
+      confirm: (request) => this.events.confirm(request),
+      // 子代理不接受交互式追问：到上限即收尾，返回已有结论
+      onRoundLimit: async () => false,
+    };
+
+    this.events.onStatus(`子代理执行中（${definition.name}）`, tag);
+
+    const child = new Agent(this.provider, this.config, this.cwd, childEvents, this.activeModel, {
+      tools: toolsForSubAgent(definition.toolNames),
+      systemPrompt: definition.systemPrompt({
+        cwd: this.cwd,
+        description: input.description,
+        prompt: input.prompt,
+      }),
+    });
+
+    await child.run(input.prompt, signal);
+
+    const report = output.trim();
+    if (!report) {
+      return {
+        ok: false,
+        content:
+          `${definition.name} 子代理未返回任何结论（可能被中断或在给出答复前用尽了轮次）。` +
+          "可改用更聚焦的 prompt 重试，或直接自己完成。",
+        summary: `子代理未返回结论：${input.description}`,
+      };
+    }
+    // 报告是要进主上下文的，失控输出（模型陷入重复）同样会把它撑爆，
+    // 因此设一道上限；截断总比把主对话挤掉好。
+    const clipped =
+      report.length > MAX_SUBAGENT_REPORT_CHARS
+        ? `${report.slice(0, MAX_SUBAGENT_REPORT_CHARS)}\n\n…（子代理报告过长，已截断 ${report.length - MAX_SUBAGENT_REPORT_CHARS} 字符）`
+        : report;
+    return {
+      ok: true,
+      content: `${definition.name} 子代理「${input.description}」的结论：\n\n${clipped}`,
+      summary: `子代理完成：${input.description}`,
+    };
   }
 
   /**
@@ -857,7 +1351,9 @@ export class Agent {
     extra: ChatMessage[],
     budgetRatio = 1,
   ): ChatMessage[] {
-    const all = [...this.history, ...extra];
+    // 先降级旧图片：图片以 base64 携带，成本随轮次线性叠加，历史里每轮都留原图
+    // 会迅速撑爆上下文（而且旧截图对后续对话没有价值）。只保留最后一张。
+    const all = stripStaleImages([...this.history, ...extra]);
     // 先按条数粗筛作为安全网（防止 contextWindow 被配成极大值时历史无限累积），
     // 再由 token 预算决定实际保留多少
     const capped =

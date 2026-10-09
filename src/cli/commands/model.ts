@@ -18,6 +18,8 @@ import {
   findProvider,
   formatContextWindow,
   inferContextWindow,
+  inferVisionSupport,
+  modelSupportsVision,
   PROVIDERS,
   resolveApiKey,
 } from "../../llm";
@@ -29,9 +31,12 @@ import { promptConfirm, promptInput, promptSelect } from "../prompt";
  * `xzh model`                    交互式管理多个模型（新增 / 删除 / 调整权重 / 查看全部）
  * `xzh model list`               列出**已配置**的模型与权重
  * `xzh model all`                列出**所有内置可用**的模型（按服务商分组）
- * `xzh model add <provider> <model> [权重]`
+ * `xzh model add <provider> <model> [权重] [上下文窗口] [on|off]`
+ *                                 （末尾 on/off = 是否支持图片输入）
  * `xzh model remove <id|序号>`   删除模型
  * `xzh model weight <id|序号> <权重>`
+ * `xzh model context <id|序号> <token>`
+ * `xzh model vision <id|序号> <on|off>`  标注是否支持图片输入
  *
  * 兼容旧用法：`xzh model <provider> [model]` 等价于 `add`。
  */
@@ -60,6 +65,9 @@ export async function modelCommand(args: string[]): Promise<void> {
     case "context":
     case "ctx":
       return setContextCommand(args.slice(1));
+    case "vision":
+    case "image":
+      return setVisionCommand(args.slice(1));
     case "reset":
       return resetWeights();
     case "help":
@@ -123,6 +131,7 @@ async function addModel(args: string[]): Promise<void> {
   const baseUrl = await chooseBaseUrl(meta.id, meta.requiresBaseUrl === true, config);
   const apiKey = await chooseApiKey(meta.id, meta.envKey, config);
   const contextWindow = await chooseContextWindow(model, args[3]);
+  const vision = await chooseVision(meta.id, model, args[4]);
 
   // provider 级设置（API Key / baseUrl / 最近使用的 model）
   config.providers = {
@@ -145,6 +154,7 @@ async function addModel(args: string[]): Promise<void> {
     model,
     weight,
     contextWindow,
+    vision,
     ...(baseUrl ? { baseUrl } : {}),
     ...(apiKey ? { apiKey } : {}),
   });
@@ -157,6 +167,7 @@ async function addModel(args: string[]): Promise<void> {
       `  ${ansi.gray}model   ：${ansi.reset}${entry.model}\n` +
       `  ${ansi.gray}权重    ：${ansi.reset}${entry.weight}\n` +
       `  ${ansi.gray}上下文  ：${ansi.reset}${formatContextWindow(entry.contextWindow ?? DEFAULT_CONTEXT_WINDOW)} token\n` +
+      `  ${ansi.gray}图片输入：${ansi.reset}${modelSupportsVision(entry) ? "支持（Ctrl+V 粘贴图片）" : "不支持"}\n` +
       (baseUrl ? `  ${ansi.gray}baseUrl ：${ansi.reset}${baseUrl}\n` : "") +
       `  ${ansi.gray}配置文件：${ansi.reset}${getConfigPath()}\n`,
   );
@@ -303,6 +314,78 @@ async function setContextCommand(args: string[]): Promise<void> {
   saveConfig(config);
   process.stdout.write(
     `\n${ansi.green}✓ 已更新上下文窗口${ansi.reset} ${target.id} → ${formatContextWindow(parsed)} token\n`,
+  );
+}
+
+/**
+ * 标注模型是否支持**图片输入**（视觉）。
+ *
+ * 未标注时按模型名自动推断；推断不出来的一律按「不支持」处理 —— 玄猪会在附加图片时
+ * 直接拒绝并提示，而不是发出去换一个 400。私有部署或新模型名需要在这里显式打开。
+ */
+async function setVisionCommand(args: string[]): Promise<void> {
+  const config = loadConfig();
+  const models = effectiveModels(config);
+  if (models.length === 0) {
+    process.stdout.write(`${ansi.yellow}尚未配置任何模型。${ansi.reset}\n`);
+    return;
+  }
+
+  const key =
+    args[0] || (await chooseFromList(models, "选择要标注视觉能力的模型："));
+  if (!key) {
+    process.stdout.write(`${ansi.gray}已取消。${ansi.reset}\n`);
+    return;
+  }
+  const id = resolveModelKey(config, key);
+  const target = id ? models.find((entry) => entry.id === id) : undefined;
+  if (!target) {
+    process.stdout.write(
+      `${ansi.red}未找到模型：${key}${ansi.reset}\n` +
+        `${ansi.gray}提示：可使用 ${ansi.reset}xzh model list${ansi.gray} 查看 id 与序号。${ansi.reset}\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  const inferred = inferVisionSupport(target.model);
+  const raw = (
+    args[1] ??
+    (await promptInput(
+      `请输入 ${target.id} 是否支持图片输入（on / off，回车按模型名推断）`,
+      inferred ? "on" : "off",
+    ))
+  )
+    .trim()
+    .toLowerCase();
+
+  const enabled = parseToggle(raw);
+  if (enabled === undefined) {
+    process.stdout.write(
+      `${ansi.red}无法识别「${raw}」，请使用 on 或 off。${ansi.reset}\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  // target 来自 effectiveModels() 的浅拷贝，写回必须拿 config.models 里的原始条目
+  const stored = materializeModels(config).find((entry) => entry.id === target.id);
+  if (!stored) {
+    process.stdout.write(`${ansi.red}设置失败：${target.id}${ansi.reset}\n`);
+    process.exitCode = 1;
+    return;
+  }
+
+  stored.vision = enabled;
+  saveConfig(config);
+
+  process.stdout.write(
+    `\n${ansi.green}✓ 已更新视觉能力${ansi.reset} ${target.id} → ${
+      enabled ? "支持图片输入" : "不支持图片输入"
+    }\n` +
+      `${ansi.gray}  生效结果：${
+        modelSupportsVision(stored) ? "可以粘贴图片" : "粘贴图片会被拒绝"
+      }（Ctrl+V 或 /image）${ansi.reset}\n`,
   );
 }
 
@@ -496,9 +579,12 @@ function printModelTable(config: XuanZhuConfig): void {
     const context = formatContextWindow(
       entry.contextWindow ?? inferContextWindow(entry.model),
     );
+    const vision = modelSupportsVision(entry)
+      ? ` ${ansi.cyan}视觉${ansi.reset}`
+      : "";
     process.stdout.write(
       `  ${marker} ${index + 1}. ${entry.id.padEnd(34)} ${ansi.gray}权重${ansi.reset} ${weightColor}${String(entry.weight).padStart(3)}${ansi.reset}` +
-        ` ${ansi.gray}ctx ${context.padStart(5)}${ansi.reset}${suffix}\n`,
+        ` ${ansi.gray}ctx ${context.padStart(5)}${ansi.reset}${vision}${suffix}\n`,
     );
   });
 
@@ -537,6 +623,7 @@ function printModelHelp(): void {
       `  ${ansi.green}xzh model remove <id|序号>${ansi.reset}            删除模型\n` +
       `  ${ansi.green}xzh model weight <id|序号> <权重>${ansi.reset}      调整权重\n` +
       `  ${ansi.green}xzh model context <id|序号> <大小>${ansi.reset}    调整上下文窗口（token，如 128000）\n` +
+      `  ${ansi.green}xzh model vision <id|序号> <on|off>${ansi.reset}   标注是否支持图片输入（视觉）\n` +
       `  ${ansi.green}xzh model reset${ansi.reset}                      恢复全部权重为 ${DEFAULT_MODEL_WEIGHT}\n\n` +
       `${ansi.bold}权重机制${ansi.reset}\n` +
       `  启动时优先加载权重最高的模型；调用失败时该模型权重 -1，并自动切换到下一个可用模型；\n` +
@@ -675,6 +762,61 @@ async function chooseContextWindow(
     return guessed;
   }
   return parsed;
+}
+
+/** 解析 on/off 形式的布尔输入；无法识别时返回 undefined */
+function parseToggle(input: string): boolean | undefined {
+  const text = input.trim().toLowerCase();
+  if (["on", "true", "yes", "y", "1"].includes(text)) return true;
+  if (["off", "false", "no", "n", "0"].includes(text)) return false;
+  return undefined;
+}
+
+/**
+ * 询问模型是否支持图片输入（视觉）。
+ *
+ * 默认值取推断结果：**自定义端点（`custom`，任意 OpenAI 兼容端点）默认为「支持」** ——
+ * 它的模型名由用户自填、无从推断，不默认放行就等于「自定义模型永远用不了图片」。
+ * 真不支持时玄猪会在请求被拒后自动去掉图片重试一次（见 Agent），代价有限，
+ * 因此这里给用户一次显式确认/关闭的机会即可。
+ *
+ * 也可用第 5 个位置参数直接给出：
+ *   xzh model add <provider> <model> [权重] [上下文窗口] [on|off]
+ */
+async function chooseVision(
+  providerId: string,
+  model: string,
+  preset?: string,
+): Promise<boolean> {
+  const guessed = modelSupportsVision({ provider: providerId, model });
+  const fallback = guessed ? "支持" : "不支持";
+
+  if (preset !== undefined && preset.trim() !== "") {
+    const parsed = parseToggle(preset);
+    if (parsed !== undefined) return parsed;
+    process.stdout.write(
+      `${ansi.yellow}无法识别图片输入设置「${preset}」，已使用${fallback}。${ansi.reset}\n`,
+    );
+    return guessed;
+  }
+
+  const why =
+    providerId === "custom"
+      ? "（自定义端点默认按支持处理）"
+      : `（按模型名推断为${fallback}）`;
+  process.stdout.write(
+    `${ansi.gray}  图片输入：${why}。${ansi.reset}\n`,
+  );
+  const input = await promptInput(
+    "该模型是否支持图片输入（Ctrl+V 粘贴图片）？输入 on / off",
+    guessed ? "on" : "off",
+  );
+  const parsed = parseToggle(input);
+  if (parsed !== undefined) return parsed;
+  process.stdout.write(
+    `${ansi.yellow}  无法识别「${input}」，已使用${fallback}。${ansi.reset}\n`,
+  );
+  return guessed;
 }
 
 async function chooseApiKey(

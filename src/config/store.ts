@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import { ensureDir, getConfigDir, getConfigPath } from "../utils/paths";
+import { DEFAULT_MEMORY_MAX_CHARS } from "../workspace";
 
 /** 单个 Provider 的配置 */
 export interface ProviderSettings {
@@ -34,6 +35,14 @@ export interface ModelEntry {
    * 未设置时按保守默认值处理（见 DEFAULT_CONTEXT_WINDOW）。
    */
   contextWindow?: number;
+  /**
+   * 该模型是否支持**图片输入**（视觉/多模态）。
+   *
+   * 未设置时按模型名自动推断（见 `src/llm/vision.ts`）。需要显式标注的场景：
+   * 私有部署或新发布的模型名推断不出来 —— 此时默认按「不支持」处理，粘贴图片
+   * 会被拒绝并给出提示。可用 `xzh model vision <id> on` 打开。
+   */
+  vision?: boolean;
   /**
    * 是否「因调用失败被降过权」。
    * 用于把「失败降到 0」与「用户主动设为 0（暂不使用）」区分开：
@@ -137,6 +146,21 @@ export interface XuanZhuConfig {
    *   而每次都弹确认对「全自动」的预期是一种破坏。
    */
   confirmSensitiveRead?: boolean;
+  /**
+   * 长期记忆（MEMORY.md）的字符上限。默认 6000（见 workspace 的 DEFAULT_MEMORY_MAX_CHARS）。
+   *
+   * 超过后：`memory_write`（scope=long）会自动去重并丢弃最旧的条目；系统提示词也会
+   * 提示模型用 `memory_compact` 做一次语义精简。设为 0 表示不限制（仍会去重）。
+   */
+  memoryMaxChars?: number;
+  /**
+   * 并行执行的子代理数量上限。默认 4。
+   *
+   * 主代理在一轮里并列发出多个 `task` 调用时，这些子代理会**并发运行**；
+   * 上限用于避免一次性打爆服务商的速率限制（每个子代理各自持有一条对话流）。
+   * 设为 1 表示退化为串行。
+   */
+  maxParallelAgents?: number;
   /** 采样温度 */
   temperature: number;
   /** 追加到系统提示词的额外内容 */
@@ -165,6 +189,11 @@ export const DEFAULT_CONFIG: XuanZhuConfig = {
   // 默认不拦凭据读取：autoApprove 为 true 时应当「完全自动放行」，
   // 否则「自动批准」的语义会被一个罕见的例外破坏。
   confirmSensitiveRead: false,
+  // 长期记忆超过 6000 字符即触发精简（去重 + 丢弃最旧条目 + 提示模型语义压缩）
+  memoryMaxChars: DEFAULT_MEMORY_MAX_CHARS,
+  // 同一轮里并列的多个子代理最多同时跑 4 个：再多容易撞上服务商的速率限制，
+  // 而收益有限（瓶颈通常就是那几个并发请求）。
+  maxParallelAgents: 4,
   temperature: 0.2,
 };
 
@@ -222,6 +251,9 @@ function mergeConfig(partial: Partial<XuanZhuConfig>): XuanZhuConfig {
     mouseCapture: partial.mouseCapture ?? DEFAULT_CONFIG.mouseCapture,
     confirmSensitiveRead:
       partial.confirmSensitiveRead ?? DEFAULT_CONFIG.confirmSensitiveRead,
+    memoryMaxChars: partial.memoryMaxChars ?? DEFAULT_CONFIG.memoryMaxChars,
+    maxParallelAgents:
+      partial.maxParallelAgents ?? DEFAULT_CONFIG.maxParallelAgents,
     temperature: partial.temperature ?? DEFAULT_CONFIG.temperature,
   };
 }
@@ -279,6 +311,8 @@ export function redactConfig(config: XuanZhuConfig): unknown {
     models: effectiveModels(config).map((entry) => ({
       id: entry.id,
       weight: entry.weight,
+      ...(entry.contextWindow ? { contextWindow: entry.contextWindow } : {}),
+      ...(entry.vision === undefined ? {} : { vision: entry.vision }),
       ...(entry.baseUrl ? { baseUrl: entry.baseUrl } : {}),
       ...(entry.apiKey ? { apiKey: maskKey(entry.apiKey) } : {}),
     })),
@@ -289,6 +323,9 @@ export function redactConfig(config: XuanZhuConfig): unknown {
     temperature: config.temperature,
     maxToolRounds: config.maxToolRounds,
     autoApprove: config.autoApprove,
+    memoryMaxChars: config.memoryMaxChars ?? DEFAULT_CONFIG.memoryMaxChars,
+    maxParallelAgents:
+      config.maxParallelAgents ?? DEFAULT_CONFIG.maxParallelAgents,
     systemPromptExtra: config.systemPromptExtra ?? "",
     providers,
   };
@@ -419,6 +456,7 @@ export function upsertModel(
     apiKey?: string;
     baseUrl?: string;
     contextWindow?: number;
+    vision?: boolean;
   },
 ): ModelEntry {
   const models = materializeModels(config);
@@ -437,6 +475,7 @@ export function upsertModel(
     if (hasContextWindow(input.contextWindow)) {
       existing.contextWindow = Math.floor(input.contextWindow!);
     }
+    if (typeof input.vision === "boolean") existing.vision = input.vision;
     return existing;
   }
 
@@ -450,6 +489,7 @@ export function upsertModel(
     ...(hasContextWindow(input.contextWindow)
       ? { contextWindow: Math.floor(input.contextWindow!) }
       : {}),
+    ...(typeof input.vision === "boolean" ? { vision: input.vision } : {}),
   };
   models.push(created);
   return created;

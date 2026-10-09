@@ -120,8 +120,21 @@ export function textWidth(text: string): number {
   return width;
 }
 
+/** 判断一个 token 是否为 SGR（颜色/样式）序列 */
+function isSgr(token: string): boolean {
+  return /^\x1b\[[0-9;]*m$/.test(token);
+}
+
 /**
- * 按显示宽度折行。保留 ANSI 颜色状态（简单处理：在折行处重置并延续）。
+ * 按显示宽度折行，并在折行处**封闭 / 重开** ANSI 样式。
+ *
+ * 为什么必须自己封闭与重开：每一物理行是**独立写出去的**（`cursor.to()` 定位 +
+ * `\x1b[2K` 清行），不能假定终端会把上一行的 SGR 状态延续到下一行。若一段加粗
+ * （或某个颜色）跨越折行点而续行没有重新打开样式，续行就会掉回默认色 ——
+ * 表现为「同一句话，前半段是亮白、后半段莫名变灰」。同理，行尾不封闭会让样式
+ * 泄漏到**后面的其它行**。
+ *
+ * 因此这里对每一行都保证：样式在本行内自洽（行尾补 reset，续行重新打开）。
  */
 export function wrapText(text: string, maxWidth: number): string[] {
   const lines: string[] = [];
@@ -132,20 +145,30 @@ export function wrapText(text: string, maxWidth: number): string[] {
     }
     let current = "";
     let width = 0;
+    /** 当前处于「开启」状态的 SGR 序列，折行时用于在下一行重开（按出现顺序） */
+    let active: string[] = [];
+
     // 逐 token（ANSI 序列视为整体）。
     // 使用 u 模式让 `.` 匹配完整码点，避免 emoji 等代理对被拆到两行之间。
     const tokens = raw.match(/\x1b\[[0-9;?]*[A-Za-z]|./gu) ?? [];
     for (const token of tokens) {
       const tokenWidth = textWidth(token);
       if (width + tokenWidth > maxWidth && current !== "") {
-        lines.push(current);
-        current = "";
+        lines.push(active.length > 0 ? `${current}${ansi.reset}` : current);
+        current = active.join("");
         width = 0;
+      }
+      if (isSgr(token)) {
+        if (token === ansi.reset || token === "\x1b[m") {
+          active = [];
+        } else {
+          active.push(token);
+        }
       }
       current += token;
       width += tokenWidth;
     }
-    lines.push(current);
+    lines.push(active.length > 0 ? `${current}${ansi.reset}` : current);
   }
   return lines;
 }

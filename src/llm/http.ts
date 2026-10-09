@@ -278,6 +278,66 @@ export function isContextLengthError(error: unknown): boolean {
   ].some((pattern) => text.includes(pattern));
 }
 
+/**
+ * 判断错误是否为「该模型不支持图片输入」。
+ *
+ * 需要单独识别的理由：这类失败**不是模型故障**（不该降权、不该切换模型），
+ * 也不该把整轮正文一起作废 —— 只要去掉图片重发一次就能继续。
+ *
+ * 自定义端点（OpenAI 兼容）的模型名由用户自填，视觉能力无从推断，因此默认按
+ * 「支持」放行；真发出去被拒时，就靠这里识别并自动降级重试。
+ *
+ * 判定同样只在 4xx 范围内（不支持图片是客户端参数问题，5xx 属服务端故障）。
+ * 措辞做特征匹配：显式模式命中即可，否则要求「提到图片」且「提到不支持」同时成立，
+ * 避免把「图片格式非法」这类错误也当成模型不支持而静默丢图。
+ */
+export function isVisionUnsupportedError(error: unknown): boolean {
+  const err = error as {
+    message?: unknown;
+    code?: unknown;
+    status?: unknown;
+    cause?: { message?: unknown };
+    error?: { code?: unknown; message?: unknown };
+  };
+
+  const status = asStatus(err?.status);
+  if (status !== undefined && (status < 400 || status >= 500)) return false;
+
+  const text = (
+    asString(err?.message) ||
+    asString(err?.error?.message) ||
+    asString(err?.cause?.message) ||
+    String(error)
+  ).toLowerCase();
+
+  const explicit = [
+    "does not support image",
+    "doesn't support image",
+    "not support image",
+    "unsupported image",
+    "image input is not supported",
+    "images are not supported",
+    "vision is not supported",
+    "does not support vision",
+    "not a multimodal",
+    "not support multimodal",
+    "unsupported content type",
+    "invalid content type",
+    "image_url is only supported",
+    "only supported by certain models",
+    "不支持图片",
+    "不支持图像",
+    "不支持多模态",
+    "不支持视觉",
+  ];
+  if (explicit.some((pattern) => text.includes(pattern))) return true;
+
+  const mentionsImage = /image|vision|multimodal|图片|图像|视觉/.test(text);
+  const mentionsUnsupported =
+    /not support|unsupported|only supported|不支持|无法处理/.test(text);
+  return mentionsImage && mentionsUnsupported;
+}
+
 function friendlyErrorRaw(error: unknown): string {
   const err = error as {
     message?: unknown;
@@ -353,6 +413,14 @@ function friendlyErrorRaw(error: unknown): string {
   }
   if (typeof status === "number" && status >= 500) {
     return `模型服务端错误（HTTP ${status}）：服务暂时不可用，请稍后重试。`;
+  }
+  if (isVisionUnsupportedError(error)) {
+    return (
+      `${raw}\n` +
+      "该模型不支持图片输入（玄猪已自动去掉图片重试一次，本轮正文不受影响）。\n" +
+      "· 想彻底避免这次白试：`xzh model vision <id> off`\n" +
+      "· 或改用 glm-4v / qwen-vl / gpt-4o / claude / gemini 等支持视觉的模型"
+    );
   }
   if (status === 400) {
     // 去掉 SDK 拼在 message 前的重复状态码

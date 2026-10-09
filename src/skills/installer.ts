@@ -101,6 +101,47 @@ export function runShell(
   });
 }
 
+/**
+ * 以「继承终端」的方式执行命令：stdin / stdout / stderr 直接接到用户的终端。
+ *
+ * 专供**需要交互**的安装使用（典型是 `sudo` 要输入密码）。`runShell` 走管道，
+ * sudo 拿不到终端会直接失败，因此这条路走不通。
+ *
+ * **调用方必须先挂起全屏界面**（退出备用屏、关闭原始模式），否则安装输出会与
+ * 界面渲染互相踩踏，屏幕上会是一片乱码。
+ */
+export function runShellInteractive(
+  command: string,
+  timeout = INSTALL_TIMEOUT,
+): Promise<CommandResult> {
+  return new Promise((resolve) => {
+    const isWindows = process.platform === "win32";
+    const shell = isWindows ? "cmd.exe" : process.env.SHELL || "bash";
+    const args = isWindows ? ["/d", "/s", "/c", command] : ["-lc", command];
+
+    const child = spawn(shell, args, { stdio: "inherit", env: process.env });
+
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // 忽略
+      }
+    }, timeout);
+
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      resolve({ ok: false, output: String(err), timedOut: false });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ ok: code === 0 && !timedOut, output: "", timedOut });
+    });
+  });
+}
+
 /** 检测某依赖是否已安装 */
 export async function isRequirementMet(
   requirement: SkillRequirement,
@@ -121,6 +162,7 @@ export async function installRequirement(
   platform: Platform = currentPlatform(),
   signal?: AbortSignal,
   onOutput?: (message: string) => void,
+  options: { interactive?: boolean } = {},
 ): Promise<InstallResult> {
   const installCommand = requirement.install[platform];
   if (!installCommand) {
@@ -138,8 +180,30 @@ export async function installRequirement(
     onOutput?.(trimmed);
   };
 
+  /**
+   * 安装命令的执行方式。
+   *
+   * `interactive`（`xzh setup` 用）走**继承终端**：安装命令能拿到真正的 tty，
+   * `sudo` 得以正常提示输入密码 —— 这正是安装系统包（xclip 等）的前提。
+   * 输出直接打在终端上，不再逐行捕获；失败详情交给用户当场看到。
+   * 默认走管道（TUI 内调用，界面不能被打断），命令里的 `[ -t 0 ]` 会判定为
+   * 无终端而改用 `sudo -n` 快速失败。
+   */
+  const execute = async (command: string): Promise<CommandResult> => {
+    if (!options.interactive) return runShell(command, INSTALL_TIMEOUT, signal);
+    const result = await runShellInteractive(command);
+    if (!result.ok) {
+      emit(
+        result.timedOut
+          ? `[执行超时 ${INSTALL_TIMEOUT}ms]`
+          : "（安装输出已直接打印在终端上）",
+      );
+    }
+    return result;
+  };
+
   emit(`$ ${installCommand}`);
-  const install = await runShell(installCommand, INSTALL_TIMEOUT, signal);
+  const install = await execute(installCommand);
   for (const line of tailLines(install.output, 12)) emit(line);
   if (!install.ok) {
     return { ok: false, log: logs.join("\n") };
@@ -148,7 +212,7 @@ export async function installRequirement(
   const postCommand = requirement.postInstall?.[platform];
   if (postCommand) {
     emit(`$ ${postCommand}`);
-    const post = await runShell(postCommand, INSTALL_TIMEOUT, signal);
+    const post = await execute(postCommand);
     for (const line of tailLines(post.output, 12)) emit(line);
     if (!post.ok) {
       return { ok: false, log: logs.join("\n") };
@@ -190,6 +254,19 @@ export async function ensureSkillRequirements(
   skillName: string,
   options: EnsureOptions = {},
 ): Promise<SkillDependencyReport> {
+  return ensureRequirements(getSkillRequirements(skillName), options);
+}
+
+/**
+ * 确保一组依赖均已安装（技能依赖与玄猪自身依赖共用这条路径）。
+ *
+ * 未装且拿到用户确认的会立即安装；`confirm` 缺省时**一律跳过** ——
+ * 调用方必须显式表达「可以装」，避免在没有交互的场景里擅自 sudo。
+ */
+export async function ensureRequirements(
+  requirements: SkillRequirement[],
+  options: EnsureOptions = {},
+): Promise<SkillDependencyReport> {
   const platform = options.platform ?? currentPlatform();
   const report: SkillDependencyReport = {
     installed: [],
@@ -197,7 +274,7 @@ export async function ensureSkillRequirements(
     failed: [],
   };
 
-  for (const requirement of getSkillRequirements(skillName)) {
+  for (const requirement of requirements) {
     if (await isRequirementMet(requirement, options.signal)) continue;
 
     const command = requirement.install[platform];

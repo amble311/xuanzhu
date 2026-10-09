@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import type {
+  ChatCompletionContentPart,
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
@@ -13,6 +14,7 @@ import type {
   ToolSpec,
   Usage,
 } from "./types";
+import { IMAGE_FALLBACK_TEXT } from "./vision";
 
 export interface OpenAICompatConfig {
   id: string;
@@ -190,8 +192,22 @@ function toOpenAIMessage(message: ChatMessage): ChatCompletionMessageParam {
   switch (message.role) {
     case "system":
       return { role: "system", content: message.content };
-    case "user":
+    case "user": {
+      // 带图片时改用 content 分片数组（纯文本仍走字符串，保持与旧行为一致）
+      if (message.images && message.images.length > 0) {
+        const parts: ChatCompletionContentPart[] = [
+          { type: "text", text: message.content || IMAGE_FALLBACK_TEXT },
+        ];
+        for (const image of message.images) {
+          parts.push({
+            type: "image_url",
+            image_url: { url: `data:${image.mimeType};base64,${image.data}` },
+          });
+        }
+        return { role: "user", content: parts };
+      }
       return { role: "user", content: message.content };
+    }
     case "assistant": {
       if (message.toolCalls && message.toolCalls.length > 0) {
         return {

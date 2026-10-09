@@ -31,6 +31,10 @@ XuanZhu is a full-screen AI agent that runs in your terminal: it can read your c
 - **Fully automatic by default**: `autoApprove` defaults to `true`, so **all tools execute directly without any confirmation** — including writing files, running commands, reading files outside the workspace, and reading credential files (`~/.ssh`, `.env`, `~/.xzh/config.json`, etc.). It works out of the box without interruptions. Use `/auto off` to switch to per-item confirmation for file writes and command execution.
   - If you want a one-time confirmation when reading credential files (to prevent secrets from being pulled into the context and forwarded to the model provider), set `confirmSensitiveRead` to `true`. It is off by default.
 - **Multi-turn autonomous execution**: chains tool calls automatically to complete a task; press `Ctrl+C` to interrupt at any time.
+- **Task planning**: complex tasks (3+ steps) start with a structured plan via `todo_write`, updated step by step and shown in the top info area.
+- **Subagents (parallel)**: `task` spawns the `code-explorer` subagent for large research runs and brings back only the conclusion, keeping the main context clean. Multiple `task` calls in one turn run **concurrently** (up to 4 by default, see `maxParallelAgents`). Definitions live in `src/subagents/` and more can be added.
+- **Automatic memory compaction**: the append-only long-term memory is compacted **automatically once it reaches the limit** (default 6000 chars) — duplicates are merged and, if still oversized, the oldest entries are trimmed.
+- **Image input**: `Ctrl+V` (or `/image`) reads an image from the system clipboard and attaches it to the current turn; dragging an image file path in also works. Available on Linux / Windows / macOS.
 
 ## Requirements
 
@@ -137,12 +141,13 @@ Take a look at what this project does, then add an engines field to package.json
 | `xzh model remove <id\|index>` | Remove a model |
 | `xzh model weight <id\|index> <weight>` | Adjust a model's weight |
 | `xzh model context <id\|index> <size>` | Adjust the context window (tokens, e.g. `128000`) |
+| `xzh model vision <id\|index> <on\|off>` | Mark whether the model accepts image input |
 | `xzh model reset` | Restore all model weights to the default |
 | `xzh config` | Show the current configuration (API Keys masked) |
 | `xzh config edit` | Edit the config file with `nano` |
 | `xzh config path` | Print the config file path |
 | `xzh config init` | Generate a default config file |
-| `xzh setup` | Check and install skill dependencies (playwright / officecli, etc.) |
+| `xzh setup` | Check and install dependencies (XuanZhu's own + skills: playwright / officecli / clipboard tools, etc.) |
 | `xzh --help` | Show help |
 | `xzh --version` | Show version |
 
@@ -168,6 +173,8 @@ This is useful for running multiple environments side by side (local / remote / 
   "temperature": 0.2,
   "maxToolRounds": 200,
   "autoApprove": true,
+  "memoryMaxChars": 6000,
+  "maxParallelAgents": 4,
   "intent": { "enabled": false },
   "providers": {
     "deepseek": {
@@ -201,6 +208,7 @@ xzh model all                          # show all built-in available models
 xzh model add openai gpt-4o 20         # add (weight 20)
 xzh model weight openai/gpt-4o 5       # adjust weight
 xzh model context openai/gpt-4o 128000 # adjust context window (leave blank to infer)
+xzh model vision openai/gpt-4o on      # mark as supporting image input (when inference fails)
 xzh model remove openai/gpt-4o         # remove (id / model name / index all work)
 xzh model reset                        # restore all default weights
 ```
@@ -278,7 +286,10 @@ API Keys can also come from environment variables, with lower priority than the 
 | `list_skills` | List all skills available to XuanZhu | No |
 | `load_skill` | Load the full guide for a given skill | No |
 | `memory_read` | Read project memory (long-term memory + recent log) | No |
-| `memory_write` | Write project memory (long-term / daily log) | No |
+| `memory_write` | Write project memory (long-term / daily log); auto-compacts long-term memory when oversized | No |
+| `memory_compact` | Rewrite long-term memory with a condensed full version | No |
+| `todo_write` | Create / update the task list (full list each call) | No |
+| `task` | Spawn a subagent (`code-explorer` by default) for a subtask; only its conclusion returns. Several calls in one turn run **in parallel** | No |
 | `read_file` | Read a file (with line numbers; supports offset and limit) | No |
 | `list_dir` | List a directory | No |
 | `glob` | Find files by `**` / `*` / `?` patterns | No |
@@ -286,6 +297,114 @@ API Keys can also come from environment variables, with lower priority than the 
 | `write_file` | Overwrite a file | Yes |
 | `edit_file` | Exact text replacement | Yes |
 | `bash` | Run a shell command | Yes |
+
+## Task planning and subagents
+
+**Task planning**: for tasks with 3+ steps (or several requirements in one message), XuanZhu
+first writes a structured plan with `todo_write` and updates it as it goes. The list is shown
+in the top info area (`任务 2/5` plus the item in progress).
+
+**Subagents**: the `task` tool spawns a **separate Agent instance** for one subtask; only its
+final conclusion comes back to the main conversation, so long research runs (reading dozens of
+files) no longer eat the main context window.
+
+**Parallel execution**: emitting **several** `task` calls in one reply runs those subagents
+**concurrently**, and results are fed back in the original call order — total time is the slowest
+branch, not the sum. The cap is `maxParallelAgents` (default `4`; `1` degrades to serial, hard
+limit 16). Tasks with ordering dependencies must be issued in separate turns.
+
+> Only tools declaring `parallelSafe` join a parallel batch (currently just `task`). Writes,
+> edits and shell commands have side effects and may depend on each other, so they always stay
+> sequential.
+
+One subagent ships built in, selected via `subagent_name` (and used by default):
+
+| Subagent | Capability | When to use |
+| --- | --- | --- |
+| `code-explorer` | **Read-only** (`read_file` / `list_dir` / `glob` / `grep` / `list_skills` / `load_skill`) | Searches across multiple files, directories or naming conventions; exploration beyond what a single `read_file` / `grep` can cover |
+
+`task` parameters:
+
+| Parameter | Description |
+| --- | --- |
+| `description` | One-line name for the subtask (shown in the UI and result summary) |
+| `prompt` | Full task description. **The subagent cannot see our conversation**, so it must be self-contained; for `code-explorer` also state the thoroughness level (`quick` / `medium` / `very thorough`) |
+| `subagent_name` | Name of the subagent to spawn; defaults to `code-explorer` |
+
+Subagents never get `task` (no unbounded recursion), `todo_write`, or `memory_write` /
+`memory_compact` (task list and memory are owned by the main agent). Their tool activity is shown
+with a `[code-explorer: <description>]` prefix — the description identifies whose output a line
+belongs to when running in parallel. Dangerous-operation confirmations are still forwarded to you
+(concurrent confirmations are **queued** rather than overwriting each other).
+
+> **Adding a subagent**: implement `SubAgentDefinition` (name, main-agent-facing description,
+> tool allowlist, system prompt) under `src/subagents/` and add it to the `SUBAGENTS` array in
+> `src/subagents/index.ts`. The `task` parameter enum, allowed tools and prompt all follow
+> automatically.
+
+**No configuration is needed to enable it**: `task` is sent to the model with every request just
+like any other tool — there is no switch. But a prompt saying "use it for large-scale research" is
+not enough on its own (the model cannot judge what counts as "large", so in practice it never
+called it). Besides turning the trigger into a checkable threshold ("expect to read 3+ files / need
+repeated glob & grep"), there is now a **deterministic reminder**: once this turn's read-only
+research reaches **8 calls** or **40k characters**, a `[系统提醒]` is appended to the tool result
+(once per turn; skipped when a subagent is already in use), putting "delegate this" right in front
+of the model.
+
+To check whether a tool is actually being sent: `/tools` lists every tool sent with the current
+request.
+
+**Automatic long-term memory compaction**: `MEMORY.md` is append-only and grows without bound,
+yet it is injected into the prompt at every startup. It is therefore compacted **automatically
+once it reaches `memoryMaxChars`** (default 6000) — no model decision involved:
+
+- duplicate blocks (identical body) are merged first (lossless);
+- if still oversized, the **oldest blocks are trimmed** (newest conclusions win);
+- it triggers at session start, on `/switch`, and after every `memory_write` (scope=long), and
+  the result is reported in the output pane;
+- `memoryMaxChars: 0` means unlimited length (dedupe only, never trims);
+- if a **single entry** alone exceeds the limit, trimming cannot help, so the prompt asks the
+  model to condense it with `memory_compact`.
+
+## Image input (Ctrl+V)
+
+Pressing **Ctrl+V** in the input box (or `/image`, `/paste`) attaches the **image on the system
+clipboard** to the current turn; the input box shows a `[图片1]` placeholder, and the image is sent
+together with the text on Enter. Backspacing over the placeholder removes it.
+
+> **Why plain right-click paste cannot work**: a terminal only carries a byte stream, so paste can
+> only deliver **text** — when the clipboard holds just an image, most terminals send nothing at
+> all and the program has no way to notice. XuanZhu therefore reads the system clipboard directly.
+
+| Platform | Tool used | When missing |
+| --- | --- | --- |
+| Linux | `wl-paste` (Wayland, `wl-clipboard`) or `xclip` (X11) | **installed automatically** after one confirmation (apt / dnf / yum / pacman / zypper / apk) |
+| Windows | built-in PowerShell | nothing to install |
+| macOS | `pngpaste`, otherwise built-in `osascript` | nothing to install (built-in fallback) |
+
+On Linux, if the clipboard tool is missing, Ctrl+V **asks once and installs it automatically**
+(the UI is suspended briefly so `sudo` can prompt for a password, then restored). You can also
+pre-install everything with `xzh setup`, which covers both XuanZhu's own dependencies and skill CLIs.
+
+- If the terminal claims Ctrl+V for its own paste (e.g. Windows Terminal), `\x16` never reaches
+  XuanZhu — use `/image` instead.
+- When the clipboard holds no image it **falls back to ordinary text paste**.
+- **Dragging an image file into the terminal** also works: a line containing **only an image file
+  path** is converted into an attachment on submit. This path needs no terminal protocol support.
+- Single image limit: **5 MB**; larger ones are ignored with a notice.
+- **The model must support vision**: `glm-4v` / `qwen-vl` / `gpt-4o` / `claude` / `gemini`, etc.
+  `xzh model list` marks such models with 「视觉」; when inference fails, set it with
+  `xzh model vision <id> on`. If the model does not support vision, XuanZhu **refuses to attach**
+  rather than sending a request that returns 400 and discards the whole turn.
+- **Custom endpoints are treated as supporting images by default**: a `custom` provider's model
+  name is whatever you type, so name-based inference cannot work — refusing by default would mean
+  "custom models can never use images". If such an endpoint actually rejects images, XuanZhu
+  **detects it and automatically retries without the images**, so your text is never discarded, and
+  suggests `xzh model vision <id> off` to turn it off permanently (avoiding the wasted attempt).
+  `xzh model add` asks about this once, or you can pass it as the 5th positional argument:
+  `xzh model add custom my-model 10 128000 off`.
+- Images are sent **only with the current turn**; older ones in history are downgraded to
+  `[图片已省略：image/png]` so base64 payloads cannot blow up the context window.
 
 ## Project directory (.xuanzhu/)
 
@@ -301,6 +420,8 @@ Memory is maintained by XuanZhu itself:
 
 - At startup it reads `MEMORY.md` **and the current day's log** into the prompt (an excerpt of each), so XuanZhu understands the project background from the beginning
 - When it needs more history it calls `memory_read`; **after completing each piece of substantive work** it must call `memory_write` to record the conclusion (technical decisions, project conventions, pitfalls hit, important findings). This requirement also appears under "Core principles" in the system prompt, which explicitly asks it to **write memory before producing the final answer** — the earlier wording ("may call") was too weak and in practice almost never triggered
+- Long-term memory is **append-only** and grows without bound, yet it is injected into the prompt at every startup (1500-char excerpt), so an oversized file truncates the conclusions that matter. **Once it reaches `memoryMaxChars` (default 6000) compaction triggers automatically** (no model decision): duplicates are merged, and if still oversized the oldest blocks are dropped (newest conclusions win). See "Automatic long-term memory compaction" above
+- Only when a **single entry alone exceeds the limit** (so nothing is left to trim) does the prompt ask the model to `memory_read` the full file and rewrite a condensed version with `memory_compact`
 - `.xuanzhu` is **always** located under the current project path, with **no upward search**: working in `/a/b/c` uses only `/a/b/c/.xuanzhu`, and an existing `.xuanzhu` in `/a` or `/a/b` is never reused
 - **At startup** and **when `/switch` changes directory**, if that directory has no `.xuanzhu` yet, it is created automatically
 - Each project directory therefore has its own memory and rules; `~/.xzh` is purely the **global config directory** (config.json / session / logs / skills) and does not participate in project memory
@@ -329,7 +450,7 @@ A skill is a guide telling XuanZhu how to use a particular external CLI tool (`s
 The CLIs listed above are installed by XuanZhu, so **you do not need to install them yourself**:
 
 - When a skill is loaded during a conversation (`load_skill`), XuanZhu checks its dependencies first; if something is missing, it asks once for confirmation and then installs and verifies it automatically.
-- You can also run `xzh setup` to check and install the dependencies of all built-in skills at once.
+- You can also run `xzh setup` to check and install **XuanZhu's own dependencies (clipboard tools) plus those of all built-in skills** at once. `xzh setup` hands the terminal to the install command, so `sudo` can prompt for a password normally.
 
 ### Custom skills
 
@@ -413,7 +534,7 @@ Where `keybindings.json` lives: in VS Code / CodeBuddy press `Ctrl+Shift+P` → 
 
 Other terminals: xterm / VTE-based ones (gnome-terminal and friends) are negotiated automatically and work out of the box; kitty / Ghostty map that xterm-compatible sequence to "report all keys as escape codes", which breaks normal input, so XuanZhu does not send the request to those two — use `Alt+Enter` instead or configure it on the terminal side.
 
-In-interface commands: `/help`, `/clear`, `/copy [N|all]`, `/mouse`, `/reset`, `/cwd`, `/switch <dir>`, `/term`, `/model`, `/auto [on|off]`, `/intent [on|off]`, `/exit`.
+In-interface commands: `/help`, `/clear`, `/tools`, `/image`, `/copy [N|all]`, `/mouse`, `/reset`, `/cwd`, `/switch <dir>`, `/term`, `/model`, `/auto [on|off]`, `/intent [on|off]`, `/exit`.
 
 ### Selecting and copying
 

@@ -70,3 +70,67 @@ export function getSkillRequirements(skillName: string): SkillRequirement[] {
 export function skillsWithRequirements(): string[] {
   return Object.keys(SKILL_REQUIREMENTS);
 }
+
+// ------------------------------------------------------------ 玄猪自身的依赖
+
+/**
+ * 生成 Linux 下的安装命令：自动识别包管理器。
+ *
+ * `sudo` 的处理是这里的关键：玄猪在 TUI 里用**管道**执行安装命令时 sudo 拿不到终端，
+ * 会直接报「no tty present」而失败；而 `sudo -n` 又会因为没缓存凭据同样失败。
+ * 因此命令自己判断有没有终端：
+ *   - 有终端（`[ -t 0 ]`，即调用方已挂起界面、把终端交给它）→ 用普通 `sudo`，正常提示密码；
+ *   - 没有终端（管道）→ 用 `sudo -n` **快速失败**，由调用方改为交互方式重跑。
+ */
+function linuxInstall(pkg: string): string {
+  return [
+    'SUDO="sudo -n"; [ -t 0 ] && SUDO="sudo"',
+    `if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get install -y ${pkg}`,
+    `elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y ${pkg}`,
+    `elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y ${pkg}`,
+    `elif command -v pacman >/dev/null 2>&1; then $SUDO pacman -S --noconfirm ${pkg}`,
+    `elif command -v zypper >/dev/null 2>&1; then $SUDO zypper --non-interactive install ${pkg}`,
+    `elif command -v apk >/dev/null 2>&1; then $SUDO apk add ${pkg}`,
+    `else echo "未识别到受支持的包管理器（apt / dnf / yum / pacman / zypper / apk）" >&2; exit 1; fi`,
+  ].join("; ");
+}
+
+const XCLIP: SkillRequirement = {
+  name: "xclip（X11 剪贴板工具）",
+  check: "command -v xclip",
+  install: { linux: linuxInstall("xclip") },
+};
+
+const WL_CLIPBOARD: SkillRequirement = {
+  name: "wl-clipboard（Wayland 剪贴板工具）",
+  check: "command -v wl-paste",
+  install: { linux: linuxInstall("wl-clipboard") },
+};
+
+/**
+ * 玄猪**自身功能**需要的平台依赖（不属于任何技能）。
+ *
+ * 目前只有一项：读取系统剪贴板以支持 `Ctrl+V` 粘贴图片。
+ * - Linux：需要 `xclip`（X11）或 `wl-clipboard`（Wayland），按当前会话选择；
+ * - macOS：内置 osascript 退路，无需安装；
+ * - Windows：内置 PowerShell，无需安装。
+ *
+ * 之所以按会话二选一而不是两个都装：安装要走 sudo 与网络，多装一个只是多一份
+ * 失败面；而 `readClipboardImage()` 本来就会把两者都试一遍，装了哪个都能用。
+ */
+export function clipboardRequirements(
+  platform: Platform = currentPlatform(),
+): SkillRequirement[] {
+  if (platform !== "linux") return [];
+  const wayland = Boolean(
+    process.env.WAYLAND_DISPLAY || process.env.WAYLAND_SOCKET,
+  );
+  return [wayland ? WL_CLIPBOARD : XCLIP];
+}
+
+/** 玄猪自身的依赖清单（用于 `xzh setup` 与 TUI 内的按需安装） */
+export function runtimeRequirements(
+  platform: Platform = currentPlatform(),
+): SkillRequirement[] {
+  return clipboardRequirements(platform);
+}

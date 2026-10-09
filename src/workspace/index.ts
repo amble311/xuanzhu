@@ -234,3 +234,193 @@ export function appendMemory(
 
   return target;
 }
+
+// ------------------------------------------------------------ 长期记忆精简
+
+/**
+ * 长期记忆（MEMORY.md）的默认字符上限。
+ *
+ * 超过该值时会触发**精简**：先去除正文完全相同的重复块，仍然超限则从最旧的块
+ * 开始丢弃。之所以要设上限：记忆是**只追加**的，长期使用后会把 MEMORY.md 撑得
+ * 很长，而它每次启动都会注入系统提示词（节选 1500 字符）—— 过长会让真正重要的
+ * 结论被截断掉。取 6000 是「内容足够丰富」与「可被有效节选」之间的折中。
+ */
+export const DEFAULT_MEMORY_MAX_CHARS = 6_000;
+
+export interface MemoryCompactResult {
+  /** 精简前字符数 */
+  before: number;
+  /** 精简后字符数 */
+  after: number;
+  /** 被去除的重复块数量 */
+  removedDuplicates: number;
+  /** 因超出上限而被丢弃的最旧块数量 */
+  removedOldest: number;
+}
+
+interface MemoryBlock {
+  /** 块标题行（`## 时间戳`） */
+  title: string;
+  /** 块正文 */
+  body: string;
+}
+
+/** 把长期记忆拆成「头部 + 若干 `## ` 块」 */
+function splitMemoryBlocks(text: string): {
+  header: string;
+  blocks: MemoryBlock[];
+} {
+  const lines = text.split("\n");
+  let firstBlock = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^##\s/.test(lines[i])) {
+      firstBlock = i;
+      break;
+    }
+  }
+  if (firstBlock < 0) return { header: text.trim(), blocks: [] };
+
+  const header = lines.slice(0, firstBlock).join("\n").trim();
+  const blocks: MemoryBlock[] = [];
+  let title = "";
+  let body: string[] = [];
+  const flush = () => {
+    if (title) blocks.push({ title, body: body.join("\n").trim() });
+  };
+  for (let i = firstBlock; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^##\s/.test(line)) {
+      flush();
+      title = line.trim();
+      body = [];
+    } else {
+      body.push(line);
+    }
+  }
+  flush();
+  return { header, blocks };
+}
+
+/** 拼回长期记忆文件内容 */
+function assembleMemoryBlocks(header: string, blocks: MemoryBlock[]): string {
+  const head = header || "# 项目长期记忆";
+  if (blocks.length === 0) return `${head}\n`;
+  const parts = blocks.map((block) => `${block.title}\n\n${block.body}`);
+  return `${head}\n\n${parts.join("\n\n")}\n`;
+}
+
+/** 去重比较用的正文键：忽略空白差异 */
+function blockKey(body: string): string {
+  return body.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * 精简长期记忆：去重 + 超限时丢弃最旧的块，仅在确有变化时写盘。
+ *
+ * **只作用于长期记忆**，不碰每日日志：每日日志天然按天分存、总量有界，
+ * 而长期记忆是无限追加的。
+ *
+ * 去重只认「正文完全相同」的块（模型重复记录同一结论很常见），不涉及语义判断；
+ * 语义层面的合并由模型通过 `memory_compact` 工具完成。
+ *
+ * `maxChars <= 0` 表示**不限制长度**：此时只做去重（无损），不裁剪任何内容。
+ */
+export function compactLongTermMemory(
+  cwd: string,
+  maxChars = DEFAULT_MEMORY_MAX_CHARS,
+): MemoryCompactResult | null {
+  const paths = resolveProjectPaths(cwd);
+  if (!fs.existsSync(paths.longTermFile)) return null;
+
+  let original: string;
+  try {
+    original = fs.readFileSync(paths.longTermFile, "utf8");
+  } catch {
+    return null;
+  }
+  const before = original.trim().length;
+  const { header, blocks } = splitMemoryBlocks(original);
+  if (blocks.length === 0) {
+    return { before, after: before, removedDuplicates: 0, removedOldest: 0 };
+  }
+
+  // 1. 去重：正文相同的块只保留最早出现的一次（时间戳也更早，位置稳定）
+  const seen = new Set<string>();
+  const kept: MemoryBlock[] = [];
+  let removedDuplicates = 0;
+  for (const block of blocks) {
+    const key = blockKey(block.body);
+    if (key && seen.has(key)) {
+      removedDuplicates++;
+      continue;
+    }
+    if (key) seen.add(key);
+    kept.push(block);
+  }
+
+  // 2. 仍然超限时从最旧的块开始丢弃（最新的结论优先保留）。
+  //    maxChars <= 0 = 不限制长度，跳过这一步、只保留上面的去重。
+  //    下限 200 是防止误配置（如 1、10）把记忆裁得只剩标题。
+  let removedOldest = 0;
+  if (maxChars > 0) {
+    const budget = Math.max(200, Math.floor(maxChars));
+    if (assembleMemoryBlocks(header, kept).trim().length > budget) {
+      let total = assembleMemoryBlocks(header, kept).trim().length;
+      while (kept.length > 1 && total > budget) {
+        const dropped = kept.shift()!;
+        total -= dropped.title.length + dropped.body.length + 4;
+        removedOldest++;
+      }
+    }
+  }
+
+  if (removedDuplicates === 0 && removedOldest === 0) {
+    return { before, after: before, removedDuplicates: 0, removedOldest: 0 };
+  }
+
+  const compacted = assembleMemoryBlocks(header, kept);
+  writeLongTermMemory(cwd, compacted);
+  return {
+    before,
+    after: compacted.trim().length,
+    removedDuplicates,
+    removedOldest,
+  };
+}
+
+/**
+ * 「达到阈值就自动精简」的入口：未超过 `maxChars` 时**什么都不做**（返回 null）。
+ *
+ * 调用方（Agent 启动 / `/switch` 切换目录）不必自己判断大小，直接调用即可 ——
+ * 精简是否发生、精简了多少，由返回值描述。
+ *
+ * `maxChars <= 0` 表示**不限制长度**：此时仍然会做无损的**去重**，
+ * 但不会裁剪任何内容。
+ */
+export function compactLongTermMemoryIfNeeded(
+  cwd: string,
+  maxChars = DEFAULT_MEMORY_MAX_CHARS,
+): MemoryCompactResult | null {
+  const unlimited = !(maxChars > 0);
+  const paths = resolveProjectPaths(cwd);
+  let size: number;
+  try {
+    if (!fs.existsSync(paths.longTermFile)) return null;
+    size = fs.readFileSync(paths.longTermFile, "utf8").trim().length;
+  } catch {
+    return null;
+  }
+  if (!unlimited && size <= maxChars) return null;
+  return compactLongTermMemory(cwd, maxChars);
+}
+
+/** 覆盖写入长期记忆（原子写：先写临时文件再 rename，避免半截文件） */
+export function writeLongTermMemory(cwd: string, content: string): string {
+  const paths = resolveProjectPaths(cwd);
+  fs.mkdirSync(paths.memoryDir, { recursive: true });
+  const data = content.trim() ? `${content.trim()}\n` : "";
+  const tmp = `${paths.longTermFile}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, data, "utf8");
+  fs.renameSync(tmp, paths.longTermFile);
+  return paths.longTermFile;
+}
