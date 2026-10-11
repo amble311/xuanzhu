@@ -35,13 +35,18 @@ xzh                 # 启动
 - **任务拆分**：3 步以上的复杂任务会先用 `todo_write` 列出计划并逐步更新，
   顶部信息区实时显示进度条（`任务 2/5` 与当前进行项）。
 - **子代理协作（可并行）**：需要大范围调研（跨多个文件 / 目录 / 命名约定）时，用 `task`
-  派生 `code-explorer` 子代理独立完成，**只把结论带回主对话** —— 中间过程不会挤占主上下文。
+  派生 `code-explorer` 子代理独立完成，**只把结论带回主对话** —— 中间过程不会挤占主上下文；
+  改完代码后可派 `test-runner` 跑测试并带回「通过/失败清单 + 失败原因 + 可复跑命令」，
+  测试日志同样不进主上下文。
   一轮里并列发出多个 `task` 时会**并发执行**（默认最多 4 个，见 `maxParallelAgents`）。
   子代理定义集中在 `src/subagents/`，可继续扩展。
 - **长期记忆自动精简**：`MEMORY.md` 只追加、会越写越长；**达到阈值（默认 6000 字符）
   自动触发** —— 先去重，仍超限就裁剪最旧的条目（最新结论优先保留），无需模型同意。
 - **图片输入**：`Ctrl+V`（或 `/image`）读取系统剪贴板里的图片作为附件发给模型，
   也支持拖拽图片文件路径；Linux / Windows / macOS 均可用。
+- **手机设备桥**：把脚本推到手机上的 **AutoJs6** / AutoX.js 运行并回收日志，等价于 VSCode 插件的
+  `Run` / `Save`，但不需要 VSCode —— Agent 也能自己操作（`device_run` 等工具）。推荐 AutoJs6
+  （`xzh device connect <手机IP>`，手机开服务器模式）；手机上的日志实时进右侧终端面板。
 
 ## 环境要求
 
@@ -156,6 +161,15 @@ xzh
 | `xzh config path` | 打印配置文件路径 |
 | `xzh config init` | 生成默认配置文件 |
 | `xzh setup` | 检查并自动安装依赖（玄猪自身 + 技能：playwright / officecli / 剪贴板工具等） |
+| `xzh skill` | 交互式管理技能：启用 / 禁用 / 删除（禁用的技能对模型不可见） |
+| `xzh skill list` | 列出全部技能（来源与状态，含已禁用项） |
+| `xzh skill enable/disable <名称>` | 启用 / 禁用技能 |
+| `xzh skill delete <名称> [--yes]` | 删除技能（仅限用户技能；内置技能请用 disable） |
+| `xzh device connect <手机IP>` | 连接手机上的 AutoJs6（服务器模式）并常驻 |
+| `xzh device serve` | 反向：等手机上的 AutoX.js 连过来 |
+| `xzh device run <文件>` | 把脚本推到手机并运行（`push` 则只保存不运行） |
+| `xzh device logs` | 查看手机上的脚本日志 |
+| `xzh device apk` | 该装哪个 AutoJs6 安装包、去哪里下载 |
 | `xzh --help` | 查看帮助 |
 | `xzh --version` | 查看版本 |
 
@@ -243,6 +257,11 @@ xzh model reset                        # 全部恢复默认权重
 > 裁剪依据是**估算**的 token 数（中文约 1 字符/token，英文与代码约 3.5 字符/token），
 > 不依赖 tokenizer，属保守近似。项目规则（`.xuanzhu/rules.md`）与 `systemPromptExtra`
 > 会全文进入系统提示词，写得过长会挤占历史额度 —— 占去窗口一半以上时界面会给出提示。
+>
+> 估算偏差还会被**真实用量回填**逐步校正：每次请求结束后，玄猪拿服务端返回的
+> **实际 prompt token 数**与本次估算相比，发现系统性偏低（实际比估的多）就把下一次的
+> 历史额度相应收紧，而不是等到撞上 400 才补救。估算偏高时**不做调整** ——
+> 保守余量必须留住（放宽反而更容易撞窗口）。
 
 若估算偏差导致仍然超限（服务端返回 `context_length_exceeded` 一类错误），玄猪会
 **把预算收敛到一半再自动重试一次**，而不会把它当成模型故障去降权或切换模型 ——
@@ -318,6 +337,11 @@ API Key 也可以来自环境变量，优先级低于配置文件：
 | `write_file` | 覆盖写入文件 | 是 |
 | `edit_file` | 精确文本替换 | 是 |
 | `bash` | 执行 shell 命令 | 是 |
+| `device_list` | 列出已连接的手机设备 | 否 |
+| `device_push` | 把脚本保存到手机（不运行） | 是 |
+| `device_run` | 把脚本推到手机并立即运行 | 是 |
+| `device_stop` | 停止手机上的脚本（默认全部） | 是 |
+| `device_logs` | 读取手机上的脚本日志 | 否 |
 
 ## 任务拆分与子代理
 
@@ -414,6 +438,88 @@ Linux 上缺少剪贴板工具时，Ctrl+V 会**弹出确认框并自动安装**
 - 图片只在**本轮**随请求发送；历史里的旧图片会自动降级为 `[图片已省略：image/png]`，
   避免 base64 把上下文撑爆。
 
+## 手机设备桥（AutoJs6 / AutoX.js）
+
+把脚本推到**手机**上运行、并把手机上的输出收回来 —— 相当于 VSCode 插件
+Auto.js-Autox.js-VSCodeExt 的 `Run` / `Save` / 日志面板，但不需要 VSCode，
+而且 **Agent 也能自己操作**（`device_run` / `device_logs` 等工具）。
+
+支持两种手机端 App，**推荐 AutoJs6**：
+
+| 手机端 | 连接方向 | 说明 |
+| --- | --- | --- |
+| **AutoJs6**（推荐） | 手机 → xzh | 手机点「连接电脑 → **客户端模式**」填 xzh 打印的地址（默认 `6347`）。**这是手机端 UI 支持最好的方向**，也是 AutoJs6 官方 VSCode 扩展走的那条路 —— 等于用 xzh 顶替那个扩展 |
+| AutoJs6（备选） | xzh → 手机 | 手机开「连接电脑 → 服务器模式」（`7347`），再 `xzh device connect <手机IP>` |
+| AutoX.js | 手机 → xzh | `xzh device serve` 监听 `9317`，手机端填 xzh 打印的 `ws://` 地址 |
+
+两者可以**同时连在同一个 xzh 上**（一次推送会同时到达全部设备），指令按各自协议分别编码。
+
+```bash
+xzh device serve                  # 常驻：同时监听 AutoJs6(6347) 与 AutoX.js(9317)，等手机连过来
+xzh device run 你的脚本.js         # 推到手机并立即运行
+xzh device logs -n 50             # 看手机上的输出
+xzh device stop                   # 停止全部脚本
+
+xzh device connect 192.168.1.20   # 备选方向：xzh 主动连手机的 AutoJs6 服务器模式
+xzh device apk                    # 该装哪个 AutoJs6 安装包、去哪里下载
+```
+
+界面内等价命令：`/device connect <手机IP>` → `/device run <文件>` → `/device logs`。
+桥跑在 xzh 进程里时，**手机日志实时显示在右侧终端面板**（Shift+Tab 切过去），
+不会把对话区刷掉；`/device logs` 可以把最近若干行打回对话区。
+
+| 子命令 | 说明 |
+| --- | --- |
+| `xzh device connect <手机IP>[:端口]` | 连接 AutoJs6 服务器模式并常驻（默认 `7347`） |
+| `xzh device serve [--port N]` | 反向：等 AutoX.js 连过来（手机端填它打印的 `ws://`） |
+| `xzh device apk` | 探测该用哪个 ABI、给出官方下载地址 |
+| `xzh device check` | 体检：无障碍是否就绪、能否操作手机（首次连接后先跑它） |
+| `xzh device shot [文件]` | 截取手机当前屏幕保存为 JPEG（系统授权框由内置脚本自动点掉） |
+| `xzh device status` / `list` | 桥状态 / 已连接设备（含来源 App） |
+| `xzh device push <文件>` | 保存到手机（不运行） |
+| `xzh device run <文件>` | 保存并立即运行 |
+| `xzh device stop [<文件>] [--all]` | 停止脚本（默认停止全部） |
+| `xzh device logs [-n 50]` | 最近的设备日志 |
+
+通用参数：`--port <端口>`（控制通道 / 监听端口）、`--device <设备名>`（只对某一台下发）；
+AutoX.js 那侧也可用环境变量 `XZH_DEVICE_PORT` 指定端口。
+
+### 首次使用
+
+手机上需要装 AutoJs6（它提供无障碍能力，xzh 通过它操作手机）。玄猪**不打包安装包** ——
+每个 ABI 约 130 MB，两个就 270 MB，塞进 npm 包会让所有用户平白多下几百 MB，
+而绝大多数人只需要其中一个。因此 `xzh device apk` 只做三件事：
+
+1. **探测该用哪个 ABI**：`adb` 能读到设备就精确判断（`ro.product.cpu.abi`），
+   否则默认 `arm64-v8a`（2018 年后的手机几乎都是 64 位 ARM，`x86_64` 基本只出现在模拟器）；
+2. **给出官方下载页**：<https://github.com/SuperMonster003/AutoJs6/releases/>；
+3. **顺带看一眼本机缓存**：`~/.xzh/apks/` 里有匹配的包就直接给出路径（不联网也能装）。
+
+`xzh device connect` 连不上时，会把「装 App → 开服务器模式 → 填 IP」的完整引导打出来，
+并**停止无谓的重试**（连续失败 3 次即放弃，避免对着填错的地址无限刷屏）。
+
+**首次连上后先跑 `xzh device check`**：它推一段带超时的探测脚本，回报无障碍状态、机型分辨率、
+当前前台界面 —— 因为"能不能操作手机"取决于**手机侧的无障碍服务是否真的在运行**，
+从连接信息里看不出来。没就绪时会给出处理办法（含实测遇到的"已启用但未运行"要关掉再打开）。
+
+**要操作手机时，Agent 会先加载内置的 `autojs6` 技能**：里面有 AutoJs6 的 API 速查
+（`auto.*` / 选择器 / UiObject 动作 / 全局动作 / app / device / 输入 / 截图）与必须遵守的约定
+（脚本在手机上跑、**返回值拿不到**，所以每步都要 `toastLog` 回报再 `device_logs` 读；
+`device_run` 是发出即返回、日志异步回来；需要 UI 操作的脚本必须用 `auto.waitFor(8000)` 开头）。
+
+- 连不上的常见原因：AutoJs6 开的是「客户端模式」而不是「服务器模式」；手机与电脑不在同一网段；
+  路由器开了 **AP 隔离**（同 WiFi 下设备互相不通，最常见）；手机系统限制 AutoJs6 后台运行
+  （OPPO / 小米等需允许后台运行）。
+- **端口冲突**：`serve` 会同时监听两个端口 —— `6347`（AutoJs6 客户端模式）与 `9317`（AutoX.js）。
+  它们分别与 VSCode 的 **AutoJs6 扩展**（`003.autojs6-vscode-ext`）和 **Auto.js/AutoX.js 插件**
+  相同，**各自不能同时开**。xzh 是"哪个端口被占就只提示那个、另一边照常用"，
+  不会因为一个端口冲突就整个起不来。
+- 只做**单文件**推送（运行 / 保存 / 停止 / 日志）；「整个项目打包 zip 同步」没有实现。
+- AutoX.js 侧若手机提示**「握手失败」**：手机端会校验握手应答里的 PC 端版本号，只认
+  「Auto.js-Autox.js-VSCodeExt」那套版本序列 —— 玄猪按插件协议版本（默认 `1.110.0`）回报，
+  可用环境变量 `XZH_DEVICE_PLUGIN_VERSION` 覆盖，无需改代码。
+- 设备操作**不对子代理开放**（手机只有一台，多个子代理并行推脚本会互相打断）。
+
 ## 项目目录（.xuanzhu/）
 
 首次在某个项目中运行 `xzh` 时，会在项目根自动创建 `.xuanzhu/`，用于保存**项目级记忆与规则**
@@ -456,12 +562,13 @@ Linux 上缺少剪贴板工具时，Ctrl+V 会**弹出确认框并自动安装**
 | --- | --- | --- |
 | `playwright` | 浏览器自动化、端到端测试、网页验证（**默认用系统已安装的 Chrome**，减少反爬拦截） | `playwright-cli`（`npm i -g @playwright/cli@latest`） |
 | `officecli` | Word / Excel / PowerPoint 文档创建与读写 | `officecli`（单二进制，见技能内安装说明） |
+| `autojs6` | **操作真实 Android 手机**：点击、滑动、输入、读界面、启动应用（脚本由设备桥推到手机上执行） | 无（手机需装 AutoJs6，见「手机设备桥」） |
 | `github` / `gitlab` | 仓库、Issue、PR / MR | `gh` / `glab` |
 | `jira` / `linear` | 项目管理 | 对应 CLI |
 | `aws` / `kubernetes` | 云资源与容器编排 | `aws` / `kubectl` |
 | `postgres` / `mysql` / `mongodb` / `redis` / `elasticsearch` | 数据库 | 对应客户端 |
 | `sentry` / `datadog` | 监控与告警 | 对应 CLI |
-| `gmail` / `email` / `telegram` | 邮件与消息 | 对应 CLI |
+| `email` / `telegram` | 邮件与消息 | 对应 CLI |
 
 ### 依赖自动安装
 
@@ -650,6 +757,7 @@ src/
 npm run build       # 打包到 dist/cli.js
 npm run dev         # 监听模式
 npm run typecheck   # 类型检查
+npm run test        # 运行测试（vitest）
 node bin/xzh.js     # 本地运行
 ```
 

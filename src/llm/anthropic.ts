@@ -4,7 +4,7 @@ import type {
   MessageParam,
   Tool,
 } from "@anthropic-ai/sdk/resources/messages";
-import { delay, isRetryableError } from "./http";
+import { StreamEmitter, withRetry } from "./stream-retry";
 import type {
   ChatMessage,
   ChatOptions,
@@ -23,9 +23,7 @@ export interface AnthropicConfig {
   maxTokens?: number;
 }
 
-const MAX_ATTEMPTS = 3;
-
-/** Anthropic Claude Provider（流式 + tool_use，含瞬时错误重试） */
+/** Anthropic Claude Provider（流式 + tool_use，重试与断连续传见 stream-retry.ts） */
 export class AnthropicProvider implements LLMProvider {
   public readonly id: string;
   public readonly model: string;
@@ -44,40 +42,12 @@ export class AnthropicProvider implements LLMProvider {
   }
 
   async *chat(options: ChatOptions): AsyncIterable<StreamChunk> {
-    let lastError: unknown;
-
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      let emitted = false;
-      try {
-        yield* this.streamOnce(options, () => {
-          emitted = true;
-        });
-        return;
-      } catch (error) {
-        lastError = error;
-        if (
-          emitted ||
-          options.signal?.aborted ||
-          attempt >= MAX_ATTEMPTS ||
-          !isRetryableError(error)
-        ) {
-          throw error;
-        }
-        options.onRetry?.(
-          attempt,
-          MAX_ATTEMPTS,
-          error instanceof Error ? error : new Error(String(error)),
-        );
-        await delay(attempt * 600);
-      }
-    }
-
-    throw lastError;
+    yield* withRetry(options, (emit) => this.streamOnce(options, emit));
   }
 
   private async *streamOnce(
     options: ChatOptions,
-    markEmitted: () => void,
+    emit: StreamEmitter,
   ): AsyncIterable<StreamChunk> {
     const { system, messages } = toAnthropicMessages(options.messages);
     const tools: Tool[] | undefined =
@@ -131,16 +101,16 @@ export class AnthropicProvider implements LLMProvider {
         case "content_block_delta": {
           const delta = event.delta;
           if (delta.type === "text_delta" && delta.text) {
-            markEmitted();
-            yield { type: "text", text: delta.text };
+            const out = emit.text(delta.text);
+            if (out) yield { type: "text", text: out };
           } else if (delta.type === "input_json_delta") {
             const buf = blocks.get(event.index);
             if (buf) buf.json += delta.partial_json ?? "";
           } else if (delta.type === "thinking_delta") {
             const thinking = (delta as { thinking?: string }).thinking;
             if (thinking) {
-              markEmitted();
-              yield { type: "reasoning", text: thinking };
+              const out = emit.reasoning(thinking);
+              if (out) yield { type: "reasoning", text: out };
             }
           }
           break;
@@ -160,7 +130,7 @@ export class AnthropicProvider implements LLMProvider {
 
     for (const buf of blocks.values()) {
       if (!buf.name) continue;
-      markEmitted();
+      if (!emit.toolCall()) continue;
       yield {
         type: "tool_call",
         toolCall: {
@@ -171,7 +141,6 @@ export class AnthropicProvider implements LLMProvider {
       };
     }
 
-    if (sawToolCall) markEmitted();
     yield {
       type: "done",
       finishReason: sawToolCall ? "tool_calls" : stopReason,

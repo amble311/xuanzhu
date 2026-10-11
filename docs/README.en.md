@@ -35,6 +35,7 @@ XuanZhu is a full-screen AI agent that runs in your terminal: it can read your c
 - **Subagents (parallel)**: `task` spawns the `code-explorer` subagent for large research runs and brings back only the conclusion, keeping the main context clean. Multiple `task` calls in one turn run **concurrently** (up to 4 by default, see `maxParallelAgents`). Definitions live in `src/subagents/` and more can be added.
 - **Automatic memory compaction**: the append-only long-term memory is compacted **automatically once it reaches the limit** (default 6000 chars) — duplicates are merged and, if still oversized, the oldest entries are trimmed.
 - **Image input**: `Ctrl+V` (or `/image`) reads an image from the system clipboard and attaches it to the current turn; dragging an image file path in also works. Available on Linux / Windows / macOS.
+- **Phone device bridge**: push scripts to **AutoJs6** / AutoX.js on a phone and collect their logs — the equivalent of the VSCode extension's `Run` / `Save`, without VSCode, and usable by the agent itself (`device_run` and friends). AutoJs6 is recommended (`xzh device connect <phone-ip>` with server mode enabled); phone logs stream into the right-hand terminal panel.
 
 ## Requirements
 
@@ -148,6 +149,11 @@ Take a look at what this project does, then add an engines field to package.json
 | `xzh config path` | Print the config file path |
 | `xzh config init` | Generate a default config file |
 | `xzh setup` | Check and install dependencies (XuanZhu's own + skills: playwright / officecli / clipboard tools, etc.) |
+| `xzh device connect <phone-ip>` | Connect to AutoJs6 on the phone (server mode) and stay running |
+| `xzh device serve` | The other direction: wait for AutoX.js to dial in |
+| `xzh device run <file>` | Push a script to the phone and run it (`push` only saves it) |
+| `xzh device logs` | Show the script logs from the phone |
+| `xzh device apk` | Which AutoJs6 build to install, and where to get it |
 | `xzh --help` | Show help |
 | `xzh --version` | Show version |
 
@@ -224,6 +230,8 @@ The model currently in use and its weight are shown at the top of the interface 
 - If the value is not configured, it is inferred from the model name (`xzh model all` and `xzh model list` show the inferred value). The inference table only covers common models, so obscure or self-hosted model names fall back to a conservative 32k — if your model's window is larger, set it explicitly with `xzh model context <id> <size>`, otherwise history will be trimmed shorter than necessary.
 
 > Trimming relies on **estimated** token counts (about 1 character/token for Chinese, about 3.5 characters/token for English and code). It does not use a tokenizer, so it is a conservative approximation. Project rules (`.xuanzhu/rules.md`) and `systemPromptExtra` are injected into the system prompt in full, so an overly long one eats into the history budget — the interface warns you when it takes up more than half the window.
+>
+> The estimate is also **back-filled from real usage**: after each request, the actual prompt token count reported by the server is compared against the estimate; if the estimate turns out to be systematically low (actual exceeds it), the next request tightens the history budget accordingly instead of waiting for a 400. It never loosens the budget when the estimate runs high — the conservative margin must stay.
 
 If estimation error still leads to an overflow (the server returns something like `context_length_exceeded`), XuanZhu **halves the budget and retries once automatically**, rather than treating it as a model failure to decay or switch models — resending the same long messages to another model would fail just the same and waste that model's weight for nothing.
 
@@ -297,6 +305,11 @@ API Keys can also come from environment variables, with lower priority than the 
 | `write_file` | Overwrite a file | Yes |
 | `edit_file` | Exact text replacement | Yes |
 | `bash` | Run a shell command | Yes |
+| `device_list` | List connected phones | No |
+| `device_push` | Save a script to the phone (without running it) | Yes |
+| `device_run` | Push a script to the phone and run it immediately | Yes |
+| `device_stop` | Stop scripts on the phone (all by default) | Yes |
+| `device_logs` | Read script logs from the phone | No |
 
 ## Task planning and subagents
 
@@ -406,6 +419,81 @@ pre-install everything with `xzh setup`, which covers both XuanZhu's own depende
 - Images are sent **only with the current turn**; older ones in history are downgraded to
   `[图片已省略：image/png]` so base64 payloads cannot blow up the context window.
 
+## Phone device bridge (AutoJs6 / AutoX.js)
+
+Push scripts to run on a **phone** and collect its output — the equivalent of the VSCode
+extension Auto.js-Autox.js-VSCodeExt (`Run` / `Save` / log panel), without VSCode, and
+**the agent can drive it too** (`device_run`, `device_logs`, ...).
+
+Two phone-side apps are supported; **AutoJs6 is recommended**:
+
+| Phone app | Direction | Notes |
+| --- | --- | --- |
+| **AutoJs6** (recommended) | xzh → phone | Enable "Connect to computer → Server mode" (port `7347`) and xzh dials in. The user only supplies one address |
+| AutoX.js | phone → xzh | xzh listens on `9317`; enter the printed `ws://` address on the phone |
+
+Both can be connected to the same xzh at the same time (one push reaches every device); commands
+are encoded per protocol.
+
+```bash
+xzh device connect 192.168.1.20   # connect to AutoJs6 on the phone (stays running; omit the address on the phone itself)
+xzh device run your-script.js     # push to the phone and run it
+xzh device logs -n 50             # show the phone's output
+xzh device stop                   # stop all scripts
+
+xzh device serve                  # the other direction: wait for AutoX.js to dial in
+xzh device apk                    # which AutoJs6 build to install, and where to get it
+```
+
+In-interface equivalents: `/device connect <phone-ip>` → `/device run <file>` → `/device logs`.
+When the bridge runs inside the xzh process, **phone logs stream into the right-hand terminal
+panel** (Shift+Tab to focus it) instead of flooding the conversation; `/device logs` prints the
+most recent lines back into the conversation.
+
+| Subcommand | Description |
+| --- | --- |
+| `xzh device connect <phone-ip>[:port]` | Connect to AutoJs6 server mode and stay running (default `7347`) |
+| `xzh device serve [--port N]` | The other direction: wait for AutoX.js (enter the printed `ws://` on the phone) |
+| `xzh device apk` | Detect the ABI to use and print the official download page |
+| `xzh device status` / `list` | Bridge status / connected devices (including which app) |
+| `xzh device push <file>` | Save to the phone (without running) |
+| `xzh device run <file>` | Save and run immediately |
+| `xzh device stop [<file>] [--all]` | Stop scripts (all by default) |
+| `xzh device logs [-n 50]` | Recent device logs |
+
+### First use
+
+The phone needs AutoJs6 installed (it provides the accessibility capability xzh drives).
+XuanZhu **does not bundle the APK**: each ABI is ~130 MB, so both would be 270 MB — bundling them
+would make every user download hundreds of megabytes extra while almost everyone needs only one.
+`xzh device apk` therefore only does three things:
+
+1. **Detects the ABI**: read from the device via `adb` (`ro.product.cpu.abi`) when available,
+   otherwise default to `arm64-v8a` (every phone since ~2018 is 64-bit ARM; `x86_64` is basically
+   emulators only);
+2. **Prints the official download page**: <https://github.com/SuperMonster003/AutoJs6/releases/>;
+3. **Checks the local cache**: a matching APK in `~/.xzh/apks/` is reported with its path, so it can
+   be installed without network access.
+
+When `xzh device connect` cannot connect, it prints the full "install the app → enable server mode →
+enter the IP" guide and **stops retrying** (three consecutive failures) instead of spinning forever
+against a mistyped address.
+
+- Common reasons a connection fails: AutoJs6 is in "client mode" instead of "server mode"; phone and
+  computer are on different subnets; the router has **AP isolation** enabled (devices on the same
+  WiFi cannot reach each other — the most common cause); the OS restricts AutoJs6 in the background
+  (OPPO / Xiaomi need background permission).
+- **Port conflict**: `serve` uses `9317`, the same port as the VSCode Auto.js extension —
+  **the two cannot run at once**.
+- **Single-file push only** (run / save / stop / logs); "zip the whole project and sync" is not
+  implemented.
+- On the AutoX.js side, if the phone reports a **handshake failure**: the app validates the PC-side
+  version number in the handshake reply and only understands the "Auto.js-Autox.js-VSCodeExt"
+  version sequence — XuanZhu reports the plugin protocol version (default `1.110.0`), overridable
+  with `XZH_DEVICE_PLUGIN_VERSION`.
+- Device operations are **not available to subagents** (there is one phone; parallel subagents
+  pushing scripts would interrupt each other).
+
 ## Project directory (.xuanzhu/)
 
 The first time you run `xzh` in a project, it creates `.xuanzhu/` at the project root to hold **project-level memory and rules** (the counterpart of CodeBuddy's `.codebuddy/memory/`):
@@ -443,7 +531,7 @@ A skill is a guide telling XuanZhu how to use a particular external CLI tool (`s
 | `aws` / `kubernetes` | Cloud resources and container orchestration | `aws` / `kubectl` |
 | `postgres` / `mysql` / `mongodb` / `redis` / `elasticsearch` | Databases | The respective client |
 | `sentry` / `datadog` | Monitoring and alerting | The respective CLI |
-| `gmail` / `email` / `telegram` | Email and messaging | The respective CLI |
+| `email` / `telegram` | Email and messaging | The respective CLI |
 
 ### Automatic dependency installation
 

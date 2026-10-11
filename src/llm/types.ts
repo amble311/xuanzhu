@@ -70,13 +70,27 @@ export type StreamChunk =
   | { type: "tool_call"; toolCall: ToolCall }
   | { type: "done"; finishReason?: string; usage?: Usage };
 
+/** 一次重试的上下文，供界面区分「从头重试」与「断连续传」 */
+export interface RetryInfo {
+  /**
+   * 是否为「已有部分输出后接着传」。
+   * false 表示尚未输出任何内容就失败，属于从头重试。
+   */
+  resumed: boolean;
+}
+
 export interface ChatOptions {
   messages: ChatMessage[];
   tools: ToolSpec[];
   temperature?: number;
   signal?: AbortSignal;
   /** 因瞬时网络错误而重试时回调（attempt 从 1 开始） */
-  onRetry?: (attempt: number, maxAttempts: number, error: Error) => void;
+  onRetry?: (
+    attempt: number,
+    maxAttempts: number,
+    error: Error,
+    info: RetryInfo,
+  ) => void;
 }
 
 export interface LLMProvider {

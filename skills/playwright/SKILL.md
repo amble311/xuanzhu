@@ -5,14 +5,7 @@ metadata:
   displayName: Playwright
   icon: browser
   category: browser-automation
-  version: 1.2.0
-  dependencies:
-    cli: playwright-cli
-    checkCommand: playwright-cli --version
-    install:
-      npm: npm install -g @playwright/cli@latest
-      # 仅当环境里没有可用的系统 Chrome / Edge，才需要 Playwright 自带内核
-      browsers: playwright-cli install-browser chromium
+  version: 1.3.0
 ---
 
 # playwright-cli
@@ -48,26 +41,19 @@ playwright-cli install-browser chromium
 
 | 优先级 | 取值 | 实际使用的浏览器 | 备注 |
 | --- | --- | --- | --- |
-| 1 | 系统默认浏览器对应的取值 | 视系统而定 | 若默认浏览器为 Chrome / Edge，就用对应的 `chrome` / `msedge`；为 Firefox 或 Safari 时**无法使用**（见下文） |
+| 1 | 系统默认浏览器对应的取值 | 视系统而定 | 若默认浏览器为 Chrome / Edge，就用对应的 `chrome` / `msedge`；为 Firefox 或 Safari 时**无法使用**（见 `references/browser-choice.md`） |
 | 2 | **`chrome`** | **系统安装的 Google Chrome** | ✅ 首选，真实二进制与版本号 |
 | 3 | **`msedge`** | **系统安装的 Microsoft Edge** | ✅ 同样走后系统安装 |
-| 4 | `firefox` | ⚠️ **Playwright 自带**的定制 Firefox | **不是系统 Firefox**，见下文 |
+| 4 | `firefox` | ⚠️ **Playwright 自带**的定制 Firefox | **不是系统 Firefox**，原因见 `references/browser-choice.md` |
 | 5 | `webkit` | Playwright 自带的 WebKit | 仅用于 Safari 兼容性验证 |
 | 6 | 不指定（默认） | Playwright 自带的 Chromium | 最后兜底 |
 
-### 为什么不要用自带的 Chromium
+**为什么默认 `chrome`**：不指定时启动的是自带的 Chromium，它带明显自动化特征
+（版本号不一致、缺插件、暴露 `navigator.webdriver`），Cloudflare / Akamai 等风控很容易据此拦截。
+换成系统安装的 Chrome / Edge 后指纹与普通用户一致，通过率显著提高。
+完整论证与边界见 `references/browser-choice.md`。
 
-不指定 `--browser` 时启动的是 Playwright 自带的 Chromium。它带有明显的自动化特征：
-版本号与官方发布版不一致、缺少常见插件、暴露 `navigator.webdriver` 等。
-Cloudflare、Akamai 以及各类风控系统很容易据此判定为机器人，返回验证页或直接拦截。
-
-改用**系统安装的 Chrome / Edge** 后，浏览器指纹与普通用户一致，通过率显著提高 ——
-这也是本技能把它列为默认选择的原因。
-
-### 必须避开 snap 版本（Linux）
-
-snap 包的浏览器运行在沙箱中，profile 目录写入、文件系统访问与 `--user-data-dir`
-都可能异常，导致启动失败或行为不一致。**选择前先确认目标浏览器不是 snap 安装**：
+**必须避开 snap 版本（Linux）** —— snap 沙箱会破坏 profile 写入与 `--user-data-dir`：
 
 ```bash
 for b in google-chrome google-chrome-stable microsoft-edge; do
@@ -79,30 +65,7 @@ for b in google-chrome google-chrome-stable microsoft-edge; do
 done
 ```
 
-若只有 snap 版本，**不要勉强使用**：宁可退回自带内核（`chromium`），也不要使用
-受沙箱限制的 snap 浏览器。
-
-### 关于 Firefox（重要限制）
-
-**`--browser firefox` 使用的不是系统安装的 Firefox，而是 Playwright 自带的定制构建**
-（位于 Playwright 的浏览器缓存目录，需先执行 `playwright-cli install-browser firefox`）。
-
-原因是 Playwright 依赖定制补丁实现的浏览器控制协议，系统原版 Firefox 无法被驱动。
-这一点对 Node 脚本同样成立：`channel: "firefox"` 依然指向自带构建，用 `executablePath`
-指向系统 Firefox 也无法工作。
-
-因此 **「使用系统已安装的 Firefox」在 Playwright 下是做不到的**。Firefox 的适用场景：
-需要验证 Gecko 引擎兼容性，或 Chromium 系被某站点针对性拦截时换一个引擎再试。
-
-### 与 Node 脚本的对应关系
-
-| CLI 取值 | Node 脚本写法 | 实际浏览器 |
-| --- | --- | --- |
-| `--browser chrome` | `chromium.launch({ channel: "chrome" })` | 系统 Chrome |
-| `--browser msedge` | `chromium.launch({ channel: "msedge" })` | 系统 Edge |
-| `--browser firefox` | `firefox.launch()` | 自带 Firefox |
-| `--browser webkit` | `webkit.launch()` | 自带 WebKit |
-| （不指定） | `chromium.launch()` | 自带 Chromium |
+若只有 snap 版本，**不要勉强使用**：宁可退回自带内核（`chromium`）。
 
 ## 基本用法
 
@@ -133,31 +96,18 @@ playwright-cli <command> --help
 4. 对每个关键步骤（尤其是失败场景）执行 `screenshot` 留存证据。
 5. 汇总结果：说明通过/失败的步骤，并给出截图文件路径。
 
-## 备选方案：Node 脚本
+## 需要时再读（按需 `read_file`，都在本技能目录下）
 
-当流程复杂（循环、条件、数据驱动）时，改用 Playwright 库编写脚本更合适。
-同样应优先指定 `channel`：
-
-```js
-const { chromium } = require("playwright");
-
-(async () => {
-  // channel: "chrome" → 使用系统安装的 Chrome（不要用默认的 bundled chromium）
-  const browser = await chromium.launch({ channel: "chrome" });
-  const page = await browser.newPage();
-  await page.goto("https://example.com");
-  await page.screenshot({ path: "shot.png" });
-  await browser.close();
-})();
-```
-
-若环境里没有系统 Chrome / Edge，再退回 `chromium.launch()`。
+| 你要做的事 | 读这个 |
+| --- | --- |
+| 搞清"为什么要用系统 Chrome / Edge"、snap 的坑、Firefox 为何只能用自带版、CLI 取值与 Node `channel` 的对应 | `references/browser-choice.md` |
+| 流程复杂（循环 / 条件 / 数据驱动）改用 Node 脚本 | `references/node-script.md` |
 
 ## 注意事项
 
 - 需要 Node.js >= 20。
 - **默认加 `--browser chrome`**：既避免使用带自动化特征的 bundled Chromium 被反爬拦截，
-  也省去下载内核的步骤（见「浏览器选择」）。
+  也省去下载内核的步骤。
 - 不要使用 snap 安装的浏览器（沙箱会破坏 profile 与文件访问）。
 - 无头模式是默认行为；只有在需要观察或调试时才使用 `--headed`。
 - 遇到验证码 / 风控页时，先确认是否漏了 `--browser chrome`，再考虑 `--headed` 人工介入。

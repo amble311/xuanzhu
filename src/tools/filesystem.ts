@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { snapshotForUndo } from "../utils/backups";
 import { expandHome } from "../utils/paths";
 import type { ToolDefinition, ToolResult } from "./types";
 
@@ -194,6 +195,9 @@ export const writeFileTool: ToolDefinition = {
     const target = resolvePath(asString(args.path), ctx.cwd);
     const content = asString(args.content);
     try {
+      // 写之前先快照（供 /undo 撤销）。覆盖已有文件才需要备份，
+      // 新建文件的撤销语义是「删除」，由 snapshotForUndo 内部区分
+      snapshotForUndo(target, ctx.cwd);
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.writeFileSync(target, content, "utf8");
       return {
@@ -298,6 +302,7 @@ export const editFileTool: ToolDefinition = {
       ? original.split(search).join(replace)
       : original.replace(search, () => replace);
 
+    snapshotForUndo(target, ctx.cwd); // 修改前先快照（供 /undo 撤销）
     fs.writeFileSync(target, updated, "utf8");
     return {
       ok: true,

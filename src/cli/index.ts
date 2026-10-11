@@ -16,6 +16,7 @@ import {
   validateProviderConfig,
 } from "../llm";
 import { friendlyError } from "../llm/http";
+import { deviceCommand } from "./commands/device";
 import { restoreTerminalSafely, TuiApp } from "../tui/app";
 import { ansi } from "../utils/ansi";
 import {
@@ -34,6 +35,7 @@ import {
 import { configCommand } from "./commands/config";
 import { modelCommand } from "./commands/model";
 import { setupCommand } from "./commands/setup";
+import { skillCommand } from "./commands/skill";
 
 // 版本号来自构建期注入（见 utils/version.ts），全项目只此一处来源
 
@@ -105,6 +107,12 @@ async function main(): Promise<void> {
       return;
     case "setup":
       await setupCommand();
+      return;
+    case "skill":
+      await skillCommand(args.slice(1));
+      return;
+    case "device":
+      await deviceCommand(args.slice(1));
       return;
     case "help":
     case "-h":
@@ -330,6 +338,15 @@ ${ansi.bold}用法${ansi.reset}
   ${ansi.green}xzh config path${ansi.reset}         打印配置文件路径
   ${ansi.green}xzh config init${ansi.reset}         生成默认配置文件
   ${ansi.green}xzh setup${ansi.reset}               检查并自动安装技能依赖（playwright / officecli 等）
+  ${ansi.green}xzh skill${ansi.reset}               交互式管理技能（启用 / 禁用 / 删除，禁用的技能对模型不可见）
+  ${ansi.green}xzh skill list${ansi.reset}          列出全部技能（含来源与状态）
+  ${ansi.green}xzh skill enable/disable <名称>${ansi.reset}
+                            启用 / 禁用技能
+  ${ansi.green}xzh skill delete <名称>${ansi.reset} 删除技能（仅限用户技能；内置技能请用 disable）
+  ${ansi.green}xzh device${ansi.reset}              与手机上的 AutoX.js / Auto.js 通信（设备桥）
+  ${ansi.green}xzh device serve${ansi.reset}        启动设备桥并常驻（手机连上后可推送脚本并运行）
+  ${ansi.green}xzh device run <文件>${ansi.reset}   把脚本推到手机并运行（push 则只保存不运行）
+  ${ansi.green}xzh device logs${ansi.reset}         查看手机上的脚本日志
   ${ansi.green}xzh --help${ansi.reset}              显示本帮助
   ${ansi.green}xzh --version${ansi.reset}           显示版本
 

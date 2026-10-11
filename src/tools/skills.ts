@@ -99,7 +99,14 @@ export const loadSkillTool: ToolDefinition = {
 
     return {
       ok: true,
-      content: `# 技能：${skill.name}\n\n${noteBlock}${content}`,
+      // 带上技能目录：技能可以「主文件 + 伴随文件」拆开写（见 docs/ARCHITECTURE.md 的技能系统），
+      // 主文件里只会写 `references/xxx.md` 这类相对路径，模型必须知道它相对谁，否则读不到。
+      content:
+        `# 技能：${skill.name}\n\n` +
+        `> 技能目录：${skill.dir}\n` +
+        `> 主文件里提到的伴随文件（如 \`references/*.md\`）都在此目录下，` +
+        `用 read_file 按「技能目录 + 相对路径」读取。\n\n` +
+        `${noteBlock}${content}`,
       summary:
         installedCount > 0
           ? `已加载 ${skill.name}（安装 ${installedCount} 项依赖）`

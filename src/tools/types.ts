@@ -1,4 +1,5 @@
-import type { JsonSchema } from "../llm/types";
+import type { DeviceBridge } from "../device/server";
+import type { ImageAttachment, JsonSchema } from "../llm/types";
 
 /** 任务项状态 */
 export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
@@ -49,6 +50,14 @@ export interface ToolContext {
   memoryMaxChars?: number;
   /** 派生子代理执行子任务（由 Agent 注入），未提供时 task 工具不可用 */
   spawnAgent?: (input: SubAgentInput) => Promise<ToolResult>;
+  /**
+   * 手机设备桥（由 Agent 注入）。
+   *
+   * 只有 **xzh 进程内**启动的桥才会出现在这里（TUI 的 `/device serve`）；
+   * 若桥跑在别的进程（`xzh device serve`），工具会回退到本地 HTTP 控制通道，
+   * 因此这个字段为空并不代表"用不了设备"，详见 `tools/device.ts`。
+   */
+  deviceBridge?: DeviceBridge;
 }
 
 /** 需要用户确认的请求 */
@@ -69,6 +78,15 @@ export interface ToolResult {
   content: string;
   /** 供界面展示的简短摘要 */
   summary?: string;
+  /**
+   * 工具产出的**图片**（如手机截图）。
+   *
+   * 为什么单独开一个字段：`content` 只能装文本，而"让模型看见手机屏幕"必须把**图片**
+   * 送进模型。Agent 会把这里的图片作为一条**额外的 user 消息**追加到工具结果之后
+   * —— 各家的 `tool` 消息都不接受图片，只有 `user` 消息能带图。
+   * 模型不支持视觉时，Agent 已有的"去掉图片重试"兜底会照常生效。
+   */
+  images?: ImageAttachment[];
 }
 
 export interface ToolDefinition {

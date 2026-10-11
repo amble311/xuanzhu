@@ -6,19 +6,6 @@ metadata:
   icon: postgres
   category: databases
   version: 1.0.0
-  dependencies:
-    cli: psql
-    checkCommand: psql --version
-    bundledInstall: skills/postgres/install.sh
-    install:
-      darwin:
-        brew: postgresql
-      linux:
-        apt: postgresql-client
-      windows:
-        scoop: postgresql
-  auth:
-    type: none
 ---
 
 # psql
@@ -42,3 +29,6 @@ Use `psql` to interact with PostgreSQL databases.
 ## Notes
 
 - Requires `psql` to be installed in the environment.
+- xzh does **not** install the `psql` client for you (only `playwright` and `officecli` are
+  auto-installed) — install it yourself, e.g. `brew install libpq` (macOS, then add `psql` to PATH),
+  `sudo apt install postgresql-client` (Debian / Ubuntu), `sudo dnf install postgresql` (RHEL).

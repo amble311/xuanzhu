@@ -1,6 +1,7 @@
 export * from "./types";
 
 import { codeExplorer } from "./code-explorer";
+import { testRunner } from "./test-runner";
 import type { SubAgentDefinition } from "./types";
 
 /**
@@ -9,7 +10,7 @@ import type { SubAgentDefinition } from "./types";
  * **新增子代理**：实现 `SubAgentDefinition` 后加进这个数组即可 ——
  * `task` 工具的参数枚举、可用工具白名单与系统提示词都会自动跟随。
  */
-export const SUBAGENTS: SubAgentDefinition[] = [codeExplorer];
+export const SUBAGENTS: SubAgentDefinition[] = [codeExplorer, testRunner];
 
 /** 未指定 `subagent_name` 时使用的子代理 */
 export const DEFAULT_SUBAGENT_NAME = SUBAGENTS[0].name;

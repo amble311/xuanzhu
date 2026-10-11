@@ -9,7 +9,10 @@ import {
   type XuanZhuConfig,
 } from "../config/store";
 import {
+  calibrateBudget,
+  calibratorFor,
   createProvider,
+  estimateMessageTokens,
   IMAGE_FALLBACK_TEXT,
   isConfigError,
   isContextLengthError,
@@ -18,6 +21,7 @@ import {
   resolveConversationBudget,
   stripAllImages,
   stripStaleImages,
+  type TokenCalibrator,
   trimMessagesToBudget,
 } from "../llm";
 import { friendlyError } from "../llm/http";
@@ -27,6 +31,7 @@ import type {
   LLMProvider,
   ToolCall,
 } from "../llm/types";
+import { appendSessionMessages } from "./sessions";
 import {
   executeTool,
   findTool,
@@ -43,6 +48,7 @@ import type {
   ToolDefinition,
   ToolResult,
 } from "../tools/types";
+import type { DeviceBridge } from "../device";
 import { findSubAgent, subAgentNames } from "../subagents";
 import { mapWithConcurrency } from "../utils/concurrency";
 import { expandHome, getConfigPath } from "../utils/paths";
@@ -111,6 +117,18 @@ export interface AgentOptions {
   tools?: ToolDefinition[];
   /** 覆盖系统提示词（子代理使用；不传则按项目规则 + 项目记忆生成） */
   systemPrompt?: string;
+  /**
+   * 工具轮数上限覆盖（默认用 config.maxToolRounds）。
+   *
+   * 子代理不接受「到上限问用户」——到顶即收尾；且并行子代理**各有配额**，
+   * 主配置的 200 轮叠加并发会把最坏情况放大数倍，因此给子代理更紧的默认值。
+   */
+  maxToolRounds?: number;
+  /**
+   * 会话文件（JSONL，见 src/core/sessions.ts）：设置后每次提交历史都会
+   * **增量追加**到该文件，退出 / 崩溃后可用 `/resume` 恢复。只有主代理会传。
+   */
+  sessionFile?: string;
 }
 
 /**
@@ -194,6 +212,17 @@ const EXPLORATION_REMINDER_CHARS = 40_000;
 const MAX_SUBAGENT_REPORT_CHARS = 20_000;
 
 /**
+ * 子代理的**默认**工具轮数上限（覆盖 config.maxToolRounds，可用
+ * `AgentOptions.maxToolRounds` 再覆盖）。
+ *
+ * 之所以不给子代理用主配置的 200 轮：子代理不接受「到上限问用户」
+ * （`onRoundLimit` 恒为 false，到顶即收尾），而且并行子代理**各有配额** ——
+ * 并发 4 个时最坏情况会被放大数倍。取 60：一次聚焦的调研（翻几十个文件）
+ * 通常足够；真不够时主代理会看到「子代理达到轮数上限」的警告，可拆小任务重试。
+ */
+const SUBAGENT_MAX_TOOL_ROUNDS = 60;
+
+/**
  * 子代理并发数的**硬上限**。
  *
  * `config.maxParallelAgents` 可以调，但再大也不会超过这里 —— 每个并行子代理
@@ -219,8 +248,20 @@ export class Agent {
   private readonly tools?: ToolDefinition[];
   /** 覆盖的系统提示词（子代理使用） */
   private readonly systemPromptOverride?: string;
+  /** 工具轮数上限覆盖（子代理用；未设置时取 config.maxToolRounds） */
+  private readonly maxToolRoundsOverride?: number;
+  /** 会话文件（主代理用）；设置后每次提交历史都增量追加（见 src/core/sessions.ts） */
+  private sessionFile: string | undefined;
   /** 当前会话的任务列表（todo_write 维护），随会话结束而丢弃 */
   private todos: TodoItem[] = [];
+  /**
+   * 手机设备桥（由界面在 `/device serve` 时注入）。
+   *
+   * 为空表示"xzh 进程内没有桥"—— 工具会回退到本地 HTTP 控制通道，
+   * 因此用户在另一个终端跑 `xzh device serve` 时同样可用（见 `tools/device.ts`）。
+   */
+  private deviceBridge?: DeviceBridge;
+
   /**
    * 构造 / 切换目录时自动精简记忆产生的提示。
    *
@@ -244,6 +285,8 @@ export class Agent {
     this.activeModel = activeModel ?? pickModel(config);
     this.tools = options?.tools;
     this.systemPromptOverride = options?.systemPrompt;
+    this.maxToolRoundsOverride = options?.maxToolRounds;
+    this.sessionFile = options?.sessionFile;
     this.systemPrompt = this.composeSystemPrompt();
   }
 
@@ -313,9 +356,34 @@ export class Agent {
     }
   }
 
+  /**
+   * 提交消息进历史；设置了会话文件时**增量追加**到 JSONL
+   * （图片降级为占位 —— 见 src/core/sessions.ts 的模块注释）。
+   * 所有进入 history 的路径都必须走这里，保证会话文件与内存一致。
+   */
+  private appendHistory(messages: ChatMessage[]): void {
+    for (const message of messages) this.history.push(message);
+    if (this.sessionFile) appendSessionMessages(this.sessionFile, messages);
+  }
+
+  /**
+   * 恢复会话（`/resume`）：整体替换历史，并把消息写入新的会话文件
+   * （此后继续增量记录；旧文件保留为存档）。
+   */
+  restoreSession(messages: ChatMessage[], sessionFile: string): void {
+    this.history = [...messages];
+    this.sessionFile = sessionFile;
+    appendSessionMessages(sessionFile, messages);
+  }
+
   /** 当前任务列表（供界面或测试查询） */
   getTodos(): TodoItem[] {
     return this.todos;
+  }
+
+  /** 注入 / 撤销设备桥（界面在 `/device serve` 与 `/device stop` 时调用） */
+  setDeviceBridge(bridge?: DeviceBridge): void {
+    this.deviceBridge = bridge;
   }
 
   /**
@@ -364,11 +432,23 @@ export class Agent {
    * `images` 为用户随本轮消息附带的图片（多模态输入）；只在**本轮**携带，
    * 历史里的旧图片会在组装请求时降级为文本占位（见 `stripStaleImages`）。
    */
+  /**
+   * 本轮运行**非正常收尾**的原因；正常给出答复后为 `undefined`。
+   *
+   * 主代理自己有 onNotice 就能告知用户；但**子代理**的中止发生在独立实例上，
+   * 主代理只能拿到它的文本回报 —— 不把原因暴露出来，一份烂尾报告
+   * （比如因重复调用被中止前吐出的半截结论）就会被当成正常结论继续使用。
+   * spawnSubAgent 据此在回报里加警告。
+   */
+  private abortReason: string | undefined;
+
   async run(
     userInput: string,
     signal?: AbortSignal,
     images?: ImageAttachment[],
   ): Promise<void> {
+    // Agent 实例可能被复用（同一实例多次 run），先清掉上一轮的中止原因
+    this.abortReason = undefined;
     let content = userInput;
 
     // 补发构造 / 切换目录期间攒下的提示（构造时终端尚未接管，不能当场写输出区）
@@ -429,12 +509,16 @@ export class Agent {
       },
     ];
 
-    // maxToolRounds 为 0 / 负数时也要至少执行一次，否则用户只会看到「已达上限」而无任何回复
-    const maxRounds = Math.max(1, Math.floor(this.config.maxToolRounds) || 1);
+    // maxToolRounds 为 0 / 负数时也要至少执行一次，否则用户只会看到「已达上限」而无任何回复。
+    // 子代理可经 AgentOptions.maxToolRounds 覆盖（并行子代理各有配额，默认值应比主代理紧）
+    const maxRounds = Math.max(
+      1,
+      Math.floor(this.maxToolRoundsOverride ?? this.config.maxToolRounds) || 1,
+    );
 
-    /** 成功收尾：把本轮全部消息提交进历史 */
+    /** 成功收尾：把本轮全部消息提交进历史（并增量写入会话文件） */
     const commitTurn = (): void => {
-      for (const message of turn) this.history.push(message);
+      this.appendHistory(turn);
       this.trimHistory();
     };
 
@@ -470,7 +554,7 @@ export class Agent {
 
       // 只剩一条 user 说明本轮什么都没做成，整体不提交，避免留下孤立 user
       if (done.length > 1) {
-        for (const message of done) this.history.push(message);
+        this.appendHistory(done);
         this.trimHistory();
       }
     };
@@ -659,6 +743,7 @@ export class Agent {
                 `· 可调大该模型的上下文窗口：xzh model context <id> <大小>\n` +
                 `· 也可以把任务拆小，或直接说「不要重复调用 ${call.name}」`,
             );
+            this.abortReason = "陷入重复调用（自我修正无效）";
             return;
           }
 
@@ -757,6 +842,20 @@ export class Agent {
             toolCallId: call.id,
             name: call.name,
           });
+
+          // 工具产出的图片（如手机截图）→ 作为一条**额外的 user 消息**追加。
+          //
+          // 为什么不塞进上面的 tool 消息：各家的 tool/function 消息都**不接受图片**，
+          // 只有 user 消息能带图。放在紧随其后的位置，模型看到的就是
+          // "工具说'图在这里' → 紧接着一张图"。
+          // 模型不支持视觉时，下面 streamAssistant 里已有的"去掉图片重试"兜底会生效。
+          if (result.images && result.images.length > 0) {
+            turn.push({
+              role: "user",
+              content: `（上面 ${call.name} 的返回附带了 ${result.images.length} 张图片）`,
+              images: result.images,
+            });
+          }
           this.events.onToolEnd(call, result);
           if (signal?.aborted) {
             commitPartialTurn();
@@ -795,14 +894,19 @@ export class Agent {
             ? `· 本轮共 ${totalCalls} 次工具调用：${usageText}\n`
             : "") +
           `· 若模型在反复做同一件事，通常早已被重复调用检测提前中止\n` +
-          `· 想调大上限：编辑 ${getConfigPath()} 里的 maxToolRounds（当前 ${this.config.maxToolRounds}）\n` +
+          // 子代理的上限来自代码里的默认值而非用户配置，"去改 config"的指引对它无意义
+          (this.maxToolRoundsOverride
+            ? `· 该上限是子代理的默认值（${maxRounds} 轮）：需要更长调研时，请在主对话里把任务拆小\n`
+            : `· 想调大上限：编辑 ${getConfigPath()} 里的 maxToolRounds（当前 ${this.config.maxToolRounds}）\n`) +
           `· 或把任务拆成更小的步骤，每步单独提一次`,
       );
+      this.abortReason = "达到工具调用上限";
     } catch (err) {
       // 中断也可能以异常形式到达（provider 在 abort 时 reject）
       commitPartialTurn();
       if (signal?.aborted) {
         this.events.onStatus("已中断");
+        this.abortReason = "已被用户中断";
         return;
       }
       throw err;
@@ -876,6 +980,13 @@ export class Agent {
       ...conversation,
     ];
 
+    // 本次请求的**输入侧估算**：用于和 provider 返回的真实 usage 比对，
+    // 回填校正估算误差（见 calibration.ts 的闭环说明）。
+    const estimatedInput = messages.reduce(
+      (sum, message) => sum + estimateMessageTokens(message),
+      0,
+    );
+
     let text = "";
     const toolCalls: ToolCall[] = [];
     // 是否已经产出过内容：已产出时不再换模型重试，避免重复输出
@@ -887,9 +998,13 @@ export class Agent {
         tools: getToolSpecs(this.tools),
         temperature: this.config.temperature,
         signal,
-        onRetry: (retryAttempt, maxAttempts, error) => {
+        onRetry: (retryAttempt, maxAttempts, error, info) => {
+          // 区分「还没输出就失败」与「输出到一半断连后续传」——
+          // 后者调用方已经看到了部分内容，提示必须说明是接着传而不是重来
           this.events.onStatus(
-            `网络中断，正在重试 (${retryAttempt}/${maxAttempts})`,
+            info.resumed
+              ? `响应中断，正在续传 (${retryAttempt}/${maxAttempts})`
+              : `网络中断，正在重试 (${retryAttempt}/${maxAttempts})`,
             friendlyError(error).split("\n")[0],
           );
         },
@@ -918,6 +1033,11 @@ export class Agent {
             toolCalls.push(chunk.toolCall);
             break;
           case "done":
+            // 真实 usage 回填：把「本次估算 vs 服务端实际计入」的偏差记进校正器，
+            // 下一次组装请求时据此收紧预算（只收紧、不放宽）。
+            if (chunk.usage?.inputTokens) {
+              this.tokenCalibrator().observe(estimatedInput, chunk.usage.inputTokens);
+            }
             break;
         }
       }
@@ -1173,6 +1293,7 @@ export class Agent {
       todos: this.todoStore(),
       memoryMaxChars: this.config.memoryMaxChars,
       spawnAgent: (input) => this.spawnSubAgent(input, signal),
+      deviceBridge: this.deviceBridge,
     };
 
     return executeTool(call.name, call.arguments, ctx, this.tools);
@@ -1299,16 +1420,34 @@ export class Agent {
         description: input.description,
         prompt: input.prompt,
       }),
+      maxToolRounds: SUBAGENT_MAX_TOOL_ROUNDS,
     });
 
-    await child.run(input.prompt, signal);
+    try {
+      await child.run(input.prompt, signal);
+    } catch (err) {
+      // 带上中止原因（如「已被用户中断」），让主代理与用户能区分
+      // 「模型调用失败」与「正常中断/达到上限」这两种完全不同的情形
+      const reason = child.abortReason ? `（${child.abortReason}）` : "";
+      throw new Error(
+        `${reason}${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    // 子代理被中止（重复调用 / 轮数上限 / 用户中断）时，它吐出的文本是**烂尾**的：
+    // 不加说明的话，主代理会把不完整的结论当成正常结论继续往下干活。
+    const abortedNotice = child.abortReason
+      ? `⚠ 子代理${child.abortReason}，以下内容可能不完整 —— ` +
+        `必要时用更聚焦的 prompt 重试，或由你自己完成。\n\n`
+      : "";
 
     const report = output.trim();
     if (!report) {
       return {
         ok: false,
         content:
-          `${definition.name} 子代理未返回任何结论（可能被中断或在给出答复前用尽了轮次）。` +
+          `${definition.name} 子代理未返回任何结论` +
+          `${child.abortReason ? `（${child.abortReason}）` : "（可能被中断或在给出答复前用尽了轮次）"}。` +
           "可改用更聚焦的 prompt 重试，或直接自己完成。",
         summary: `子代理未返回结论：${input.description}`,
       };
@@ -1321,22 +1460,36 @@ export class Agent {
         : report;
     return {
       ok: true,
-      content: `${definition.name} 子代理「${input.description}」的结论：\n\n${clipped}`,
-      summary: `子代理完成：${input.description}`,
+      content: `${abortedNotice}${definition.name} 子代理「${input.description}」的结论：\n\n${clipped}`,
+      summary: `${child.abortReason ? `子代理中止（${child.abortReason}）` : `子代理完成`}：${input.description}`,
     };
+  }
+
+  /**
+   * 当前模型对应的 token 估算校正器。
+   *
+   * 按模型 id 取、**进程内共享** —— 主代理与并行子代理用的是同一个实例，
+   * 观测样本能互相累积（子代理的请求同样会回填真实 usage）。
+   */
+  private tokenCalibrator(): TokenCalibrator {
+    const key = this.activeModel?.id ?? this.provider.model;
+    return calibratorFor(key);
   }
 
   /**
    * 会话部分（不含 system prompt）可用的 token 预算。
    *
    * 随当前模型变化：切换模型后窗口不同，预算需重新计算。
+   * 再叠加**真实 usage 回填**得到的收紧系数 —— 估算系统性偏低时提前裁剪，
+   * 而不是等到撞上 400 再靠 `CONTEXT_RETRY_BUDGET_RATIO` 收敛重试。
    */
   private conversationBudget(): number {
-    return resolveConversationBudget(
+    const raw = resolveConversationBudget(
       this.activeModel?.contextWindow,
       this.activeModel?.model ?? "",
       this.systemPrompt,
     );
+    return calibrateBudget(raw, this.tokenCalibrator().factor());
   }
 
   /**

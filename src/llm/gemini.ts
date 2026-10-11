@@ -7,7 +7,7 @@ import {
   type Part,
   type Tool,
 } from "@google/generative-ai";
-import { delay, isRetryableError } from "./http";
+import { StreamEmitter, withRetry } from "./stream-retry";
 import { IMAGE_FALLBACK_TEXT } from "./vision";
 import type {
   ChatMessage,
@@ -25,9 +25,7 @@ export interface GeminiConfig {
   model: string;
 }
 
-const MAX_ATTEMPTS = 3;
-
-/** Google Gemini Provider（流式 + function calling，含瞬时错误重试） */
+/** Google Gemini Provider（流式 + function calling，重试与断连续传见 stream-retry.ts） */
 export class GeminiProvider implements LLMProvider {
   public readonly id: string;
   public readonly model: string;
@@ -43,40 +41,12 @@ export class GeminiProvider implements LLMProvider {
   }
 
   async *chat(options: ChatOptions): AsyncIterable<StreamChunk> {
-    let lastError: unknown;
-
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      let emitted = false;
-      try {
-        yield* this.streamOnce(options, () => {
-          emitted = true;
-        });
-        return;
-      } catch (error) {
-        lastError = error;
-        if (
-          emitted ||
-          options.signal?.aborted ||
-          attempt >= MAX_ATTEMPTS ||
-          !isRetryableError(error)
-        ) {
-          throw error;
-        }
-        options.onRetry?.(
-          attempt,
-          MAX_ATTEMPTS,
-          error instanceof Error ? error : new Error(String(error)),
-        );
-        await delay(attempt * 600);
-      }
-    }
-
-    throw lastError;
+    yield* withRetry(options, (emit) => this.streamOnce(options, emit));
   }
 
   private async *streamOnce(
     options: ChatOptions,
-    markEmitted: () => void,
+    emit: StreamEmitter,
   ): AsyncIterable<StreamChunk> {
     const genAI = new GoogleGenerativeAI(this.apiKey);
     const { system, contents } = toGeminiContents(options.messages);
@@ -112,14 +82,14 @@ export class GeminiProvider implements LLMProvider {
       if (options.signal?.aborted) break;
       const text = safeText(chunk);
       if (text) {
-        markEmitted();
-        yield { type: "text", text };
+        const out = emit.text(text);
+        if (out) yield { type: "text", text: out };
       }
 
       const calls = safeFunctionCalls(chunk);
       for (const call of calls) {
         sawToolCall = true;
-        markEmitted();
+        if (!emit.toolCall()) continue;
         yield {
           type: "tool_call",
           toolCall: {
@@ -139,7 +109,6 @@ export class GeminiProvider implements LLMProvider {
       }
     }
 
-    if (sawToolCall) markEmitted();
     yield {
       type: "done",
       finishReason: sawToolCall ? "tool_calls" : "stop",

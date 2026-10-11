@@ -6,35 +6,6 @@ metadata:
   icon: alert-circle
   category: monitoring
   version: 1.0.0
-  dependencies:
-    cli: sentry-cli
-    checkCommand: sentry-cli --version
-    install:
-      darwin:
-        brew: getsentry/tools/sentry-cli
-        script: curl -sL https://sentry.io/get-cli/ | bash
-      linux:
-        script: curl -sL https://sentry.io/get-cli/ | bash
-      windows:
-        scoop: sentry-cli
-        npm: "@sentry/cli"
-  config:
-    - name: SENTRY_ORG
-      label: Organization
-      type: string
-      required: true
-      placeholder: your-org-slug
-    - name: SENTRY_PROJECT
-      label: Project
-      type: string
-      required: true
-      placeholder: your-project-slug
-    - name: SENTRY_AUTH_TOKEN
-      label: Auth Token
-      type: secret
-      required: true
-  auth:
-    type: api-key
 ---
 
 # sentry-cli
@@ -56,4 +27,7 @@ Use `sentry-cli` to interact with Sentry.
 ## Notes
 
 - Requires `sentry-cli` to be installed.
+- xzh does **not** install `sentry-cli` for you (only `playwright` and `officecli` are
+  auto-installed) — install it yourself: <https://docs.sentry.io/cli/>
+  (macOS: `brew install getsentry/tools/sentry-cli`).
 - Requires `SENTRY_AUTH_TOKEN` and `SENTRY_ORG` environment variables or configuration.

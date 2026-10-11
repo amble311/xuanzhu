@@ -2,6 +2,12 @@ import * as fs from "fs";
 import * as path from "path";
 import { Agent, type AgentEvents } from "../core/agent";
 import {
+  listSessions,
+  loadSessionMessages,
+  startSession,
+} from "../core/sessions";
+import { undoLastChange } from "../utils/backups";
+import {
   effectiveModels,
   saveConfig,
   type ModelEntry,
@@ -9,6 +15,16 @@ import {
 } from "../config/store";
 import { findProvider } from "../llm";
 import { friendlyError } from "../llm/http";
+import {
+  AUTOJS6_APP_SERVER_PORT,
+  AUTOJS6_PC_SERVER_PORT,
+  buildDeviceSetupGuide,
+  detectAndroidAbi,
+  DeviceBridge,
+  findLocalApk,
+  isRunningOnAndroid,
+  resolveDevicePort,
+} from "../device";
 import { modelSupportsVision, type ImageAttachment } from "../llm";
 import type { LLMProvider, ToolCall } from "../llm/types";
 import { clipboardRequirements, currentPlatform } from "../skills/dependencies";
@@ -112,6 +128,8 @@ export class TuiApp {
   private readonly agent: Agent;
   private readonly markdown = new MarkdownRenderer();
   private cwd: string;
+  /** 当前会话文件（JSONL）；/reset 与 /resume 会切换它 */
+  private currentSessionFile: string;
 
   /** 当前模型（可能因失败降级而切换） */
   private modelProviderLabel: string;
@@ -126,6 +144,13 @@ export class TuiApp {
   private statusDetail = "";
   /** 当前任务列表（todo_write），显示在顶部信息区 */
   private todoItems: TodoItem[] = [];
+  /**
+   * 手机设备桥（`/device serve` 启动）。
+   *
+   * 桥跑在 xzh 进程内，同时注入给 Agent（见 `setDeviceBridge`），
+   * 于是 Agent 的 `device_*` 工具和界面用的是同一个桥。
+   */
+  private deviceBridge?: DeviceBridge;
   /**
    * 本轮待发送的图片附件，key 为输入框里占位标记 `[图片N]` 中的编号。
    *
@@ -275,12 +300,16 @@ export class TuiApp {
           danger: false,
         }),
     };
+    // 会话持久化：每次提交历史都会增量写入该 JSONL，崩溃 / 退出后可用 /resume 恢复
+    const sessionFile = startSession(options.cwd, VERSION);
+    this.currentSessionFile = sessionFile;
     this.agent = new Agent(
       options.provider,
       options.config,
       options.cwd,
       events,
       options.activeModel,
+      { sessionFile },
     );
   }
 
@@ -441,6 +470,11 @@ export class TuiApp {
   private shutdown(): void {
     if (this.exited) return;
     this.exited = true;
+    // 设备桥持有监听中的 http/ws 句柄 —— 不关掉事件循环不会空，进程会退不出去
+    const bridge = this.deviceBridge;
+    this.deviceBridge = undefined;
+    this.agent.setDeviceBridge(undefined);
+    void bridge?.stop();
     // 右侧终端里的命令以 detached 独立进程组运行，不主动终止会成为孤儿进程
     this.term.dispose();
     this.exitTerminal();
@@ -1620,6 +1654,10 @@ export class TuiApp {
       case "tools":
         this.printTools();
         break;
+      case "device":
+        // 手机设备桥（AutoX.js）：启动 / 查看 / 推脚本 / 看日志。异步，故不阻塞按键处理。
+        void this.handleDeviceCommand(arg);
+        break;
       case "copy":
         this.copyOutput(arg);
         break;
@@ -1635,7 +1673,16 @@ export class TuiApp {
         break;
       case "reset":
         this.agent.reset();
+        // 重置后开一个新的会话文件：旧文件保留为存档，/resume 仍能找回重置前的对话
+        this.currentSessionFile = startSession(this.cwd, VERSION);
+        this.agent.restoreSession([], this.currentSessionFile);
         this.lines.push(`${ansi.gray}会话已重置。${ansi.reset}`);
+        break;
+      case "undo":
+        this.lines.push(undoLastChange(this.cwd));
+        break;
+      case "resume":
+        this.handleResumeCommand(arg);
         break;
       case "exit":
       case "quit":
@@ -1737,6 +1784,64 @@ export class TuiApp {
         this.lines.push(`${ansi.yellow}未知命令：/${command}，输入 /help 查看帮助。${ansi.reset}`);
     }
     this.scheduleRender();
+  }
+
+  /**
+   * /resume —— 恢复历史会话。
+   *
+   * 不带参数：列出当前项目的会话（新的在前），提示用 `/resume <编号>` 恢复；
+   * 带编号：整体替换对话历史，并开启**新的**会话文件继续增量记录
+   * （旧文件保留为存档，恢复后的内容不写入旧文件）。
+   *
+   * 之所以不用交互式选择器：TUI 常驻 raw 模式并有自有按键处理，
+   * 与 promptSelect 的按键监听会互相干扰；「先列表后带编号」是同一套输入框就能完成的交互。
+   */
+  private handleResumeCommand(arg: string): void {
+    const sessions = listSessions(this.cwd).filter(
+      (session) => session.file !== this.currentSessionFile,
+    );
+    if (sessions.length === 0) {
+      this.lines.push(`${ansi.gray}没有可恢复的历史会话。${ansi.reset}`);
+      return;
+    }
+
+    if (!arg) {
+      this.lines.push(
+        `${ansi.bold}历史会话${ansi.reset} ${ansi.gray}(新的在前，输入 /resume <编号> 恢复)${ansi.reset}`,
+      );
+      sessions.slice(0, 10).forEach((session, index) => {
+        const when = session.startedAt ?? "未知时间";
+        this.lines.push(
+          `  ${index + 1}. ${ansi.cyan}${when}${ansi.reset} ${ansi.gray}· ${ansi.reset}${(session.bytes / 1024).toFixed(1)} KB`,
+        );
+      });
+      return;
+    }
+
+    const index = Number.parseInt(arg, 10) - 1;
+    const picked = Number.isInteger(index) ? sessions[index] : undefined;
+    if (!picked) {
+      this.lines.push(
+        `${ansi.yellow}无效编号：${arg}。先运行 /resume 查看列表。${ansi.reset}`,
+      );
+      return;
+    }
+
+    const messages = loadSessionMessages(picked.file);
+    if (messages.length === 0) {
+      this.lines.push(
+        `${ansi.yellow}该会话文件里没有可恢复的消息。${ansi.reset}`,
+      );
+      return;
+    }
+
+    const file = startSession(this.cwd, VERSION);
+    this.currentSessionFile = file;
+    this.agent.restoreSession(messages, file);
+    this.lines.push(
+      `${ansi.green}✓ 已恢复 ${messages.length} 条消息的对话历史。${ansi.reset}`,
+      `${ansi.gray}继续对话即可；此后内容会写入新的会话文件。${ansi.reset}`,
+    );
   }
 
   /** 切换当前工作目录（/switch） */
@@ -1904,6 +2009,327 @@ export class TuiApp {
   }
 
   /**
+   * 构造设备桥（含事件接线），供 `/device serve` 与 `/device connect` 共用。
+   *
+   * 事件分工：**设备上下线进对话区**（重要、低频），**脚本日志只进右侧面板**
+   * （console.log 可能很密，刷进对话区会把正文淹掉）。
+   */
+  private createDeviceBridge(controlPort: number): DeviceBridge {
+    return new DeviceBridge({
+      port: controlPort,
+      baseDir: this.cwd,
+      // 桥自身的状态只进右侧面板：启动信息下面会单独排版，避免重复刷对话区
+      onStatus: (message) => this.term.notice(`${ansi.gray}${message}${ansi.reset}`),
+      onDeviceAttach: (device) => {
+        const kind = device.kind === "autojs6" ? "AutoJs6" : "AutoX.js";
+        this.handleNotice(`设备已连接：${device.name}（${kind}）`);
+        this.term.notice(
+          `${ansi.brightGreen}●${ansi.reset} 设备已连接：${ansi.bold}${device.name}${ansi.reset}` +
+            `${ansi.gray}（${kind}）${ansi.reset}`,
+        );
+      },
+      onDeviceDetach: (device) => {
+        this.handleNotice(`设备已断开：${device.name}`);
+        this.term.notice(`${ansi.yellow}○${ansi.reset} 设备已断开：${device.name}`);
+      },
+      onLog: (entry) =>
+        this.term.notice(
+          `${ansi.gray}[${entry.device}]${ansi.reset} ${sanitizeControl(entry.text)}`,
+        ),
+    });
+  }
+
+  /** 把「首次连接手机」的引导打进对话区（ABI 探测 + 官方下载地址 + 本机缓存） */
+  private pushDeviceSetupGuide(address?: string): void {
+    const detection = detectAndroidAbi();
+    const guide = buildDeviceSetupGuide({
+      where: isRunningOnAndroid() ? "phone" : "pc",
+      abi: detection.abi,
+      address,
+      localApk: findLocalApk(detection.abi),
+    });
+    this.lines.push(
+      `${ansi.yellow}需要先装 AutoJs6${ansi.reset}${ansi.gray}（${detection.detail}）${ansi.reset}`,
+    );
+    for (const line of guide.split("\n")) {
+      if (line) this.lines.push(`${ansi.gray}  ${line}${ansi.reset}`);
+    }
+  }
+
+  /**
+   * `/device` —— 手机设备桥（AutoX.js / Auto.js）。
+   *
+   * 与 `xzh device` 的 CLI 子命令等价，区别是桥跑在**本进程内**：
+   *   - 手机端连上后，脚本日志实时显示在**右侧终端面板**（不刷进对话区）；
+   *   - 桥实例同时交给 Agent，于是可以直接说"把这个脚本推到手机跑一遍"。
+   *
+   * 用法：`/device`（状态） · `/device serve [端口]` · `/device stop` ·
+   *       `/device list` · `/device push <文件>` · `/device run <文件>` · `/device logs [N]`
+   */
+  private async handleDeviceCommand(arg: string): Promise<void> {
+    const [sub, ...rest] = arg.trim().split(/\s+/);
+    const value = rest.join(" ").trim();
+    const bridge = this.deviceBridge;
+
+    switch (sub) {
+      case "":
+      case "status": {
+        if (!bridge?.isRunning() && !bridge?.status().autojs6) {
+          this.lines.push(`${ansi.yellow}设备桥未启动${ansi.reset}`);
+          this.lines.push(
+            `${ansi.gray}  · 连接 AutoJs6（推荐）：/device connect <手机IP>（手机本机运行时不用填）${ansi.reset}`,
+          );
+          this.lines.push(
+            `${ansi.gray}  · 或等 AutoX.js 连过来：/device serve${ansi.reset}`,
+          );
+          break;
+        }
+        const status = bridge.status();
+        this.lines.push(
+          `${ansi.brightGreen}●${ansi.reset} 设备桥运行中 ${ansi.gray}端口 ${status.port}${ansi.reset}`,
+        );
+        if (status.autojs6) {
+          this.lines.push(
+            `${ansi.gray}  AutoJs6：${ansi.reset}${status.autojs6.address} ` +
+              (status.autojs6.connected
+                ? `${ansi.brightGreen}已连接${ansi.reset}`
+                : `${ansi.yellow}连接中/等待重试${ansi.reset}`),
+          );
+        }
+        for (const url of status.urls) {
+          this.lines.push(`${ansi.gray}  手机端 AutoX.js 填写：${ansi.reset}${url}`);
+        }
+        this.lines.push(
+          `${ansi.gray}  已连接设备：${ansi.reset}${status.devices.length}`,
+        );
+        for (const device of status.devices) {
+          const kind = device.kind === "autojs6" ? "AutoJs6" : "AutoX.js";
+          this.lines.push(
+            `    ${ansi.cyan}${device.name}${ansi.reset} ${ansi.gray}${device.id} · ${kind}${ansi.reset}`,
+          );
+        }
+        break;
+      }
+
+      case "connect": {
+        if (bridge?.isRunning() || bridge?.status().autojs6) {
+          this.lines.push(
+            `${ansi.yellow}设备桥已在运行${ansi.reset}${ansi.gray}（先 /device stop 再连）${ansi.reset}`,
+          );
+          break;
+        }
+        const onPhone = isRunningOnAndroid();
+        let host = "";
+        let port = AUTOJS6_APP_SERVER_PORT;
+        if (value) {
+          const match = /^(.*?)(?::(\d+))?$/.exec(value);
+          host = (match?.[1] ?? value).trim();
+          const parsedPort = match?.[2] ? Number.parseInt(match[2], 10) : NaN;
+          if (Number.isFinite(parsedPort)) port = parsedPort;
+        } else if (onPhone) {
+          // 手机本机运行：AutoJs6 就在同一台设备上，不必让用户去查 IP
+          host = "127.0.0.1";
+        }
+
+        if (!host) {
+          this.lines.push(
+            `${ansi.gray}用法：/device connect <手机IP>[:端口]（默认 ${AUTOJS6_APP_SERVER_PORT}）${ansi.reset}`,
+          );
+          this.pushDeviceSetupGuide();
+          break;
+        }
+
+        const created = this.createDeviceBridge(resolveDevicePort());
+        try {
+          await created.connectAutoJs6(host, port);
+        } catch (err) {
+          this.lines.push(
+            `${ansi.red}✗ 设备桥启动失败：${err instanceof Error ? err.message : String(err)}${ansi.reset}`,
+          );
+          break;
+        }
+        this.deviceBridge = created;
+        this.agent.setDeviceBridge(created);
+        // 手机连上后日志会打到右侧面板，面板关着就等于看不见 —— 自动展开
+        if (!this.termVisible) this.termVisible = true;
+        this.lines.push(
+          `${ansi.brightGreen}●${ansi.reset} 正在连接手机 ${ansi.brightGreen}${host}:${port}${ansi.reset}` +
+            `${ansi.gray}（AutoJs6 服务器模式）${ansi.reset}`,
+        );
+
+        // 等一小会儿：连不上就把「装 AutoJs6 + 开服务器模式 + 填 IP」的引导打出来。
+        // 注意这不会终止连接尝试 —— 客户端仍在后台按退避重连。
+        let connected = false;
+        for (let i = 0; i < 20 && !connected; i++) {
+          connected = created.status().autojs6?.connected ?? false;
+          if (!connected) await new Promise((resolve) => setTimeout(resolve, 150));
+        }
+        if (connected) {
+          this.lines.push(
+            `${ansi.gray}  已连接。推送脚本：/device run <文件>；日志显示在右侧终端面板。${ansi.reset}`,
+          );
+        } else {
+          const retrying = created.status().autojs6?.retrying ?? false;
+          this.lines.push(
+            retrying
+              ? `${ansi.yellow}暂时没连上，仍在后台按退避重试${ansi.reset}${ansi.gray}（/device stop 可停止）${ansi.reset}`
+              : `${ansi.red}连不上手机（已停止重试）${ansi.reset}${ansi.gray} —— 按下面步骤检查后，先 /device stop 再重新 /device connect${ansi.reset}`,
+          );
+          this.pushDeviceSetupGuide(`${host}:${port}`);
+        }
+        break;
+      }
+
+      case "serve":
+      case "start": {
+        if (bridge?.isRunning()) {
+          this.lines.push(
+            `${ansi.yellow}设备桥已在运行${ansi.reset}${ansi.gray}（端口 ${bridge.getPort()}）${ansi.reset}`,
+          );
+          break;
+        }
+        const port = value ? Number.parseInt(value, 10) : resolveDevicePort();
+        const created = this.createDeviceBridge(
+          Number.isFinite(port) && port > 0 ? port : resolveDevicePort(),
+        );
+
+        try {
+          await created.start();
+        } catch (err) {
+          this.lines.push(
+            `${ansi.red}✗ 设备桥启动失败：${err instanceof Error ? err.message : String(err)}${ansi.reset}`,
+          );
+          break;
+        }
+        this.deviceBridge = created;
+        this.agent.setDeviceBridge(created);
+        // 手机连上后日志会打到右侧面板，面板关着就等于看不见 —— 自动展开
+        if (!this.termVisible) this.termVisible = true;
+
+        this.lines.push(
+          `${ansi.brightGreen}●${ansi.reset} 设备桥已启动 ${ansi.gray}（端口 ${created.getPort()}）${ansi.reset}`,
+        );
+        for (const url of created.urls()) {
+          this.lines.push(
+            `${ansi.gray}  手机端 AutoX.js 填写：${ansi.reset}${ansi.brightGreen}${url}${ansi.reset}`,
+          );
+        }
+        // AutoJs6 那侧也监听上（手机「客户端模式」连过来）：与 9317 独立，
+        // 端口被占（多半是 VSCode 的 AutoJs6 扩展）只提示、不中断 AutoX.js 那边。
+        try {
+          await created.startAutoJs6Listener();
+          this.lines.push(
+            `${ansi.brightGreen}●${ansi.reset} AutoJs6 监听已就绪 ${ansi.gray}（端口 ${AUTOJS6_PC_SERVER_PORT}）${ansi.reset}`,
+          );
+          for (const url of created.listenerUrls()) {
+            this.lines.push(
+              `${ansi.gray}  手机 AutoJs6「客户端模式」填：${ansi.reset}${ansi.brightGreen}${url}${ansi.reset}`,
+            );
+          }
+        } catch (err) {
+          this.lines.push(
+            `${ansi.yellow}⚠ AutoJs6 监听未启动${ansi.reset}${ansi.gray}：${
+              err instanceof Error ? err.message : String(err)
+            }${ansi.reset}`,
+          );
+        }
+
+        this.lines.push(
+          `${ansi.gray}  脚本日志显示在右侧终端面板；推送脚本：/device run <文件>（或 /device push）。${ansi.reset}`,
+        );
+        this.lines.push(
+          `${ansi.gray}  停止：/device stop${ansi.reset}`,
+        );
+        break;
+      }
+
+      case "stop": {
+        if (!bridge?.isRunning()) {
+          this.lines.push(`${ansi.gray}设备桥未在运行。${ansi.reset}`);
+          break;
+        }
+        await bridge.stop();
+        this.deviceBridge = undefined;
+        this.agent.setDeviceBridge(undefined);
+        this.lines.push(`${ansi.gray}设备桥已停止。${ansi.reset}`);
+        break;
+      }
+
+      case "list":
+      case "devices": {
+        if (!bridge?.isRunning()) {
+          this.lines.push(`${ansi.yellow}设备桥未启动${ansi.reset}${ansi.gray}（/device serve）${ansi.reset}`);
+          break;
+        }
+        const devices = bridge.listDevices();
+        if (devices.length === 0) {
+          this.lines.push(`${ansi.gray}当前没有已连接的设备。${ansi.reset}`);
+          break;
+        }
+        this.lines.push(`${ansi.gray}已连接设备（${devices.length}）：${ansi.reset}`);
+        for (const device of devices) {
+          this.lines.push(
+            `  ${ansi.cyan}${device.name}${ansi.reset} ${ansi.gray}${device.id} · versionCode ${device.appVersionCode}${ansi.reset}`,
+          );
+        }
+        break;
+      }
+
+      case "push":
+      case "run": {
+        if (!value) {
+          this.lines.push(`${ansi.gray}用法：/device ${sub} <脚本文件>${ansi.reset}`);
+          break;
+        }
+        if (!bridge?.isRunning()) {
+          this.lines.push(`${ansi.yellow}设备桥未启动${ansi.reset}${ansi.gray}（/device serve）${ansi.reset}`);
+          break;
+        }
+        const result =
+          sub === "run" ? bridge.runScript(value) : bridge.pushScript(value);
+        if (!result.ok) {
+          this.lines.push(`${ansi.red}✗ ${result.message}${ansi.reset}`);
+          break;
+        }
+        this.lines.push(
+          `${ansi.green}✓${ansi.reset} ${
+            sub === "run" ? "已推送到设备并开始运行" : "已保存到设备"
+          }：${result.path}\n` +
+            `${ansi.gray}  目标设备（${result.delivered}）：${result.devices.join("、")}${ansi.reset}`,
+        );
+        break;
+      }
+
+      case "logs": {
+        if (!bridge?.isRunning()) {
+          this.lines.push(`${ansi.yellow}设备桥未启动${ansi.reset}${ansi.gray}（/device serve）${ansi.reset}`);
+          break;
+        }
+        const limit = Number.parseInt(value, 10);
+        const entries = bridge.recentLogs(Number.isFinite(limit) && limit > 0 ? limit : 30);
+        if (entries.length === 0) {
+          this.lines.push(`${ansi.gray}暂无设备日志。${ansi.reset}`);
+          break;
+        }
+        this.lines.push(`${ansi.gray}最近 ${entries.length} 条设备日志：${ansi.reset}`);
+        for (const entry of entries) {
+          this.lines.push(
+            `${ansi.gray}[${entry.device}]${ansi.reset} ${sanitizeControl(entry.text)}`,
+          );
+        }
+        break;
+      }
+
+      default:
+        this.lines.push(
+          `${ansi.gray}用法：/device [connect <手机IP>|serve|stop|list|push <文件>|run <文件>|logs]${ansi.reset}`,
+        );
+        break;
+    }
+    this.scheduleRender();
+  }
+
+  /**
    * 列出本轮实际发给模型的工具（`/tools`）。
    *
    * 用途：当某个工具「好像从来没被调用过」时，先确认它到底有没有发出去。
@@ -1934,11 +2360,16 @@ export class TuiApp {
       `  /help          显示本帮助`,
       `  /clear         清空屏幕`,
       `  /tools         列出本轮发给模型的工具（排查「某个工具似乎没被调用过」）`,
+      `  /device        手机设备桥（先 /device serve 或 /device connect <手机IP>）`,
+      `                 子命令：connect｜serve｜stop｜list｜push <文件>｜run <文件>｜logs [N]`,
+      `                 体检与截图请用命令行：xzh device check / xzh device shot`,
       `  /copy [N|A-B|last|all]  复制左侧对话到系统剪贴板（默认最近 30 行）`,
       `  /copy term [N|A-B|all]  复制右侧终端输出（按栏取内容，不会串栏）`,
       `  /image         把系统剪贴板里的图片加为本轮附件（同 Ctrl+V；别名 /paste）`,
       `  /mouse         切换鼠标捕获：开启后可在输出区拖拽选择（按整行）`,
       `  /reset         重置对话上下文`,
+      `  /undo          撤销玄猪对文件的最近一次修改（改前自动备份）`,
+      `  /resume [编号]  列出 / 恢复历史会话（对话历史会自动保存）`,
       `  /cwd           显示当前工作目录`,
       `  /switch <目录> 切换当前对话的项目目录`,
       `  /term          显示/隐藏右侧终端面板（/term clear 清空输出）`,

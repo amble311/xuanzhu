@@ -6,28 +6,6 @@ metadata:
   icon: list
   category: project-management
   version: 1.0.0
-  dependencies:
-    cli: linear
-    checkCommand: linear --version
-    install:
-      darwin:
-        npm: "@linear/cli"
-      linux:
-        npm: "@linear/cli"
-      windows:
-        npm: "@linear/cli"
-  config:
-    - name: LINEAR_API_KEY
-      label: API Key
-      type: secret
-      required: true
-    - name: LINEAR_TEAM_ID
-      label: Team ID
-      type: string
-      required: false
-      placeholder: your-team-id
-  auth:
-    type: api-key
 ---
 
 # linear-cli
@@ -45,4 +23,6 @@ Use `linear` (or appropriate CLI wrapper) to interact with Linear.
 ## Notes
 
 - Requires a Linear CLI tool to be installed.
+- xzh does **not** install a Linear CLI for you (only `playwright` and `officecli` are
+  auto-installed) — pick one yourself and put it on `PATH`.
 - Requires `LINEAR_API_KEY` environment variable.

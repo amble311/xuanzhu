@@ -6,36 +6,6 @@ metadata:
   icon: cloud
   category: cloud
   version: 1.0.0
-  dependencies:
-    cli: kubectl
-    checkCommand: kubectl version --client
-    install:
-      darwin:
-        brew: kubernetes-cli
-        scriptArch:
-          x64: curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/darwin/amd64/kubectl" && chmod +x kubectl && sudo mv kubectl /usr/local/bin/
-          arm64: curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/darwin/arm64/kubectl" && chmod +x kubectl && sudo mv kubectl /usr/local/bin/
-        manual: Download from https://kubernetes.io/docs/tasks/tools/install-kubectl-macos/
-      linux:
-        snap: kubectl --classic
-        apt: kubectl
-        scriptArch:
-          x64: curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && chmod +x kubectl && sudo mv kubectl /usr/local/bin/
-          arm64: curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/arm64/kubectl" && chmod +x kubectl && sudo mv kubectl /usr/local/bin/
-      windows:
-        scoop: kubectl
-        choco: kubernetes-cli
-        winget: Kubernetes.kubectl
-        manual: Download from https://kubernetes.io/docs/tasks/tools/install-kubectl-windows/
-  config:
-    - name: KUBECONFIG
-      label: Kubeconfig Path
-      type: string
-      required: false
-      placeholder: ~/.kube/config
-  auth:
-    type: none
-    setupCommand: kubectl config view
 ---
 
 # kubectl
@@ -68,3 +38,5 @@ Use `kubectl` to interact with Kubernetes clusters.
 ## Notes
 
 - Requires `kubectl` to be installed and configured (`~/.kube/config`).
+- xzh does **not** install `kubectl` for you (only `playwright` and `officecli` are
+  auto-installed) — install it yourself: <https://kubernetes.io/docs/tasks/tools/> (macOS: `brew install kubectl`).

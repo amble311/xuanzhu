@@ -4,7 +4,8 @@ import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
-import { createNonPoolingAgent, delay, isRetryableError } from "./http";
+import { createNonPoolingAgent } from "./http";
+import { StreamEmitter, withRetry } from "./stream-retry";
 import type {
   ChatOptions,
   ChatMessage,
@@ -23,8 +24,6 @@ export interface OpenAICompatConfig {
   model: string;
 }
 
-const MAX_ATTEMPTS = 3;
-
 /**
  * OpenAI 兼容协议 Provider。
  * 适用于 OpenAI / DeepSeek / GLM / Qwen / Groq / Ollama / 任意兼容端点。
@@ -32,7 +31,8 @@ const MAX_ATTEMPTS = 3;
  * 针对 "Premature close" 的处理：
  * 1. 使用 `keepAlive: false` 的 Agent，避免复用已被关闭的长连接；
  * 2. 不在请求中强制发送 `stream_options`（部分兼容端点不支持会导致连接异常）；
- * 3. 在尚未产生任何输出前，对瞬时网络错误自动重试。
+ * 3. 瞬时网络错误由 `withRetry` 统一重试，**输出中途断连时跳过重复前缀续传**
+ *    （见 `stream-retry.ts`）。
  */
 export class OpenAICompatProvider implements LLMProvider {
   public readonly id: string;
@@ -47,7 +47,7 @@ export class OpenAICompatProvider implements LLMProvider {
       apiKey: config.apiKey || "not-needed",
       baseURL: config.baseUrl,
       httpAgent: createNonPoolingAgent(targetUrl),
-      // 重试由本 Provider 统一控制（见下方 MAX_ATTEMPTS 与 onRetry）。
+      // 重试统一交给 withRetry（见 stream-retry.ts）。
       // SDK 默认 maxRetries = 2 且**不会**回调 onRetry，会让实际请求次数
       // 最多膨胀到 1+2 再乘以 MAX_ATTEMPTS，界面上却仍显示 "1/3"。
       maxRetries: 0,
@@ -55,42 +55,12 @@ export class OpenAICompatProvider implements LLMProvider {
   }
 
   async *chat(options: ChatOptions): AsyncIterable<StreamChunk> {
-    let lastError: unknown;
-
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      // emitted 标记：一旦向调用方输出了内容，就不再重试，避免重复输出
-      let emitted = false;
-
-      try {
-        yield* this.streamOnce(options, () => {
-          emitted = true;
-        });
-        return;
-      } catch (error) {
-        lastError = error;
-        if (
-          emitted ||
-          options.signal?.aborted ||
-          attempt >= MAX_ATTEMPTS ||
-          !isRetryableError(error)
-        ) {
-          throw error;
-        }
-        options.onRetry?.(
-          attempt,
-          MAX_ATTEMPTS,
-          error instanceof Error ? error : new Error(String(error)),
-        );
-        await delay(attempt * 600);
-      }
-    }
-
-    throw lastError;
+    yield* withRetry(options, (emit) => this.streamOnce(options, emit));
   }
 
   private async *streamOnce(
     options: ChatOptions,
-    markEmitted: () => void,
+    emit: StreamEmitter,
   ): AsyncIterable<StreamChunk> {
     const messages = options.messages.map(toOpenAIMessage);
     const tools: ChatCompletionTool[] | undefined =
@@ -133,14 +103,14 @@ export class OpenAICompatProvider implements LLMProvider {
       if (delta) {
         const text = delta.content;
         if (typeof text === "string" && text.length > 0) {
-          markEmitted();
-          yield { type: "text", text };
+          const out = emit.text(text);
+          if (out) yield { type: "text", text: out };
         }
 
         const reasoning = delta.reasoning_content;
         if (typeof reasoning === "string" && reasoning.length > 0) {
-          markEmitted();
-          yield { type: "reasoning", text: reasoning };
+          const out = emit.reasoning(reasoning);
+          if (out) yield { type: "reasoning", text: out };
         }
 
         const toolCalls = delta.tool_calls as
@@ -175,11 +145,10 @@ export class OpenAICompatProvider implements LLMProvider {
         name: buf.name,
         arguments: buf.args || "{}",
       };
-      markEmitted();
+      if (!emit.toolCall()) continue;
       yield { type: "tool_call", toolCall: call };
     }
 
-    if (sawToolCall) markEmitted();
     yield {
       type: "done",
       finishReason: sawToolCall ? "tool_calls" : finishReason,

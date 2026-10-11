@@ -22,7 +22,8 @@ src/
 │       ├── model.ts     xzh model —— 多模型管理（新增 / 删除 / 权重）
 │       └── config.ts    xzh config —— 查看 / 编辑 / 初始化配置
 ├── core/                Agent 核心
-│   ├── agent.ts         多轮工具调用循环、历史管理、模型失败降级
+│   ├── agent.ts         多轮工具调用循环、历史管理、模型失败降级、死循环检测
+│   ├── sessions.ts      会话增量持久化（~/.xzh/sessions/，崩溃/退出后可 /resume 恢复）
 │   └── prompt.ts        系统提示词
 ├── llm/                 LLM 抽象层（与 SDK 解耦）
 │   ├── types.ts         ChatMessage（含 images）/ ToolSpec / StreamChunk / LLMProvider
@@ -30,6 +31,8 @@ src/
 │   ├── anthropic.ts     Anthropic Claude 实现（含 tool_use 流）
 │   ├── gemini.ts        Google Gemini 实现（含 function calling）
 │   ├── context.ts       token 估算、历史裁剪、图片降级
+│   ├── calibration.ts   真实 usage 回填校正（token 估算闭环，按模型进程内共享）
+│   ├── stream-retry.ts  统一重试 / 断连续传（前缀去重，三家 Provider 共用）
 │   ├── http.ts          非复用连接 Agent、瞬时错误判定与友好化
 │   ├── vision.ts        模型是否支持图片输入的推断与标注
 │   └── index.ts         Provider 注册表、校验、工厂
@@ -45,9 +48,19 @@ src/
 ├── subagents/           子代理注册表（定义各自的工具白名单与系统提示词）
 │   ├── types.ts         SubAgentDefinition / SubAgentContext
 │   ├── code-explorer.ts code-explorer —— 只读代码库探索子代理
+│   ├── test-runner.ts   test-runner —— 测试运行子代理（只运行、不修改）
 │   └── index.ts         SUBAGENTS 注册表与查找（新增子代理只需改这里）
+├── device/              手机设备桥（AutoJs6 / AutoX.js）
+│   ├── protocol.ts      AutoX.js 线协议（WebSocket 文本帧；手机连电脑）
+│   ├── server.ts        DeviceBridge —— 设备注册表 / 日志缓冲 / 本地 HTTP 控制通道 / 传输抽象
+│   ├── client.ts        控制通道客户端（CLI 一次性命令与 Agent 工具共用）
+│   ├── apk.ts           AutoJs6 安装包的 ABI 探测、本地缓存查找与安装引导
+│   └── autojs6/
+│       ├── protocol.ts  AutoJs6 线协议（裸 TCP + 8 字节分帧；xzh 连手机）
+│       └── client.ts    AutoJs6 出站连接（断线重连 + 失败放弃 + 连接超时）
 ├── skills/              技能发现与加载（内置技能位于仓库 skills/，构建后复制到 dist/skills）
-│   ├── index.ts         技能发现与加载
+│   ├── index.ts         技能发现与加载（默认过滤掉已禁用的技能）
+│   ├── state.ts         技能启用/禁用状态（~/.xzh/skills.json 的读写）
 │   ├── dependencies.ts  依赖声明（技能 CLI + 玄猪自身的剪贴板工具）与包管理器安装命令
 │   └── installer.ts     依赖检测 / 安装 / 复核（管道与继承终端两种执行方式）
 ├── tui/                 全屏终端界面（零第三方依赖，纯 ANSI）
@@ -58,6 +71,7 @@ src/
 ├── config/store.ts      配置读写（~/.xzh/config.json）与多模型权重
 └── utils/
     ├── ansi.ts          颜色、显示宽度、折行
+    ├── backups.ts       文件修改前的快照与 /undo 撤销（~/.xzh/backups/，按项目隔离）
     ├── clipboard.ts     读取系统剪贴板图片/文本（Linux/Windows/macOS）+ 图片魔数嗅探
     ├── concurrency.ts   mapWithConcurrency —— 固定并发度的 worker 池
     └── paths.ts         路径与配置目录
@@ -109,6 +123,12 @@ Agent.run(text) ──► LLMProvider.chat({ messages, tools })
 7. 历史按 **token 预算**裁剪（`trimMessagesToBudget()`），先压缩老旧的大块工具输出、
    再从最老的消息整条丢弃，并保持 tool 消息与其 assistant 消息配对；
    另有一道 `MAX_HISTORY_MESSAGES`（400 条）的安全网。
+8. **token 估算闭环**：每次流结束时（`done` 事件）若 Provider 带回了真实 `usage`，
+   就用 `真实 prompt token / 本次估算` 更新该模型的校正器（`calibration.ts`，EWMA、
+   进程内按模型共享），下一次计算会话预算时按比值**收紧**（`calibrateBudget()`）。
+   目的：估算误差一旦是**系统性**的（服务端还计入工具 schema / 消息结构开销，
+   或对中文切分更碎），保守估算也会失效 —— 撞上 400；用真实值回填可逐次收敛。
+   **只收紧、不放宽**：估算偏高时不调整，以免把「宁可高估」的余量还回去。
 
 工作目录可在启动时指定（`xzh <目录>`），也可在对话中用 `/switch <目录>` 切换。
 `Agent.setCwd()` 会同时更新工具上下文（`ToolContext.cwd`）与系统提示词中的目录信息，
@@ -140,11 +160,21 @@ chat(options: ChatOptions): AsyncIterable<StreamChunk>
   （Node 的 `ERR_STREAM_PREMATURE_CLOSE`）。
 - **参数兼容**：流式请求不发送 `stream_options`，因为部分 OpenAI 兼容端点不支持该参数，
   可能导致连接被服务端异常终止。
-- **自动重试**：所有 Provider 在**尚未向调用方输出任何内容**前，对瞬时网络错误
+- **自动重试与断连续传**（`src/llm/stream-retry.ts`，三家 Provider 共用）：对瞬时网络错误
   （`Premature close`、`ECONNRESET`、`socket hang up`、超时、HTTP 5xx/429 等）
-  自动重试最多 3 次，退避 600ms / 1200ms。一旦已有输出则不再重试，避免重复内容。
+  自动重试最多 3 次，退避 600ms / 1200ms。三种情形：
+  1. **尚未输出任何内容** → 从头重试（旧行为）；
+  2. **已输出部分正文** → **续传**：重跑一次，由 `StreamEmitter` 逐块校验重跑流的前缀
+     是否与已交付内容逐字一致，一致则只放行新增部分，用户看到无缝续上的内容。
+     前缀不一致（含流提前结束、前缀只重建了一部分）→ 放弃续传，抛回**原始网络错误**，
+     绝不拼接出错乱内容。续传时**丢弃重跑的思考内容**（推理模型重跑几乎必然给出不同的
+     思考，逐字校验只会白白让续传失败）。
+  3. **已交付工具调用** → 不再重跑：工具调用只在流末尾产出，重跑必然导致同一工具被执行
+     两次（副作用重复）。
 - **错误呈现**：底层异常经 `friendlyError()`（`src/llm/http.ts`）转换为中文提示；
-  重试过程通过 `ChatOptions.onRetry` 回调，在界面状态栏展示 "网络中断，正在重试 (n/3)"。
+  重试过程通过 `ChatOptions.onRetry` 回调，在界面状态栏展示
+  "网络中断，正在重试 (n/3)"（尚未输出）或 "响应中断，正在续传 (n/3)"（续传，
+  由回调第 4 个参数 `info.resumed` 区分）。
 
 ### 图片输入（多模态）
 
@@ -267,6 +297,14 @@ interface ToolDefinition {
   （并行时输出会交错，前缀里的任务说明用于区分来源）；危险操作确认**转发给主代理**，
   不因在子代理内而绕过；轮次用尽时 `onRoundLimit` 直接返回 false（子代理无法与用户交互），
   以已有内容收尾。
+- **类型与边界**：目前两个 —— `code-explorer`（**只读**：read/grep/glob，隔离调研）与
+  `test-runner`（**只运行**：bash + 读取类，跑测试并汇总失败原因；提示词强约束
+  不改文件、不装依赖、不做 git 写操作）。取向是：子代理做**可隔离、输出冗长、低风险**的专项，
+  写代码永远由主代理自己做 —— 修改类任务无法用"报告"传递一手上下文，拆出去反而失真。
+- **轮数与中止**：子代理默认 60 轮（`SUBAGENT_MAX_TOOL_ROUNDS`，经 `AgentOptions.maxToolRounds`
+  覆盖 config.maxToolRounds —— 它不接受「到上限问用户」且并行时各有配额）；非正常收尾
+  （重复调用中止 / 轮数上限 / 被中断）会把原因带回主代理（回报前加 ⚠ 警告），
+  避免烂尾报告被当成正常结论。
 
 **并行执行**（`Agent.run()` 的工具循环）：
 
@@ -304,9 +342,118 @@ interface ToolDefinition {
 `toolNames` / `systemPrompt`）并加进 `SUBAGENTS` 数组。`task` 的 `subagent_name` 枚举、
 工具白名单与提示词都会自动跟随，无需改动 `tools/` 或 `core/`。
 
+### 设备桥（`device_*`）
+
+把脚本推到**手机**上的 AutoX.js / Auto.js 运行、并回收脚本日志 —— 即 VSCode 插件
+Auto.js-Autox.js-VSCodeExt 的能力，搬到终端与 Agent 里。
+
+**线协议**（`src/device/protocol.ts`）逐字兼容手机端，因为改协议等于改手机端：
+手机作为 **WebSocket 客户端**连到 PC 的 `ws://<ip>:9317/`，双方收发 JSON 文本帧 ——
+
+| 方向 | 消息 |
+| --- | --- |
+| 设备→PC | `{"type":"hello","data":{"device_name":…,"app_version_code":…,"client_version":…}}`（握手，10s 内不回则断开） |
+| PC→设备 | `{"type":"hello","data":"ok","version":…,"debug":false}`（`app_version_code < 629` 的老版本只认 `data`，回中文串） |
+| 设备→PC | `{"type":"ping"}` → PC 回 `{"type":"pong","data":…}` |
+| PC→设备 | `{"type":"command","data":{"command":"run"｜"save"｜"stop"｜"stopAll","id":…,"script":"<脚本全文>"}}` |
+| 设备→PC | `{"type":"log","data":{"log":"…"}}` |
+
+**单文件指令把脚本全文塞在 `script` 字段里**（插件 `runOrRerun()` / `saveTo()` 即如此），
+因此推脚本**不需要任何文件传输或压缩** —— 这是只做单文件就能覆盖日常调试的原因。
+插件另一条"项目打包 zip + md5 走二进制帧"的路本实现**不涉及**（需要时仍用插件）。
+
+⚠ **握手应答里的 `version` 必须是插件那套版本号**（`DEVICE_PLUGIN_PROTOCOL_VERSION`，
+默认 `1.110.0`），不能回玄猪自身版本：手机端拿它做兼容性判断，回 `0.3.0` 会被判为
+**握手失败**并立刻断开（真机实测：OPPO PHQ110 / AutoX.js 7.2.2，versionCode 722）。
+握手帧（手机原始 `hello`、我们的应答、未知消息类型）都会写进 `onStatus` 日志，
+这类问题不靠猜。
+
+**两种存在形式**，工具与 CLI 都能覆盖：
+
+1. **xzh 进程内**（TUI `/device serve`）：`TuiApp.deviceBridge` 持有实例，
+   经 `Agent.setDeviceBridge()` 注入到 `ToolContext.deviceBridge`，工具直接调它的方法；
+   手机日志实时进**右侧终端面板**（`term.notice`），不刷进对话区；`shutdown()` 时一并停止
+   （否则监听句柄会让进程退不出去）。
+2. **独立进程**（`xzh device serve`）：工具发现没有进程内桥时，回退到桥上的
+   **本地 HTTP 控制通道**（`/status`、`/devices`、`/logs`、`/exec?cmd=…&path=…`）——
+   与插件自己的 `/exec?cmd=save&path=` 是同一思路。于是"用户先开着桥、再让 agent 推脚本"
+   也成立。
+
+**其它设计点**：
+
+- 桥**不会**由工具自行启动：它要占端口、还要用户在手机上点连接，隐式启动只会让状态难以理解；
+  未启动时工具给出的提示里直接写明 `/device serve` 与 `xzh device serve` 两条路。
+- 端口冲突（**9317 与 VSCode 插件相同**）是最常见的失败：`start()` 捕获 `EADDRINUSE` 并给出
+  可操作说明。另需 `wss.on("error")` 兜底 —— `ws` 会把底层 http server 的 `error` 转发到
+  WSS 自身，不监听就会变成未捕获异常直接打掉进程。
+- 设备操作**对子代理禁用**（列入 `SUBAGENT_FORBIDDEN_TOOLS`）：手机只有一台，并行子代理推脚本
+  会互相打断，且这属于"对外部真实环境施加影响"。
+- `ws` 是本项目**第一个非 LLM SDK 的运行时依赖**：设备桥需要一个健壮的 WebSocket 服务端，
+  自己实现（帧编解码 + 掩码 + 长度扩展）不划算。与三个 SDK 同样在 `esbuild.js` 里保持
+  `external`，由 `package.json` 的 `dependencies` 声明。
+
+### 设备桥的两种传输（AutoJs6 / AutoX.js）
+
+两套协议**毫无关系**，但被抽象成同一套设备注册表 —— 上层（指令下发、日志缓冲、
+HTTP 控制通道、Agent 工具）只认 `Session` 视图，因此 `xzh device run/logs/...`、
+`/device` 与 `device_*` 工具对两种连接**完全一致，没有任何分支**：
+
+```ts
+interface Session {
+  kind: "autoxjs" | "autojs6";
+  id: string;
+  info: DeviceInfo | null;              // 握手完成后才有
+  sendJson(payload: string): boolean;   // 已序列化的 JSON
+  isAlive(): boolean;
+  close(): void;                        // 清理定时器 / 停掉重连计划
+}
+```
+
+| | AutoX.js | AutoJs6（客户端模式） | AutoJs6（服务器模式） |
+| --- | --- | --- | --- |
+| 方向 | 手机连**我们** | 手机连**我们** | **我们连手机** |
+| 传输 | WebSocket 文本帧 `9317` | 裸 TCP + 8 字节大端头 `[len][type]` `6347` | 同上，端口 `7347` |
+| 握手 | 手机先发 `hello`，我们必须回**插件版本号**（≥1.110.0） | 手机先发 `hello`，我们必须回 `extensionVersion` **≥1.0.13**，且**只等 6400ms** | 我们先发 `hello`，手机只认"收到了" |
+| 设备名 | 手机上报型号 | 手机上报型号（拿得到） | 拿不到，用地址代替 |
+
+AutoJs6 的两个方向都实现，是因为**手机端 UI 的可用性不同**：客户端模式在手机上点一下、
+填个 IP 就行（官方 VSCode 扩展也只实现这一侧，xzh 因此可以顶替它）；服务器模式在部分版本里
+入口还是「开发中」。xzh 侧两者共用同一套 `autojs6/protocol.ts`，只是 socket 来源相反。
+
+AutoJs6 为什么选"我们连手机"：另一个方向（客户端模式）要求用户先在手机上正确填写
+**电脑的 IP**；而这个方向只要一个地址 —— 电脑上是手机 IP，手机本机（termux）上是
+`127.0.0.1`，同一套代码覆盖两种部署，本地还完全不联网。
+
+AutoJs6 连接的三个必要策略（`autojs6/client.ts`）：**指数退避自动重连**（手机切后台/
+开关服务器模式很常见）、**连续 3 次失败即放弃并给指引**（否则对着填错的地址无限刷屏）、
+**5 秒连接超时**（IP 被黑洞时 `connect` 会一直挂着）。`status().autojs6.retrying`
+把这个状态透给界面，避免"已经放弃却提示仍在重试"这种撒谎式提示。
+
+**安装包不打包**（`apk.ts`）：每个 ABI 约 130 MB，两个 270 MB，进 npm 包纯属浪费。
+只做 ABI 探测（`adb shell getprop ro.product.cpu.abi` 优先，否则默认 `arm64-v8a`）、
+官方下载页、以及 `~/.xzh/apks/` 的本地缓存查找。
+
+**截图**（`screenshot.ts` + 桥的 `/shot`、`/screenshot` 端点）是个特例，值得记下它的形状：
+`captureScreen()` 走系统 MediaProjection，会弹「立即开始」授权框且**自身阻塞**（点击必须
+在另一个线程里做）、而且**每次截图都要重新授权**（真机实测）；拿到的 `Image` 又留在手机上，
+而桥只有"推脚本 + 收日志"两条通路。于是：**脚本模板内置**（授权线程 + 缩图 + base64）→
+手机 **POST `/shot`** 回传 → 桥缓存最近一张 → `POST /screenshot` 触发并**直接返回 JPEG**
+（避免两步轮询）。多网卡机器上回传地址取**与手机同网段的那个本机 IP**，否则手机传不回来。
+
+**技能也可以教 xzh 自己的工具**：`autojs6` 技能没有任何外部 CLI 依赖，它教的是"如何写脚本
+驱动设备桥"（三条硬约束、`auto.waitFor` 的两种失败态、API 速查、排查清单）。
+工具只提供"能推脚本"，而**怎么写、结果怎么回报、失败怎么查**才是模型真正缺的上下文 ——
+这类内容放技能里按需加载，比塞进系统提示词更合适。
+
 ### 技能系统（Skills）
 
 技能是一份指导模型使用某个**外部 CLI 工具**的指南，存放于 `skills/<name>/SKILL.md`。
+
+> 技能不限于"外部 CLI"：新内置的 `autojs6` 技能没有任何外部依赖，它教的是**如何驱动
+> xzh 自己的设备桥**（`device_run` + `device_logs`）去操作手机 —— 也就是说，
+> 技能系统同时承载"把 xzh 自身能力的使用方式写清楚"这件事。
+> 这正是设备桥那类能力所需要的：工具只提供"能推脚本"，而**怎么写脚本、结果怎么回报、
+> 失败怎么排查**才是模型真正缺的上下文，写在技能里比塞进系统提示词更合适（按需加载、不常驻）。
 
 - **发现**：`src/skills/index.ts` 扫描两个全局来源并解析 frontmatter 的 `name` / `description`，
   同名时用户技能（`~/.xzh/skills`）覆盖内置技能（`dist/skills`）。技能不做项目级隔离。
@@ -320,9 +467,32 @@ interface ToolDefinition {
   - `rules.md` 内容作为项目规则追加进系统提示词。
 - **使用**：模型通过 `list_skills` 查看可用技能，通过 `load_skill` 加载 `SKILL.md` 全文，
   再借助 `bash` 执行指南中描述的命令。技能指南在对话中持续有效，无需重复加载。
+- **启用 / 禁用 / 删除**（`xzh skill` 子命令）：状态存放在 `~/.xzh/skills.json`
+  （`{ version, disabled: string[] }`；与 config.json 分开 —— config 是模型配置，归 `xzh model` 管）。
+  `discoverSkills()` **默认过滤掉被禁用的技能**，因此 `list_skills` / `load_skill` 对模型完全不可见；
+  需要 full 列表时（`xzh skill` 的列表与操作）传 `includeDisabled: true`。
+  **删除只对用户技能生效**：内置技能随包分发、重装即还原，删除没有意义，一律引导改用禁用；
+  删除曾覆盖同名内置技能的用户技能时会顺手清掉禁用标记（内置版恢复可见）。
+  交互菜单（无参数的 `xzh skill`）要求 TTY —— 非交互场景（管道 / stdin 关闭）下
+  `promptSelect` 会回落为「默认选项即动作」，菜单循环会永不退出，因此直接拒绝并指路子命令。
 - **构建**：esbuild 的 `copy-skills` 插件在构建结束时把仓库根目录的 `skills/` 复制到 `dist/skills`，
   使打包产物自带技能。
 - **约定**：技能目录名即技能名；技能文件兼容 `SKILL.md` 与 `skill.md` 两种命名。
+- **可拆分：主文件索引 + 伴随文件**：`load_skill` 会把主文件**整份**灌进上下文，所以技能不该是一份
+  长文档 —— 目录下的其他文件会随构建一起复制（`copy-skills` 是整目录 `cpSync`），因此可以
+  把"查表"内容拆进 `references/*.md`，**主文件只留"每次都要遵守"的部分**（硬约束、前提、
+  不可逆操作的红线）并给出「要做什么 → 读哪个文件」对照表。
+  为此 `load_skill` 的返回**带上技能目录绝对路径**（`> 技能目录：…`）：拆出去的文件只能按相对路径
+  指路，而技能在不同安装形态下路径不同（仓库内是 `dist/skills/<name>`，npm 安装后是
+  `<node_modules>/xuanzhu/dist/skills/<name>`），**不能写死**，模型需要现成的目录才能拼出绝对路径
+  并用 `read_file` 取用。目前有五个技能采用这套写法：`autojs6`（api / patterns / screenshot /
+  input / troubleshooting）、`officecli`（l1-read / l2-edit / element-types / watch-selection /
+  subskills）、`datadog`（commands / datadog-ci）、`playwright`（browser-choice / node-script）、
+  `telegram`（commands）。
+- **frontmatter 只有 `name` 与 `description` 会被读取**（`parseFrontmatter`）：`metadata.*` 里的
+  `displayName` / `icon` / `category` / `version` 目前**不生效**，仅作标注；原 CodeBuddy 扩展遗留的
+  `dependencies` / `config` / `auth` 三个键已从全部内置技能中清除（它们连同 `install.sh` 一起，
+  属于"项目级 `.codebuddy/bin`"那套已废弃的机制）。
 - **内置技能**：18 个，涵盖 playwright（浏览器自动化）、officecli（Office 文档）、
   github / gitlab、jira / linear、aws / kubernetes、数据库、监控与消息类。
 - **依赖自动安装**：`src/skills/dependencies.ts` 以 TS 常量声明每个技能所需的 CLI

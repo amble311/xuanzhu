@@ -49,7 +49,8 @@ const RECENT_MESSAGES_PROTECTED = 6;
  * 两侧都取保守值（ASCII 按 3.5、CJK 按 1），即**宁可高估**。
  * 不引入 tokenizer 是因为各 provider 分词各不相同，而通用 tokenizer
  * （如 gpt-tokenizer）仅 BPE 表就有约 1MB，对当前约 200KB 的包是数量级的膨胀。
- * 估算误差由 INPUT_BUDGET_RATIO 与真实 usage 回填共同吸收。
+ * 估算误差由 INPUT_BUDGET_RATIO 兜住余量，并由**真实 usage 回填校正**逐次收敛
+ * （见 `calibration.ts`：观测真实 prompt token 与本次估算的比值，只用于收紧预算）。
  */
 export function estimateTokens(text: string): number {
   if (!text) return 0;
@@ -140,26 +141,40 @@ export function sliceToTokenBudget(text: string, maxTokens: number): string {
 }
 
 /**
- * 截断单条消息的正文以适配预算。无法处理时返回 null（连外壳都超预算）。
+ * 截断单条消息以适配预算。连「无图片的空壳」都放不下时返回 null（理论上极难到达）。
  *
  * 只动 `content`，**绝不动 `toolCalls.arguments`** —— 那是 JSON，截断会产出非法结构，
  * 而 assistant 与其 tool 结果的配对完整性一旦破坏，下一次请求会直接 400。
  */
 function shrinkMessage(message: ChatMessage, budget: number): ChatMessage | null {
-  const overhead = estimateMessageTokens({ ...message, content: "" });
-  const reserve = 30; // 留给截断提示语
-  if (overhead + reserve >= budget) return null;
+  // 尝试在预算内收缩一条消息；keepImages=false 时把图片降级为占位文本。
+  // 图片按固定高估值计费（IMAGE_TOKENS_ESTIMATE），多张图可能自身就吃掉全部预算 ——
+  // 那会导致本函数返回 null、trimMessagesToBudget 返回空会话：模型对本轮任务彻底失忆，
+  // 还可能重复执行已有副作用的操作。因此图片放不下时**丢图保内容**（请求里没有图
+  // 远好于整个会话被裁空），reserve 多留一些给占位文本。
+  const attempt = (keepImages: boolean): ChatMessage | null => {
+    const reserve = keepImages ? 30 : 50; // 留给截断/占位提示语
+    const probe = keepImages ? message : { ...message, images: undefined };
+    const overhead = estimateMessageTokens({ ...probe, content: "" });
+    if (overhead + reserve >= budget) return null;
 
-  const content = message.content ?? "";
-  const allow = budget - overhead - reserve;
-  if (estimateTokens(content) <= allow) return message;
+    const content = message.content ?? "";
+    const allow = budget - overhead - reserve;
+    if (estimateTokens(content) <= allow) {
+      return keepImages
+        ? message
+        : { ...probe, content: `${content}\n\n[图片已省略：因超出上下文预算]` };
+    }
 
-  const truncated = sliceToTokenBudget(content, allow);
-  const dropped = content.length - truncated.length;
-  return {
-    ...message,
-    content: `${truncated}\n\n…（内容过长，已截断 ${dropped} 字符以适配模型上下文窗口）`,
+    const truncated = sliceToTokenBudget(content, allow);
+    const dropped = content.length - truncated.length;
+    return {
+      ...probe,
+      content: `${truncated}\n\n…（内容过长，已截断 ${dropped} 字符以适配模型上下文窗口）`,
+    };
   };
+
+  return attempt(true) ?? attempt(false);
 }
 
 /**

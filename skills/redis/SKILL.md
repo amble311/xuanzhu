@@ -6,32 +6,6 @@ metadata:
   icon: database
   category: databases
   version: 1.0.0
-  dependencies:
-    cli: redis-cli
-    checkCommand: redis-cli --version
-    bundledInstall: skills/redis/install.sh
-    install:
-      darwin:
-        brew: redis
-      linux:
-        apt: redis-tools
-        dnf: redis
-      windows:
-        choco: redis-64
-        scoop: redis
-  config:
-    - name: REDIS_HOST
-      label: Host
-      type: string
-      required: false
-      placeholder: localhost
-    - name: REDIS_PORT
-      label: Port
-      type: string
-      required: false
-      placeholder: "6379"
-  auth:
-    type: basic
 ---
 
 # redis-cli
@@ -56,3 +30,6 @@ Use `redis-cli` to interact with Redis instances.
 ## Notes
 
 - Requires `redis-cli` to be installed in the environment.
+- xzh does **not** install the `redis-cli` client for you (only `playwright` and `officecli` are
+  auto-installed) — install it yourself, e.g. `brew install redis` (macOS),
+  `sudo apt install redis-tools` (Debian / Ubuntu), `sudo dnf install redis` (RHEL).

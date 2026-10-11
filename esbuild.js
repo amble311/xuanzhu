@@ -14,6 +14,9 @@ const external = [
   "openai",
   "@anthropic-ai/sdk",
   "@google/generative-ai",
+  // 设备桥的 WebSocket 服务端：与上面几个同样保持 external（package.json 的 dependencies 里声明，
+  // npm 安装时会一并装上）。它虽可内联，但保持与既有 SDK 一致的处理方式更不容易漏。
+  "ws",
   "readline/promises",
 ];
 

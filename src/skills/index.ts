@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { getBuiltinSkillsDir, getUserSkillsDir } from "../utils/paths";
+import { getDisabledSkillNames } from "./state";
 
 /**
  * 玄猪技能系统。
@@ -119,19 +120,40 @@ function scanDir(
   }
 }
 
-/** 发现全部可用技能（同名时用户技能覆盖内置技能） */
-export function discoverSkills(): SkillInfo[] {
+export interface DiscoverSkillsOptions {
+  /**
+   * 是否包含**已禁用**的技能。
+   *
+   * 默认排除：`list_skills` / `load_skill` 面向模型，被禁用的技能应当不可见、不可加载。
+   * 需要看全量（`xzh skill` 的列表、启用/删除操作）时显式传 `includeDisabled: true`。
+   */
+  includeDisabled?: boolean;
+}
+
+/** 发现全部可用技能（同名时用户技能覆盖内置技能；默认不含已禁用项） */
+export function discoverSkills(
+  options: DiscoverSkillsOptions = {},
+): SkillInfo[] {
   const found = new Map<string, SkillInfo>();
   scanDir(getBuiltinSkillsDir(), "builtin", found);
   scanDir(getUserSkillsDir(), "user", found);
-  return [...found.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const all = [...found.values()].sort((a, b) => a.name.localeCompare(b.name));
+  if (options.includeDisabled) return all;
+
+  const disabled = new Set(
+    getDisabledSkillNames().map((name) => name.toLowerCase()),
+  );
+  return all.filter((skill) => !disabled.has(skill.name.toLowerCase()));
 }
 
-/** 按名称查找技能（大小写不敏感） */
-export function findSkill(name: string): SkillInfo | undefined {
+/** 按名称查找技能（大小写不敏感；默认不含已禁用项，见 discoverSkills） */
+export function findSkill(
+  name: string,
+  options: DiscoverSkillsOptions = {},
+): SkillInfo | undefined {
   const normalized = name.trim().toLowerCase();
   if (!normalized) return undefined;
-  return discoverSkills().find(
+  return discoverSkills(options).find(
     (skill) => skill.name.toLowerCase() === normalized,
   );
 }
@@ -142,3 +164,10 @@ export function loadSkillContent(skill: SkillInfo): string {
   if (content.length <= MAX_SKILL_CHARS) return content;
   return `${content.slice(0, MAX_SKILL_CHARS)}\n\n…（技能内容过长，已截断）`;
 }
+
+export {
+  getDisabledSkillNames,
+  getSkillStatePath,
+  isSkillDisabled,
+  setSkillDisabled,
+} from "./state";

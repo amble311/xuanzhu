@@ -1,6 +1,6 @@
 {
   "name": "xuanzhu",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "玄猪（XuanZhu）— 专为终端打造的 AI 编码 Agent",
   "keywords": [
     "ai",
@@ -39,6 +39,7 @@
     "build": "node esbuild.js",
     "dev": "node esbuild.js --watch",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
     "start": "node bin/xzh.js",
     "clean": "rm -rf dist",
     "prepare": "node esbuild.js --production"
@@ -46,11 +47,14 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0",
     "@google/generative-ai": "^0.21.0",
-    "openai": "^4.28.0"
+    "openai": "^4.28.0",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
     "@types/node": "^20.2.5",
+    "@types/ws": "^8.18.2",
     "esbuild": "^0.25.8",
-    "typescript": "^5.4.3"
+    "typescript": "^5.4.3",
+    "vitest": "^3.2.7"
   }
 }

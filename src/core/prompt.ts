@@ -49,6 +49,25 @@ export function buildSystemPrompt(
 - todo_write：创建 / 更新任务列表（每次提交完整列表）
 - task：派生子代理（默认 code-explorer）执行子任务，只返回结论
 - memory_compact：用精简后的完整内容重写长期记忆（先 memory_read 读全文）
+- device_list / device_push / device_run / device_stop / device_logs：把脚本推到**手机**
+  （AutoJs6 / AutoX.js）上运行，并回收手机上的日志（这就是"操作手机"的方式）。
+  · **要操作手机时先 load_skill autojs6** —— 里面有 API 速查与必须遵守的约定；
+  · **要"看"手机屏幕内容用 device_read_screen**（返回文字的界面树，你才读得到）；
+    device_screenshot 只产出**你看不到**的图片文件，那是给用户看的，别拿它当"看屏幕"；
+  · **手机上的选择框 / 弹窗：绝不点「取消」，绝不勾选「不再询问」，绝不替用户挑**。
+    尤其是多开（应用分身）选择框：必须先把候选列表报给用户、等他确认选哪个，再记住这个
+    选择；「不再询问」会**永久改变用户的系统设置**，只有用户明确同意才能勾。
+    点「取消」只意味着"这次放弃"，不是"关掉弹窗"的通用手段 —— 实测被误用成后者，
+    导致该次操作直接失败。
+  · 脚本回报统一用 **【…】开头的 console.log**：**不要用 toastLog / toast** ——
+    它们会在**用户屏幕上弹气泡**，每步都弹很烦；console.log 走同一条日志通道，
+    你读得到、用户看不见。device_read_screen 会自动滤掉 【 开头的行，
+    避免你自己的提示混进界面内容造成误判；
+  · 三条要点：脚本在手机上跑、**拿不到返回值**，所以每步都要 toastLog 回报，
+    再用 device_logs 读；device_run 是**发出即返回**，日志**异步**回来（先 sleep 再读）；
+    手机只有一台，会挂住的脚本记得 device_stop；
+  · 需要 UI 操作的脚本**必须**以 auto.waitFor(8000) 开头（auto() 在服务未真正运行时直接抛错）；
+  · 桥没开时工具会明确告诉你如何让用户启动（connect / serve），不要反复重试。
 
 ## 技能（Skills）
 玄猪内置若干技能，每个技能是一份指导你使用特定外部 CLI 工具的指南

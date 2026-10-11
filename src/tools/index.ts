@@ -9,6 +9,7 @@ import {
   readFileTool,
   writeFileTool,
 } from "./filesystem";
+import { deviceTools } from "./device";
 import { memoryCompactTool, memoryReadTool, memoryWriteTool } from "./memory";
 import { listSkillsTool, loadSkillTool } from "./skills";
 import { todoWriteTool } from "./todo";
@@ -32,6 +33,7 @@ export const TOOLS: ToolDefinition[] = [
   writeFileTool,
   editFileTool,
   bashTool,
+  ...deviceTools,
 ];
 
 /**
@@ -40,13 +42,17 @@ export const TOOLS: ToolDefinition[] = [
  * - `task`：否则子代理可以再派生子代理，形成无界递归；
  * - `todo_write`：任务列表属于主会话，子代理的任务不展示给用户，写上只会造成混乱；
  * - `memory_write` / `memory_compact`：记忆由主代理统一维护 —— 子代理只了解一件
- *   子任务，不具备判断「什么值得跨会话保留」的全局视角，两边同时写还容易重复。
+ *   子任务，不具备判断「什么值得跨会话保留」的全局视角，两边同时写还容易重复；
+ * - `device_*`：手机只有一台，多个子代理并行推脚本会互相打断（一个跑起来就把上一个顶掉），
+ *   而且设备操作属于「对外部真实环境施加影响」，应由主代理统一发起。
+ *   将来若要"在手机上验证"的子代理，需要先在这里开例外 —— 那是有意的决定。
  */
 export const SUBAGENT_FORBIDDEN_TOOLS = new Set([
   "task",
   "todo_write",
   "memory_write",
   "memory_compact",
+  ...deviceTools.map((tool) => tool.name),
 ]);
 
 export function findTool(

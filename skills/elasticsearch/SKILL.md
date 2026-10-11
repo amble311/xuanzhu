@@ -6,36 +6,16 @@ metadata:
   icon: search
   category: databases
   version: 1.0.0
-  dependencies:
-    cli: curl
-    checkCommand: curl --version
-    bundledInstall: skills/elasticsearch/install.sh
-    install:
-      darwin:
-        brew: curl
-      linux:
-        apt: curl
-        dnf: curl
-      windows:
-        scoop: curl
-        choco: curl
-  config:
-    - name: ES_URL
-      label: Base URL
-      type: string
-      required: false
-      placeholder: http://localhost:9200
-  auth:
-    type: api-key
 ---
 
 # Elasticsearch
 
-Use the provided `es-cli` wrapper or direct REST API calls to manage indexes and search data.
+Use your own `es-cli` wrapper (if you have one) or direct REST API calls to manage indexes and search data.
 
-## CLI Usage (Recommended)
+## CLI Usage (optional)
 
-An `es-cli` wrapper is available in `.codebuddy/bin`.
+`es-cli` is **not** shipped by xzh — it's an optional thin wrapper you may already have on `PATH`.
+If it isn't there, just use the `curl` examples below (nothing extra to install).
 
 Base URL default: `http://localhost:9200` (Override with ES_URL env var)
 

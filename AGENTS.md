@@ -1,5 +1,5 @@
 不要主动发布新版本，发布时需要用户同意
-解决当检测到模型陷入死循环时，agent通过某些方式解除陷入循环
+这是一个独立项目，编写项目同时需要考虑到上传npm后，其他用户通过npm安装后的使用是否一致。
 
 # 玄猪（XuanZhu）项目指南
 
@@ -14,7 +14,7 @@
 
 | 目录 | 位置 | 存什么 |
 | --- | --- | --- |
-| **`~/.xzh/`** | 用户**主目录**，与 cwd 无关 | **全局配置**：`config.json`（服务商、模型、权重、上下文窗口、`autoApprove` 等）；另含 `session.lock` / `crash.log`（异常退出诊断） |
+| **`~/.xzh/`** | 用户**主目录**，与 cwd 无关 | **全局配置**：`config.json`（服务商、模型、权重、上下文窗口、`autoApprove` 等）；`skills.json`（技能启用/禁用状态，由 `xzh skill` 管理）；`skills/`（用户自定义技能）；`sessions/`（对话历史 JSONL，供 `/resume` 恢复）；`backups/`（文件修改前快照，供 `/undo` 撤销）；另含 `session.lock` / `crash.log`（异常退出诊断） |
 | **`<cwd>/.xuanzhu/`** | 用户运行 `xzh` 时所处的目录，**含 `/switch` 切换后的目录** | **项目级数据**：`memory/`（按天记录 + `MEMORY.md` 长期记忆）、`rules.md`（项目规则，注入系统提示词） |
 
 **必须遵守的规则**：
@@ -41,6 +41,7 @@
   - `npm install` 安装依赖
   - `npm run build` 构建
   - `npm run typecheck` 类型检查
+  - `npm run test` 运行测试（vitest，覆盖 context 裁剪与 token 校正 / 流式续传 / 技能解析 / 会话与备份）
   - `npm run dev` 监听构建
   - `node bin/xzh.js` 本地运行
 

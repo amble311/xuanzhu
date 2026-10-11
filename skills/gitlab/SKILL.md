@@ -6,35 +6,6 @@ metadata:
   icon: git-merge
   category: version-control
   version: 1.0.0
-  dependencies:
-    cli: glab
-    checkCommand: glab --version
-    bundledInstall: skills/gitlab/install.sh
-    install:
-      darwin:
-        brew: glab
-        scriptArch:
-          x64: curl -fsSL https://gitlab.com/gitlab-org/cli/-/releases/permalink/latest/downloads/glab_*_macOS_x86_64.tar.gz | tar xz && sudo mv bin/glab /usr/local/bin/
-          arm64: curl -fsSL https://gitlab.com/gitlab-org/cli/-/releases/permalink/latest/downloads/glab_*_macOS_arm64.tar.gz | tar xz && sudo mv bin/glab /usr/local/bin/
-        manual: Download from https://gitlab.com/gitlab-org/cli/-/releases
-      linux:
-        apt: glab
-        dnf: glab
-        snap: glab
-        script: curl -fsSL https://gitlab.com/gitlab-org/cli/-/releases/permalink/latest/downloads/glab_*_Linux_x86_64.tar.gz | tar xz && sudo mv bin/glab /usr/local/bin/
-      windows:
-        scoop: glab
-        choco: glab
-        winget: GLab.GLab
-  config:
-    - name: GITLAB_HOST
-      label: GitLab Host
-      type: string
-      required: false
-      placeholder: https://gitlab.com
-  auth:
-    type: oauth
-    setupCommand: glab auth login
 ---
 
 # glab
@@ -44,9 +15,15 @@ This tool allows you to view, create, and update GitLab issues and merge request
 
 ## Setup
 
-Ensure `glab` is installed and authenticated.
-If using the bundled version, run:
-`./.codebuddy/bin/glab auth login`
+xzh does **not** install this CLI for you — install it yourself (official docs:
+<https://docs.gitlab.com/cli/>; e.g. `brew install glab`, or download a release binary),
+then authenticate:
+
+```bash
+glab auth login
+```
+
+> Only `playwright` and `officecli` are auto-installed by xzh.
 
 ## Common Commands
 

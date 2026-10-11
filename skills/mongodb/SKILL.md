@@ -6,27 +6,6 @@ metadata:
   icon: database
   category: databases
   version: 1.0.0
-  dependencies:
-    cli: mongosh
-    checkCommand: mongosh --version
-    install:
-      darwin:
-        brew: mongosh
-      linux:
-        apt: mongodb-mongosh
-        script: wget -qO - https://www.mongodb.org/static/pgp/server-7.0.asc | sudo apt-key add - && sudo apt install mongodb-mongosh
-      windows:
-        winget: MongoDB.Shell
-        choco: mongodb-shell
-        scoop: mongosh
-  config:
-    - name: MONGODB_URI
-      label: Connection URI
-      type: string
-      required: false
-      placeholder: mongodb://localhost:27017
-  auth:
-    type: none
 ---
 
 # mongosh
@@ -51,3 +30,6 @@ Use `mongosh` to interact with MongoDB databases.
 ## Notes
 
 - Requires `mongosh` to be installed in the environment.
+- xzh does **not** install `mongosh` for you (only `playwright` and `officecli` are
+  auto-installed) — install it yourself: <https://www.mongodb.com/docs/mongodb-shell/install/>
+  (macOS: `brew install mongosh`).

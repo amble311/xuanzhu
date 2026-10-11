@@ -34,6 +34,13 @@ export {
   stripStaleImages,
   trimMessagesToBudget,
 } from "./context";
+export {
+  calibrateBudget,
+  calibratorFor,
+  DEFAULT_TOKEN_FACTOR,
+  resetCalibrators,
+  TokenCalibrator,
+} from "./calibration";
 
 export type ProviderKind = "openai" | "anthropic" | "gemini";
 

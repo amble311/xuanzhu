@@ -4,6 +4,246 @@
 
 ## [未发布]
 
+## [0.4.0] — 2026-10-11
+
+### 新增
+
+- **新子代理 `test-runner`：跑测试并带回验证过的结论**（`src/subagents/test-runner.ts`）。
+  改完代码后把测试交给它：测试日志动辄几十屏，主代理真正需要的只是
+  「通过/失败清单 + 失败原因（`文件路径:行号` 级引用）+ 可复跑的命令」——
+  正是上下文隔离收益最大的场景。
+  - 工具白名单：`bash` + 读取类（read_file / glob / grep / list_dir）；
+  - 与只读的 `code-explorer` 的差别在于它是「**只运行、不修改**」：提示词强约束
+    不改文件、不装依赖、不做 git 写操作 —— 风险点只有 bash，靠提示词与确认机制兜底；
+  - 提示词还规定了工作方式与报告格式：先从 package.json / Makefile / CI 配置确认测试命令
+    （**找不到不猜**）、优先跑单文件/单用例、失败三分类（断言 / 环境 / 代码 bug）；
+  - 受上一条的两项防护约束：默认 60 轮上限，被中止时回报带 ⚠ 原因。
+- **新子命令 `xzh skill`：技能的启用 / 禁用 / 删除**（`src/cli/commands/skill.ts`、`src/skills/state.ts`）。
+  此前装进来的技能只能全开 —— `list_skills` 的清单随安装增长，模型上下文跟着膨胀，也没有办法
+  关掉不用的。
+  - 无参数进入**交互菜单**：列表带 ✓/✗ 状态、来源（内置 / 用户）与描述，选「启用/禁用」或
+    「删除」即可；非交互场景提供 `list` / `enable|disable <名称>` / `delete <名称> [--yes]` 子命令；
+  - 状态存 `~/.xzh/skills.json`（与 config.json 分开：config 是模型配置，由 `xzh model` 管理）；
+    `discoverSkills()` 默认**过滤掉禁用项** ⇒ `list_skills` / `load_skill` 对模型完全不可见；
+  - **删除只对用户技能生效**：内置技能随包分发（重装即还原），删除没有意义 → 引导改用禁用；
+    删除曾覆盖同名内置技能的用户技能时会顺带清掉禁用标记（内置版恢复可见）；
+  - 非 TTY（管道 / stdin 关闭）进入交互菜单会被拒绝并指路子命令 —— 否则 `promptSelect` 的
+    「stdin 关闭即返回默认项」回落会让菜单循环永不退出（实测 `xzh skill < /dev/null` 无限刷列表）。
+- **会话自动保存与 `/resume` 恢复**（`src/core/sessions.ts`、`src/core/agent.ts`）：
+  对话历史原本纯内存、退出 / 崩溃即丢。现在主代理每次提交历史都**增量追加**到
+  `~/.xzh/sessions/<项目>-<哈希>/<时间戳>.jsonl`（崩溃最多丢未提交的最后一轮），
+  界面内 `/resume` 列出本项目的历史会话、`/resume <编号>` 整体恢复（恢复后开启新文件继续记录）；
+  图片以 base64 随行会把 JSONL 撑爆，保存时降级为占位文本（与恢复后 `stripStaleImages`
+  对旧图的处理一致）。
+- **文件修改的撤销 `/undo`**（`src/utils/backups.ts`）：write_file / edit_file 写盘前
+  把原内容快照到 `~/.xzh/backups/<项目>-<哈希>/` 并按序登记；`/undo` 弹出最近一条恢复
+  （新建文件的撤销语义是删除）。快照只覆盖玄猪改过的文件，与用户的 git 互不干扰；
+  最多保留 50 步，超出连同备份文件一起清理。
+- **自动化测试**（vitest，`npm run test`，55 个用例）：此前项目**零测试**全靠手测。
+  覆盖最容易回归的纯逻辑 —— 上下文裁剪（`estimateTokens` / `trimMessagesToBudget` /
+  图片超预算回归）、token 估算回填校正、断连续传（前缀去重 / 不一致放弃 / 工具调用不重跑）、
+  技能 frontmatter 解析与启用/禁用状态、会话往返、备份撤销往返。
+- **内置「手机操作」技能 + 首次连接体检**（`skills/autojs6/SKILL.md`、`xzh device check`）：
+  把"通过 AutoJs6 操作手机"变成**可照做**的能力，而不是让模型盲写脚本。
+  - 技能内容按 AutoJs6 源码（`runtime/api/augment/`）核对，并写入本轮**真机实测**的经验：
+    ① 脚本在**手机上**跑、**拿不到返回值** → 每步必须 `toastLog` 回报、再用 `device_logs` 读，
+    失败分支必须打出 `currentPackage()`/`currentActivity()`；② `device_run` **发出即返回**、
+    日志**异步**回来（`run → sleep → logs`）；③ 手机只有一台、脚本会挂住 → 用 `device_stop` 收尾。
+  - **无障碍**：脚本里一律用 `auto.waitFor([timeout])`（已核实可带超时），**不要用 `auto()`**
+    —— 实测两种隐蔽失败：`无障碍服务未启动`（设置里没开）与`无障碍服务已启用但未运行`
+    （要关掉再打开或重启）。
+  - 含脚本模板、三级兜底（点名 → 坐标 → 图像）、滑动找列表、弹窗处理、只读读界面、排查清单。
+  - 真机测出的 API 坑也写进了技能：`app.launchSettings(pkg)` 其实是**应用详情页**
+    （`launchAppDetailsSettings`，不带包名直接抛错）；开系统设置要用
+    `app.launchPackage("com.android.settings")`。
+  - `device_run` 的工具描述与系统提示词都会引导先 `load_skill autojs6`。
+  - `xzh device check`：推一段**带超时**的探测脚本，回报无障碍状态 / 机型分辨率 / 当前前台界面；
+    三种结果各给明确下一步（可操作 / 无障碍不可用给处理办法 / **没有任何回报 = 卡在等待**，
+    提示先 `device_stop` 收尾）。真机实测输出：
+    `无障碍=已就绪`、`设备=OPPO PHQ110 1080x2412`、`结论=可以操作手机`。
+  - **端到端实证**：xzh 实际启动手机上的系统设置、读到 18 条真实界面文本、并 `back()` 返回。
+- **技能支持「主文件 + 伴随文件」拆分**（首个改造：`autojs6` 技能；`src/tools/skills.ts`）：
+  `load_skill` 会把主文件**整份**灌进上下文，而 `autojs6` 的正文已长到 **480 行**，其中大半是
+  "查表"内容（API 速查、套路片段、截图样板、排查清单），只有少数内容需要每次都在眼前
+  （三条硬约束、无障碍前提、多开/克隆选择弹窗的三条禁止）。
+  - 现按需拆成 `references/{api,patterns,screenshot,input,troubleshooting}.md`，
+    主文件缩到约 **130 行**，并给出「要做什么 → 读哪个文件」对照表；
+  - 为此 `load_skill` 的返回**新增技能目录绝对路径**（`> 技能目录：…`）：拆出去的文件只能按
+    相对路径指路，而技能在不同安装形态下路径不同（仓库内 `dist/skills/autojs6`、
+    npm 安装后 `node_modules/xuanzhu/dist/skills/autojs6`），**不能写死** —— 模型拿到目录才能
+    用 `read_file` 取用；`copy-skills` 本就是整目录复制，无需改动；
+  - 顺带清掉技能里的一处**本机专有路径**（原文写死了"本机源码在 `~/object/AutoJs6`"），
+    改成"AutoJs6 是开源的，实现在其源码 `runtime/api/augment/` 下"这种通用说法。
+- **19 个内置技能体检后的清理**（同一批次的收尾）：
+  - **剥离死元数据**：18 个技能的 frontmatter 里还带着原 CodeBuddy 扩展的 schema
+    （`metadata.dependencies` / `config` / `auth`）。玄猪的 `parseFrontmatter` 只取
+    `name` / `description`，这些键**一律不生效**——已剥离（删 300+ 行，正文零改动，只动 frontmatter）。
+    同时删掉 6 个**只往 `.codebuddy/bin` 里装东西**的 `install.sh`
+    （elasticsearch / gitlab / gmail / mysql / postgres / redis）：玄猪没有"项目级 bin"这套机制，
+    这些安装脚本必然装完也用不上。
+  - **继续拆分超长技能**（沿用「主文件索引 + 伴随文件」）：`officecli`（422 → 主文件 130 行 + 5 个
+    `references/`）、`datadog`（230 → 77 + 2）、`playwright`（164 → 121 + 2）、`telegram`（133 → 71 + 1）。
+    拆分只搬内容不改语义：主文件留下"每次都要遵守"的规则（如 playwright 的浏览器优先级与
+    「默认 `--browser chrome`」），把论证与边界（为何不用自带 Chromium、snap 的坑、Firefox 限制、
+    Node 写法）移进 `references/`。
+  - **删除 `gmail` 技能**：它整套是 CodeBuddy 时代的产物 —— `gmail-cli-wrapper` /
+    `.codebuddy/bin/gmail-cli` 这类路径在玄猪里根本不存在（56 处引用），而唯一的安装脚本
+    （装到 `.codebuddy/bin`）又刚在上一条里被删掉，等于**没有任何可用路径**；同时它的主文件
+    还是最长的（205 行）+ 4 个伴随文档。同类需求走 `email` 技能。内置技能数回到 **18**。
+  - **清除遗留的 `.codebuddy/bin` 路径**（CodeBuddy 时代的"项目级 bin"在玄猪里不存在，
+    模型照做会 `command not found`）：`github` / `jira` / `mysql` / `email` / `gitlab` /
+    `elasticsearch` 的正文全部改成**裸命令**（`gh` / `jira` / `mysql` / `mailsend` / `glab`），
+    并逐个补上**安装说明**（`gh` / `jira-cli` / `mailsend-go` / `glab` 各自的官方途径；
+    `mysql` 客户端的 brew/apt/dnf/winget 配方取自原元数据）；`aws` / `kubernetes` / `sentry` /
+    `linear` / `mongodb` / `postgres` / `redis` 也统一补了一句
+    「xzh 不代装，仅自动安装 playwright 与 officecli」。
+- **`device_read_screen` 工具：让模型真正"看"到手机界面**。补上一个设计缺口 ——
+  此前"看屏幕"只有 `device_screenshot`（返回值**只有文件路径**，模型看不到图片），
+  于是模型面对"查看当前手机屏幕里的内容"只能回一句"你可以打开这个文件看"。
+  正确做法是读**无障碍树**并把文字返回（模型只能读文字）：
+  `device_read_screen` 返回包名/Activity + 可见控件的 类名｜文本/描述｜是否可点击｜坐标。
+  - 真机实测：一次返回 345 个控件中的前 60 条，例如
+    `Button | 日志 | click=Y | [792,117,936,239]` —— 足够模型判断界面并决定点哪里。
+  - 控件明细用 `console.log` 而非 `toastLog`（后者每个控件弹一个 toast，会把用户屏幕刷满）。
+  - **修掉一个实测出的隐患**：日志缓冲是**跨调用共享**的，只按 `【界面】` 过滤会把
+    **上一次运行的残留**也算进来（实测混入了上一次截图的 `MediaProjectionPermissionActivity`），
+    从而报出**过期界面**。现在每次运行带唯一标记 `【开始】<runId>`，只取标记之后的行。
+  - `device_screenshot` 的描述同步改为"只用于给用户产出截图文件；要看屏幕请用
+    device_read_screen"，系统提示词与技能也做了同样的指引。
+- **手机截图能力**（`xzh device shot` / `device_screenshot` 工具）：截取手机当前屏幕并保存为 JPEG。
+  - 难点在于 `captureScreen()` 走系统 **MediaProjection**，会弹「**立即开始**」授权框，而它是
+    **阻塞**的 —— 点击必须写在**另一个线程**里、主线程再去截图。**真机实测：这个授权框
+    _每次截图_都会弹**（不是只有首次，用户手动点过也不会变成永久授权），因此这段样板
+    是每次都必须有的。样板集中在 `src/device/screenshot.ts`，调用方不用再写。
+  - 图片回传：`captureScreen()` 的 `Image` 留在手机上，而设备桥只有"推脚本 + 收日志"
+    两条通路 —— 因此缩图（30%）+ base64 后由手机**主动 POST** 回桥的新端点 `/shot`；
+    触发走 `/screenshot`（直接把图片返回，避免两步轮询）。桥只复用现有的控制端口，
+    不额外监听。
+  - 多语言授权按钮兜底（`立即开始`/`开始现在`/`允许`/`START NOW`/`Allow`）；
+    回传地址取**与手机同网段的本机 IP**（多网卡机器上给错地址会让手机传不回来）。
+  - Agent 侧新增工具 `device_screenshot`（工具结果只有路径 —— 模型看不到图片内容，
+    它的用途是给用户产出截图文件；要模型自己判断界面请用文本树）。
+
+- **设备桥新增 AutoJs6 的「客户端模式」监听（推荐方向）**：手机点「连接电脑 → 客户端模式」
+  填本机地址（默认 `6347`）即可连上 xzh —— 这是**手机端 UI 支持最好**的方向，也正是
+  AutoJs6 官方 VSCode 扩展（`003.autojs6-vscode-ext`）走的那条路，因此 xzh 可以**直接顶替它**。
+  - 真机实测场景：用户按手机上的直觉点了「客户端模式」并连上，但那台机器上监听 `6347` 的是
+    VSCode 里的 AutoJs6 扩展（`ESTAB 192.168.11.129:6347 ← 手机`），所以"连接成功"连的并不是 xzh。
+    禁用该扩展后 xzh 即可接管同一端口。
+  - 握手时序是这条路的**关键约束**：手机连上后立刻发 `hello`，然后**只等 6400ms** 应答，
+    超时就弹「连接无法建立」。因此收到 hello 必须**立即回**，且回的是**插件协议版本**
+    （`extensionVersion ≥ 1.0.13`），不是玄猪自己的版本号。实测应答耗时 **7ms**。
+  - 这个方向还能拿到**真实设备名**（握手里有 `device_name`），服务器模式则只有地址。
+  - `xzh device serve` 现在**同时监听两个端口**（`6347` AutoJs6 + `9317` AutoX.js），
+    且**哪个端口被占就只提示那个、另一边照常用** —— 因为 VSCode 的 AutoJs6 扩展与 Auto.js 插件
+    恰好各占一个，全有或全无会让用户误以为 xzh 起不来。
+  - `Session` 增加 `origin: "dial" | "listen"`：AutoJs6 的两个方向 `kind` 相同，
+    但生命周期各由不同入口管理，清理时必须各清各的。
+- **支持 AutoJs6（推荐）—— 设备桥新增第二种传输**。此前只支持 AutoX.js（手机作为
+  WebSocket 客户端连电脑）；现在也可以让 xzh **主动连手机**（AutoJs6 的「连接电脑 →
+  服务器模式」，默认 `7347`），两种连接可同时接入同一个 xzh，指令按各自协议编码。
+  - 为什么统一走"我们连手机"：另一个方向要求用户先在手机上正确填写**电脑的 IP**；
+    而这个方向只要一个地址 —— 电脑上是手机 IP，手机本机（termux）上是 `127.0.0.1`，
+    同一套代码覆盖两种部署，本地还完全不联网。
+  - `src/device/autojs6/protocol.ts`：AutoJs6 线协议 —— **裸 TCP + 8 字节大端头
+    `[len][type]`**（类型 1=JSON / 2=BYTES），与 `JsonSocket#getHeaderBytes()` 逐字节一致；
+    自带增量解码器处理**粘包/半包**，长度非法时明确报"不是 AutoJs6 协议"。
+  - `src/device/autojs6/client.ts`：出站连接 —— 握手（**由我们先发 hello**，服务器模式
+    不校验版本）、`run` / `save` / `stop` / `stopAll` 指令、日志与手机上报指令的接收；
+    带**指数退避自动重连**、**连续 3 次失败即放弃并给出可操作指引**、**5 秒连接超时**。
+  - `DeviceBridge` 把 session 抽象成「传输 + 发送 + 关闭」（`Session` / `DeviceKind`），
+    两种传输因此天然共享同一套设备注册表、日志缓冲、HTTP 控制通道与 `device_*` 工具 ——
+    CLI、界面与 Agent 侧**没有任何分支**。
+  - 新增 `xzh device connect <手机IP>[:端口]` 与界面 `/device connect <手机IP>`；
+    `xzh device status` 会显示 AutoJs6 是「已连接」还是「连接中/等待重试」。
+- **首次连接手机的引导**（`src/device/apk.ts`）：手机需要 AutoJs6（它提供无障碍能力）。
+  玄猪**不打包安装包** —— 每个 ABI 约 130 MB、两个 270 MB，进 npm 包会让所有用户平白多下
+  几百 MB，而绝大多数人只需要一个。因此新增 `xzh device apk`：探测该用哪个 ABI
+  （`adb shell getprop ro.product.cpu.abi` 优先，否则默认 `arm64-v8a`）、给出官方下载页
+  <https://github.com/SuperMonster003/AutoJs6/releases/>、并检查 `~/.xzh/apks/` 本地缓存。
+  `connect` 连不上时会打印完整引导（装 App → 开服务器模式 → 填 IP → 常见原因排查）并
+  **停止无谓的重试**。
+
+- **手机设备桥（`xzh device` / 界面 `/device`）**：把脚本推到**手机**上的 AutoX.js / Auto.js
+  运行、并回收脚本日志 —— 即 VSCode 插件 Auto.js-Autox.js-VSCodeExt 的 `Run` / `Save` /
+  日志面板，搬到终端里，而且 **Agent 也能自己操作**（新增 `device_list` / `device_push` /
+  `device_run` / `device_stop` / `device_logs` 五个工具）。
+  - **协议逐字兼容手机端**（`src/device/protocol.ts`）：手机作为 WebSocket 客户端连到 `9317`，
+    双方收发 JSON 文本帧；单文件指令把**脚本全文塞在 `data.script` 里**（插件的
+    `runOrRerun()` / `saveTo()` 就是这样），因此推脚本不需要任何文件传输或压缩。
+    插件那条"整个项目打包 zip + md5 走二进制帧"的路、以及 ADB/USB 免填 IP 的模式，
+    本次**未实现**（需要时继续用插件）。
+  - **两种用法**：`xzh device serve` 常驻，其余子命令（`status` / `list` / `push` / `run` /
+    `stop` / `logs`）通过桥上的**本地 HTTP 控制通道**说话；界面内 `/device serve` 则把桥跑在
+    xzh 进程里 —— 手机日志实时进**右侧终端面板**（不刷对话区），同时把桥注入给 Agent 的工具。
+  - 端口冲突是最常见的失败：`9317` 与 VSCode 插件是同一个端口，**两者不能同时开**。
+    被占用时给出可操作提示；也可用 `--port` / 环境变量 `XZH_DEVICE_PORT` 换端口。
+    （另需给 `wss` 挂 `error` 监听 —— `ws` 会把底层 http server 的 error 转发到 WSS 自身，
+    不监听会变成未捕获异常直接打掉进程。）
+  - 设备操作**对子代理禁用**（列入 `SUBAGENT_FORBIDDEN_TOOLS`）：手机只有一台，
+    并行子代理推脚本会互相打断。
+  - 依赖变化：新增运行时依赖 `ws`（本项目**第一个非 LLM SDK 的依赖**），
+    与三个 SDK 一样在 `esbuild.js` 里保持 `external`。
+- **token 估算闭环：用真实 usage 回填校正裁剪预算**（`src/llm/calibration.ts`、`src/core/agent.ts`）。
+  玄猪按「ASCII 3.5 字符/token、CJK 1 字符/token」保守估算（不引入 tokenizer），
+  但某些模型的真实用量会比估算还大（服务端把工具 schema、消息结构开销也计入，
+  或对中文切分更碎）—— 这类**系统性**低估会让裁剪后的请求仍然超限，撞上 400。
+  - 三家 Provider 本就返回 `usage`，此前在 Agent 的 `done` 分支被**直接丢弃**；
+    现在拿 `真实 prompt token / 本次估算` 做 EWMA，按模型在**进程内共享**累积样本，
+    下一次计算会话预算时据此**收紧**（`calibrateBudget`，`budget / factor`）。
+  - 刻意**只收紧、不放宽**：估算偏高（factor < 1）时不做任何调整 —— 放宽等于把
+    「宁可高估」的 20% 余量还回去，反而更容易撞窗口。
+  - 样本门槛 2 次（首个样本可能是 Anthropic 缓存命中导致的骤降）、EWMA α=0.3、
+    比值上限 4、异常样本（0.1–8 之外）直接丢弃；状态**不落盘**（运行时自适应量，
+    一两次请求即可重新收敛，没必要新增配置文件）。
+
+### 修复
+
+- **多图超出上下文预算时，整个会话被裁空**（`src/llm/context.ts` 的 `shrinkMessage`）：
+  图片按固定 1600 token/张估算，多张图可能**自身**就吃掉全部预算 —— 此时 `shrinkMessage`
+  不处理 `images`、直接返回 `null`，`trimMessagesToBudget` 随之返回**空会话**：
+  请求退化成只剩 system prompt，模型对本轮任务彻底失忆，还可能重复执行已有副作用的操作。
+  现在「图片放不下预算」时会**丢图保内容**（降级为占位文本再收缩正文）——
+  请求里没有图，远好于整个会话被裁空。
+- **子代理被中止时，主代理不再把烂尾报告当正常结论**：子代理与主代理**共用同一套循环**
+  （`src/core/agent.ts` 的 run），死循环检测（同一工具 + 同参数连续 4 次 → 先自我修正 →
+  再中止）与轮数上限本就会作用于它；但中止原因没有暴露 —— 主代理只拿到文本回报，
+  一份因重复被中止前吐出的半截报告会被当成正常结论继续使用。
+  现在 Agent 暴露非正常收尾的原因（陷入重复 / 达到轮数上限 / 被中断），
+  `spawnSubAgent` 把它带进返回结果：结论前加 ⚠ 警告、summary 改为「子代理中止（…）」、
+  无结论时说明原因。
+- **子代理有了自己的轮数上限（默认 60 轮）**：`AgentOptions` 新增 `maxToolRounds` 覆盖。
+  此前子代理沿用主配置的 `maxToolRounds`（默认 200）—— 但子代理**不接受**「到上限问用户」
+  （到顶即收尾），且并行子代理**各有配额**，主配置叠加并发会把最坏情况放大数倍
+  （并发 4 个 → 最坏 800 轮）。现在子代理默认 60 轮（`SUBAGENT_MAX_TOOL_ROUNDS`，
+  一次聚焦的调研足够），到顶即收尾并在回报中注明原因；轮数提示也会区分
+  「改 config.maxToolRounds」（主代理）与「这是子代理默认值，请拆小任务」（子代理）。
+- **设备桥握手被 AutoX.js 判为失败**（真机实测：OPPO PHQ110 / AutoX.js 7.2.2，
+  versionCode 722）。握手应答里的 `version` 字段**必须回 VSCode 插件那套版本号**
+  （`1.110.0`）—— 手机端拿它做兼容性判断，此前回的是玄猪自身版本（`0.3.0`），
+  手机收到应答后立刻断开并在界面上提示「握手失败」。两者的应答只有这一个字段不同。
+  现在由 `DEVICE_PLUGIN_PROTOCOL_VERSION` 提供（可用环境变量 `XZH_DEVICE_PLUGIN_VERSION`
+  覆盖，以便手机端将来提高要求时不用改代码）。
+  同时把握手帧写进日志（手机原始 `hello` / 我们的应答 / 未知消息类型），
+  这类问题以后不用靠猜。
+- **输出到一半网络断了，不再整轮作废（断连续传）**（`src/llm/stream-retry.ts`）。
+  此前三个 Provider 各自实现的规则是「只要已经向调用方输出过内容就不再重试」——
+  理由是怕重复输出，但代价是「用户已经看到大半段回复，只因最后一段没到而整轮失败」，
+  长回复（尤其推理模型的长思考）撞上这条的概率并不低。
+  - 现在把这套逻辑抽成统一的 `withRetry`：重跑时由 `StreamEmitter` 逐块校验
+    「重跑流的前缀是否与已交付内容逐字一致」，一致则**只放行新增部分**（跳过重复前缀），
+    用户看到的是无缝续上的内容。
+  - 前缀不一致 → 放弃续传，抛回**原始网络错误**（退化为旧行为），绝不拼接出错乱内容；
+    流提前结束、前缀只重建了一部分，同样放弃。
+  - 续传时**丢弃重跑的思考内容**：推理模型重跑几乎必然给出不同（甚至更短）的思考，
+    逐字校验只会白白让续传失败，而思考本来就是一次性的、用户已看过第一遍。
+  - 已交付过**工具调用**则一律不再重跑：工具调用只在流末尾产出，重跑必然导致同一工具
+    被执行两次（副作用重复），这比丢掉一次回复严重得多。
+  - `ChatOptions.onRetry` 新增第 4 个参数 `info`（`{ resumed }`），界面据此区分
+    「网络中断，正在重试」与「响应中断，正在续传」。
+  - 三家 Provider 的重试循环（原有 `MAX_ATTEMPTS`/退避 600/1200ms 逻辑）随之去重，
+    统一收敛到 `stream-retry.ts`。
+
 ## [0.3.0] — 2026-10-09
 
 ### 新增

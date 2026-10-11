@@ -6,40 +6,6 @@ metadata:
   icon: cloud
   category: cloud
   version: 1.0.0
-  dependencies:
-    cli: aws
-    checkCommand: aws --version
-    install:
-      darwin:
-        brew: awscli
-        scriptArch:
-          x64: curl "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "AWSCLIV2.pkg" && sudo installer -pkg AWSCLIV2.pkg -target /
-          arm64: curl "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "AWSCLIV2.pkg" && sudo installer -pkg AWSCLIV2.pkg -target /
-        manual: Download installer from https://aws.amazon.com/cli/
-      linux:
-        scriptArch:
-          x64: curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && unzip awscliv2.zip && sudo ./aws/install
-          arm64: curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "awscliv2.zip" && unzip awscliv2.zip && sudo ./aws/install
-        pip: awscli
-      windows:
-        winget: Amazon.AWSCLI
-        choco: awscli
-        scoop: aws
-        manual: Download MSI from https://aws.amazon.com/cli/
-  config:
-    - name: AWS_DEFAULT_REGION
-      label: Default Region
-      type: string
-      required: false
-      placeholder: us-east-1
-    - name: AWS_PROFILE
-      label: Profile
-      type: string
-      required: false
-      placeholder: default
-  auth:
-    type: api-key
-    setupCommand: aws configure
 ---
 
 # AWS CLI
@@ -68,3 +34,6 @@ Use `aws` to interact with Amazon Web Services.
 ## Notes
 
 - Requires `aws` CLI to be installed and configured (`aws configure`).
+- xzh does **not** install the `aws` CLI for you (only `playwright` and `officecli` are
+  auto-installed) — install it yourself: macOS `brew install awscli`;
+  Linux/Windows installer from <https://aws.amazon.com/cli/>.
