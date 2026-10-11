@@ -735,6 +735,11 @@ This project stands on the open-source work of others. Special thanks to:
   and **retains its original copyright notice** as required by the MIT license.
 - **[Playwright](https://github.com/microsoft/playwright)** — open-sourced by Microsoft.
   The built-in `playwright` skill uses it for browser automation and end-to-end testing.
+- **[AutoJs6](https://github.com/SuperMonster003/AutoJs6)** — by SuperMonster003.
+  Both wire protocols of the phone device bridge (`xzh device`) were verified against its
+  implementation, and the built-in `autojs6` skill was compiled from its source — which is
+  what turns "drive the phone from a script" into something you can actually follow
+  rather than something the model has to guess at.
 
 Thanks also to every open-source project among the direct and indirect dependencies,
 and to the many tools in the npm ecosystem (see `package.json` for the full list).

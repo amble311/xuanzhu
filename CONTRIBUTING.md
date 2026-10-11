@@ -37,5 +37,5 @@ node bin/xzh.js     # 本地运行
 
 ## 文档同步
 
-修改代码后，若与 `AGENTS.md` 或 `docs/ARCHITECTURE.md` 的描述不一致，
+修改代码后，若与 `docs/ARCHITECTURE.md` 的描述不一致，
 **必须同步更新对应文档**，并在说明中标注与原设计的不同之处。

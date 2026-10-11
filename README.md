@@ -795,6 +795,10 @@ registry 已可见（npm 有 staging 阶段，期间 `npm view` / `npm install` 
   并依 MIT 许可**保留其原始版权声明**。
 - **[Playwright](https://github.com/microsoft/playwright)** —— 由 Microsoft 开源。
   内置的 `playwright` 技能基于它实现浏览器自动化与端到端测试。
+- **[AutoJs6](https://github.com/SuperMonster003/AutoJs6)** —— 作者 SuperMonster003。
+  手机设备桥（`xzh device`）的两套线协议都对着它的实现逐一核对，
+  内置的 `autojs6` 技能也按它的源码整理而成 ——
+  这才让「用脚本操作手机」成为可照做的能力，而不是让模型盲写。
 
 同时也感谢所有直接与间接依赖的开源项目，以及 npm 生态中的众多工具
 （完整清单见 `package.json`）。

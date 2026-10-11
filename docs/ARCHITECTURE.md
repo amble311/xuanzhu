@@ -659,4 +659,4 @@ AutoJs6 连接的三个必要策略（`autojs6/client.ts`）：**指数退避自
 | 依赖规模 | 40+ 运行时依赖（LangChain、ChromaDB、Telemetry 等） | 3 个运行时依赖（各家 LLM SDK） |
 | 配置 | VSCode settings + SecretStorage | `~/.xzh/config.json` + 环境变量 |
 
-改造过程中的设计取舍记录在本文档与 `AGENTS.md` 中。
+改造过程中的设计取舍记录在本文件中。
