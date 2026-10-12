@@ -233,6 +233,15 @@ const MAX_PARALLEL_AGENTS_CAP = 16;
 /** `config.maxParallelAgents` 未设置时的默认并发数 */
 const DEFAULT_PARALLEL_AGENTS = 4;
 
+/** 被跳过（并未真正执行）的工具调用，其 `tool` 结果统一以此前缀开头 */
+const SKIPPED_CALL_PREFIX = "[系统] 本次调用已跳过";
+
+/** 「上一轮已中止」说明里最多列出的工具调用条数，其余只计数（提示本身也不能吃掉上下文） */
+const ABORT_NOTE_MAX_CALLS = 12;
+
+/** 「上一轮已中止」说明里单条工具调用参数的最大长度 */
+const ABORT_NOTE_ARG_CHARS = 120;
+
 export class Agent {
   private provider: LLMProvider;
   private readonly config: XuanZhuConfig;
@@ -523,38 +532,71 @@ export class Agent {
     };
 
     /**
-     * 中断/出错收尾：只提交本轮「已完整配对」的部分。
+     * 生成「上一轮已中止」的说明；本轮什么都没真正执行时返回 `null`（无可奉告）。
      *
-     * 工具一旦执行就产生了真实副作用（文件已改、命令已跑），若把它从历史里抹掉，
-     * 模型完全不知情，下一次很可能重复执行同样的破坏性操作。因此这里保留已完成的记录，
-     * 只丢弃末尾那个「声明了 tool_calls 但结果不全」的 assistant 以维持结构合法
-     * （否则 assistant 的 tool_calls 数与 tool 消息数不匹配，下一次请求会 400）。
+     * 用 `system` 角色承载：它**不参与 user / assistant 的交替结构** —— Anthropic 与
+     * Gemini 会把 history 里的 system 消息并入系统提示词（见各自的 `to*Messages()`），
+     * OpenAI 兼容端点也允许一次请求里出现多条 system 消息。因此无论历史被裁到哪一条，
+     * 这条说明都不会让请求结构非法。
      */
-    const commitPartialTurn = (): void => {
-      const done: ChatMessage[] = [];
-      for (let i = 0; i < turn.length; i++) {
-        const message = turn[i];
-        done.push(message);
-        if (message.role !== "assistant" || !message.toolCalls?.length) continue;
-
-        // 这条 assistant 声明了 N 个 tool_call，检查其后是否已收到全部 N 条 tool 结果。
-        // 中断通常发生在工具循环中间，此时 turn 末尾是 tool 而不是 assistant，
-        // 所以必须主动回溯比对，不能只看最后一条。
-        const needed = message.toolCalls.length;
-        let received = 0;
-        for (let j = i + 1; j < turn.length && received < needed; j++) {
-          if (turn[j].role === "tool") received++;
-        }
-        if (received < needed) {
-          // 结果不全：丢掉这条 assistant，保留它之前已完成的部分
-          done.pop();
-          break;
-        }
+    const abortNote = (reason: string): ChatMessage | null => {
+      // 先建立 id → 参数 的索引：`tool` 消息本身不带参数，得回到 assistant 的 tool_calls 取
+      const argsById = new Map<string, string>();
+      for (const message of turn) {
+        for (const call of message.toolCalls ?? []) argsById.set(call.id, call.arguments);
       }
 
-      // 只剩一条 user 说明本轮什么都没做成，整体不提交，避免留下孤立 user
-      if (done.length > 1) {
-        this.appendHistory(done);
+      const executed: string[] = [];
+      for (const message of turn) {
+        if (message.role !== "tool") continue;
+        // 被跳过（自我修正 / 重复检测）的调用只是占位，并没有真的执行
+        if (message.content.startsWith(SKIPPED_CALL_PREFIX)) continue;
+        const args = argsById.get(message.toolCallId ?? "") ?? "";
+        const shown =
+          args.length > ABORT_NOTE_ARG_CHARS
+            ? `${args.slice(0, ABORT_NOTE_ARG_CHARS)}…`
+            : args;
+        executed.push(`${message.name ?? "工具"}(${shown})`);
+      }
+      if (executed.length === 0) return null;
+
+      const listed = executed
+        .slice(0, ABORT_NOTE_MAX_CALLS)
+        .map((line) => `· ${line}`);
+      if (executed.length > listed.length) {
+        listed.push(`· …等共 ${executed.length} 次调用`);
+      }
+      return {
+        role: "system",
+        content:
+          `[上一轮已中止] 上一轮${reason}，没有给出结论，该轮对话已作废。\n` +
+          `中止前**已经真实执行**过的操作（副作用仍然存在，不要重复执行）：\n` +
+          listed.join("\n") +
+          `\n请直接回应用户最新的消息，不要接着完成被中止的旧任务。`,
+      };
+    };
+
+    /**
+     * 中断/出错收尾：**本轮整体回滚**（turn 一条都不提交），另补一条说明。
+     *
+     * 为什么是整轮回滚：曾有一个「部分提交」版本，保留已完整配对的 user /
+     * assistant(tool_calls) / tool 记录，只丢弃末尾对不齐的 assistant（理由是工具副作用
+     * 真实存在、抹掉会让模型重做）。但那样历史里会留下一条**没有最终答复的 user 轮次** ——
+     * 用户中断后发新消息时，模型看到的是「上一轮工具都跑完了却没收尾」，于是先把旧任务
+     * 答完，表现为「发了新消息，模型却仍在回复被中断的那条」。用户按 `Ctrl+D` 的语义
+     * 就是「这一轮不要了」，因此历史回到本轮起点。
+     *
+     * 为什么还要补说明：整轮回滚后模型看不见自己做过什么，若不告诉它，它会以为什么都没
+     * 发生、**重复执行**已经生效的写文件 / 执行命令。说明只列真实执行过的调用
+     * （跳过的不算），既保住「工具做过什么」这份信息，又不留下悬空的 user 轮次。
+     */
+    const rollbackTurn = (reason: string): void => {
+      const note = abortNote(reason);
+      // turn 是本轮私有的消息数组，且所有调用点随后都会 return（catch 分支则重新抛出），
+      // 因此「回滚」在实现上就是什么都不提交；清空数组只是让语义显式。
+      turn.length = 0;
+      if (note) {
+        this.appendHistory([note]);
         this.trimHistory();
       }
     };
@@ -619,7 +661,7 @@ export class Agent {
       for (let round = 0; ; round++) {
         if (round >= roundLimit) {
           if (signal?.aborted) {
-            commitPartialTurn();
+            rollbackTurn("被用户中断");
             this.events.onStatus("已中断");
             return;
           }
@@ -632,7 +674,7 @@ export class Agent {
         }
 
         if (signal?.aborted) {
-          commitPartialTurn();
+          rollbackTurn("被用户中断");
           this.events.onStatus("已中断");
           return;
         }
@@ -651,9 +693,9 @@ export class Agent {
         );
 
         // streamAssistant 在中断时可能「正常返回」部分内容：
-        // 此时不能把半截 assistant 提交，也不该继续执行工具
+        // 此时不能把半截 assistant 提交，也不该继续执行工具 —— 本轮整体回滚
         if (signal?.aborted) {
-          commitPartialTurn();
+          rollbackTurn("被用户中断");
           this.events.onStatus("已中断");
           return;
         }
@@ -800,7 +842,7 @@ export class Agent {
               }
 
               if (signal?.aborted) {
-                commitPartialTurn();
+                rollbackTurn("被用户中断");
                 this.events.onStatus("已中断");
                 return;
               }
@@ -858,7 +900,7 @@ export class Agent {
           }
           this.events.onToolEnd(call, result);
           if (signal?.aborted) {
-            commitPartialTurn();
+            rollbackTurn("被用户中断");
             this.events.onStatus("已中断");
             return;
           }
@@ -903,7 +945,7 @@ export class Agent {
       this.abortReason = "达到工具调用上限";
     } catch (err) {
       // 中断也可能以异常形式到达（provider 在 abort 时 reject）
-      commitPartialTurn();
+      rollbackTurn(signal?.aborted ? "被用户中断" : "因出错中止");
       if (signal?.aborted) {
         this.events.onStatus("已中断");
         this.abortReason = "已被用户中断";
