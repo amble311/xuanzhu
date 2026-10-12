@@ -43,6 +43,45 @@ info() { printf '  %s%s%s\n' "$C_DIM" "$1" "$C_RESET"; }
 warn() { printf '  %s⚠%s %s\n' "$C_YELLOW" "$C_RESET" "$1"; }
 die()  { printf '  %s✗%s %s\n' "$C_RED" "$C_RESET" "$1" >&2; exit 1; }
 
+# ─────────────────────── 全局安装残留清理 ───────────────────────
+#
+# 清掉全局 node_modules 下 npm 留下的暂存目录（形如 .<包名>-XXXXXX）。
+#
+# 为什么必须清：npm 给暂存目录起的名字是「.<包名>-<固定哈希>」——**同一个包每次都是同一个名字**。
+# 上一次安装留下的残渣只要还在，npm 的 rename(<包名> → <暂存名>) 就会失败并报：
+#   npm error ENOTEMPTY: directory not empty, rename '.../xuanzhu' -> '.../.xuanzhu-XXXX'
+# 而且名字固定，**此后每一次** `npm i -g` 都会失败，不是偶发。
+#
+# 顺序是「先删、删不掉再移出 node_modules」：
+#   - 某些环境装有 safe-delete 之类的保护机制，对**大批量**删除（数千文件）直接拒绝，
+#     而且**静默失败、不抛异常**（rmSync 看似成功、目录其实还在），所以删完必须复查；
+#   - 删不掉就把它**移出** node_modules —— npm 只关心那个固定名字有没有被占用。
+#     早期版本是「在原地重命名成 xxx.orphan-<时间戳>」，那是**留**而不是**清**：
+#     每次发布会多叠一层 .orphan-，几轮之后名字长得离谱，磁盘也被反复占住。
+clear_stale_staging() {
+  root="$1"
+  if [ -z "$root" ] || [ ! -d "$root" ]; then return 0; fi
+  stale_dir="${TMPDIR:-/tmp}/xuanzhu-npm-stale"
+  cleared=0
+  for stale in "$root"/."$PACKAGE"-*; do
+    [ -e "$stale" ] || continue
+    rm -rf "$stale" 2>/dev/null || true
+    if [ -e "$stale" ]; then
+      mkdir -p "$stale_dir" 2>/dev/null || true
+      mv "$stale" "$stale_dir/$(basename "$stale").$(date +%s%N)" 2>/dev/null || true
+    fi
+    if [ -e "$stale" ]; then
+      warn "残留暂存目录无法清理，请手工删除：$stale"
+    else
+      cleared=$((cleared + 1))
+    fi
+  done
+  if [ "$cleared" -gt 0 ]; then
+    info "已清理 $cleared 个残留暂存目录"
+  fi
+  return 0
+}
+
 # ──────────────────────────── 参数 ────────────────────────────
 
 BUMP="${1:-patch}"
@@ -273,35 +312,10 @@ else
   if [ "$SYNCED" != "1" ]; then
     warn "registry 尚未同步，跳过更新；稍后可执行：npm i -g $PACKAGE@latest"
   else
-    # 先处理历史安装中断留下的暂存目录（形如 .<包名>-XXXXXX）。
-    # npm 在安装前需要删掉它们，而某些环境装有 safe-delete 之类的保护机制：
-    # 对**大批量**删除（数千文件）会直接拒绝，而且**静默失败、不抛异常** ——
-    # 于是 rmSync 看起来成功、目录其实还在，安装继续失败，
-    # 表现为「发布成功但本机没更新」，很难排查。
-    #
-    # 这里改用**重命名**把它挪开：重命名不属于删除操作，不受该机制限制，
-    # 而对 npm 来说效果相同（它只看那个固定名字是否已被占用）。
     GLOBAL_ROOT=$(npm root -g 2>/dev/null || printf '')
-    if [ -n "$GLOBAL_ROOT" ] && [ -d "$GLOBAL_ROOT" ]; then
-      node -e "
-        const fs = require('fs'); const path = require('path');
-        const root = process.argv[1];
-        let moved = 0;
-        try {
-          for (const entry of fs.readdirSync(root)) {
-            if (!entry.startsWith('.$PACKAGE-')) continue;
-            const from = path.join(root, entry);
-            try {
-              fs.renameSync(from, from + '.orphan-' + Date.now());
-              moved++;
-            } catch { /* 忽略单个失败 */ }
-          }
-        } catch { /* 忽略 */ }
-        if (moved > 0) {
-          process.stdout.write('  已挪开 ' + moved + ' 个残留暂存目录（改名而非删除，避开大批量删除保护）\n');
-        }
-      " "$GLOBAL_ROOT" || true
-    fi
+
+    # 安装前必须**腾出** npm 要用的那个固定暂存名，否则它的 rename 必然 ENOTEMPTY。
+    clear_stale_staging "$GLOBAL_ROOT"
 
     INSTALL_ERR=$(npm i -g "$PACKAGE@$NEW_VERSION" 2>&1) && INSTALL_OK=1 || INSTALL_OK=0
     if [ "$INSTALL_OK" != "1" ]; then
@@ -310,6 +324,10 @@ else
       INSTALL_ERR=$(npm i -g "https://registry.npmjs.org/$PACKAGE/-/$PACKAGE-$NEW_VERSION.tgz" 2>&1) \
         && INSTALL_OK=1 || INSTALL_OK=0
     fi
+
+    # 安装后 npm 也可能删不掉它刚挪开的旧包（就是上面那种静默失败）——
+    # 再清一次，免得下一次安装卡在同一个名字上。
+    clear_stale_staging "$GLOBAL_ROOT"
 
     if [ "$INSTALL_OK" = "1" ]; then
       ok "已安装 $PACKAGE@$NEW_VERSION"
