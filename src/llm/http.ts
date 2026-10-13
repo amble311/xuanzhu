@@ -168,9 +168,10 @@ export function friendlyError(error: unknown): string {
 /**
  * 判断错误是否为「配置类问题」—— 密钥无效、模型名不存在、端点地址错误等。
  *
- * 这类失败**重试与降权都没有意义**：配置不改就永远失败。
- * 若照常扣权重，一次配置错误会把所有可用模型一起拖到不可用
- * （权重耗尽还会触发全局重置），而用户真正需要做的是去修配置。
+ * 这类失败**重试与切换模型都没有意义**：配置不改就永远失败。
+ * 若照常沿模型列表回退，一次配置错误会把所有模型都白试一遍、
+ * 并把「当前使用的模型」改成一个同样不可用的，掩盖真正的原因 ——
+ * 用户真正需要做的是去修配置。
  */
 export function isConfigError(error: unknown): boolean {
   const err = error as {
@@ -208,11 +209,28 @@ export function isConfigError(error: unknown): boolean {
 }
 
 /**
+ * 判断错误是否为「这个**模型**在该端点不存在 / 不可用」（典型是 404）。
+ *
+ * 与 `isConfigError` 分开的原因：两者的**责任层级不同**，多模型下的正确反应也不同。
+ * - 401 / 403（密钥无效、无权限）是 **provider 级**：这张列表上的其它模型多半同样不可用，
+ *   回退只会白试一遍并把「当前使用的模型」换成另一个不可用的 → 不该回退；
+ * - 404（模型名写错、端点没上这个模型）是 **模型级**：列表里的下一个模型很可能可用
+ *   → **应当照常回退**。
+ *
+ * 早期把 404 一起归到「配置错误、不切换」，结果是**列表里一个模型名写错就中止整条回退链**，
+ * 与「按列表顺序自动回退」的设计目标直接冲突。
+ */
+export function isModelUnavailableError(error: unknown): boolean {
+  const err = error as { status?: unknown };
+  return asStatus(err?.status) === 404;
+}
+
+/**
  * 判断错误是否为「上下文超出模型窗口」。
  *
  * 这类错误必须与其他调用失败区别对待：
- *   - 它不是模型的故障，**不该降权、不该切换模型** ——
- *     换个模型拿同样长的消息再发一次只会同样失败，还白白扣掉权重；
+ *   - 它不是模型的故障，**不该切换模型** ——
+ *     换个模型拿同样长的消息再发一次只会同样失败，还白白走一遍回退链；
  *   - 它是可自愈的：收敛历史长度后重试即可。
  *
  * 三家 provider 措辞不同，这里做特征匹配而非精确匹配：
@@ -264,8 +282,8 @@ export function isContextLengthError(error: unknown): boolean {
     "too many tokens",
     // ── 本地推理（llama.cpp / llama-server / Ollama 等）──
     // 这些用的措辞是 "context size" 而不是 "context length"，
-    // 早期只匹配后者，导致本地模型超限时被当成普通故障：降权 + 切换模型，
-    // 而换模型后再发同样长的内容必然同样失败，白白把权重耗光。
+    // 早期只匹配后者，导致本地模型超限时被当成普通故障：沿列表一路切换模型，
+    // 而换模型后再发同样长的内容必然同样失败，把整条回退链白走一遍。
     "context size",
     "context_size",
     "exceeds the available context",
@@ -408,7 +426,7 @@ function friendlyErrorRaw(error: unknown): string {
       "可尝试：减小上下文长度（llama.cpp 的 -c，例如 -c 8192）、降低 KV cache 精度\n" +
       "（--cache-type-k q8_0 --cache-type-v q8_0）、减少 GPU 卸载层数（-ngl）、\n" +
       "换更小的模型 / 量化，或先释放被其他进程占用的显存。\n" +
-      "修好服务端后可用 `xzh model reset` 把被降掉的权重恢复为默认值。"
+      "修好服务端后重试即可；若本轮已沿模型列表回退到别的模型，下次启动会接着用它。"
     );
   }
   if (typeof status === "number" && status >= 500) {
@@ -427,7 +445,7 @@ function friendlyErrorRaw(error: unknown): string {
     const detail = raw.replace(/^4\d\d\s*/, "");
     const hint = /model/i.test(detail)
       ? "\n提示：多半是模型名不被该端点支持。可用 `curl <baseUrl>/models` 查看端点支持的模型 id，" +
-        "再用 `xzh model weight <id> 10` 后的 `xzh model` 更正模型名。"
+        "再用 `xzh model remove <id>` + `xzh model add <provider> <model>` 更正模型名。"
       : "";
     return `请求被拒绝（HTTP 400）：${detail}${hint}`;
   }

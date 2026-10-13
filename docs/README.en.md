@@ -116,10 +116,10 @@ npm unlink -g xuanzhu && npm i -g xuanzhu
 ## Getting Started
 
 ```bash
-# 1. Configure a model and provider (interactive; you can add several models and set their weights)
+# 1. Configure a model and provider (interactive; you can add several models)
 xzh model
 
-# 2. Launch XuanZhu (it picks the model with the highest weight)
+# 2. Launch XuanZhu (it uses the model you used last)
 xzh
 ```
 
@@ -135,15 +135,14 @@ Take a look at what this project does, then add an engines field to package.json
 | --- | --- |
 | `xzh` | Launch the full-screen interface in the current directory |
 | `xzh <directory>` | Launch in the given project directory, e.g. `xzh /home` |
-| `xzh model` | Interactively manage models (add / remove / adjust weight / list all) |
-| `xzh model list` | List **configured** models and their weights |
+| `xzh model` | Interactively manage models (add / remove / list all) |
+| `xzh model list` | List **configured** models (in fallback order) |
 | `xzh model all` | List **all built-in available** models (grouped by provider, configured ones marked) |
-| `xzh model add <provider> <model> [weight]` | Add a model (default weight `10`) |
+| `xzh model add <provider> <model> [context window] [on\|off]` | Add a model (trailing `on`/`off` = image input support) |
 | `xzh model remove <id\|index>` | Remove a model |
-| `xzh model weight <id\|index> <weight>` | Adjust a model's weight |
 | `xzh model context <id\|index> <size>` | Adjust the context window (tokens, e.g. `128000`) |
 | `xzh model vision <id\|index> <on\|off>` | Mark whether the model accepts image input |
-| `xzh model reset` | Restore all model weights to the default |
+| `xzh model vision <id\|index> <on\|off>` | Mark whether image input is supported |
 | `xzh config` | Show the current configuration (API Keys masked) |
 | `xzh config edit` | Edit the config file with `nano` |
 | `xzh config path` | Print the config file path |
@@ -173,8 +172,8 @@ This is useful for running multiple environments side by side (local / remote / 
   "provider": "deepseek",
   "model": "deepseek-chat",
   "models": [
-    { "id": "deepseek/deepseek-chat", "provider": "deepseek", "model": "deepseek-chat", "weight": 10 },
-    { "id": "openai/gpt-4o", "provider": "openai", "model": "gpt-4o", "weight": 6 }
+    { "id": "deepseek/deepseek-chat", "provider": "deepseek", "model": "deepseek-chat" },
+    { "id": "openai/gpt-4o", "provider": "openai", "model": "gpt-4o" }
   ],
   "temperature": 0.2,
   "maxToolRounds": 200,
@@ -191,35 +190,41 @@ This is useful for running multiple environments side by side (local / remote / 
 }
 ```
 
-> Older configs (with only `provider` / `model` and no `models`) still work: they are treated as a single model with weight `10`.
+> Older configs (with only `provider` / `model` and no `models`) still work: they are treated as the only model.
+> The legacy `weight` / `decayed` fields are obsolete — they are ignored on load and dropped on the next save.
 
-### Multiple models and call weights
+### Multiple models and automatic fallback
 
-`models` can hold several models, each with a **call weight** (default `10`):
+`models` can hold several models, and **list order is the priority** (there are no weights):
 
 | Behavior | Description |
 | --- | --- |
-| Startup selection | Prefers the model with the **highest weight** |
-| Call failure | That model's weight **-1** (a manual `Ctrl+C` interrupt does not count as a failure) |
-| Automatic fallback | If another usable model has **not been tried yet**, switch to the highest-weighted one and retry (each model is tried at most once per request, up to 3 switches) |
-| No pointless retries | When only one model exists (or the weights were reset to it), it does **not** retry — it reports the error along with the current model info |
-| Weights exhausted | When **every model's weight is 0**, it warns in the terminal and resets all weights back to `10` |
-| Config errors do not decay | Invalid key / no permission / model or endpoint not found: **no weight is deducted and nothing is written to disk**; it just tells you to check the config — an unfixed config will always fail, and deducting weight would only drag the other usable models down with it |
-| Context overflow does not decay | When the model's window is exceeded, it **trims history and retries automatically**, again without deducting weight (see the section above) |
+| Default choice | Uses the model you used **last** (remembered in `provider` / `model`, updated on every switch) |
+| No record | If that model was removed, it falls back to the **first entry** in the list |
+| Call failure | Switches to the **next** model in the list (wrapping around at the end); each model is tried at most once per request |
+| All failed | It only gives up after every model has been tried, and says so explicitly |
+| Remembering | Every switch is written back to the config, so the next launch starts from the last working model |
+| Config errors do not fall back | Invalid key / no permission / model or endpoint not found: **no switch, nothing written to disk** — an unfixed config will always fail, and switching would only walk the whole fallback chain for nothing |
+| Context overflow does not fall back | When the model's window is exceeded, it **trims history and retries automatically** instead of switching models (see the section above) |
+| `Ctrl+C` / `Ctrl+D` interrupts | Not failures; they never trigger a fallback |
 
 ```bash
 xzh model                              # interactive menu
-xzh model list                         # show configured models and weights
+xzh model list                         # show configured models (fallback order; ❯ marks the current one)
 xzh model all                          # show all built-in available models
-xzh model add openai gpt-4o 20         # add (weight 20)
-xzh model weight openai/gpt-4o 5       # adjust weight
+xzh model add openai gpt-4o            # add (appended to the end = last resort in the chain)
+xzh model add openai gpt-4o 128000     # also specify the context window
+xzh model add openai gpt-4o 128000 on  # also mark image input as supported
 xzh model context openai/gpt-4o 128000 # adjust context window (leave blank to infer)
 xzh model vision openai/gpt-4o on      # mark as supporting image input (when inference fails)
 xzh model remove openai/gpt-4o         # remove (id / model name / index all work)
-xzh model reset                        # restore all default weights
 ```
 
-The model currently in use and its weight are shown at the top of the interface and in the status bar (e.g. `gpt-4o w6`); a fallback switch is announced in the output pane.
+To keep a model **out of the fallback chain**, just `xzh model remove` it. The model in use is shown at the
+top of the interface and in the status bar, and every fallback is announced in the output pane.
+
+> ⚠️ The positional arguments of `xzh model add` **all shifted by one** as of v0.5 (the old `[weight]` slot is
+> gone): it is now `add <provider> <model> [context window] [on|off]`.
 
 ### What the context window does
 
@@ -233,7 +238,7 @@ The model currently in use and its weight are shown at the top of the interface 
 >
 > The estimate is also **back-filled from real usage**: after each request, the actual prompt token count reported by the server is compared against the estimate; if the estimate turns out to be systematically low (actual exceeds it), the next request tightens the history budget accordingly instead of waiting for a 400. It never loosens the budget when the estimate runs high — the conservative margin must stay.
 
-If estimation error still leads to an overflow (the server returns something like `context_length_exceeded`), XuanZhu **halves the budget and retries once automatically**, rather than treating it as a model failure to decay or switch models — resending the same long messages to another model would fail just the same and waste that model's weight for nothing.
+If estimation error still leads to an overflow (the server returns something like `context_length_exceeded`), XuanZhu **halves the budget and retries once automatically**, rather than treating it as a model failure to switch models — resending the same long messages to another model would fail just the same and walk the whole fallback chain for nothing.
 
 ### Intent analysis (optional, off by default)
 
@@ -258,7 +263,7 @@ Key behaviors:
 
 - The intent request **carries no tool declarations** and is not written to the conversation history (keeping the main flow's context clean)
 - The analysis is shown in the output pane first (along with the original message) so you can confirm it understood correctly
-- On failure or an empty result it **falls back** to your original input, without affecting the main flow and without decaying the model's weight
+- On failure or an empty result it **falls back** to your original input, without affecting the main flow and without triggering a model fallback
 - Trade-off: one extra model request per message (roughly doubling token usage), hence off by default
 
 API Keys can also come from environment variables, with lower priority than the config file:
@@ -677,7 +682,7 @@ XZH_KITTY_KEYS=1 xzh
 
 Auto-approval is on by default (`autoApprove: true`), so all tools — including writing files and running commands — execute directly without asking; run `/auto off` to switch to per-item confirmation, and the setting is persisted to the config file.
 
-`/switch <dir>` lets you change the project directory mid-conversation: relative paths resolve against the current directory and `~` expands; afterwards all file reads/writes and command execution target the new directory, and the conversation context is kept (run `/reset` if you want to clear it).
+`/switch <dir>` switches projects: relative paths resolve against the current directory and `~` expands. Afterwards all file reads/writes and command execution target the new directory, and the **most recent session of that project is loaded automatically** so you can pick up where you left off (the session file moves to the new project too; the previous conversation stays archived under the old project — switch back and use `/resume` to recover it). If the project has no prior sessions, you start fresh.
 
 ## Project structure
 
@@ -740,6 +745,11 @@ This project stands on the open-source work of others. Special thanks to:
   implementation, and the built-in `autojs6` skill was compiled from its source — which is
   what turns "drive the phone from a script" into something you can actually follow
   rather than something the model has to guess at.
+- **[OfficeCLI](https://github.com/iOfficeAI/OfficeCLI)** — open-sourced by iOfficeAI.
+  The built-in `officecli` skill uses it to read, edit and automate Word / Excel / PowerPoint
+  files (the skill was compiled from that repository's `SKILL.md` and its reference files).
+  It is a dependency-free single binary that needs no Office installation, and `xzh setup`
+  installs it for you.
 
 Thanks also to every open-source project among the direct and indirect dependencies,
 and to the many tools in the npm ecosystem (see `package.json` for the full list).

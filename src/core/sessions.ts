@@ -46,10 +46,14 @@ export interface SessionInfo {
 export function startSession(cwd: string, version: string): string {
   const dir = sessionDirFor(cwd);
   ensureDir(dir);
-  const file = path.join(
-    dir,
-    `${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`,
-  );
+  // 文件名只精确到毫秒：同毫秒内连续两次 startSession（快速的 /reset、/resume）
+  // 会撞名，而下面的 writeFileSync 是**截断写** —— 前一个会话的记录会被整段覆盖。
+  // 撞名时顺延编号，保证每次都是新文件。
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  let file = path.join(dir, `${stamp}.jsonl`);
+  for (let suffix = 2; fs.existsSync(file); suffix++) {
+    file = path.join(dir, `${stamp}-${suffix}.jsonl`);
+  }
   try {
     fs.writeFileSync(
       file,

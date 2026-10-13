@@ -17,10 +17,58 @@ const MAX_GREP_LINE_CHARS = 2000;
  *
  * `grep` 的模式由模型给出，而 JS 正则**无法设置执行超时**：
  * 一个 `(a+)+$` 遇到长行就能让整个进程（含 TUI 事件循环）卡死。
- * 这里拦掉最典型的「量词叠加在可重复分组上」的形态，宁可误报让模型改写模式。
+ * 这里拦掉最典型的两种「指数级回溯」形态，宁可误报让模型改写模式：
+ *
+ * 1. **组内有量词、组外又重复**：`(a+)+`、`(?:a*)*`、`(\d+){2,}`；
+ * 2. **组内是重叠交替、组外又重复**：`(a|aa)+$`、`(\d|\d\d)+x`。这类组内没有量词，
+ *    早期版本完全漏掉 —— 而它同样是指数级（Fibonacci 级）回溯。
+ *
+ * ⚠️ 这只是**粗筛**：任何静态规则都能被绕过。要彻底消除风险需要把匹配放进带超时的
+ * worker 里执行；这里先覆盖已确认会被触发的两类形态。
  */
 function looksCatastrophic(patternText: string): boolean {
-  return /\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)\s*[+*{]/.test(patternText);
+  // 1. 组内含量词 + 组外紧跟量词
+  if (/\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)\s*[+*{]/.test(patternText)) {
+    return true;
+  }
+  // 2. 组内有交替 + 组外紧跟量词（组内无量词也能指数级回溯）
+  return /\((?:[^()\\]|\\.)*\|(?:[^()\\]|\\.)*\)\s*[+*{]/.test(patternText);
+}
+
+/**
+ * 写入 / 编辑前的目标体检。
+ *
+ * `read_file` 早就挡住了设备文件、FIFO 与超大文件（见其内部注释：`/dev/zero` 的 size 恒为 0
+ * 且永远读不到 EOF、无写者的 FIFO 会阻塞，而 `readFileSync` 不可中断），
+ * 但 `edit_file` / `write_file` 一直漏了同款检查 —— 对它们来说后果更重：
+ * 不只是读挂死，`/undo` 的快照（`copyFileSync`）也会一起挂死，二进制文件还会被
+ * 按 utf8 有损解码后写回、静默损坏原文件。
+ *
+ * 返回错误信息；目标不存在（新建）时返回 null。
+ */
+function checkWritableTarget(target: string): { problem: string } | null {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(target); // 跟随符号链接：指向 /dev/zero 的软链同样要拦
+  } catch {
+    return null; // ENOENT → 新建文件，放行
+  }
+  if (stat.isDirectory()) {
+    return { problem: `错误：${target} 是一个目录，不能作为文件写入` };
+  }
+  if (!stat.isFile()) {
+    return {
+      problem: `错误：${target} 不是普通文件（设备文件 / 管道 / socket），拒绝写入`,
+    };
+  }
+  if (stat.size > MAX_FILE_BYTES) {
+    return {
+      problem: `错误：文件过大（${(stat.size / 1024 / 1024).toFixed(1)}MB），超出 ${
+        MAX_FILE_BYTES / 1024 / 1024
+      }MB 限制`,
+    };
+  }
+  return null;
 }
 
 const IGNORED_DIRS = new Set([
@@ -194,6 +242,12 @@ export const writeFileTool: ToolDefinition = {
   async execute(args, ctx): Promise<ToolResult> {
     const target = resolvePath(asString(args.path), ctx.cwd);
     const content = asString(args.content);
+
+    // 体检必须放在 snapshotForUndo **之前**：快照会 copyFileSync，
+    // 对 /dev/zero、FIFO 同样会挂死整个进程。
+    const bad = checkWritableTarget(target);
+    if (bad) return { ok: false, content: bad.problem };
+
     try {
       // 写之前先快照（供 /undo 撤销）。覆盖已有文件才需要备份，
       // 新建文件的撤销语义是「删除」，由 snapshotForUndo 内部区分
@@ -240,6 +294,11 @@ export const editFileTool: ToolDefinition = {
     if (!fs.existsSync(target)) {
       return { ok: false, content: `错误：文件不存在：${target}` };
     }
+    // 与 read_file 同一道体检：设备文件 / FIFO / 超大文件必须挡在这里，
+    // 否则 readFileSync 会把整个进程挂死
+    const bad = checkWritableTarget(target);
+    if (bad) return { ok: false, content: bad.problem };
+
     const search = asString(args.search);
     const replace = asString(args.replace);
     const replaceAll = args.replace_all === true;
@@ -248,7 +307,15 @@ export const editFileTool: ToolDefinition = {
       return { ok: false, content: "错误：search 不能为空" };
     }
 
-    const original = fs.readFileSync(target, "utf8");
+    const buffer = fs.readFileSync(target);
+    // 二进制文件不能按 utf8 有损解码后再写回 —— 那会把文件改坏且用户毫无察觉
+    if (isBinaryBuffer(buffer)) {
+      return {
+        ok: false,
+        content: `错误：${target} 是二进制文件，edit_file 只处理文本；确实要整体替换请用 write_file`,
+      };
+    }
+    const original = buffer.toString("utf8");
     if (!original.includes(search)) {
       // 空白差异是这类失败最常见的原因：模型凭记忆写的片段常常
       // 缩进多/少几个空格，或把制表符写成空格，肉眼几乎一样但匹配不上。

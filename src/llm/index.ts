@@ -14,6 +14,7 @@ export {
   friendlyError,
   isConfigError,
   isContextLengthError,
+  isModelUnavailableError,
   isRetryableError,
   isVisionUnsupportedError,
 } from "./http";
@@ -26,6 +27,7 @@ export {
   inferContextWindow,
   INPUT_BUDGET_RATIO,
   isSystemPromptTight,
+  keepFromValidStart,
   MIN_CONVERSATION_BUDGET,
   resolveConversationBudget,
   sliceToTokenBudget,

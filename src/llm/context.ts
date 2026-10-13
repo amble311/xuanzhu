@@ -17,7 +17,7 @@ export const DEFAULT_CONTEXT_WINDOW = 32_000;
  *
  * 留出的 20% 用于容纳：本次回复的输出 token、字符估算的误差、
  * 以及各 provider 对消息结构额外添加的开销。宁可略早裁剪，也不要撞上窗口上限
- * —— 撞上会直接 400，且当前实现会把它误判为模型故障而白扣权重。
+ * —— 撞上会直接 400（虽然会收敛预算后重试一次，但那一次请求纯属浪费）。
  */
 export const INPUT_BUDGET_RATIO = 0.8;
 
@@ -95,23 +95,32 @@ export function estimateMessageTokens(message: ChatMessage): number {
  *
  * 图片以 base64 形式携带，成本随轮次线性叠加：如果每轮的历史都留着原图，
  * 上下文会被迅速撑爆（而且旧的截图对后续对话几乎没有价值）。
- * 因此只在请求里保留**最后一条**带图片的消息（也就是本轮刚发的那张），
- * 更早的一律替换成 `[图片已省略：<mime>]`。
+ * 因此只在请求里保留**一张**图，更早的一律替换成 `[图片已省略：<mime>]`。
+ *
+ * ⚠️ 只保留的那张必须是**本轮**的（`keepFrom` = 本轮消息在整个数组里的起始下标，
+ * 由 `buildConversation` 传 `history.length`）。早期实现是「整个数组里最后一张」——
+ * 于是上一轮发过的截图会被无限期地每轮重发，而且「模型不支持图片」的降级判断
+ * 只看本轮、看不到它，导致每个模型都拿同一张旧图再撞一次。
  */
-export function stripStaleImages(messages: ChatMessage[]): ChatMessage[] {
-  let lastImageIndex = -1;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i];
-    if (message?.images && message.images.length > 0) {
-      lastImageIndex = i;
+export function stripStaleImages(
+  messages: ChatMessage[],
+  keepFrom = 0,
+): ChatMessage[] {
+  if (messages.length === 0) return messages;
+  const from = Math.max(0, Math.min(keepFrom, messages.length));
+
+  let keepIndex = -1;
+  for (let i = messages.length - 1; i >= from; i--) {
+    if (messages[i]?.images?.length) {
+      keepIndex = i;
       break;
     }
   }
-  if (lastImageIndex < 0) return messages;
 
   return messages.map((message, index) => {
+    if (index === keepIndex) return message;
     const images = message.images;
-    if (index >= lastImageIndex || !images || images.length === 0) return message;
+    if (!images || images.length === 0) return message;
     const kinds = [...new Set(images.map((img) => img.mimeType))].join("、");
     const note = `\n\n[图片已省略：${kinds}${
       images.length > 1 ? `，共 ${images.length} 张` : ""
@@ -214,10 +223,15 @@ export function squeezeStaleToolOutput(
     const tail = tailChars > 0 ? content.slice(-tailChars) : "";
     const omitted = content.length - head.length - tail.length;
 
-    return {
-      ...message,
-      content: `${head}\n\n…（此处省略 ${omitted} 字符的中间内容）\n\n${tail}`,
-    };
+    const squeezedContent = `${head}\n\n…（此处省略 ${omitted} 字符的中间内容）\n\n${tail}`;
+    // 压缩必须**真的变短**才替换。
+    //
+    // head 是按 token 折算、tail 是按字符折算（口径不同，中文按 1 token/字符），
+    // 于是中文内容在 601–1080 字符这个区间会算出 omitted = 0，
+    // 拼上提示反而比原文更长 —— 既多占 token，又给模型一句「省略 0 字符」的噪音。
+    if (omitted <= 0 || squeezedContent.length >= content.length) return message;
+
+    return { ...message, content: squeezedContent };
   });
 }
 
@@ -239,6 +253,29 @@ export function stripAllImages(messages: ChatMessage[]): ChatMessage[] {
       images: undefined,
     };
   });
+}
+
+/**
+ * 去掉开头的 `assistant` / `tool` 消息，让保留窗口从一个**三家都能接受**的位置开始。
+ *
+ * - Anthropic / Gemini 的归一化会**丢掉开头所有非 user 的消息**
+ *   （`while (merged[0].role !== "user") shift()`，见 toAnthropicMessages / toGeminiContents）。
+ *   若窗口恰好从 `assistant(tool_calls)` 开始，前缀被丢后它后面的 `tool` 就成了
+ *   **引用不存在 tool_use_id 的孤立结果** → 直接 400。所以开头的 assistant / tool
+ *   干脆在这里一起去掉（它们本来就是这段窗口里的残渣）。
+ * - `system` 消息**刻意保留**：Anthropic / Gemini 会把它并进系统提示词、OpenAI 也接受它；
+ *   而且「本轮被中断」的说明（`role: "system"`）常常是这条窗口里**唯一**的消息，
+ *   一并丢掉等于把该提示丢了。
+ * - 全是残渣时返回空数组，由调用方兜底（见 trimMessagesToBudget 的第 3 步）。
+ */
+export function keepFromValidStart(messages: ChatMessage[]): ChatMessage[] {
+  let start = 0;
+  while (start < messages.length) {
+    const role = messages[start].role;
+    if (role !== "assistant" && role !== "tool") break;
+    start++;
+  }
+  return start === 0 ? messages : messages.slice(start);
 }
 
 /**
@@ -270,12 +307,9 @@ export function trimMessagesToBudget(
     cut = i;
   }
 
-  let kept = squeezed.slice(cut);
+  let kept = keepFromValidStart(squeezed.slice(cut));
 
-  // 2. 开头不能是孤立的 tool 消息（它必须紧跟其 assistant）
-  while (kept.length > 0 && kept[0].role === "tool") kept.shift();
-
-  // 3. 兜底：若什么都不剩（预算只够放下零散的工具结果，而它们作为孤立前缀被清掉），
+  // 3. 兜底：若什么都不剩（预算只够放下零散的工具结果，而它们作为前缀被清掉），
   //    至少保留最后一条 user 消息。否则模型对本轮完全失忆 ——
   //    工具其实已经执行过并产生了副作用，它却会重新执行一遍。
   if (kept.length === 0) {

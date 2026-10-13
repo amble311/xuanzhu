@@ -13,10 +13,24 @@ interface RunResult {
   code: number | null;
   timedOut: boolean;
   aborted: boolean;
+  /** 输出是否因为超过 MAX_OUTPUT 而被丢弃了一部分 */
+  truncated: boolean;
 }
 
 /** 终止后等待管道冲刷 / 强杀兜底的时间 */
 const KILL_GRACE_MS = 1500;
+
+/**
+ * 输出被截断时的提示（放在正文**最前面**，见 execute 里的说明）。
+ *
+ * 为什么必须让它可见：早期只是静默丢弃超限部分，于是「正常日志把上限占满、
+ * 真正的报错在末尾被丢掉」时，模型看到的是一段没有错误的输出 + 退出码 0，
+ * 会直接误判成功。
+ */
+const TRUNCATED_NOTE =
+  `[输出被截断] 单条命令的捕获上限为 ${MAX_OUTPUT} 字符，**超出部分已丢弃** —— ` +
+  `下面的内容并不完整（结尾的报错也可能在里面）。` +
+  `需要完整内容时请把命令拆小，或先重定向到文件再用 read_file / grep 定位。`;
 
 /**
  * 在子进程中执行命令。
@@ -43,6 +57,7 @@ function runCommand(
         code: null,
         timedOut: false,
         aborted: true,
+        truncated: false,
       });
       return;
     }
@@ -64,6 +79,7 @@ function runCommand(
     let timedOut = false;
     let aborted = false;
     let settled = false;
+    let truncated = false;
     let idleTimer: NodeJS.Timeout | undefined;
 
     const killGroup = (sig: NodeJS.Signals): void => {
@@ -86,7 +102,7 @@ function runCommand(
       clearTimeout(timer);
       if (idleTimer) clearTimeout(idleTimer);
       signal?.removeEventListener("abort", onAbort);
-      resolve({ stdout, stderr, code, timedOut, aborted });
+      resolve({ stdout, stderr, code, timedOut, aborted, truncated });
     };
 
     /** 终止后若 close 迟迟不来，兜底 resolve，避免整个 Agent/TUI 卡死 */
@@ -109,11 +125,24 @@ function runCommand(
 
     signal?.addEventListener("abort", onAbort, { once: true });
 
+    // 超限后**必须记下「被截断」这件事**：早期只是静默丢弃后续输出，
+    // 于是命令前面的正常日志把上限占满、真正的报错在末尾被丢掉时，
+    // 模型看到的就是一段「没有错误的输出 + 退出码 0」，直接误判成功。
     child.stdout?.on("data", (data: Buffer) => {
-      if (stdout.length < MAX_OUTPUT) stdout += data.toString();
+      if (stdout.length >= MAX_OUTPUT) {
+        truncated = true;
+        return;
+      }
+      stdout += data.toString();
+      if (stdout.length >= MAX_OUTPUT) truncated = true;
     });
     child.stderr?.on("data", (data: Buffer) => {
-      if (stderr.length < MAX_OUTPUT) stderr += data.toString();
+      if (stderr.length >= MAX_OUTPUT) {
+        truncated = true;
+        return;
+      }
+      stderr += data.toString();
+      if (stderr.length >= MAX_OUTPUT) truncated = true;
     });
     child.on("error", (err) => {
       stderr += String(err);
@@ -185,7 +214,11 @@ export const bashTool: ToolDefinition = {
     const output = parts.join("\n\n");
     return {
       ok: result.code === 0 && !result.timedOut && !result.aborted,
-      content: output.slice(0, MAX_OUTPUT),
+      // 截断提示必须放在**最前面**：正文本身已经顶到 MAX_OUTPUT，
+      // 放在末尾会被下面的 slice 直接切掉，等于没提示。
+      content:
+        (result.truncated ? `${TRUNCATED_NOTE}\n\n` : "") +
+        output.slice(0, MAX_OUTPUT),
       summary: result.aborted
         ? "已中断"
         : result.timedOut

@@ -63,8 +63,9 @@ export function buildSystemPrompt(
     它们会在**用户屏幕上弹气泡**，每步都弹很烦；console.log 走同一条日志通道，
     你读得到、用户看不见。device_read_screen 会自动滤掉 【 开头的行，
     避免你自己的提示混进界面内容造成误判；
-  · 三条要点：脚本在手机上跑、**拿不到返回值**，所以每步都要 toastLog 回报，
-    再用 device_logs 读；device_run 是**发出即返回**，日志**异步**回来（先 sleep 再读）；
+  · 三条要点：脚本在手机上跑、**拿不到返回值**，所以每步都要用上面那种
+    【…】开头的 console.log 回报（**不是 toastLog**），再用 device_logs 读；
+    device_run 是**发出即返回**，日志**异步**回来（先 sleep 再读）；
     手机只有一台，会挂住的脚本记得 device_stop；
   · 需要 UI 操作的脚本**必须**以 auto.waitFor(8000) 开头（auto() 在服务未真正运行时直接抛错）；
   · 桥没开时工具会明确告诉你如何让用户启动（connect / serve），不要反复重试。

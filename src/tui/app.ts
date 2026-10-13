@@ -60,9 +60,7 @@ export interface TuiAppOptions {
   cwd: string;
   providerLabel: string;
   model: string;
-  /** 当前模型的调用权重（多模型权重机制） */
-  modelWeight?: number;
-  /** 启动时选中的模型条目，交由 Agent 做失败降级切换 */
+  /** 启动时选中的模型条目，交由 Agent 在调用失败时沿列表回退 */
   activeModel?: ModelEntry | null;
   /**
    * 是否启用意图分析。缺省时读取配置中的 `intent.enabled`；
@@ -131,10 +129,9 @@ export class TuiApp {
   /** 当前会话文件（JSONL）；/reset 与 /resume 会切换它 */
   private currentSessionFile: string;
 
-  /** 当前模型（可能因失败降级而切换） */
+  /** 当前模型（可能因调用失败回退而切换） */
   private modelProviderLabel: string;
   private modelLabel: string;
-  private modelWeight?: number;
 
   private lines: string[] = [];
   private input = "";
@@ -260,7 +257,6 @@ export class TuiApp {
     };
     this.modelProviderLabel = options.providerLabel;
     this.modelLabel = options.model;
-    this.modelWeight = options.modelWeight;
     this.term = new ShellPanel(options.cwd, () => this.scheduleRender());
 
     // 首次运行时初始化项目目录（<项目>/.xuanzhu）
@@ -404,8 +400,30 @@ export class TuiApp {
   /** 裁剪输出区，只保留最近的若干行 */
   private trimOutputLines(): void {
     const max = TuiApp.MAX_OUTPUT_LINES;
-    if (this.lines.length > max) {
-      this.lines.splice(0, this.lines.length - max);
+    const dropped = this.lines.length - max;
+    if (dropped <= 0) return;
+    this.lines.splice(0, dropped);
+
+    // 所有「指向 lines 的下标」都必须跟着前移，否则会指向错的逻辑行：
+    //   - lastAnswerStart 不跟着走 → /copy last 会 slice 到空数组（用户什么都复制不到）
+    //   - 选区不跟着走 → 高亮会套在无关的行上
+    if (this.lastAnswerStart > 0) {
+      this.lastAnswerStart = Math.max(0, this.lastAnswerStart - dropped);
+    }
+    const anchor = this.selectionAnchor;
+    const head = this.selectionHead;
+    if (anchor !== undefined || head !== undefined) {
+      const fellOff =
+        (anchor !== undefined && anchor < dropped) ||
+        (head !== undefined && head < dropped);
+      if (fellOff) {
+        // 选区已被滚出保留窗口：整体作废（而不是把它夹到 0 指向别的行）
+        this.selectionAnchor = undefined;
+        this.selectionHead = undefined;
+      } else {
+        if (anchor !== undefined) this.selectionAnchor = anchor - dropped;
+        if (head !== undefined) this.selectionHead = head - dropped;
+      }
     }
   }
 
@@ -575,23 +593,18 @@ export class TuiApp {
     this.scheduleRender();
   }
 
-  /** 模型降级切换 / 权重耗尽重置后的界面更新 */
+  /** 模型因调用失败回退到下一个之后的界面更新 */
   private handleModelChange(info: {
     provider: string;
     model: string;
-    weight: number;
     reason: string;
   }): void {
     this.modelProviderLabel =
       findProvider(info.provider)?.label ?? info.provider;
     this.modelLabel = info.model;
-    this.modelWeight = info.weight;
-    // 只有真正发生「切换」才在输出区提示；纯降权仅更新状态栏，避免刷屏
-    if (info.reason !== "调用失败降权") {
-      this.lines.push(
-        `${ansi.yellow}⇄ 模型已切换为 ${info.provider}/${info.model}（权重 ${info.weight}）${ansi.reset}`,
-      );
-    }
+    this.lines.push(
+      `${ansi.yellow}⇄ 模型已切换为 ${info.provider}/${info.model}（${info.reason}）${ansi.reset}`,
+    );
     this.scheduleRender();
   }
 
@@ -665,17 +678,7 @@ export class TuiApp {
     for (;;) {
       const key = this.readKey();
       if (key === null) {
-        if (this.keyBuffer.startsWith("\x1b")) {
-          if (this.escTimer) clearTimeout(this.escTimer);
-          this.escTimer = setTimeout(() => {
-            this.escTimer = undefined;
-            const pending = this.keyBuffer;
-            this.keyBuffer = "";
-            if (pending === "\x1b") {
-              this.handleKey("\x1b");
-            }
-          }, 40);
-        }
+        this.armIncompleteTimer();
         return;
       }
       if (this.escTimer) {
@@ -687,6 +690,44 @@ export class TuiApp {
     }
   }
 
+  /**
+   * 缓冲里还剩「不完整的输入」时：决定等多久、超时后怎么办。
+   *
+   * 两种情形**不能一视同仁**：
+   * - **括号粘贴未收全**（收到了 `\x1b[200~` 但还没等到 `\x1b[201~`）：一次长粘贴本来就可能
+   *   跨多次 read 到达，按 40ms 丢弃等于把用户粘贴内容的前半段吃掉。这里给足宽限，
+   *   超时也**把已收到的正文插入**而不是丢弃 —— 宁可内容不全，也不要静默吞掉。
+   * - **其它转义序列前缀**（`\x1b`、`\x1b[`）：40ms 后判定。确实只是单独的 ESC 就当 ESC 处理，
+   *   残缺序列丢弃（避免残留字节被当作输入插入）。
+   */
+  private armIncompleteTimer(): void {
+    if (this.escTimer) clearTimeout(this.escTimer);
+    this.escTimer = undefined;
+
+    const pending = this.keyBuffer;
+    if (pending.startsWith(PASTE_START)) {
+      this.escTimer = setTimeout(() => {
+        this.escTimer = undefined;
+        const buffered = this.keyBuffer;
+        if (!buffered.startsWith(PASTE_START)) return;
+        this.keyBuffer = "";
+        this.insertPastedText(buffered.slice(PASTE_START.length));
+      }, PASTE_GRACE_MS);
+      return;
+    }
+
+    if (pending.startsWith("\x1b")) {
+      this.escTimer = setTimeout(() => {
+        this.escTimer = undefined;
+        const leftover = this.keyBuffer;
+        this.keyBuffer = "";
+        if (leftover === "\x1b") {
+          this.handleKey("\x1b");
+        }
+      }, ESC_WAIT_MS);
+    }
+  }
+
   private readKey(): string | null {
     const buf = this.keyBuffer;
     if (buf.length === 0) return null;
@@ -694,11 +735,11 @@ export class TuiApp {
     // 括号粘贴（bracketed paste）：终端把粘贴内容包在 \x1b[200~ … \x1b[201~ 之间。
     // 必须整段取出交给 handleKey 一次性插入 —— 否则其中的换行会被当成「提交」，
     // 粘贴一大段文本就会连发好几条消息。内容可能分多次到达，未收全时返回 null 等待。
-    if (buf.startsWith("\x1b[200~")) {
-      const end = buf.indexOf("\x1b[201~", 6);
+    if (buf.startsWith(PASTE_START)) {
+      const end = buf.indexOf(PASTE_END, PASTE_START.length);
       if (end === -1) return null;
-      this.keyBuffer = buf.slice(end + 6);
-      return buf.slice(0, end + 6);
+      this.keyBuffer = buf.slice(end + PASTE_END.length);
+      return buf.slice(0, end + PASTE_END.length);
     }
 
     if (buf[0] === "\x1b") {
@@ -733,13 +774,10 @@ export class TuiApp {
   private handleKey(rawKey: string): void {
     // 括号粘贴：整段一次性插入输入框（保留其中的换行），不逐字走按键逻辑 ——
     // 逐字处理会让内容里的回车触发「提交」，也会把粘贴的转义码当控制键执行。
-    if (rawKey.startsWith("\x1b[200~") && rawKey.endsWith("\x1b[201~")) {
-      const pasted = rawKey
-        .slice(6, rawKey.length - 6)
-        .replace(/\r\n?/g, "\n")
-        // 去掉残留的控制字符，避免粘贴内容里的光标移动指令干扰渲染
-        .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
-      if (pasted) this.insertText(pasted);
+    if (rawKey.startsWith(PASTE_START) && rawKey.endsWith(PASTE_END)) {
+      this.insertPastedText(
+        rawKey.slice(PASTE_START.length, rawKey.length - PASTE_END.length),
+      );
       return;
     }
 
@@ -1228,6 +1266,19 @@ export class TuiApp {
   }
 
   /**
+   * 插入一段粘贴内容（调用方已剥掉括号粘贴的标记）。
+   *
+   * 保留其中的换行（提交前用户还能改），但去掉会干扰渲染的控制字符 ——
+   * 否则粘贴内容里的光标移动 / 清屏指令会破坏整屏。
+   */
+  private insertPastedText(pasted: string): void {
+    const text = pasted
+      .replace(/\r\n?/g, "\n")
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+    if (text) this.insertText(text);
+  }
+
+  /**
    * 把**剪贴板里的图片**加为本轮附件；剪贴板只有文本时退化为常规文本粘贴。
    *
    * 为什么必须由玄猪主动读取：终端与程序之间只有字节流，粘贴只能传文本，
@@ -1467,7 +1518,18 @@ export class TuiApp {
   }
 
   private moveCursor(delta: number): void {
-    const next = this.inputCursor + delta;
+    let next = this.inputCursor + delta;
+    next = Math.max(0, Math.min(this.input.length, next));
+    // 不要停在代理对中间（emoji 等）：落在低位代理上时按方向跨过整个字符，
+    // 否则随后的 insertText 会把这个字符切成两半。
+    // 退格早已处理了这一点（见 backspace），这里必须对齐。
+    if (delta > 0 && next > 0 && next < this.input.length) {
+      const prev = this.input.charCodeAt(next - 1);
+      if (prev >= 0xd800 && prev <= 0xdbff) next += 1;
+    } else if (delta < 0 && next < this.input.length) {
+      const here = this.input.charCodeAt(next);
+      if (here >= 0xdc00 && here <= 0xdfff) next -= 1;
+    }
     this.inputCursor = Math.max(0, Math.min(this.input.length, next));
     this.scheduleRender();
   }
@@ -1606,9 +1668,9 @@ export class TuiApp {
     this.abortController = new AbortController();
     this.scheduleRender();
 
-    // 快照本次请求使用的模型：run 内部可能因失败而降权或切换模型，
+    // 快照本次请求使用的模型：run 内部可能因失败而回退到别的模型，
     // 出错时应报告「实际发起请求时」用的模型，否则会把旧模型的错误归到新模型头上。
-    const requestModel = { label: this.modelLabel, weight: this.modelWeight };
+    const requestModel = { label: this.modelLabel };
 
     try {
       await this.agent.run(
@@ -1622,11 +1684,9 @@ export class TuiApp {
       for (const extra of rest) {
         this.lines.push(`${ansi.gray}  ${extra}${ansi.reset}`);
       }
-      // 附上本次请求实际使用的模型与权重（用快照，避免被降级切换后的值覆盖）
-      const weightText =
-        requestModel.weight !== undefined ? `（权重 ${requestModel.weight}）` : "";
+      // 附上本次请求实际使用的模型（用快照，避免被回退切换后的值覆盖）
       this.lines.push(
-        `${ansi.gray}  本次请求使用的模型：${this.modelProviderLabel} / ${requestModel.label}${weightText}${ansi.reset}`,
+        `${ansi.gray}  本次请求使用的模型：${this.modelProviderLabel} / ${requestModel.label}${ansi.reset}`,
       );
     } finally {
       const tail = this.markdown.flush();
@@ -1758,25 +1818,22 @@ export class TuiApp {
         break;
       }
       case "model": {
-        const entries = effectiveModels(this.options.config).sort(
-          (a, b) => b.weight - a.weight,
-        );
-        const weightText =
-          this.modelWeight !== undefined ? `（权重 ${this.modelWeight}）` : "";
         this.lines.push(
-          `${ansi.gray}当前模型：${ansi.reset}${this.modelProviderLabel} / ${this.modelLabel}${ansi.gray}${weightText}${ansi.reset}`,
+          `${ansi.gray}当前模型：${ansi.reset}${this.modelProviderLabel} / ${this.modelLabel}${ansi.reset}`,
         );
+        // 顺序即回退优先级：当前模型调用失败会沿这张表往后找下一个
+        const entries = effectiveModels(this.options.config);
         if (entries.length > 0) {
-          this.lines.push(`${ansi.gray}已配置模型（按权重降序）：${ansi.reset}`);
-          for (const entry of entries) {
+          this.lines.push(`${ansi.gray}已配置模型（按回退顺序）：${ansi.reset}`);
+          entries.forEach((entry, index) => {
             const current = entry.model === this.modelLabel ? " ← 当前" : "";
             this.lines.push(
-              `${ansi.gray}  · ${entry.id}　权重 ${entry.weight}${current}${ansi.reset}`,
+              `${ansi.gray}  ${index + 1}. ${entry.id}${current}${ansi.reset}`,
             );
-          }
+          });
         }
         this.lines.push(
-          `${ansi.gray}管理模型（新增 / 删除 / 调整权重）：${ansi.reset}xzh model${ansi.reset}`,
+          `${ansi.gray}管理模型（新增 / 删除）：${ansi.reset}xzh model${ansi.reset}`,
         );
         break;
       }
@@ -1844,7 +1901,17 @@ export class TuiApp {
     );
   }
 
-  /** 切换当前工作目录（/switch） */
+  /**
+   * 切换项目（/switch）。
+   *
+   * 语义是「切换项目 = 在该项目重新开局」：除了换 cwd / 规则 / 记忆 / 终端目录，
+   * 还会**载入目标目录最近一次会话**接着聊，会话文件也随之换到该项目名下。
+   *
+   * 为什么必须连会话文件一起换：会话文件按项目分目录（`sessionDirFor(cwd)`），
+   * 而 `/resume` 只列**当前项目**目录下的文件 —— 若切了目录却沿用原会话文件，
+   * 在新项目里聊的内容会一直记在原项目名下，从新项目里永远 `/resume` 不到。
+   * 代价是当前对话就此中断：它已增量存档在原项目的会话文件里，切回去即可找回。
+   */
   private switchDirectory(input: string): void {
     const expanded = expandHome(input.trim());
     const target = path.isAbsolute(expanded)
@@ -1881,9 +1948,25 @@ export class TuiApp {
         `${ansi.gray}  已初始化项目目录 ${project.paths.dir}（memory/ 记忆 · rules.md 规则）${ansi.reset}`,
       );
     }
-    this.lines.push(
-      `${ansi.gray}  后续文件与命令操作将基于该目录；对话上下文已保留（可用 /reset 清空）。${ansi.reset}`,
-    );
+
+    // 载入目标目录最近一次会话（排除当前正在写的这份，防止 /switch 回原目录时自我套娃）
+    const previous = listSessions(resolved).filter(
+      (session) => session.file !== this.currentSessionFile,
+    )[0];
+    const messages = previous ? loadSessionMessages(previous.file) : [];
+    const file = startSession(resolved, VERSION);
+    this.currentSessionFile = file;
+    this.agent.restoreSession(messages, file);
+    if (messages.length > 0) {
+      this.lines.push(
+        `${ansi.gray}  已载入该项目上次会话（${messages.length} 条消息，${previous.startedAt ?? "未知时间"}），` +
+          `接着聊即可；原对话已存档，切回后 /resume 可找回。${ansi.reset}`,
+      );
+    } else {
+      this.lines.push(
+        `${ansi.gray}  该项目还没有历史会话，全新开局；后续文件与命令操作将基于该目录。${ansi.reset}`,
+      );
+    }
     this.scheduleRender();
   }
 
@@ -2371,9 +2454,9 @@ export class TuiApp {
       `  /undo          撤销玄猪对文件的最近一次修改（改前自动备份）`,
       `  /resume [编号]  列出 / 恢复历史会话（对话历史会自动保存）`,
       `  /cwd           显示当前工作目录`,
-      `  /switch <目录> 切换当前对话的项目目录`,
+      `  /switch <目录> 切换项目（载入该项目上次会话接着聊）`,
       `  /term          显示/隐藏右侧终端面板（/term clear 清空输出）`,
-      `  /model         显示当前模型与权重、已配置模型列表`,
+      `  /model         显示当前模型与已配置模型（按回退顺序）`,
       `  /auto [on|off] 切换自动批准（on：所有工具直接执行，写入配置）`,
       `  /intent [on|off] 切换意图分析（on：每条消息先做意图分析再处理，写入配置）`,
       `  /exit          退出玄猪`,
@@ -2412,10 +2495,8 @@ export class TuiApp {
    * 高度受限时必须保留（见 render 的头部裁剪），故不能被一起裁掉。
    */
   private buildHeaderLines(width: number): { info: string[]; divider: string } {
-    const weightText =
-      this.modelWeight !== undefined ? ` · 权重 ${this.modelWeight}` : "";
     const modelText = truncate(
-      `${this.modelProviderLabel} / ${this.modelLabel}${weightText}`,
+      `${this.modelProviderLabel} / ${this.modelLabel}`,
       Math.max(10, width - 8),
     );
     const dirText = truncate(this.cwd, Math.max(10, width - 8));
@@ -2594,7 +2675,10 @@ export class TuiApp {
           `${ansi.gray}│${ansi.reset}` +
           truncate(panel.rows[i] ?? "", termWidth);
       } else {
-        out += left;
+        // 右栏隐藏时 leftWidth === columns，但**仍然必须截断 + 补齐**：
+        // 头部那几条固定提示行（约 54 列）在窄终端下会超出宽度，
+        // 而终端已关闭自动换行（?7l），超宽内容会在末列互相覆盖、错位。
+        out += padEnd(truncate(left, columns), columns);
       }
     }
 
@@ -2642,7 +2726,11 @@ export class TuiApp {
       ? `${ansi.bgBlue}${ansi.brightWhite} 终端 ${ansi.reset}`
       : `${ansi.gray} 终端 ${ansi.reset}`;
     const status = running ? `${ansi.brightYellow} ● 运行中${ansi.reset}` : "";
-    const room = Math.max(6, width - 9 - (running ? 5 : 0));
+    // 标题行 = label + cwd(≤room) + status，三者之和必须 ≤ width。
+    // 早期按 `width - 9 - (running ? 5 : 0)` 手算保留宽度，与实际文本宽度对不上
+    // （「 终端 」6 列、「 ● 运行中」9 列）→ 运行中时固定超宽 1 列，被 render 截断掉字。
+    const reserved = textWidth(label) + textWidth(status);
+    const room = Math.max(6, width - reserved);
     rows.push(
       `${label}${ansi.gray}${truncate(this.term.getCwd(), room)}${ansi.reset}${status}`,
     );
@@ -2674,12 +2762,31 @@ export class TuiApp {
     rows.push(`${ansi.gray}${"─".repeat(width)}${ansi.reset}`);
     const promptWidth = 2;
     const avail = Math.max(1, width - promptWidth);
-    let text = this.termInput;
-    let cursorWidth = textWidth(text.slice(0, this.termInputCursor));
-    while (cursorWidth > avail && text.length > 0) {
-      text = text.slice(1);
-      cursorWidth = textWidth(text.slice(0, this.termInputCursor));
+    // 超宽时从左侧滚动，保证光标可见。
+    // ⚠️ 两处必须做对：① 按 **code point** 丢字符（否则会把 emoji 从中间切开）；
+    // ② 丢掉的字符数要**同步从光标位置里扣掉**。早期实现用 `slice(1)` 丢字符、
+    // 却仍按原来的 `termInputCursor` 算光标宽度，于是既多丢字符、光标又与真实插入点错位。
+    const chars = Array.from(this.termInput);
+    let cursorCp = chars.length;
+    {
+      let count = 0;
+      for (let i = 0; i < chars.length; i++) {
+        if (count >= this.termInputCursor) {
+          cursorCp = i;
+          break;
+        }
+        count += chars[i].length;
+      }
     }
+    let scrollFrom = 0;
+    while (
+      scrollFrom < cursorCp &&
+      textWidth(chars.slice(scrollFrom, cursorCp).join("")) > avail
+    ) {
+      scrollFrom++;
+    }
+    const text = chars.slice(scrollFrom).join("");
+    const cursorWidth = textWidth(chars.slice(scrollFrom, cursorCp).join(""));
     const prompt = this.termFocus
       ? `${ansi.brightCyan}❯${ansi.reset} `
       : `${ansi.gray}❯${ansi.reset} `;
@@ -2721,8 +2828,6 @@ export class TuiApp {
         ? "终端▸ "
         : "对话▸ "
       : "";
-    const weightMark =
-      this.modelWeight !== undefined ? ` w${this.modelWeight}` : "";
     // 滚动指示：偏移量 > 0 时提示已上翻的行数，便于发现「有历史可回看 / 需按 End 回到最新」
     const scrollMark =
       this.scrollOffset > 0
@@ -2739,7 +2844,7 @@ export class TuiApp {
             Math.abs(this.selectionHead - this.selectionAnchor) + 1
           } 行${this.dragging ? "（松开复制）" : "（已复制）"}${ansi.reset}${ansi.bgBlue} `
         : "";
-    const right = ` ${autoMark}${intentMark}${focusMark}${selectionMark}${scrollMark}${termScrollMark}${this.modelLabel}${weightMark} │ ${this.statusText}${this.statusDetail ? " · " + this.statusDetail : ""} `;
+    const right = ` ${autoMark}${intentMark}${focusMark}${selectionMark}${scrollMark}${termScrollMark}${this.modelLabel} │ ${this.statusText}${this.statusDetail ? " · " + this.statusDetail : ""} `;
     const middle = ` ${this.cwd} `;
     const elapsed = this.busy ? `${ansi.brightYellow}● 运行中${ansi.reset}${ansi.bgBlue}` : "";
     // elapsed 的显示宽度必须计入保留宽度，否则 busy 时状态栏必然超宽并走兜底截断
@@ -2848,6 +2953,16 @@ export class TuiApp {
     return { lines, cursorRow: 0, cursorCol: 0 };
   }
 }
+
+// ------------------------------------------------------------ 输入分片容错
+
+/** 括号粘贴的起止标记：终端把粘贴内容包在两者之间 */
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
+/** 不完整转义序列的等待时间：够覆盖按键分片，又不会让单独的 ESC 明显卡顿 */
+const ESC_WAIT_MS = 40;
+/** 括号粘贴未收全时的宽限：长粘贴可能跨多次 read 到达，不能按 40ms 丢弃 */
+const PASTE_GRACE_MS = 2_000;
 
 // ------------------------------------------------------------ 扩展按键归一化
 

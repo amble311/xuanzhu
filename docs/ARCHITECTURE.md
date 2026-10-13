@@ -19,10 +19,10 @@ src/
 │   ├── index.ts         参数解析 / 命令分发 / 启动 TUI
 │   ├── prompt.ts        交互式输入、选择、确认
 │   └── commands/
-│       ├── model.ts     xzh model —— 多模型管理（新增 / 删除 / 权重）
+│       ├── model.ts     xzh model —— 多模型管理（新增 / 删除 / 回退顺序）
 │       └── config.ts    xzh config —— 查看 / 编辑 / 初始化配置
 ├── core/                Agent 核心
-│   ├── agent.ts         多轮工具调用循环、历史管理、模型失败降级、死循环检测
+│   ├── agent.ts         多轮工具调用循环、历史管理、模型失败回退、死循环检测
 │   ├── sessions.ts      会话增量持久化（~/.xzh/sessions/，崩溃/退出后可 /resume 恢复）
 │   └── prompt.ts        系统提示词
 ├── llm/                 LLM 抽象层（与 SDK 解耦）
@@ -68,7 +68,7 @@ src/
 │   ├── terminal.ts      右侧终端面板（命令执行、输出缓冲、cd 维护）
 │   └── markdown.ts      流式 Markdown 行渲染
 ├── workspace/index.ts   项目级工作区（<项目>/.xuanzhu：memory/ + rules.md）
-├── config/store.ts      配置读写（~/.xzh/config.json）与多模型权重
+├── config/store.ts      配置读写（~/.xzh/config.json）与多模型回退
 └── utils/
     ├── ansi.ts          颜色、显示宽度、折行
     ├── backups.ts       文件修改前的快照与 /undo 撤销（~/.xzh/backups/，按项目隔离）
@@ -107,7 +107,7 @@ Agent.run(text) ──► LLMProvider.chat({ messages, tools })
 0. **意图分析（可选，默认关闭）**：若 `config.intent.enabled` 为真，先发起一次**独立请求**
    （`Agent.analyzeIntent()`）：用模板（`buildIntentPrompt()`，占位符 `{{'用户发送过来的消息'}}`）
    包裹用户消息，取返回正文作为本轮输入。该请求**不携带工具声明、不写入对话历史**，
-   失败或返回为空时回退原始输入，且**不参与模型降权**（辅助请求，避免与主请求重复降权）。
+   失败或返回为空时回退原始输入，且**不触发模型回退**（辅助请求，避免与主请求重复走回退链）。
    开关来源：配置 `intent.enabled` / CLI `--intent`|`--no-intent`（仅本次运行）/ 界面 `/intent on|off`（写盘）。
 1. 追加用户消息。
 2. 调用 Provider 流式生成，收集正文与工具调用。
@@ -121,8 +121,15 @@ Agent.run(text) ──► LLMProvider.chat({ messages, tools })
 6. 回到第 2 步，最多 `maxToolRounds`（默认 200）轮；用尽时不硬性中断，而是经
    `onRoundLimit` 询问用户是否追加配额（非交互场景直接收尾）。
 7. 历史按 **token 预算**裁剪（`trimMessagesToBudget()`），先压缩老旧的大块工具输出、
-   再从最老的消息整条丢弃，并保持 tool 消息与其 assistant 消息配对；
-   另有一道 `MAX_HISTORY_MESSAGES`（400 条）的安全网。
+   再从最老的消息整条丢弃。裁剪后有两条结构性约束：
+   - 开头的 `assistant` / `tool` 一律去掉（`keepFromValidStart()`）—— Anthropic / Gemini
+     的归一化本来就会丢掉开头的非 user 消息，留着它们只会让后面的 `tool` 变成
+     「引用不存在 tool_use_id 的孤立结果」→ 400；`system` 消息刻意保留（会被并进系统提示词，
+     而且「上一轮已中止」的说明常常是窗口里唯一的一条）。
+   - 兜底：裁空时至少保留最后一条 `user`；
+   两道安全网：`MAX_HISTORY_MESSAGES`（400 条）在**组装请求**（`buildConversation`）与
+   **持久历史**（`trimHistory`）两侧都生效 —— 只作用于请求副本时，窗口配得很大的模型
+   （1M 上下文）会让 `this.history` 一路堆到几十万 token 对应的条数，而每轮都要全量复制它。
 8. **token 估算闭环**：每次流结束时（`done` 事件）若 Provider 带回了真实 `usage`，
    就用 `真实 prompt token / 本次估算` 更新该模型的校正器（`calibration.ts`，EWMA、
    进程内按模型共享），下一次计算会话预算时按比值**收紧**（`calibrateBudget()`）。
@@ -146,8 +153,14 @@ Agent.run(text) ──► LLMProvider.chat({ messages, tools })
    - 本轮什么都没真正执行时（纯聊天被打断）返回一条都不加 —— 无可交代，避免无谓噪音。
 
 工作目录可在启动时指定（`xzh <目录>`），也可在对话中用 `/switch <目录>` 切换。
-`Agent.setCwd()` 会同时更新工具上下文（`ToolContext.cwd`）与系统提示词中的目录信息，
-对话历史保留不重置。
+`Agent.setCwd()` 会同时更新工具上下文（`ToolContext.cwd`）与系统提示词中的目录信息。
+
+`/switch` 的语义是「**切换项目 = 在该项目重新开局**」：除上述切换外，还会载入目标目录
+**最近一次会话**接着聊（相当于自动做了一次 `/resume`），会话文件也换到该项目名下。
+必须连会话文件一起换的原因：会话文件按项目分目录（`sessionDirFor(cwd)`），而 `/resume`
+只列**当前项目**目录下的文件 —— 若只切目录不换文件，在新项目里聊的内容会一直记在原项目名下，
+从新项目里永远恢复不到。代价是当前对话就此中断：它已增量存档在原项目的会话文件里，
+切回去即可找回。目标目录没有历史会话时即为全新开局。
 
 ## 5. LLM Provider 抽象
 
@@ -207,9 +220,12 @@ chat(options: ChatOptions): AsyncIterable<StreamChunk>
    `IMAGE_TOKENS_ESTIMATE`（1600）的固定值保守估算 —— 不解析图片头去算尺寸，因为
    低估会把请求顶到窗口上限，而高估只是让历史早一点被裁剪。
 
-**旧图片降级**（`stripStaleImages`）：图片以 base64 携带，成本随轮次线性叠加，
-所以每次组装请求时只保留**最后一条**带图片的消息，更早的替换成
-`[图片已省略：image/png]`。
+**旧图片降级**（`stripStaleImages(messages, keepFrom)`）：图片以 base64 携带，成本随轮次线性叠加，
+所以只保留**一张**图 —— 且必须是**本轮**的那张（`keepFrom` = `history.length`），
+历史里的图一律替换成 `[图片已省略：image/png]`。
+早期是「整个数组里最后一张」，于是上一轮发过的截图会被无限期地每轮重发，
+而且「模型不支持图片」的降级判断只看本轮、看不到它，导致每个模型都拿同一张旧图再撞一次
+（该判断现在看整条会话，见 `streamAssistant` 里的 `hasImages`）。
 
 **入站**（TUI → 附件）：终端只能传文本，剪贴板里只有图片时多数终端粘贴时什么都不发，
 因此由 TUI 主动读系统剪贴板（`src/utils/clipboard.ts`，见目录树）。三条通路：
@@ -236,8 +252,8 @@ provider 默认支持 → 否定关键词 → 肯定关键词 → 默认不支�
   「提到不支持」同时成立，避免把「图片格式非法」这类错误也当成模型不支持而静默丢图；
 - `streamAssistant` 命中后以 `stripAllImages()` 去掉全部图片**重试一次**
   （`dropImages` 参数保证不会反复重试），并提示用户 `xzh model vision <id> off` 彻底关闭。
-- 这一步必须放在 `handleModelFailure` **之前**：它不是模型故障，降权与切换模型都没有意义
-  —— 换个模型拿同样的图片再发一次可能同样失败，只会白扣权重。
+- 这一步必须放在 `handleModelFailure` **之前**：它不是模型故障，切换模型没有意义
+  —— 换个模型拿同样的图片再发一次可能同样失败，只会白走一遍回退链。
 
 ## 6. 工具系统
 
@@ -541,39 +557,56 @@ AutoJs6 连接的三个必要策略（`autojs6/client.ts`）：**指数退避自
 - API Key 也可来自环境变量（如 `DEEPSEEK_API_KEY`、`ANTHROPIC_API_KEY`、`GEMINI_API_KEY`），优先级低于配置文件。
 - `xzh config` 展示时对 Key 脱敏；`xzh config edit` 调用 nano 编辑原始文件。
 
-### 多模型与调用权重
+### 多模型与自动回退
 
-配置中的 `models: ModelEntry[]` 承载多模型与权重（`id = <provider>/<model>`，`weight` 默认 `10`）：
+配置中的 `models: ModelEntry[]` 承载多模型（`id = <provider>/<model>`）。
+**列表顺序即优先级/回退顺序，没有权重**：`ModelEntry` 只有 `apiKey` / `baseUrl` /
+`contextWindow` / `vision` 这些覆盖项。
 
-- **兼容旧配置**：`models` 为空时 `effectiveModels()` 把 `provider` / `model` 视为一个默认权重模型。
+- **兼容旧配置**：`models` 为空时 `effectiveModels()` 把 `provider` / `model` 视为唯一的模型。
   任何「先改 provider/model、再操作 models」的流程都必须先调用 `materializeModels()` 固定列表，
   否则兼容回退会取到新值（早期实现正是因此丢失过模型）。
-- **选择**：`pickModel()` = `rankedModels()[0]`，即权重最高者（同权重按配置顺序）。
-- **降权**：`decayModelWeight(config, id)` 令权重 -1（下限 0）；若**全部**模型权重变为 0，
-  则把全部权重重置为 `DEFAULT_MODEL_WEIGHT` 并返回 `reset: true`。
-- **降级重试**：`Agent.streamAssistant()` 捕获非中断错误后调用 `handleModelFailure()`：
-  降权 → 写回配置 → 选出下一个可用模型 → 用 `createProvider(config, entry)` 重建 provider → 重试。
-  三条约束（缺一都会导致「空转」）：
+  旧配置里的 `weight` / `decayed` 由 `sanitizeModelEntry()` 在读取时丢弃（不 `{...entry}`，
+  否则会一直挂在内存对象上、下次保存又被写回）。
+- **默认选择**：`activeModelEntry()` = `config.provider` / `config.model` 指向的那个
+  （即「上次用过的」）；它不在列表里（被删 / 没记录）时退回列表第一项。
+- **记住选择**：`rememberModel(config, entry)` 把当前模型写回 `config.provider` / `config.model`
+  与 `providers[provider].model` —— 这两个字段同时是旧版单模型配置的兼容字段，一物两用。
+- **回退链**：`nextModelAfter(config, currentId, tried)` 从当前模型在列表中的位置**向后**找，
+  跳过 `tried` 里已试过的；`currentId` 不在列表里时从表头开始。查找是**环形**的
+  （末尾失败绕回表头），否则「直到所有模型都试过」永远达不成；`currentId` 自身也一定跳过
+  （否则单模型列表会返回它自己）。
+- **回退重试**：`Agent.streamAssistant()` 捕获非中断错误后调用 `handleModelFailure()`：
+  `tried` 记下当前模型 → `nextModelAfter()` 选下一个 → 用 `createProvider(config, entry)`
+  重建 provider → `rememberModel()` + 写盘 → 重试。三条约束（缺一都会导致「空转」）：
   1. 仅在**尚未产出任何内容**（`produced === false`）时重试，避免重复输出；
-  2. `handleModelFailure` 接收本次请求的 `tried: Set<modelId>`，`pickModel(config, tried)` 会跳过
-     已尝试过的模型 —— **每个模型在一次请求内最多尝试一次**；
-  3. 若选出的仍是当前模型（只有一个模型，或权重耗尽重置回它自己），**直接返回 false 不重试**：
-     认证失败 / 模型名不存在 / baseUrl 错误这类配置问题用相同参数重试必然再次失败，
-     只会白白消耗权重并让用户长时间等待。
-  单次请求最多切换 `MAX_MODEL_SWITCHES`(3) 次；`Ctrl+C` 主动中断不计为失败。
-- **启动兜底**：`startChat()` 若发现全部权重为 0（例如手工改坏配置），直接重置并提示。
-- **界面反馈**：权重变化与切换通过 `AgentEvents.onModelChange` / `onNotice` 呈现，
-  顶部与状态栏显示当前模型及权重（如 `gpt-4o w6`）。
-- **序号语义**：`xzh model list` 按权重降序展示，`remove` / `weight` 的序号参数按**同一顺序**解析
+  2. 本次请求的 `tried: Set<modelId>` 会跳过已尝试过的 —— **每个模型一次请求内最多试一次**；
+  3. **provider 级**配置错误（401 密钥无效 / 403 无权限，以及文本特征匹配到的同类）
+     **直接返回 false 不切换**：配置不改就永远失败，切换只会把整条回退链白走一遍并掩盖真正的原因。
+     但 **404（模型名在该端点不存在）是模型级问题**（`isModelUnavailableError()`）：列表里的下一个
+     模型很可能可用，**必须照常回退** —— 否则「列表里一个模型名写错」就会中止整条回退链。
+     上下文超限同理不切换（由外层收敛预算后重试）。
+  **不需要切换次数上限**：终止条件就是 `nextModelAfter()` 在 `tried` 覆盖全表后返回 `null`。
+  `Ctrl+C` / `Ctrl+D` 主动中断不计为失败。
+- **删除时维护指针**：`removeModel()` 若删掉的正是「上次使用」的那个，把指针切到剩下的第一项
+  （直接读 `config.models` 判定，不能经 `effectiveModels()` —— 它在 `models` 为空时会回退到
+  `provider` / `model` 兼容字段，导致刚删掉的模型被当成「仍然存在」写回去）。
+- **界面反馈**：回退通过 `AgentEvents.onModelChange` / `onNotice` 呈现，
+  顶部与状态栏显示当前模型（不再有 `w6` 一类的权重标记）。
+- **序号语义**：`xzh model list` 按**配置顺序**展示（不排序 —— 这个顺序就是回退顺序），
+  `remove` / `context` / `vision` 的序号参数按**同一顺序**解析
   （`resolveModelKey` 优先精确匹配 id、再模型名、最后才是序号）。
 
 ## 8. 界面渲染
 
 - 使用 ANSI 转义序列实现：交替屏幕缓冲（`?1049h`）、光标定位与隐藏、行清除。
 - 输入为 raw mode 逐键处理，自行解析方向键 / PgUp / PgDn / 控制键。
-- 输入解析对**转义序列分片**做容错：不完整前缀（如只收到 `\x1b` 或 `\x1b[`）会等待最多 40ms
-  再判定——确为单独 ESC 才按 ESC 处理，其余不完整序列直接丢弃，避免残留字节被当作输入插入
-  （终端与输入法在 pty 上分片发送时常见）。
+- 输入解析对**转义序列分片**做容错（`armIncompleteTimer()`）：不完整前缀（如只收到 `\x1b` 或 `\x1b[`）
+  会等待最多 40ms 再判定——确为单独 ESC 才按 ESC 处理，其余不完整序列直接丢弃，
+  避免残留字节被当作输入插入（终端与输入法在 pty 上分片发送时常见）。
+  但**括号粘贴未收全**（收到 `\x1b[200~` 还没等到 `\x1b[201~`）走另一条规则：宽限 2s，
+  且超时是**把已收到的正文插入**而不是丢弃 —— 一次长粘贴本来就可能跨多次 read 到达，
+  按 40ms 丢弃等于把用户粘贴内容的前半段吃掉。
 - **扩展按键归一化**（`normalizeKey`）：Enter 系按键在不同终端下的编码完全不同，统一成本应用既有
   语义（`\r` 提交、`\n` 换行、`\x1b[Z` 切换焦点）。支持的来源：
   - `ESC CR`：legacy 终端的 `Ctrl+Enter`（xterm 系同时用它表示 `Alt+Enter`）；

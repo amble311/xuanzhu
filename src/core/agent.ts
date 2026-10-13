@@ -1,9 +1,9 @@
 import {
+  activeModelEntry,
   buildIntentPrompt,
-  decayModelWeight,
   DEFAULT_INTENT_PROMPT,
-  DEFAULT_MODEL_WEIGHT,
-  pickModel,
+  nextModelAfter,
+  rememberModel,
   saveConfig,
   type ModelEntry,
   type XuanZhuConfig,
@@ -17,7 +17,9 @@ import {
   isConfigError,
   isContextLengthError,
   isSystemPromptTight,
+  isModelUnavailableError,
   isVisionUnsupportedError,
+  keepFromValidStart,
   resolveConversationBudget,
   stripAllImages,
   stripStaleImages,
@@ -93,11 +95,10 @@ export interface AgentEvents {
   onNotice?: (message: string) => void;
   /** 意图分析完成（analysis 为分析结果，original 为用户原始消息） */
   onIntent?: (analysis: string, original: string) => void;
-  /** 当前使用的模型发生变化（失败降级 / 权重耗尽重置） */
+  /** 当前使用的模型发生变化（因调用失败而回退到下一个模型） */
   onModelChange?: (info: {
     provider: string;
     model: string;
-    weight: number;
     reason: string;
   }) => void;
   /** 任务列表更新（来自 todo_write） */
@@ -179,8 +180,6 @@ const MAX_IDENTICAL_TOOL_CALLS = 4;
  * 失败（再次累计到阈值）才中止 —— 不至于让同一次卡顿反复消耗轮次。
  */
 const MAX_SELF_CORRECTIONS = 1;
-/** 单次请求内因模型调用失败而切换模型的最大次数 */
-const MAX_MODEL_SWITCHES = 3;
 
 /**
  * 只读「调研类」工具。
@@ -251,7 +250,7 @@ export class Agent {
   /** 是否已就「系统提示词撑满窗口」提示过（避免每条消息都刷一遍） */
   private warnedTightContext = false;
   private history: ChatMessage[] = [];
-  /** 当前使用的模型条目（多模型权重机制） */
+  /** 当前使用的模型条目（多模型：默认上次使用的，失败后沿列表回退） */
   private activeModel: ModelEntry | null;
   /** 可用的工具集合；未指定时使用全部内置工具（子代理会传入受限集合） */
   private readonly tools?: ToolDefinition[];
@@ -291,7 +290,7 @@ export class Agent {
     this.config = config;
     this.cwd = cwd;
     this.events = events;
-    this.activeModel = activeModel ?? pickModel(config);
+    this.activeModel = activeModel ?? activeModelEntry(config);
     this.tools = options?.tools;
     this.systemPromptOverride = options?.systemPrompt;
     this.maxToolRoundsOverride = options?.maxToolRounds;
@@ -299,7 +298,7 @@ export class Agent {
     this.systemPrompt = this.composeSystemPrompt();
   }
 
-  /** 当前使用的模型（含权重） */
+  /** 当前使用的模型 */
   getActiveModel(): ModelEntry | null {
     return this.activeModel;
   }
@@ -687,7 +686,6 @@ export class Agent {
 
         const { text, toolCalls } = await this.streamAssistant(
           signal,
-          0,
           new Set(),
           turn,
         );
@@ -717,6 +715,16 @@ export class Agent {
         // Agent 实例，并行能立刻缩短多路调研的等待；而写文件 / 执行命令可能互相依赖，
         // 一旦并行就会乱序甚至冲突，必须保持顺序。
         let index = 0;
+
+        // 工具产出的图片要等**这条 assistant 的最后一个工具结果**之后再插入。
+        //
+        // 为什么不能紧跟各自的 tool 消息：若模型在一轮里并列多个调用，而**非最后一个**
+        // 返回了图片（目前只有 device_screenshot 会带图），序列会变成
+        // [tool, user(图), tool] —— OpenAI 协议要求所有 tool 消息紧跟自己那条 assistant，
+        // 中间夹一条 user 会被服务端以 400 拒绝（"messages with role 'tool' must be a
+        // response to a preceeding message with 'tool_calls'"）。统一挪到末尾即可。
+        const imageNotes: ChatMessage[] = [];
+
         while (index < toolCalls.length) {
           const call = toolCalls[index];
 
@@ -885,14 +893,14 @@ export class Agent {
             name: call.name,
           });
 
-          // 工具产出的图片（如手机截图）→ 作为一条**额外的 user 消息**追加。
+          // 工具产出的图片（如手机截图）→ 收集起来，等本轮的 tool 消息**全部**写完后
+          // 再作为一条额外的 user 消息追加（见上面 imageNotes 的说明）。
           //
-          // 为什么不塞进上面的 tool 消息：各家的 tool/function 消息都**不接受图片**，
-          // 只有 user 消息能带图。放在紧随其后的位置，模型看到的就是
-          // "工具说'图在这里' → 紧接着一张图"。
+          // 为什么不塞进 tool 消息：各家的 tool/function 消息都**不接受图片**，
+          // 只有 user 消息能带图。
           // 模型不支持视觉时，下面 streamAssistant 里已有的"去掉图片重试"兜底会生效。
           if (result.images && result.images.length > 0) {
-            turn.push({
+            imageNotes.push({
               role: "user",
               content: `（上面 ${call.name} 的返回附带了 ${result.images.length} 张图片）`,
               images: result.images,
@@ -906,6 +914,9 @@ export class Agent {
           }
           index++;
         }
+
+        // 本轮所有 tool 消息已写完，此时再插入带图消息（见 imageNotes 的说明）
+        if (imageNotes.length > 0) turn.push(...imageNotes);
       }
 
       // 达到工具轮次上限（用户选择不再继续）：工具已经真实执行过（有副作用），
@@ -1003,7 +1014,6 @@ export class Agent {
 
   private async streamAssistant(
     signal?: AbortSignal,
-    attempt = 0,
     tried: Set<string> = new Set(),
     extra: ChatMessage[] = [],
     budgetRatio = 1,
@@ -1033,6 +1043,14 @@ export class Agent {
     const toolCalls: ToolCall[] = [];
     // 是否已经产出过内容：已产出时不再换模型重试，避免重复输出
     let produced = false;
+
+    // 本次请求里是否存在图片：用于「模型不支持图片」时决定要不要去掉图片重试。
+    // 必须看**整条会话**而不只是本轮的 extra —— 上一轮发过的截图（已提交进 history）
+    // 同样会被发出去；只看 extra 会让这条兜底在「本轮是纯文本」时完全不生效，
+    // 于是每个模型都拿同一张旧图再撞一次。
+    const hasImages = [...this.history, ...extra].some(
+      (message) => (message.images?.length ?? 0) > 0,
+    );
 
     try {
       const stream = this.provider.chat({
@@ -1086,16 +1104,14 @@ export class Agent {
 
       return { text, toolCalls };
     } catch (err) {
-      // 用户主动中断不算模型失败，不降权
+      // 用户主动中断不算模型失败，不触发回退
       if (signal?.aborted) throw err;
 
-      // 已经产出内容时本轮必然失败：仍然按规则降权并写盘，但不再切换模型
-      // （切换只会让「当前模型」与实际出错的模型不一致，且重试会造成重复输出）。
       // 上下文超限 → 收敛预算后重试一次。
       //
-      // 必须放在 handleModelFailure **之前**：超限不是模型故障，降权毫无意义，
-      // 而切换模型更是有害 —— 新模型会拿到同样长的消息，必然同样失败，
-      // 结果只是把可用模型的权重一个个耗光（这正是旧实现的行为）。
+      // 必须放在 handleModelFailure **之前**：超限不是模型故障，切换模型是有害的 ——
+      // 新模型会拿到同样长的消息，必然同样失败，结果只是把整条回退链白白走一遍
+      // 并让用户长时间等待。
       //
       // 要求 !produced：已产出内容时不能重试，否则用户会看到重复输出。
       // （实践中超限通常在请求阶段就返回 400，不会走到产出。）
@@ -1106,12 +1122,14 @@ export class Agent {
         isContextLengthError(err)
       ) {
         this.events.onStatus("上下文超限", "已收敛历史，正在重试");
+        // 保留 dropImages：若上一次已经因为「模型不支持图片」去掉过图片，
+        // 这里再把它塞回去只会重复撞同一个错误
         return this.streamAssistant(
           signal,
-          attempt,
           tried,
           extra,
           CONTEXT_RETRY_BUDGET_RATIO,
+          dropImages,
         );
       }
 
@@ -1120,13 +1138,13 @@ export class Agent {
       // 这条兜底是「自定义端点默认按支持视觉放行」的前提：自定义端点的模型名由用户
       // 自填，推断无从下手，只能先发出去；真被拒时在这里自动降级，用户的正文不受影响。
       //
-      // 同样必须放在 handleModelFailure 之前：这不是模型故障，降权与切换模型都没有意义
-      // （换个模型拿同样的图片再发一次可能同样失败，白扣权重）。
+      // 同样必须放在 handleModelFailure 之前：这不是模型故障，切换模型没有意义
+      // （换个模型拿同样的图片再发一次可能同样失败，还白走一遍回退链）。
       if (
         !produced &&
         !signal?.aborted &&
         !dropImages &&
-        extra.some((message) => (message.images?.length ?? 0) > 0) &&
+        hasImages &&
         isVisionUnsupportedError(err)
       ) {
         this.events.onStatus("模型不支持图片", "已去掉图片重试");
@@ -1137,7 +1155,6 @@ export class Agent {
         );
         return this.streamAssistant(
           signal,
-          attempt,
           tried,
           extra,
           budgetRatio,
@@ -1145,20 +1162,25 @@ export class Agent {
         );
       }
 
+      // 换一个模型重试：`tried` 会逐次增长，`nextModelAfter` 在全部试过后返回 null，
+      // 因此这里不需要额外的次数上限 —— 终止条件就是「所有模型都试过了」。
       const switched = this.handleModelFailure(err, tried, !produced);
-      if (switched && attempt < MAX_MODEL_SWITCHES) {
-        return this.streamAssistant(signal, attempt + 1, tried, extra, budgetRatio);
+      if (switched) {
+        return this.streamAssistant(signal, tried, extra, budgetRatio);
       }
       throw err;
     }
   }
 
   /**
-   * 模型调用失败的处理：当前模型权重 -1，并选出权重最高的可用模型。
+   * 模型调用失败的处理：沿列表回退到**下一个尚未试过的**模型。
    *
-   * - 仍有可用模型（且与当前不同）→ 切换并返回 true，调用方会重试
-   * - 全部模型权重耗尽 → 重置全部权重为默认值，返回 true
-   * - 无模型条目（理论上不会发生）或切换失败 → 返回 false
+   * - 还有没试过的模型 → 切换并返回 true，调用方带着新的 provider 重试
+   * - 所有模型都试过（或不允许切换）→ 返回 false，调用方把错误抛给用户
+   *
+   * 与旧实现的区别：不再有「权重 -1，全部归零后集体重置」那一套。失败的模型只是
+   * **本次请求内不再尝试**（记进 `tried`），既不写回配置、也不会被剔出列表 ——
+   * 用户配置的列表顺序始终是权威。
    */
   private handleModelFailure(
     error: unknown,
@@ -1168,69 +1190,48 @@ export class Agent {
     const current = this.activeModel;
     if (!current) return false;
 
+    // 当前这个也记进去：同一次请求内不重复尝试同一个模型
+    tried.add(current.id);
     const reason = friendlyError(error).split("\n")[0];
 
-    // 配置类错误（密钥无效 / 模型名不存在 / 端点地址错误）**不衰减、不写盘**。
-    // 配置不改就永远失败，扣权重只会把其他可用模型一起拖到不可用；
-    // 用户真正需要做的是去修配置，而不是让玄猪悄悄换一个模型继续撞同一面墙。
-    if (isConfigError(error)) {
+    // **provider 级**配置错误（密钥无效 / 无权限）不切换：配置不改就永远失败，
+    // 沿着列表回退只会把每个模型都白试一遍，还把「当前使用的模型」换成另一个同样
+    // 不可用的，反而掩盖真正的原因。
+    //
+    // 但 404（模型名在该端点不存在）是**模型级**问题：列表里的下一个模型很可能可用，
+    // 必须照常回退 —— 否则「列表里一个模型名写错」就会中止整条回退链。
+    if (isConfigError(error) && !isModelUnavailableError(error)) {
       this.events.onNotice?.(
         `⚠ 模型 ${current.id} 的配置可能有误（${reason}）。` +
-          `已跳过权重衰减 —— 请检查 provider、API Key 与 baseUrl。`,
+          `已跳过模型回退 —— 请检查 provider、API Key 与 baseUrl。`,
       );
       return false;
     }
 
-    const result = decayModelWeight(this.config, current.id);
-    if (!result) return false;
-
-    this.persistConfig();
-
-    if (result.reset) {
-      this.events.onNotice?.(
-        `⚠ 模型 ${current.id} 调用失败（${reason}）；所有模型权重均已耗尽，` +
-          `已把全部权重重置为 ${DEFAULT_MODEL_WEIGHT}。`,
-      );
-      this.events.onStatus("权重已重置");
-    } else {
-      this.events.onNotice?.(
-        `⚠ 模型 ${current.id} 调用失败（${reason}），权重降为 ${result.weight}。`,
-      );
-    }
-
-    // 即使不再切换模型，也要把新权重同步给界面：
-    // 否则状态栏与随后打印的错误信息会长期显示旧权重，误导诊断。
-    this.events.onModelChange?.({
-      provider: current.provider,
-      model: current.model,
-      weight: result.reset ? DEFAULT_MODEL_WEIGHT : result.weight,
-      reason: "调用失败降权",
-    });
-
-    // 不允许切换时到此为止（已产出内容，本轮必定失败）
+    // 已产出内容时不再切换：换模型重发必然造成重复输出（调用方会把错误抛给用户）
     if (!allowSwitch) return false;
 
-    // 跳过本次请求已经用过的模型：若没有「另一个」模型可用，就不再重试。
-    // 单模型（或权重耗尽重置后仍是它自己）时用完全相同的参数重试必然再次失败，
-    // 例如认证失败、模型名不存在、baseUrl 错误等配置类问题——
-    // 重试只会白白消耗权重并让用户长时间等待。
-    const next = pickModel(this.config, tried);
-    if (!next || next.id === current.id) {
-      if (next) this.activeModel = next;
+    const next = nextModelAfter(this.config, current.id, tried);
+    if (!next) {
+      this.events.onNotice?.(
+        `⚠ ${current.id} 调用失败（${reason}），且已配置的模型都试过了 —— 本轮无法完成。`,
+      );
       return false;
     }
 
     try {
       this.provider = createProvider(this.config, next);
       this.activeModel = next;
+      // 记住这次用的是哪个模型：下次启动直接用它，不必再从表头试一遍
+      rememberModel(this.config, next);
+      this.persistConfig();
       this.events.onNotice?.(
-        `↻ 已切换到模型 ${next.id}（权重 ${next.weight}）重试。`,
+        `↻ ${current.id} 调用失败（${reason}），已切换到 ${next.id} 重试。`,
       );
       this.events.onModelChange?.({
         provider: next.provider,
         model: next.model,
-        weight: next.weight,
-        reason: "调用失败降级",
+        reason: "调用失败回退",
       });
       return true;
     } catch (err) {
@@ -1239,12 +1240,12 @@ export class Agent {
     }
   }
 
-  /** 把权重变化写回配置文件；写盘失败不影响当前会话 */
+  /** 把「当前使用的模型」写回配置文件；写盘失败不影响当前会话 */
   private persistConfig(): void {
     try {
       saveConfig(this.config);
     } catch {
-      // 忽略：内存中的权重仍然生效
+      // 忽略：内存中的选择仍然生效
     }
   }
 
@@ -1547,8 +1548,10 @@ export class Agent {
     budgetRatio = 1,
   ): ChatMessage[] {
     // 先降级旧图片：图片以 base64 携带，成本随轮次线性叠加，历史里每轮都留原图
-    // 会迅速撑爆上下文（而且旧截图对后续对话没有价值）。只保留最后一张。
-    const all = stripStaleImages([...this.history, ...extra]);
+    // 会迅速撑爆上下文（而且旧截图对后续对话没有价值）。
+    // `this.history.length` 是「本轮起点」：只有本轮携带的图才保留原图，
+    // 历史里的图一律降级 —— 否则一张旧截图会被每轮重发。
+    const all = stripStaleImages([...this.history, ...extra], this.history.length);
     // 先按条数粗筛作为安全网（防止 contextWindow 被配成极大值时历史无限累积），
     // 再由 token 预算决定实际保留多少
     const capped =
@@ -1564,10 +1567,17 @@ export class Agent {
    * 按 token 预算裁（而非消息条数）：一条 30000 字符的 `bash` 输出与一条「好的」
    * 在旧实现里占同样的名额，于是「60 条以内」也可能轻松越过窗口上限。
    *
+   * 另加一道 `MAX_HISTORY_MESSAGES` 条数上限：token 预算在「窗口被配成极大值」时形同虚设
+   * （预算跟着涨），历史会一路堆到几十万 token 对应的条数，而每轮组装请求都要全量复制它。
+   * 条数裁剪可能把起点切在 tool / assistant 上，故用 `keepFromUserBoundary` 拉回 user 边界。
+   *
    * 返回被裁掉的条数（仅用于日志/调试，回滚不应依赖它，见 run 的说明）。
    */
   private trimHistory(): number {
-    const kept = trimMessagesToBudget(this.history, this.conversationBudget());
+    let kept = trimMessagesToBudget(this.history, this.conversationBudget());
+    if (kept.length > MAX_HISTORY_MESSAGES) {
+      kept = keepFromValidStart(kept.slice(kept.length - MAX_HISTORY_MESSAGES));
+    }
     if (kept.length === this.history.length) return 0;
     const removed = this.history.length - kept.length;
     this.history = kept;

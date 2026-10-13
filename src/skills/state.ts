@@ -10,7 +10,7 @@ import { ensureDir, getConfigDir } from "../utils/paths";
  *   - 用户自建（~/.xzh/skills/<name>，归用户所有）。
  * 「禁用内置技能」不可能靠删文件实现，所以统一记名字；「删除」则只对用户技能生效。
  *
- * 与 `config.json` 分开的原因：config.json 是**模型配置**（provider / key / 权重），
+ * 与 `config.json` 分开的原因：config.json 是**模型配置**（provider / key / 模型列表），
  * 由 `xzh model` / `xzh config` 管理；技能状态自成一体，读写它的只有这里与 `xzh skill`，
  * 不给主配置增加结构（也不参与 config 的版本迁移）。
  */

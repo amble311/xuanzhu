@@ -23,7 +23,6 @@ const model: ModelEntry = {
   id: "fake/fake",
   provider: "fake",
   model: "fake",
-  weight: 10,
   contextWindow: 100000,
 };
 

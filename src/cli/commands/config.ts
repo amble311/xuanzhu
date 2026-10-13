@@ -92,7 +92,16 @@ function openInEditor(): void {
       process.stdout.write(
         `${ansi.red}编辑器启动失败：${result.error.message}${ansi.reset}\n`,
       );
+      process.exitCode = 1;
       return;
+    }
+    // 编辑器自己以非 0 退出（没权限保存、磁盘满……）也必须反映到退出码上，
+    // 否则 `xzh config edit || echo 失败` 会把「没保存成功」当成成功
+    if (typeof result.status === "number" && result.status !== 0) {
+      process.stdout.write(
+        `${ansi.yellow}编辑器退出码 ${result.status}，配置可能未保存。${ansi.reset}\n`,
+      );
+      process.exitCode = 1;
     }
     return;
   }
@@ -100,4 +109,5 @@ function openInEditor(): void {
   process.stdout.write(
     `${ansi.yellow}未找到可用的文本编辑器，请手动编辑：${file}${ansi.reset}\n`,
   );
+  process.exitCode = 1;
 }

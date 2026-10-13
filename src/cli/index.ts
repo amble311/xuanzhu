@@ -1,14 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import {
-  configExists,
-  DEFAULT_MODEL_WEIGHT,
-  effectiveModels,
-  loadConfig,
-  pickModel,
-  resetModelWeights,
-  saveConfig,
-} from "../config/store";
+import { activeModelEntry, configExists, loadConfig } from "../config/store";
 import {
   createProvider,
   findProvider,
@@ -197,30 +189,13 @@ async function startChat(
 
   const config = loadConfig();
 
-  // 「权重耗尽」只针对**因调用失败被降权**的模型（decayed 标记）。
-  // 用户主动把权重设为 0 表示"临时停用"，启动流程不应静默推翻这一意图 ——
-  // 这与 decayModelWeight 里对「失败降权」和「用户主动禁用」的区分保持一致。
-  const configured = effectiveModels(config);
-  if (
-    configured.length > 0 &&
-    configured.every((entry) => entry.weight <= 0 && entry.decayed === true)
-  ) {
-    resetModelWeights(config);
-    saveConfig(config);
-    process.stdout.write(
-      `${ansi.yellow}⚠ 所有模型权重均为 0，已重置为 ${DEFAULT_MODEL_WEIGHT}。${ansi.reset}\n`,
-    );
-  }
-
-  // 优先加载权重最高的模型
-  const active = pickModel(config);
+  // 默认使用**上次用过的**那个模型（记在 config.provider / config.model）；
+  // 它已不在列表里时退回列表第一项 —— 顺序即回退优先级。
+  const active = activeModelEntry(config);
   if (!active) {
     process.stdout.write(
-      configured.length === 0
-        ? `${ansi.yellow}尚未配置任何模型。${ansi.reset}\n` +
-            `${ansi.gray}请先运行 ${ansi.reset}xzh model add <provider> <model>${ansi.gray} 添加模型。${ansi.reset}\n`
-        : `${ansi.red}没有可用的模型（全部权重为 0）。${ansi.reset}\n` +
-            `${ansi.gray}运行 ${ansi.reset}xzh model${ansi.gray} 查看与管理模型。${ansi.reset}\n`,
+      `${ansi.yellow}尚未配置任何模型。${ansi.reset}\n` +
+        `${ansi.gray}请先运行 ${ansi.reset}xzh model add <provider> <model>${ansi.gray} 添加模型。${ansi.reset}\n`,
     );
     process.exitCode = 1;
     return;
@@ -266,7 +241,6 @@ async function startChat(
     cwd: cwd ?? process.cwd(),
     providerLabel: meta?.label ?? active.provider,
     model: active.model,
-    modelWeight: active.weight,
     activeModel: active,
     intentEnabled:
       intentOverride !== undefined
@@ -325,14 +299,12 @@ ${ansi.bold}用法${ansi.reset}
   ${ansi.green}xzh <目录>${ansi.reset}              在指定项目目录启动，例如 ${ansi.gray}xzh /home${ansi.reset}
   ${ansi.green}xzh --intent${ansi.reset}            本次启动启用意图分析（默认关闭）
   ${ansi.green}xzh --no-intent${ansi.reset}         本次启动强制关闭意图分析
-  ${ansi.green}xzh model${ansi.reset}               交互式管理多模型（新增 / 删除 / 调整权重 / 查看全部）
-  ${ansi.green}xzh model list${ansi.reset}          列出已配置的模型与权重
+  ${ansi.green}xzh model${ansi.reset}               交互式管理多模型（新增 / 删除 / 查看全部）
+  ${ansi.green}xzh model list${ansi.reset}          列出已配置的模型（按回退顺序）
   ${ansi.green}xzh model all${ansi.reset}           列出所有内置可用的模型
-  ${ansi.green}xzh model add <provider> <model> [权重]${ansi.reset}
-                            新增模型（默认权重 ${DEFAULT_MODEL_WEIGHT}）
+  ${ansi.green}xzh model add <provider> <model> [上下文窗口] [on|off]${ansi.reset}
+                            新增模型（末尾 on/off = 是否支持图片输入）
   ${ansi.green}xzh model remove <id|序号>${ansi.reset}    删除模型
-  ${ansi.green}xzh model weight <id|序号> <权重>${ansi.reset}
-                            调整模型的调用权重
   ${ansi.green}xzh config${ansi.reset}              查看当前配置（API Key 脱敏）
   ${ansi.green}xzh config edit${ansi.reset}         使用 nano 编辑配置文件
   ${ansi.green}xzh config path${ansi.reset}         打印配置文件路径
@@ -362,9 +334,9 @@ ${ansi.bold}意图分析${ansi.reset}
   也可在界面内用 ${ansi.gray}/intent on${ansi.reset}），每条消息会先用模板包裹并请求一次模型，
   返回的分析结果作为本次输入交给主流程。模板可在配置 ${ansi.gray}intent.prompt${ansi.reset} 中自定义。
 
-${ansi.bold}多模型与权重${ansi.reset}
-  启动时优先使用权重最高的模型；调用失败时该模型权重 -1，并自动切换到下一个可用模型；
-  当所有模型权重耗尽时会在终端警告，并把全部权重重置为 ${DEFAULT_MODEL_WEIGHT}。
+${ansi.bold}多模型与回退${ansi.reset}
+  默认使用**上次用过的**模型；它调用失败时按列表顺序自动切换到下一个，直到所有模型都试过。
+  **列表顺序即优先级**（${ansi.gray}xzh model list${ansi.reset} 的顺序），没有权重设置。
 
 ${ansi.bold}界面内快捷键${ansi.reset}
   Enter 提交 · Ctrl+J 换行 · ↑/↓ 历史 · PgUp/PgDn 滚动

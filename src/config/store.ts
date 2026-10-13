@@ -9,22 +9,18 @@ export interface ProviderSettings {
   model?: string;
 }
 
-/** 单个模型的调用权重默认值 */
-export const DEFAULT_MODEL_WEIGHT = 10;
-
-/** 多模型列表中的一项 */
+/**
+ * 多模型列表中的一项。
+ *
+ * **列表顺序就是优先级**：启动时使用「上次用过的那个」（记在 `config.provider` / `config.model`），
+ * 它不可用时按列表顺序向后回退，直到全部试过。因此这里**没有权重字段** ——
+ * 旧配置里的 `weight` / `decayed` 在读取时会被直接丢弃。
+ */
 export interface ModelEntry {
   /** 唯一标识：`<provider>/<model>` */
   id: string;
   provider: string;
   model: string;
-  /**
-   * 调用权重：越高越优先。
-   * - 启动时选择权重最高的模型
-   * - 调用失败时 -1；降到 0 表示该模型暂不可用
-   * - 所有模型都为 0 时视为「全部耗尽」，会被重置回默认权重
-   */
-  weight: number;
   /** 可选：仅对该模型生效的 API Key（否则沿用 providers[provider].apiKey） */
   apiKey?: string;
   /** 可选：仅对该模型生效的 baseUrl */
@@ -43,13 +39,6 @@ export interface ModelEntry {
    * 会被拒绝并给出提示。可用 `xzh model vision <id> on` 打开。
    */
   vision?: boolean;
-  /**
-   * 是否「因调用失败被降过权」。
-   * 用于把「失败降到 0」与「用户主动设为 0（暂不使用）」区分开：
-   * 只有前者才参与「全部耗尽 → 重置」的判定，否则用户显式禁用会被静默推翻。
-   * 用户手动设置权重后会清除该标记。
-   */
-  decayed?: boolean;
 }
 
 /** 意图分析设置 */
@@ -97,13 +86,15 @@ export function buildIntentPrompt(template: string, message: string): string {
 /** 玄猪主配置 */
 export interface XuanZhuConfig {
   version: number;
-  /** 当前使用的 provider 标识（见 src/llm/index.ts PROVIDERS） */
+  /** **上次使用的** provider 标识（见 src/llm/index.ts PROVIDERS）；空表示还没选过 */
   provider: string;
-  /** 当前使用的模型名 */
+  /** **上次使用的**模型名；它与 provider 一起充当「记住上次用的模型」 */
   model: string;
   /**
-   * 多模型列表（支持权重与降级）。
-   * 为空时回退到 provider/model 单模型配置，以兼容旧版本配置文件。
+   * 多模型列表，**顺序即优先级/回退顺序**：
+   * - 启动时使用「上次用过的那个」（即上面的 provider / model）；
+   * - 它不可用时按本列表顺序向后回退，直到全部试过；
+   * - 为空时回退到 provider / model 单模型配置，以兼容旧版本配置文件。
    */
   models: ModelEntry[];
   /** 意图分析设置（默认关闭） */
@@ -217,6 +208,28 @@ export function loadConfig(): XuanZhuConfig {
   }
 }
 
+/**
+ * 把配置文件里读到的模型条目规范化为当前结构：补齐 id、**丢弃已废弃的字段**。
+ *
+ * 旧版本用 `weight`（调用权重）与 `decayed`（失败降权标记）实现多模型降级，
+ * 现在改为「列表顺序 + 记住上次使用」。这里**逐字段重建**而不是 `{...entry}` ——
+ * 后者会让这两个字段一直挂在内存对象上，并在下次保存时又被写回配置文件。
+ */
+function sanitizeModelEntry(entry: ModelEntry): ModelEntry {
+  const clean: ModelEntry = {
+    id: entry.id || modelId(entry.provider, entry.model),
+    provider: entry.provider,
+    model: entry.model,
+  };
+  if (entry.apiKey) clean.apiKey = entry.apiKey;
+  if (entry.baseUrl) clean.baseUrl = entry.baseUrl;
+  if (hasContextWindow(entry.contextWindow)) {
+    clean.contextWindow = Math.floor(entry.contextWindow!);
+  }
+  if (typeof entry.vision === "boolean") clean.vision = entry.vision;
+  return clean;
+}
+
 function mergeConfig(partial: Partial<XuanZhuConfig>): XuanZhuConfig {
   const models = Array.isArray(partial.models)
     ? partial.models
@@ -226,14 +239,7 @@ function mergeConfig(partial: Partial<XuanZhuConfig>): XuanZhuConfig {
             typeof entry.provider === "string" &&
             typeof entry.model === "string",
         )
-        .map((entry) => ({
-          ...entry,
-          id: entry.id || modelId(entry.provider, entry.model),
-          weight:
-            typeof entry.weight === "number" && Number.isFinite(entry.weight)
-              ? entry.weight
-              : DEFAULT_MODEL_WEIGHT,
-        }))
+        .map((entry) => sanitizeModelEntry(entry))
     : DEFAULT_CONFIG.models;
 
   return {
@@ -310,7 +316,6 @@ export function redactConfig(config: XuanZhuConfig): unknown {
     model: config.model,
     models: effectiveModels(config).map((entry) => ({
       id: entry.id,
-      weight: entry.weight,
       ...(entry.contextWindow ? { contextWindow: entry.contextWindow } : {}),
       ...(entry.vision === undefined ? {} : { vision: entry.vision }),
       ...(entry.baseUrl ? { baseUrl: entry.baseUrl } : {}),
@@ -331,7 +336,7 @@ export function redactConfig(config: XuanZhuConfig): unknown {
   };
 }
 
-// ------------------------------------------------------------ 多模型与权重
+// ------------------------------------------------------------ 多模型与回退
 
 /** 模型唯一标识：`<provider>/<model>` */
 export function modelId(provider: string, model: string): string {
@@ -339,10 +344,11 @@ export function modelId(provider: string, model: string): string {
 }
 
 /**
- * 生效的模型列表：
+ * 生效的模型列表（**顺序即优先级/回退顺序**）：
  * - `config.models` 非空时直接使用；
- * - 否则把旧的单模型配置（provider / model）视为一个默认权重的模型，
- *   以兼容历史配置文件。
+ * - 否则把旧的单模型配置（provider / model）视为唯一的模型，以兼容历史配置文件。
+ *
+ * 返回的是**浅拷贝**（防止调用方误改配置）：要写回必须用 `materializeModels()`。
  */
 export function effectiveModels(config: XuanZhuConfig): ModelEntry[] {
   if (config.models && config.models.length > 0) {
@@ -351,35 +357,67 @@ export function effectiveModels(config: XuanZhuConfig): ModelEntry[] {
   const provider = config.provider;
   const model = config.providers[provider]?.model || config.model;
   if (provider && model) {
-    return [
-      {
-        id: modelId(provider, model),
-        provider,
-        model,
-        weight: DEFAULT_MODEL_WEIGHT,
-      },
-    ];
+    return [{ id: modelId(provider, model), provider, model }];
   }
   return [];
 }
 
-/** 可用模型（权重 > 0），按权重从高到低排序（同权重保持配置顺序） */
-export function rankedModels(config: XuanZhuConfig): ModelEntry[] {
-  return effectiveModels(config)
-    .filter((entry) => entry.weight > 0)
-    .sort((a, b) => b.weight - a.weight);
+/**
+ * 启动 / 展示用的「当前模型」：**上次用过的那个**（记在 config.provider / config.model）；
+ * 它已不在列表里（被删掉、或配置里没记录）时退回列表第一项；没有模型时返回 null。
+ */
+export function activeModelEntry(config: XuanZhuConfig): ModelEntry | null {
+  const models = effectiveModels(config);
+  if (models.length === 0) return null;
+  const currentId =
+    config.provider && config.model ? modelId(config.provider, config.model) : "";
+  return models.find((entry) => entry.id === currentId) ?? models[0];
 }
 
 /**
- * 当前应使用的模型：权重最高者；没有可用模型时返回 null。
- * 传入 `exclude` 可跳过指定模型（用于「同一次请求内不重复尝试同一个模型」）。
+ * 回退链上的下一个模型：从 `currentId` 在列表中的位置**向后**找，跳过 `tried` 里
+ * 已经试过的；`currentId` 不在列表里时从表头开始。全部试过则返回 null。
+ *
+ * 为什么是**环形**查找而不是只取「后面一个」：列表末尾的模型失败时必须绕回表头继续试，
+ * 否则「直到所有模型都尝试过」永远达不成。跳过的判定依据是本次请求内试过哪些，
+ * 而不是把失败的模型从列表里剔掉 —— 那会破坏用户配置。
  */
-export function pickModel(
+export function nextModelAfter(
   config: XuanZhuConfig,
-  exclude?: Iterable<string>,
+  currentId: string,
+  tried: Iterable<string> = [],
 ): ModelEntry | null {
-  const skip = new Set(exclude ?? []);
-  return rankedModels(config).find((entry) => !skip.has(entry.id)) ?? null;
+  const models = effectiveModels(config);
+  if (models.length === 0) return null;
+  const skip = new Set(tried);
+  // 当前这个一定跳过：环形查找下若不跳过，单模型列表会返回它自己
+  // （调用方即使忘传 tried 也不会「切到自己」）
+  skip.add(currentId);
+  const start = models.findIndex((entry) => entry.id === currentId);
+  for (let offset = 1; offset <= models.length; offset++) {
+    const entry = models[(start + offset + models.length) % models.length];
+    if (!skip.has(entry.id)) return entry;
+  }
+  return null;
+}
+
+/**
+ * 记住「这次用的是哪个模型」，供下次启动直接使用。
+ *
+ * 写在 `config.provider` / `config.model` 上（它们同时是旧版单模型配置的兼容字段），
+ * 并顺手更新 `providers[provider].model` —— 那里是「该服务商最近用过的模型」，
+ * `xzh model add` 的交互默认值取自它。
+ */
+export function rememberModel(config: XuanZhuConfig, entry: ModelEntry): void {
+  config.provider = entry.provider;
+  config.model = entry.model;
+  config.providers = {
+    ...config.providers,
+    [entry.provider]: {
+      ...(config.providers[entry.provider] ?? {}),
+      model: entry.model,
+    },
+  };
 }
 
 /**
@@ -395,64 +433,17 @@ export function materializeModels(config: XuanZhuConfig): ModelEntry[] {
   return config.models;
 }
 
-export interface DecayResult {
-  /** 目标模型的 id */
-  id: string;
-  /** 降权后的权重（触发重置时为 0） */
-  weight: number;
-  /** 是否因「所有模型权重耗尽」而触发全局重置 */
-  reset: boolean;
-}
-
-/**
- * 模型调用失败：权重 -1（最低 0）。
- * 当所有已配置模型的权重都变成 0 时，把全部权重重置回默认值，并返回 `reset: true`。
- */
-export function decayModelWeight(
-  config: XuanZhuConfig,
-  id: string,
-): DecayResult | null {
-  const models = materializeModels(config);
-  const target = models.find((entry) => entry.id === id);
-  if (!target) return null;
-
-  target.weight = Math.max(0, target.weight - 1);
-  target.decayed = true;
-  const decayedWeight = target.weight;
-
-  // 只有「因失败降权过」的模型全部归零才算耗尽：
-  // 用户主动设为 0（暂不使用）的模型不参与判定，也不会被重置复活。
-  const failed = models.filter((entry) => entry.decayed === true);
-  if (failed.length > 0 && failed.every((entry) => entry.weight <= 0)) {
-    for (const entry of failed) {
-      entry.weight = DEFAULT_MODEL_WEIGHT;
-      entry.decayed = false;
-    }
-    return { id, weight: 0, reset: true };
-  }
-  return { id, weight: decayedWeight, reset: false };
-}
-
-/** 把全部模型权重重置为默认值（并清除失败降权标记） */
-export function resetModelWeights(config: XuanZhuConfig): void {
-  for (const entry of materializeModels(config)) {
-    entry.weight = DEFAULT_MODEL_WEIGHT;
-    entry.decayed = false;
-  }
-}
-
-/** 新增模型（已存在则按需更新权重与覆盖项）；返回该条目 */
 /** 判断上下文窗口值是否有效（有限正数） */
 function hasContextWindow(value: unknown): boolean {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 
+/** 新增模型（已存在则更新覆盖项）；返回该条目 */
 export function upsertModel(
   config: XuanZhuConfig,
   input: {
     provider: string;
     model: string;
-    weight?: number;
     apiKey?: string;
     baseUrl?: string;
     contextWindow?: number;
@@ -461,15 +452,9 @@ export function upsertModel(
 ): ModelEntry {
   const models = materializeModels(config);
   const id = modelId(input.provider, input.model);
-  const hasWeight =
-    typeof input.weight === "number" && Number.isFinite(input.weight);
   const existing = models.find((entry) => entry.id === id);
 
   if (existing) {
-    if (hasWeight) {
-      existing.weight = Math.max(0, Math.floor(input.weight!));
-      existing.decayed = false;
-    }
     if (input.apiKey) existing.apiKey = input.apiKey;
     if (input.baseUrl) existing.baseUrl = input.baseUrl;
     if (hasContextWindow(input.contextWindow)) {
@@ -483,7 +468,6 @@ export function upsertModel(
     id,
     provider: input.provider,
     model: input.model,
-    weight: hasWeight ? Math.max(0, Math.floor(input.weight!)) : DEFAULT_MODEL_WEIGHT,
     ...(input.apiKey ? { apiKey: input.apiKey } : {}),
     ...(input.baseUrl ? { baseUrl: input.baseUrl } : {}),
     ...(hasContextWindow(input.contextWindow)
@@ -508,7 +492,15 @@ export function findModelIndex(models: ModelEntry[], key: string): number {
   return -1;
 }
 
-/** 删除模型；未找到返回 null */
+/**
+ * 删除模型；未找到返回 null。
+ *
+ * 删掉的若是「上次使用」的那个，顺手把记忆切到剩下的第一项 —— 否则配置里会留下一个
+ * 指向已删除模型的死引用（虽然 `activeModelEntry()` 会兜底到第一项，但没有意义）。
+ * ⚠️ 这里**直接读 `config.models`**（经 materializeModels），不能用 `effectiveModels()`：
+ * 后者在 `models` 为空时会回退到 provider / model 兼容字段，导致刚删掉的模型被当成
+ * 「仍然存在」写回去（历史上出现过「删除后模型又回来了」）。
+ */
 export function removeModel(
   config: XuanZhuConfig,
   key: string,
@@ -517,20 +509,15 @@ export function removeModel(
   const index = findModelIndex(models, key);
   if (index < 0) return null;
   const [removed] = models.splice(index, 1);
-  return removed ?? null;
-}
 
-/** 设置指定模型的权重；未找到返回 null */
-export function setModelWeight(
-  config: XuanZhuConfig,
-  key: string,
-  weight: number,
-): ModelEntry | null {
-  const models = materializeModels(config);
-  const index = findModelIndex(models, key);
-  if (index < 0) return null;
-  models[index].weight = Math.max(0, Math.floor(weight));
-  // 用户显式接管该模型的权重后，不再把它视为「失败降权」的产物
-  models[index].decayed = false;
-  return models[index];
+  const activeId =
+    config.provider && config.model
+      ? modelId(config.provider, config.model)
+      : "";
+  if (removed && removed.id === activeId) {
+    const fallback = models[0];
+    config.provider = fallback ? fallback.provider : "";
+    config.model = fallback ? fallback.model : "";
+  }
+  return removed ?? null;
 }

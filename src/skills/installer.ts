@@ -10,6 +10,17 @@ const CHECK_TIMEOUT = 15_000;
 const INSTALL_TIMEOUT = 900_000;
 const MAX_OUTPUT = 20_000;
 
+/**
+ * `exit` 之后给管道冲刷留的窗口，以及终止后等待 `close` 的宽限。
+ *
+ * 为什么必须有：`close` 要等**所有** stdio 关闭（含孙进程继承的管道）才触发，
+ * 管道 / 后台进程场景下可能**永不触发** —— 那样 `installRequirement` 的 await
+ * 永不返回，TUI 内的 `load_skill` 自动安装会把整个会话挂住。
+ * `tools/bash.ts` 早就用 `exit` + 兜底 resolve 解决了这点，这里是同一套做法。
+ */
+const PIPE_FLUSH_MS = 120;
+const KILL_GRACE_MS = 1500;
+
 export interface CommandResult {
   ok: boolean;
   output: string;
@@ -38,6 +49,7 @@ export function runShell(
     let output = "";
     let timedOut = false;
     let settled = false;
+    let graceTimer: NodeJS.Timeout | undefined;
 
     const append = (data: Buffer) => {
       if (output.length < MAX_OUTPUT) output += data.toString();
@@ -47,6 +59,7 @@ export function runShell(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
       signal?.removeEventListener("abort", onAbort);
       resolve(result);
     };
@@ -68,9 +81,22 @@ export function runShell(
       }
     };
 
+    /** 终止后 `close` 若迟迟不来就兜底 resolve，避免调用方永久卡住 */
+    const forceFinishSoon = () => {
+      if (graceTimer) clearTimeout(graceTimer);
+      graceTimer = setTimeout(() => {
+        finish({
+          ok: false,
+          output: timedOut ? `${output}\n[执行超时 ${timeout}ms]` : output,
+          timedOut,
+        });
+      }, KILL_GRACE_MS);
+    };
+
     const timer = setTimeout(() => {
       timedOut = true;
       killTree();
+      forceFinishSoon();
     }, timeout);
 
     const onAbort = () => {
@@ -91,6 +117,18 @@ export function runShell(
     child.on("error", (err) => {
       finish({ ok: false, output: output + String(err), timedOut });
     });
+    // exit 先于 close 触发；给它一个很短的窗口冲刷管道后就结束，
+    // 不再无限等待可能永不触发的 close。
+    child.on("exit", (code) => {
+      if (graceTimer) clearTimeout(graceTimer);
+      graceTimer = setTimeout(() => {
+        finish({
+          ok: code === 0 && !timedOut,
+          output: timedOut ? `${output}\n[执行超时 ${timeout}ms]` : output,
+          timedOut,
+        });
+      }, PIPE_FLUSH_MS);
+    });
     child.on("close", (code) => {
       finish({
         ok: code === 0 && !timedOut,
@@ -109,35 +147,87 @@ export function runShell(
  *
  * **调用方必须先挂起全屏界面**（退出备用屏、关闭原始模式），否则安装输出会与
  * 界面渲染互相踩踏，屏幕上会是一片乱码。
+ *
+ * ⚠️ 这里**刻意不用 `detached: true`**（与 `runShell` 不同）：`detached` 会 `setsid()`
+ * 让子进程失去控制终端，而 `sudo` 正是靠 `/dev/tty` 提示密码 —— 加了它反而会让
+ * 交互式安装直接失败（"no tty present"）。代价是无法按进程组整棵终止：超时/中断时
+ * 只能杀 shell 本身，它派生的 `apt-get`/`npm` 可能成为孤儿继续跑，因此会在日志里
+ * 明确提示用户。同理**绝不能**用 `process.kill(-pid)`：那会命中 xzh 自己所在的进程组。
  */
 export function runShellInteractive(
   command: string,
   timeout = INSTALL_TIMEOUT,
+  signal?: AbortSignal,
 ): Promise<CommandResult> {
   return new Promise((resolve) => {
     const isWindows = process.platform === "win32";
     const shell = isWindows ? "cmd.exe" : process.env.SHELL || "bash";
     const args = isWindows ? ["/d", "/s", "/c", command] : ["-lc", command];
 
-    const child = spawn(shell, args, { stdio: "inherit", env: process.env });
+    const child = spawn(shell, args, {
+      stdio: "inherit",
+      env: process.env,
+      windowsHide: true,
+    });
 
     let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
+    let settled = false;
+    let graceTimer: NodeJS.Timeout | undefined;
+
+    const finish = (result: CommandResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(result);
+    };
+
+    const killChild = () => {
       try {
         child.kill("SIGKILL");
       } catch {
-        // 忽略
+        // 进程可能已退出
       }
+    };
+
+    /** 与 runShell 同理：`close` 可能永不触发，必须有兜底 resolve */
+    const forceFinishSoon = () => {
+      if (graceTimer) clearTimeout(graceTimer);
+      graceTimer = setTimeout(() => finish({ ok: false, output: "", timedOut }), KILL_GRACE_MS);
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killChild();
+      forceFinishSoon();
     }, timeout);
 
+    const onAbort = () => {
+      killChild();
+      forceFinishSoon();
+    };
+
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+
     child.on("error", (err) => {
-      clearTimeout(timer);
-      resolve({ ok: false, output: String(err), timedOut: false });
+      finish({ ok: false, output: String(err), timedOut: false });
+    });
+    child.on("exit", (code) => {
+      if (graceTimer) clearTimeout(graceTimer);
+      graceTimer = setTimeout(
+        () => finish({ ok: code === 0 && !timedOut, output: "", timedOut }),
+        PIPE_FLUSH_MS,
+      );
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ ok: code === 0 && !timedOut, output: "", timedOut });
+      finish({ ok: code === 0 && !timedOut, output: "", timedOut });
     });
   });
 }
@@ -191,11 +281,14 @@ export async function installRequirement(
    */
   const execute = async (command: string): Promise<CommandResult> => {
     if (!options.interactive) return runShell(command, INSTALL_TIMEOUT, signal);
-    const result = await runShellInteractive(command);
+    // 交互式安装也必须能被打断与超时收尾：此前这里既不传 signal（Ctrl+C 无效），
+    // 也没有兜底 resolve（close 不来就永久挂起）。
+    const result = await runShellInteractive(command, INSTALL_TIMEOUT, signal);
     if (!result.ok) {
       emit(
         result.timedOut
-          ? `[执行超时 ${INSTALL_TIMEOUT}ms]`
+          ? `[执行超时 ${INSTALL_TIMEOUT}ms]；交互式安装无法按进程组终止，` +
+            `若安装程序仍在后台跑，请手动检查`
           : "（安装输出已直接打印在终端上）",
       );
     }

@@ -129,10 +129,10 @@ npm unlink -g xuanzhu && npm i -g xuanzhu
 ## 快速开始
 
 ```bash
-# 1. 配置模型与服务商（交互式，可添加多个模型并设置调用权重）
+# 1. 配置模型与服务商（交互式，可添加多个模型）
 xzh model
 
-# 2. 启动玄猪（自动使用权重最高的模型）
+# 2. 启动玄猪（默认使用上次用过的模型）
 xzh
 ```
 
@@ -148,14 +148,13 @@ xzh
 | --- | --- |
 | `xzh` | 在当前目录启动全屏交互界面 |
 | `xzh <目录>` | 在指定项目目录启动，例如 `xzh /home` |
-| `xzh model` | 交互式管理多模型（新增 / 删除 / 调整权重 / 查看全部） |
-| `xzh model list` | 列出**已配置**的模型与调用权重 |
+| `xzh model` | 交互式管理多模型（新增 / 删除 / 查看全部） |
+| `xzh model list` | 列出**已配置**的模型（按回退顺序） |
 | `xzh model all` | 列出**所有内置可用**的模型（按服务商分组，标注已配置项） |
-| `xzh model add <provider> <model> [权重]` | 新增模型（默认权重 `10`） |
+| `xzh model add <provider> <model> [上下文窗口] [on\|off]` | 新增模型（末尾 `on`/`off` = 是否支持图片输入） |
 | `xzh model remove <id\|序号>` | 删除模型 |
-| `xzh model weight <id\|序号> <权重>` | 调整模型的调用权重 |
 | `xzh model context <id\|序号> <大小>` | 调整上下文窗口（token，如 `128000`） |
-| `xzh model reset` | 把全部模型权重恢复为默认值 |
+| `xzh model vision <id\|序号> <on\|off>` | 标注是否支持图片输入 |
 | `xzh config` | 查看当前配置（API Key 脱敏） |
 | `xzh config edit` | 使用 `nano` 编辑配置文件 |
 | `xzh config path` | 打印配置文件路径 |
@@ -191,8 +190,8 @@ XZH_HOME=/path/to/dir xzh          # 改用 /path/to/dir/config.json
   "provider": "deepseek",
   "model": "deepseek-chat",
   "models": [
-    { "id": "deepseek/deepseek-chat", "provider": "deepseek", "model": "deepseek-chat", "weight": 10 },
-    { "id": "openai/gpt-4o", "provider": "openai", "model": "gpt-4o", "weight": 6 }
+    { "id": "deepseek/deepseek-chat", "provider": "deepseek", "model": "deepseek-chat" },
+    { "id": "openai/gpt-4o", "provider": "openai", "model": "gpt-4o" }
   ],
   "temperature": 0.2,
   "maxToolRounds": 200,
@@ -209,35 +208,41 @@ XZH_HOME=/path/to/dir xzh          # 改用 /path/to/dir/config.json
 }
 ```
 
-> 旧版配置（只有 `provider` / `model`、没有 `models`）依然可用：会被视为一个权重为 `10` 的模型。
+> 旧版配置（只有 `provider` / `model`、没有 `models`）依然可用：会被视为唯一的一个模型。
+> 旧配置里的 `weight` / `decayed` 字段已废弃，读取时会被忽略、下次保存时自动清掉。
 
-### 多模型与调用权重
+### 多模型与自动回退
 
-`models` 可配置多个模型，每个模型带一个**调用权重**（默认 `10`）：
+`models` 可配置多个模型，**列表顺序就是优先级**（没有权重）：
 
 | 行为 | 说明 |
 | --- | --- |
-| 启动选择 | 优先加载**权重最高**的模型 |
-| 调用失败 | 该模型权重 **-1**（`Ctrl+C` 主动中断不算失败） |
-| 自动降级 | 若还有**尚未尝试过**的可用模型，切换到权重最高的那个并重试（单次请求内每个模型最多尝试一次，最多切换 3 次） |
-| 不做空转 | 只有一个模型（或权重耗尽重置回它自己）时**不重试**，直接报错并附上当前模型信息 |
-| 权重耗尽 | 当**所有模型权重都为 0** 时，在终端警告并把全部权重重置回 `10` |
-| 配置错误不降权 | 密钥无效 / 无权限 / 模型名或端点不存在时**不扣权重、不写盘**，只提示检查配置 —— 配置不改就永远失败，扣权重只会把其他可用模型一起拖下水 |
-| 上下文超限不降权 | 超出模型窗口时**收敛历史后自动重试**，也不扣权重（见上一节） |
+| 默认选择 | 使用**上次用过的**那个模型（记在 `provider` / `model` 里，随每次切换更新） |
+| 上次那个不在了 | 退回列表**第一项**（被删除、或配置里没有记录） |
+| 调用失败 | 自动切换到列表里的**下一个**（走到末尾会绕回表头），单次请求内每个模型最多试一次 |
+| 全部失败 | 直到所有模型都试过才报错，并说明「已配置的模型都试过了」 |
+| 记住结果 | 每次切换都会写回配置，下次启动直接用最后成功的那个 |
+| 配置错误不回退 | 密钥无效 / 无权限 / 模型名或端点不存在时**不切换、不写盘**，只提示检查配置 —— 配置不改就永远失败，换模型只会把整条回退链白走一遍 |
+| 上下文超限不回退 | 超出模型窗口时**收敛历史后自动重试**，也不切换模型（见上一节） |
+| `Ctrl+C` / `Ctrl+D` 中断 | 不算失败，不触发回退 |
 
 ```bash
 xzh model                              # 交互式菜单
-xzh model list                         # 查看已配置的模型与权重
+xzh model list                         # 查看已配置的模型（按回退顺序，❯ 标出当前使用）
 xzh model all                          # 查看所有内置可用模型
-xzh model add openai gpt-4o 20         # 新增（权重 20）
-xzh model weight openai/gpt-4o 5       # 调整权重
+xzh model add openai gpt-4o            # 新增（追加到末尾，成为最后一道回退）
+xzh model add openai gpt-4o 128000     # 顺带指定上下文窗口
+xzh model add openai gpt-4o 128000 on  # 再顺带标注支持图片输入
 xzh model context openai/gpt-4o 128000 # 调整上下文窗口（留空则自动推断）
 xzh model vision openai/gpt-4o on      # 标注支持图片输入（推断不出来时用）
 xzh model remove openai/gpt-4o         # 删除（id / 模型名 / 序号均可）
-xzh model reset                        # 全部恢复默认权重
 ```
 
-当前使用的模型与权重会显示在界面顶部与状态栏（如 `gpt-4o w6`），降级切换时输出区会给出提示。
+想让某个模型**不参与回退**，直接 `xzh model remove` 删掉即可。当前使用的模型显示在界面顶部与状态栏，
+发生回退时输出区会给出提示。
+
+> ⚠️ `xzh model add` 的位置参数自 v0.5 起**整体前移一位**（原来的 `[权重]` 已取消）：
+> 现在是 `add <provider> <model> [上下文窗口] [on|off]`。
 
 ### 上下文窗口的作用
 
@@ -264,8 +269,8 @@ xzh model reset                        # 全部恢复默认权重
 > 保守余量必须留住（放宽反而更容易撞窗口）。
 
 若估算偏差导致仍然超限（服务端返回 `context_length_exceeded` 一类错误），玄猪会
-**把预算收敛到一半再自动重试一次**，而不会把它当成模型故障去降权或切换模型 ——
-换模型拿同样长的消息重发只会同样失败，还会白白扣掉权重。
+**把预算收敛到一半再自动重试一次**，而不会把它当成模型故障去切换模型 ——
+换模型拿同样长的消息重发只会同样失败，还会白白走一遍回退链。
 
 ### 意图分析（可选，默认关闭）
 
@@ -290,7 +295,7 @@ xzh --no-intent         # 仅本次启动强制关闭
 
 - 意图请求**不携带工具声明**，也不写入对话历史（保持主流程上下文干净）
 - 分析结果会先展示在输出区（附原始消息），便于你确认它理解对了
-- 失败或返回为空时**自动回退**为你的原始输入，不影响主流程，也不会因此降低模型权重
+- 失败或返回为空时**自动回退**为你的原始输入，不影响主流程，也不会因此触发模型回退
 - 代价：每条消息多一次模型请求（token 消耗约翻倍），故默认关闭
 
 API Key 也可以来自环境变量，优先级低于配置文件：
@@ -732,8 +737,10 @@ XZH_KITTY_KEYS=1 xzh
 默认开启自动批准（`autoApprove: true`），所有工具——包括写文件与执行命令——都会直接执行、不再询问；
 执行 `/auto off` 可切换为逐项确认，设置会持久保存到配置文件。
 
-其中 `/switch <目录>` 可在对话中切换项目目录：相对路径基于当前目录解析，支持 `~` 展开；
-切换后所有文件读写与命令执行都会作用于新目录，且对话上下文保留（如需清空可执行 `/reset`）。
+其中 `/switch <目录>` 用于切换项目：相对路径基于当前目录解析，支持 `~` 展开。
+切换后所有文件读写与命令执行都会作用于新目录，并且会**自动载入该项目最近一次会话**接着聊
+（会话文件也随之换到该项目名下；当前对话已存档在原项目，切回后 `/resume` 可找回）。
+若该项目还没有历史会话，则是全新开局。
 
 ## 项目结构
 
@@ -791,14 +798,20 @@ registry 已可见（npm 有 staging 阶段，期间 `npm view` / `npm install` 
 
 - **[CodeBuddy](https://github.com/olasunkanmi-SE/codebuddy)** —— 作者
   [Oyinlola Olasunkanmi Raymond](https://github.com/olasunkanmi-SE)。
-  玄猪由该项目改造而来（移除编辑器依赖、改为纯粹的终端形态），
-  并依 MIT 许可**保留其原始版权声明**。
+  玄猪由该项目改造而来，依 MIT 许可**保留其原始版权声明**。
+  
 - **[Playwright](https://github.com/microsoft/playwright)** —— 由 Microsoft 开源。
   内置的 `playwright` 技能基于它实现浏览器自动化与端到端测试。
+
 - **[AutoJs6](https://github.com/SuperMonster003/AutoJs6)** —— 作者 SuperMonster003。
   手机设备桥（`xzh device`）的两套线协议都对着它的实现逐一核对，
   内置的 `autojs6` 技能也按它的源码整理而成 ——
   这才让「用脚本操作手机」成为可照做的能力，而不是让模型盲写。
+
+- **[OfficeCLI](https://github.com/iOfficeAI/OfficeCLI)** —— 由 iOfficeAI 开源。
+  内置的 `officecli` 技能基于它读写与自动化 Word / Excel / PowerPoint
+  （技能内容整理自该项目仓库的 `SKILL.md` 及其参考文件）；
+  它是零依赖的单文件 CLI、无需安装 Office，`xzh setup` 会一并装好。
 
 同时也感谢所有直接与间接依赖的开源项目，以及 npm 生态中的众多工具
 （完整清单见 `package.json`）。

@@ -1,14 +1,11 @@
 import {
-  DEFAULT_MODEL_WEIGHT,
+  activeModelEntry,
   effectiveModels,
   loadConfig,
   materializeModels,
   modelId,
-  pickModel,
   removeModel,
-  resetModelWeights,
   saveConfig,
-  setModelWeight,
   upsertModel,
   type ModelEntry,
   type XuanZhuConfig,
@@ -25,20 +22,23 @@ import {
 } from "../../llm";
 import { ansi } from "../../utils/ansi";
 import { getConfigPath } from "../../utils/paths";
-import { promptConfirm, promptInput, promptSelect } from "../prompt";
+import { promptInput, promptSelect } from "../prompt";
 
 /**
- * `xzh model`                    交互式管理多个模型（新增 / 删除 / 调整权重 / 查看全部）
- * `xzh model list`               列出**已配置**的模型与权重
+ * `xzh model`                    交互式管理多个模型（新增 / 删除 / 查看全部）
+ * `xzh model list`               列出**已配置**的模型（按回退顺序）
  * `xzh model all`                列出**所有内置可用**的模型（按服务商分组）
- * `xzh model add <provider> <model> [权重] [上下文窗口] [on|off]`
+ * `xzh model add <provider> <model> [上下文窗口] [on|off]`
  *                                 （末尾 on/off = 是否支持图片输入）
  * `xzh model remove <id|序号>`   删除模型
- * `xzh model weight <id|序号> <权重>`
  * `xzh model context <id|序号> <token>`
  * `xzh model vision <id|序号> <on|off>`  标注是否支持图片输入
  *
  * 兼容旧用法：`xzh model <provider> [model]` 等价于 `add`。
+ *
+ * **列表顺序即优先级**：启动时用「上次用过的」那个模型，它调用失败时按列表顺序
+ * 回退到下一个，直到全部试过。因此这里没有权重相关的子命令 —— 想让某个模型不参与，
+ * 直接 `remove` 即可。
  */
 export async function modelCommand(args: string[]): Promise<void> {
   const sub = args[0];
@@ -59,17 +59,12 @@ export async function modelCommand(args: string[]): Promise<void> {
     case "rm":
     case "delete":
       return removeModelCommand(args.slice(1));
-    case "weight":
-    case "w":
-      return setWeightCommand(args.slice(1));
     case "context":
     case "ctx":
       return setContextCommand(args.slice(1));
     case "vision":
     case "image":
       return setVisionCommand(args.slice(1));
-    case "reset":
-      return resetWeights();
     case "help":
     case "-h":
     case "--help":
@@ -111,27 +106,11 @@ async function addModel(args: string[]): Promise<void> {
     process.stdout.write(`${ansi.gray}已取消。${ansi.reset}\n`);
     return;
   }
-  const weightText = args[2];
-  let weight: number | undefined;
-  if (weightText !== undefined) {
-    // 严格解析：`parseInt("5abc")` 会得到 5，静默接受明显错误的输入
-    const parsed = /^\d+$/.test(weightText.trim())
-      ? Number.parseInt(weightText.trim(), 10)
-      : Number.NaN;
-    if (Number.isNaN(parsed) || parsed < 0) {
-      process.stdout.write(
-        `${ansi.red}权重必须是 ≥ 0 的整数：${weightText}${ansi.reset}\n`,
-      );
-      process.exitCode = 1;
-      return;
-    }
-    weight = parsed;
-  }
-
   const baseUrl = await chooseBaseUrl(meta.id, meta.requiresBaseUrl === true, config);
   const apiKey = await chooseApiKey(meta.id, meta.envKey, config);
-  const contextWindow = await chooseContextWindow(model, args[3]);
-  const vision = await chooseVision(meta.id, model, args[4]);
+  // ⚠ 位置参数自 v0.5 起整体前移一位：原来的 [权重] 已取消
+  const contextWindow = await chooseContextWindow(model, args[2]);
+  const vision = await chooseVision(meta.id, model, args[3]);
 
   // provider 级设置（API Key / baseUrl / 最近使用的 model）
   config.providers = {
@@ -152,7 +131,6 @@ async function addModel(args: string[]): Promise<void> {
   const entry = upsertModel(config, {
     provider: meta.id,
     model,
-    weight,
     contextWindow,
     vision,
     ...(baseUrl ? { baseUrl } : {}),
@@ -165,7 +143,6 @@ async function addModel(args: string[]): Promise<void> {
     `\n${ansi.green}✓ ${existed ? "已更新" : "已新增"}模型${ansi.reset} ${ansi.bold}${entry.id}${ansi.reset}\n` +
       `  ${ansi.gray}provider：${ansi.reset}${meta.label}\n` +
       `  ${ansi.gray}model   ：${ansi.reset}${entry.model}\n` +
-      `  ${ansi.gray}权重    ：${ansi.reset}${entry.weight}\n` +
       `  ${ansi.gray}上下文  ：${ansi.reset}${formatContextWindow(entry.contextWindow ?? DEFAULT_CONTEXT_WINDOW)} token\n` +
       `  ${ansi.gray}图片输入：${ansi.reset}${modelSupportsVision(entry) ? "支持（Ctrl+V 粘贴图片）" : "不支持"}\n` +
       (baseUrl ? `  ${ansi.gray}baseUrl ：${ansi.reset}${baseUrl}\n` : "") +
@@ -199,70 +176,11 @@ async function removeModelCommand(args: string[]): Promise<void> {
     return;
   }
 
-  syncActiveFields(config);
+  // 「当前使用」的指针由 removeModel() 一并维护（删的正是它时切到剩下的第一项）
   saveConfig(config);
 
   process.stdout.write(
     `\n${ansi.green}✓ 已删除模型${ansi.reset} ${removed.id}\n`,
-  );
-  printActiveHint(config);
-}
-
-/** 调整模型权重 */
-async function setWeightCommand(args: string[]): Promise<void> {
-  const config = loadConfig();
-  let models = effectiveModels(config);
-  if (models.length === 0) {
-    process.stdout.write(`${ansi.yellow}尚未配置任何模型。${ansi.reset}\n`);
-    return;
-  }
-
-  const key = args[0] || (await chooseFromList(models, "选择要调整权重的模型："));
-  if (!key) {
-    process.stdout.write(`${ansi.gray}已取消。${ansi.reset}\n`);
-    return;
-  }
-  const id = resolveModelKey(config, key);
-  const target = id ? models.find((entry) => entry.id === id) : undefined;
-  if (!target) {
-    process.stdout.write(
-      `${ansi.red}未找到模型：${key}${ansi.reset}\n` +
-        `${ansi.gray}提示：可使用 ${ansi.reset}xzh model list${ansi.gray} 查看 id 与序号。${ansi.reset}\n`,
-    );
-    process.exitCode = 1;
-    return;
-  }
-
-  const input =
-    args[1] ??
-    (await promptInput(
-      `请输入 ${target.id} 的新权重（0 表示暂不使用）`,
-      String(target.weight),
-    ));
-  // 与 addModel 保持同样的严格解析：`parseInt("5abc")` 会静默得到 5，
-  // 而 addModel 用的是 /^\d+$/ 校验，两处标准必须一致
-  const trimmedWeight = input.trim();
-  const weight = /^\d+$/.test(trimmedWeight) ? Number(trimmedWeight) : Number.NaN;
-  if (Number.isNaN(weight)) {
-    process.stdout.write(
-      `${ansi.red}权重必须是 ≥ 0 的整数：${input}${ansi.reset}\n`,
-    );
-    process.exitCode = 1;
-    return;
-  }
-
-  const updated = setModelWeight(config, target.id, weight);
-  if (!updated) {
-    process.stdout.write(`${ansi.red}设置失败：${target.id}${ansi.reset}\n`);
-    process.exitCode = 1;
-    return;
-  }
-
-  syncActiveFields(config);
-  saveConfig(config);
-
-  process.stdout.write(
-    `\n${ansi.green}✓ 已更新权重${ansi.reset} ${updated.id} → ${updated.weight}\n`,
   );
   printActiveHint(config);
 }
@@ -389,33 +307,6 @@ async function setVisionCommand(args: string[]): Promise<void> {
   );
 }
 
-/** 把全部模型权重恢复为默认值 */
-async function resetWeights(): Promise<void> {
-  const config = loadConfig();
-  const models = effectiveModels(config);
-  if (models.length === 0) {
-    process.stdout.write(`${ansi.yellow}尚未配置任何模型。${ansi.reset}\n`);
-    return;
-  }
-
-  // 这条操作会改动**所有**模型的权重，先确认一次。
-  // 顺带也提供了「返回」的机会 —— 菜单里其余动作都能中途取消，它不该是例外。
-  const confirmed = await promptConfirm(
-    `将把 ${models.length} 个模型的权重全部重置为 ${DEFAULT_MODEL_WEIGHT}，继续？`,
-  );
-  if (!confirmed) {
-    process.stdout.write(`${ansi.gray}已取消。${ansi.reset}\n`);
-    return;
-  }
-
-  resetModelWeights(config);
-  syncActiveFields(config);
-  saveConfig(config);
-  process.stdout.write(
-    `${ansi.green}✓ 已把 ${models.length} 个模型的权重重置为 ${DEFAULT_MODEL_WEIGHT}。${ansi.reset}\n`,
-  );
-}
-
 /** 打印已配置的模型列表 */
 function listModels(): void {
   const config = loadConfig();
@@ -481,8 +372,7 @@ function listAvailableModels(): void {
     );
     for (const entry of extra) {
       process.stdout.write(
-        `    ${ansi.brightGreen}❯${ansi.reset} ${entry.id}  ` +
-          `${ansi.gray}← 权重 ${entry.weight}${ansi.reset}\n`,
+        `    ${ansi.brightGreen}❯${ansi.reset} ${entry.id}\n`,
       );
     }
   }
@@ -490,7 +380,7 @@ function listAvailableModels(): void {
   process.stdout.write(
     `\n${ansi.gray}❯ 表示已加入配置。添加模型：${ansi.reset}` +
       `${ansi.brightGreen}xzh model add <provider> <model>${ansi.reset}\n` +
-      `${ansi.gray}查看已配置的模型与权重：${ansi.reset}xzh model list\n`,
+      `${ansi.gray}查看已配置的模型：${ansi.reset}xzh model list\n`,
   );
 }
 
@@ -509,13 +399,7 @@ async function interactiveMenu(): Promise<void> {
         // 放进交互菜单会把这里刷成一大片、盖住真正需要操作的条目。
         { label: "查看已配置的模型", value: "list", hint: "list" },
         { label: "删除模型", value: "remove", hint: "remove" },
-        { label: "调整调用权重", value: "weight", hint: "weight" },
         { label: "调整上下文窗口", value: "context", hint: "context" },
-        {
-          label: `恢复全部权重为 ${DEFAULT_MODEL_WEIGHT}`,
-          value: "reset",
-          hint: "reset",
-        },
         { label: "退出", value: "exit" },
       ],
       0,
@@ -531,14 +415,8 @@ async function interactiveMenu(): Promise<void> {
       case "remove":
         await removeModelCommand([]);
         break;
-      case "weight":
-        await setWeightCommand([]);
-        break;
       case "context":
         await setContextCommand([]);
-        break;
-      case "reset":
-        await resetWeights();
         break;
       default:
         process.stdout.write(`\n${ansi.gray}已退出模型管理。${ansi.reset}\n`);
@@ -551,7 +429,7 @@ async function interactiveMenu(): Promise<void> {
 
 function printModelTable(config: XuanZhuConfig): void {
   const models = effectiveModels(config);
-  const active = pickModel(config);
+  const active = activeModelEntry(config);
 
   process.stdout.write(
     `\n${ansi.bold}玄猪模型列表${ansi.reset} ${ansi.gray}(${getConfigPath()})${ansi.reset}\n`,
@@ -565,16 +443,10 @@ function printModelTable(config: XuanZhuConfig): void {
     return;
   }
 
-  const sorted = models.slice().sort((a, b) => b.weight - a.weight);
-  sorted.forEach((entry, index) => {
+  // 按配置顺序展示，**不再排序**：这个顺序就是回退顺序，重排会让用户看不懂
+  models.forEach((entry, index) => {
     const isActive = active !== null && entry.id === active.id;
     const marker = isActive ? `${ansi.brightGreen}❯${ansi.reset}` : " ";
-    const weightColor =
-      entry.weight <= 0
-        ? ansi.red
-        : entry.weight < DEFAULT_MODEL_WEIGHT
-          ? ansi.yellow
-          : ansi.green;
     const suffix = isActive ? `  ${ansi.gray}← 当前使用${ansi.reset}` : "";
     const context = formatContextWindow(
       entry.contextWindow ?? inferContextWindow(entry.model),
@@ -583,31 +455,26 @@ function printModelTable(config: XuanZhuConfig): void {
       ? ` ${ansi.cyan}视觉${ansi.reset}`
       : "";
     process.stdout.write(
-      `  ${marker} ${index + 1}. ${entry.id.padEnd(34)} ${ansi.gray}权重${ansi.reset} ${weightColor}${String(entry.weight).padStart(3)}${ansi.reset}` +
+      `  ${marker} ${index + 1}. ${entry.id.padEnd(34)}` +
         ` ${ansi.gray}ctx ${context.padStart(5)}${ansi.reset}${vision}${suffix}\n`,
     );
   });
 
   process.stdout.write(
-    `${ansi.gray}  权重越高越优先；调用失败 -1，全部为 0 时自动重置为 ${DEFAULT_MODEL_WEIGHT}。${ansi.reset}\n`,
+    `${ansi.gray}  顺序即回退顺序：先用「当前使用」那个，它调用失败时按此顺序往后切换，直到全部试过。${ansi.reset}\n`,
   );
 }
 
 function printActiveHint(config: XuanZhuConfig): void {
-  const active = pickModel(config);
+  const active = activeModelEntry(config);
   if (active) {
     process.stdout.write(
-      `${ansi.gray}下次启动将使用权重最高的模型：${ansi.reset}${ansi.bold}${active.id}${ansi.reset} ${ansi.gray}(权重 ${active.weight})${ansi.reset}\n`,
+      `${ansi.gray}下次启动将使用上次用过的模型：${ansi.reset}${ansi.bold}${active.id}${ansi.reset}\n`,
     );
   } else if ((config.models ?? []).length === 0) {
     process.stdout.write(
       `${ansi.yellow}⚠ 尚未配置任何模型，运行 ${ansi.reset}` +
         `xzh model add <provider> <model>${ansi.yellow} 添加。${ansi.reset}\n`,
-    );
-  } else {
-    process.stdout.write(
-      `${ansi.yellow}⚠ 所有模型权重均为 0（已停用），运行 ${ansi.reset}` +
-        `xzh model weight <id> <权重>${ansi.yellow} 启用其中一个。${ansi.reset}\n`,
     );
   }
   process.stdout.write(`\n运行 ${ansi.brightGreen}xzh${ansi.reset} 开始使用。\n`);
@@ -617,42 +484,22 @@ function printModelHelp(): void {
   process.stdout.write(
     `\n${ansi.bold}xzh model —— 多模型管理${ansi.reset}\n` +
       `  ${ansi.green}xzh model${ansi.reset}                              交互式菜单\n` +
-      `  ${ansi.green}xzh model list${ansi.reset}                       列出已配置的模型与权重\n` +
+      `  ${ansi.green}xzh model list${ansi.reset}                       列出已配置的模型（按回退顺序）\n` +
       `  ${ansi.green}xzh model all${ansi.reset}                        列出所有内置可用模型\n` +
-      `  ${ansi.green}xzh model add <provider> <model> [权重]${ansi.reset}  新增模型（默认权重 ${DEFAULT_MODEL_WEIGHT}）\n` +
-      `  ${ansi.green}xzh model remove <id|序号>${ansi.reset}            删除模型\n` +
-      `  ${ansi.green}xzh model weight <id|序号> <权重>${ansi.reset}      调整权重\n` +
+      `  ${ansi.green}xzh model add <provider> <model> [上下文窗口] [on|off]${ansi.reset}\n` +
+      `                                                 新增模型（末尾 on/off = 是否支持图片输入）\n` +
+      `  ${ansi.green}xzh model remove <id|序号>${ansi.reset}            删除模型（不再参与回退）\n` +
       `  ${ansi.green}xzh model context <id|序号> <大小>${ansi.reset}    调整上下文窗口（token，如 128000）\n` +
-      `  ${ansi.green}xzh model vision <id|序号> <on|off>${ansi.reset}   标注是否支持图片输入（视觉）\n` +
-      `  ${ansi.green}xzh model reset${ansi.reset}                      恢复全部权重为 ${DEFAULT_MODEL_WEIGHT}\n\n` +
-      `${ansi.bold}权重机制${ansi.reset}\n` +
-      `  启动时优先加载权重最高的模型；调用失败时该模型权重 -1，并自动切换到下一个可用模型；\n` +
-      `  当所有模型权重都为 0 时，会在终端警告并把全部权重重置为 ${DEFAULT_MODEL_WEIGHT}。\n\n` +
+      `  ${ansi.green}xzh model vision <id|序号> <on|off>${ansi.reset}   标注是否支持图片输入（视觉）\n\n` +
+      `${ansi.bold}多模型与回退${ansi.reset}\n` +
+      `  默认使用**上次用过的**模型（记住在配置里）；它调用失败时按列表顺序自动切换到下一个，\n` +
+      `  直到所有模型都试过才报错。**列表顺序即优先级**，不再有权重设置 ——\n` +
+      `  不想让某个模型参与，直接 ${ansi.green}xzh model remove${ansi.reset} 删掉即可。\n\n` +
       `${ansi.gray}可用 provider：${PROVIDERS.map((p) => p.id).join(", ")}${ansi.reset}\n`,
   );
 }
 
 // ------------------------------------------------------------------ 交互选择
-
-/**
- * 把当前生效的模型同步回 config.provider / config.model（供单模型兼容路径使用）。
- *
- * ⚠️ 这里**不能**用 pickModel() / effectiveModels() 来判断「还有没有模型」：
- * 它们在 config.models 为空时会回退到 config.provider / config.model 这两个兼容字段，
- * 于是刚被删除的模型会被当成「仍然存在」原样写回 —— 表现为「删除后模型又回来了」。
- * 因此必须直接读 config.models。
- */
-function syncActiveFields(config: XuanZhuConfig): void {
-  const models = config.models ?? [];
-  const active =
-    models.length > 0
-      ? models
-          .slice()
-          .sort((a, b) => b.weight - a.weight || a.id.localeCompare(b.id))[0]
-      : null;
-  config.provider = active ? active.provider : "";
-  config.model = active ? active.model : "";
-}
 
 async function chooseProvider(): Promise<string | undefined> {
   // 末项「返回」返回空串、Esc/Ctrl+C 返回 undefined，两者都表示中止
@@ -727,8 +574,8 @@ function parseContextWindow(input: string): number | undefined {
  * 询问模型的上下文窗口（token）。
  *
  * 没有任何接口能直接查询这个值（OpenAI 兼容端点的 /models 只返回 id 与 owner），
- * 因此留空时按模型名推断（见 llm/context.ts）。也可用第 4 个位置参数直接给出：
- *   xzh model add <provider> <model> [权重] [上下文窗口]
+ * 因此留空时按模型名推断（见 llm/context.ts）。也可用第 3 个位置参数直接给出：
+ *   xzh model add <provider> <model> [上下文窗口]
  */
 async function chooseContextWindow(
   model: string,
@@ -780,8 +627,8 @@ function parseToggle(input: string): boolean | undefined {
  * 真不支持时玄猪会在请求被拒后自动去掉图片重试一次（见 Agent），代价有限，
  * 因此这里给用户一次显式确认/关闭的机会即可。
  *
- * 也可用第 5 个位置参数直接给出：
- *   xzh model add <provider> <model> [权重] [上下文窗口] [on|off]
+ * 也可用第 4 个位置参数直接给出：
+ *   xzh model add <provider> <model> [上下文窗口] [on|off]
  */
 async function chooseVision(
   providerId: string,
@@ -844,7 +691,7 @@ async function chooseApiKey(
 
 /**
  * 把用户输入（id / 模型名 / 序号）解析为模型 id。
- * 序号的顺序与 `xzh model list` 的展示保持一致（按权重降序）。
+ * 序号与 `xzh model list` 的展示保持一致（即配置里的回退顺序）。
  */
 function resolveModelKey(config: XuanZhuConfig, key: string): string | null {
   const models = effectiveModels(config);
@@ -853,9 +700,8 @@ function resolveModelKey(config: XuanZhuConfig, key: string): string | null {
   const byModel = models.find((entry) => entry.model === key);
   if (byModel) return byModel.id;
   if (/^\d+$/.test(key.trim())) {
-    const sorted = models.slice().sort((a, b) => b.weight - a.weight);
     const index = Number.parseInt(key, 10);
-    if (index >= 1 && index <= sorted.length) return sorted[index - 1].id;
+    if (index >= 1 && index <= models.length) return models[index - 1].id;
   }
   return null;
 }
@@ -863,23 +709,22 @@ function resolveModelKey(config: XuanZhuConfig, key: string): string | null {
 /**
  * 让用户从已配置的模型里挑一个。
  *
+ * 顺序与 `xzh model list` 一致（回退顺序，不重排）。
  * 列表末尾始终附一个「返回」，选中即返回空字符串 —— 调用方据此中止操作。
- * 没有它的话，用户一旦进入某个子操作（删除 / 调权重 / 调上下文）就只能硬着头皮选一个，
+ * 没有它的话，用户一旦进入某个子操作（删除 / 调上下文）就只能硬着头皮选一个，
  * 想放弃只能 Ctrl+C 退出整个进程。
  */
 async function chooseFromList(
   models: ModelEntry[],
   label: string,
 ): Promise<string | undefined> {
-  const sorted = models.slice().sort((a, b) => b.weight - a.weight);
   const chosen = await promptSelect(
     label,
     [
-      ...sorted.map((entry) => ({
-        label:
-          `${entry.id}  权重 ${entry.weight}  ctx ${formatContextWindow(
-            entry.contextWindow ?? inferContextWindow(entry.model),
-          )}`,
+      ...models.map((entry) => ({
+        label: `${entry.id}  ctx ${formatContextWindow(
+          entry.contextWindow ?? inferContextWindow(entry.model),
+        )}`,
         value: entry.id,
       })),
       { label: "返回", value: "" },

@@ -100,9 +100,19 @@ export function snapshotForUndo(target: string, cwd: string): void {
     const entries = readManifest(cwd);
     let backup: string | null = null;
     if (fs.existsSync(target)) {
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-      backup = `${path.basename(target)}.${stamp}-${++snapshotSeq}.bak`;
-      fs.copyFileSync(target, path.join(backupDirFor(cwd), backup));
+      // 只给**普通文件**做快照：对 `/dev/zero`、无写者的 FIFO 调 `copyFileSync`
+      // 会永久阻塞，而外层 try/catch 兜不住「挂住」——它根本不抛错。
+      let snapshottable = false;
+      try {
+        snapshottable = fs.statSync(target).isFile();
+      } catch {
+        snapshottable = false;
+      }
+      if (snapshottable) {
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        backup = `${path.basename(target)}.${stamp}-${++snapshotSeq}.bak`;
+        fs.copyFileSync(target, path.join(backupDirFor(cwd), backup));
+      }
     }
     entries.push({ file: target, backup, time: new Date().toISOString() });
     writeManifest(cwd, entries);
