@@ -33,7 +33,7 @@ XuanZhu is a full-screen AI agent that runs in your terminal: it can read your c
 - **Multi-turn autonomous execution**: chains tool calls automatically to complete a task; press `Ctrl+C` to interrupt at any time.
 - **Task planning**: complex tasks (3+ steps) start with a structured plan via `todo_write`, updated step by step and shown in the top info area.
 - **Subagents (parallel)**: `task` spawns the `code-explorer` subagent for large research runs and brings back only the conclusion, keeping the main context clean. Multiple `task` calls in one turn run **concurrently** (up to 4 by default, see `maxParallelAgents`). Definitions live in `src/subagents/` and more can be added.
-- **Automatic memory compaction**: the append-only long-term memory is compacted **automatically once it reaches the limit** (default 6000 chars) — duplicates are merged and, if still oversized, the oldest entries are trimmed.
+- **Topic-organized long-term memory**: `MEMORY.md` is a knowledge base rather than a running log — new conclusions are merged into the existing topic section via `memory_compact`, entries carry evidence (`file::func` / command) and the reason, and details live in the project docs behind a pointer. It is compacted **automatically once it reaches the limit** (default 12000 chars): duplicates are merged and, if still oversized, the oldest **appended blocks** are trimmed — curated topic sections are never auto-dropped.
 - **Image input**: `Ctrl+V` (or `/image`) reads an image from the system clipboard and attaches it to the current turn; dragging an image file path in also works. Available on Linux / Windows / macOS.
 - **Phone device bridge**: push scripts to **AutoJs6** / AutoX.js on a phone and collect their logs — the equivalent of the VSCode extension's `Run` / `Save`, without VSCode, and usable by the agent itself (`device_run` and friends). AutoJs6 is recommended (`xzh device connect <phone-ip>` with server mode enabled); phone logs stream into the right-hand terminal panel.
 
@@ -178,7 +178,7 @@ This is useful for running multiple environments side by side (local / remote / 
   "temperature": 0.2,
   "maxToolRounds": 200,
   "autoApprove": true,
-  "memoryMaxChars": 6000,
+  "memoryMaxChars": 12000,
   "maxParallelAgents": 4,
   "intent": { "enabled": false },
   "providers": {
@@ -300,7 +300,7 @@ API Keys can also come from environment variables, with lower priority than the 
 | `load_skill` | Load the full guide for a given skill | No |
 | `memory_read` | Read project memory (long-term memory + recent log) | No |
 | `memory_write` | Write project memory (long-term / daily log); auto-compacts long-term memory when oversized | No |
-| `memory_compact` | Rewrite long-term memory with a condensed full version | No |
+| `memory_compact` | Rewrite long-term memory with a condensed full version (merge new conclusions into topic sections / semantic compression) | No |
 | `todo_write` | Create / update the task list (full list each call) | No |
 | `task` | Spawn a subagent (`code-explorer` by default) for a subtask; only its conclusion returns. Several calls in one turn run **in parallel** | No |
 | `read_file` | Read a file (with line numbers; supports offset and limit) | No |
@@ -372,17 +372,23 @@ of the model.
 To check whether a tool is actually being sent: `/tools` lists every tool sent with the current
 request.
 
-**Automatic long-term memory compaction**: `MEMORY.md` is append-only and grows without bound,
-yet it is injected into the prompt at every startup. It is therefore compacted **automatically
-once it reaches `memoryMaxChars`** (default 6000) — no model decision involved:
+**Automatic long-term memory compaction**: `MEMORY.md` grows without bound, yet it is injected
+into the prompt at every startup. It is therefore compacted **automatically once it reaches
+`memoryMaxChars`** (default 12000) — no model decision involved:
 
 - duplicate blocks (identical body) are merged first (lossless);
-- if still oversized, the **oldest blocks are trimmed** (newest conclusions win);
+- if still oversized, the **oldest appended blocks are trimmed** (`## <timestamp>`, i.e. the
+  running blocks added by `memory_write`; newest conclusions win);
+- **curated topic sections** (e.g. `## 环境与部署`) are **never** auto-trimmed — their order is
+  importance, not time, so dropping one would silently erase project facts — and the **newest
+  appended block is never dropped** either (it is usually a conclusion just written, not yet
+  merged into a topic);
 - it triggers at session start, on `/switch`, and after every `memory_write` (scope=long), and
   the result is reported in the output pane;
 - `memoryMaxChars: 0` means unlimited length (dedupe only, never trims);
-- if a **single entry** alone exceeds the limit, trimming cannot help, so the prompt asks the
-  model to condense it with `memory_compact`.
+- when the automatic layer cannot converge (only topic sections left, or a **single entry** alone
+  exceeds the limit), both `memory_write`'s result and a "⚠ long-term memory still too long"
+  prompt section ask the model to condense it with `memory_compact`.
 
 ## Image input (Ctrl+V)
 
@@ -505,16 +511,17 @@ The first time you run `xzh` in a project, it creates `.xuanzhu/` at the project
 
 | Path | Purpose |
 | --- | --- |
-| `.xuanzhu/memory/MEMORY.md` | Long-term memory: stable project conclusions and conventions, injected into the system prompt (an excerpt) at startup |
-| `.xuanzhu/memory/YYYY-MM-DD.md` | Daily log: a running record appended per day |
+| `.xuanzhu/memory/MEMORY.md` | Long-term memory: a **topic-organized knowledge base** (stable facts, conventions, pitfalls), injected into the system prompt (an excerpt) at startup |
+| `.xuanzhu/memory/YYYY-MM-DD.md` | Daily log: progress and process notes appended per day |
 | `.xuanzhu/rules.md` | Project rules, injected into the system prompt as "project-level instructions". **On first initialization, if the project root already has `AGENTS.md`**, an instruction is written instead — "you must strictly follow `AGENTS.md`" — rather than copying its content, so that `AGENTS.md` remains the single source of truth: edit it and the model sees the new version on its next read |
 
 Memory is maintained by XuanZhu itself:
 
 - At startup it reads `MEMORY.md` **and the current day's log** into the prompt (an excerpt of each), so XuanZhu understands the project background from the beginning
 - When it needs more history it calls `memory_read`; **after completing each piece of substantive work** it must call `memory_write` to record the conclusion (technical decisions, project conventions, pitfalls hit, important findings). This requirement also appears under "Core principles" in the system prompt, which explicitly asks it to **write memory before producing the final answer** — the earlier wording ("may call") was too weak and in practice almost never triggered
-- Long-term memory is **append-only** and grows without bound, yet it is injected into the prompt at every startup (1500-char excerpt), so an oversized file truncates the conclusions that matter. **Once it reaches `memoryMaxChars` (default 6000) compaction triggers automatically** (no model decision): duplicates are merged, and if still oversized the oldest blocks are dropped (newest conclusions win). See "Automatic long-term memory compaction" above
-- Only when a **single entry alone exceeds the limit** (so nothing is left to trim) does the prompt ask the model to `memory_read` the full file and rewrite a condensed version with `memory_compact`
+- Long-term memory is **not a running log**: the system prompt asks for topic sections (`## 环境与部署`, `## 权限机制`, …), with each new conclusion merged into the matching section via `memory_compact` (`memory_write` is only for brand-new topics). Entries should be a stable conclusion plus its evidence (`file::func`, a command, a table name) and the reason it works that way, with `⚠` on dangerous steps; version narratives and long arguments stay in the project docs and the memory keeps only a **pointer**; superseded content is deleted
+- It grows without bound, yet it is injected into the prompt at every startup (1500-char excerpt), so an oversized file truncates the conclusions that matter. **Once it reaches `memoryMaxChars` (default 12000) compaction triggers automatically** (no model decision): duplicates are merged, and if still oversized the oldest **appended blocks** are dropped (newest conclusions win) — curated topic sections are never auto-trimmed. See "Automatic long-term memory compaction" above
+- When the automatic layer cannot converge (only topic sections left, or a **single entry alone exceeds the limit**) both `memory_write`'s result and the prompt ask the model to `memory_read` the full file and rewrite a condensed version with `memory_compact`
 - `.xuanzhu` is **always** located under the current project path, with **no upward search**: working in `/a/b/c` uses only `/a/b/c/.xuanzhu`, and an existing `.xuanzhu` in `/a` or `/a/b` is never reused
 - **At startup** and **when `/switch` changes directory**, if that directory has no `.xuanzhu` yet, it is created automatically
 - Each project directory therefore has its own memory and rules; `~/.xzh` is purely the **global config directory** (config.json / session / logs / skills) and does not participate in project memory
@@ -525,12 +532,13 @@ Memory is maintained by XuanZhu itself:
 
 A skill is a guide telling XuanZhu how to use a particular external CLI tool (`skills/<name>/SKILL.md`). When a task touches some domain, XuanZhu first calls `list_skills` to see what is available, then `load_skill` to load the full guide (which installs and verifies its dependencies), and finally uses `bash` to run the commands described in the guide.
 
-18 skills ship with the package; the commonly used ones:
+19 skills ship with the package; the commonly used ones:
 
 | Skill | Domain | Dependency |
 | --- | --- | --- |
 | `playwright` | Browser automation, end-to-end testing, web verification (**uses your installed Chrome by default** to reduce anti-bot blocking) | `playwright-cli` (`npm i -g @playwright/cli@latest`) |
 | `officecli` | Creating and reading Word / Excel / PowerPoint documents | `officecli` (single binary; see the install notes inside the skill) |
+| `release` | **Release flow**: version bump / CHANGELOG / build & test / `npm publish` / wait for the registry / push to GitHub / post-publish verification (with a step checklist and pitfalls) | None (`npm` / `git`) |
 | `github` / `gitlab` | Repositories, issues, PRs / MRs | `gh` / `glab` |
 | `jira` / `linear` | Project management | The respective CLI |
 | `aws` / `kubernetes` | Cloud resources and container orchestration | `aws` / `kubectl` |

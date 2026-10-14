@@ -14,8 +14,10 @@ const MAX_DISPLAY = 12_000;
 export const memoryReadTool: ToolDefinition = {
   name: "memory_read",
   description:
-    "读取当前项目的记忆（存放在 <项目>/.xuanzhu/memory/）：包含长期记忆 MEMORY.md 与最近一份每日日志。" +
+    "读取当前项目的记忆（存放在 <项目>/.xuanzhu/memory/）：包含长期记忆 MEMORY.md（按主题整理的结论库）" +
+    "与最近一份每日日志。" +
     "在开始处理需要项目背景的任务前调用它，可以了解此前积累的约定与结论。" +
+    "写长期记忆（scope=long）之前也应当先读，确认新结论属于哪个主题小节。" +
     "当系统提示词提示「长期记忆过长」时，也应先用它读取全文，再调用 memory_compact 精简。",
   parameters: {
     type: "object",
@@ -60,7 +62,10 @@ export const memoryWriteTool: ToolDefinition = {
   description:
     "把值得跨会话保留的信息写入项目记忆（<项目>/.xuanzhu/memory/）。" +
     "在完成实质工作（实现功能、修复缺陷、确定技术方案、约定项目规范）后调用，以便后续会话复用。" +
-    "scope=daily 追加到当日日志（默认，适合过程记录）；scope=long 追加到长期记忆 MEMORY.md（适合稳定的结论与约定）。" +
+    "scope=daily 追加到当日日志（默认，适合当天的进展与过程记录）；" +
+    "scope=long 在长期记忆 MEMORY.md 末尾追加一块 —— **只适合全新主题**：" +
+    "若新结论属于已有的主题小节，应先 memory_read 再用 memory_compact 并进那个小节，" +
+    "否则长期记忆会退化成按时间堆叠、越用越乱的流水账。" +
     "请写简洁的事实性内容，不要记录瞬时信息（临时路径、工具报错等）。" +
     "长期记忆超出上限时会自动去重与精简，摘要中会说明精简结果。",
   parameters: {
@@ -73,7 +78,8 @@ export const memoryWriteTool: ToolDefinition = {
       scope: {
         type: "string",
         enum: ["daily", "long"],
-        description: "daily=当日日志（默认）；long=长期记忆 MEMORY.md",
+        description:
+          "daily=当日日志（默认）；long=长期记忆 MEMORY.md（仅用于全新主题；已有主题请用 memory_compact 并入）",
       },
     },
     required: ["content"],
@@ -89,25 +95,34 @@ export const memoryWriteTool: ToolDefinition = {
       const file = appendMemory(ctx.cwd, content, scope);
       const label = scope === "long" ? "长期记忆" : "当日日志";
 
-      // 长期记忆只追加会无界增长，而它每次启动都要注入提示词。写入后检查一次：
-      // 达到阈值即自动去重 + 裁剪最旧块（只处理确定性部分，语义合并交给 memory_compact）。
+      // 长期记忆会无界增长，而它每次启动都要注入提示词。写入后检查一次：
+      // 达到阈值即自动去重 + 裁剪最旧的追加块（确定性部分），语义合并交给 memory_compact。
       let compactNote = "";
       if (scope === "long") {
-        const result = compactLongTermMemoryIfNeeded(
-          ctx.cwd,
-          ctx.memoryMaxChars ?? DEFAULT_MEMORY_MAX_CHARS,
-        );
+        const limit = ctx.memoryMaxChars ?? DEFAULT_MEMORY_MAX_CHARS;
+        const result = compactLongTermMemoryIfNeeded(ctx.cwd, limit);
         if (result && (result.removedDuplicates > 0 || result.removedOldest > 0)) {
           const parts: string[] = [];
           if (result.removedDuplicates > 0) {
             parts.push(`去除 ${result.removedDuplicates} 条重复记录`);
           }
           if (result.removedOldest > 0) {
-            parts.push(`丢弃 ${result.removedOldest} 条最旧记录`);
+            parts.push(`丢弃 ${result.removedOldest} 条最旧的追加记录`);
           }
           compactNote =
             `\n\n（长期记忆已自动精简：${parts.join("、")}，` +
             `${result.before} → ${result.after} 字符）`;
+        }
+
+        // 自动层只删得出「追加块」。剩下的若是按主题整理的稳定小节（自动删会抹掉
+        // 项目事实），就得当场把语义压缩交给模型 —— 等下次启动的系统提示词太晚：
+        // 本轮追加进去的内容很可能正是最后压垮它的那一块。
+        const size = readProjectMemory(ctx.cwd).longTerm.length;
+        if (limit > 0 && size > limit) {
+          compactNote +=
+            `\n\n⚠ 长期记忆仍有 ${size} 字符（上限 ${limit}），自动精简已无法继续` +
+            `（剩下的都是按主题整理的稳定小节）。请**立即**用 memory_read 读取全文，` +
+            `再用 memory_compact 提交合并同主题、删减过时内容后的完整版本。`;
         }
       }
 
@@ -138,10 +153,12 @@ export const memoryCompactTool: ToolDefinition = {
   name: "memory_compact",
   description:
     "用一份**精简后的完整内容**覆盖长期记忆 MEMORY.md（语义压缩）。" +
-    "当长期记忆过长、内容重复或有过时条目时使用：先 memory_read 读取全文，" +
-    "再合并同一主题、删除已过时/被推翻的内容、把冗长的过程浓缩为结论，" +
-    "最后把重写结果通过本工具提交。" +
+    "两个用途：① 把新结论**并进已有主题小节**（这是长期记忆的常规更新方式，" +
+    "因为 memory_write 只会在文末追加）；② 长期记忆过长 / 重复 / 有过时条目时做整体整理。" +
+    "做法：先 memory_read 读取全文，再按主题合并条目、删除已过时或被后续结论推翻的内容、" +
+    "把冗长的过程浓缩为结论（细节留在项目文档里、这里只留指针），最后把重写结果通过本工具提交。" +
     "注意：提交的是**完整的新版本**（会整体覆盖），不要只提交增量；" +
+    "结构上保留「文首维护说明 + `## 主题` 小节」的组织方式，不要退回按时间堆叠的日期块；" +
     "必须保留仍然有效的关键结论、项目约定与踩坑经验。",
   parameters: {
     type: "object",
@@ -149,7 +166,7 @@ export const memoryCompactTool: ToolDefinition = {
       content: {
         type: "string",
         description:
-          "精简后的长期记忆全文（Markdown，建议保留 `## 时间戳` 形式的条目结构）",
+          "精简后的长期记忆全文（Markdown：文首一行维护说明，正文按 `## 主题` 分节）",
       },
     },
     required: ["content"],

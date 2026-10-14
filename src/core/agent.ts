@@ -320,7 +320,7 @@ export class Agent {
   }
 
   /**
-   * 长期记忆达到阈值即**自动精简**（去重 + 必要时裁剪最旧条目），不依赖模型主动调用。
+   * 长期记忆达到阈值即**自动精简**（去重 + 必要时裁剪最旧的追加块），不依赖模型主动调用。
    *
    * 触发点：会话构造、`/switch` 切换目录。之所以放在这两处而不是每轮：记忆文件只有几 KB，
    * 读一次成本极低，但每轮都读属于无谓开销；而「会话中把记忆写大」的路径已经由
@@ -343,10 +343,11 @@ export class Agent {
       parts.push(`去除 ${result.removedDuplicates} 条重复记录`);
     }
     if (result.removedOldest > 0) {
-      parts.push(`裁剪 ${result.removedOldest} 条最旧记录`);
+      parts.push(`裁剪 ${result.removedOldest} 条最旧的追加记录`);
     }
     this.pendingMemoryNotices.push(
       `长期记忆已自动精简（${parts.join("、")}，${result.before} → ${result.after} 字符）。` +
+        `按主题整理的稳定小节不受自动裁剪影响；` +
         `若需要更彻底的压缩，可让玄猪用 memory_compact 重写为精简版本。`,
     );
   }

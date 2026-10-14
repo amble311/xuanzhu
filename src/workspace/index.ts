@@ -6,7 +6,7 @@ import * as path from "path";
  *
  *   <cwd>/.xuanzhu/
  *   ├── memory/              项目级记忆
- *   │   ├── MEMORY.md          长期记忆（持续维护）
+ *   │   ├── MEMORY.md          长期记忆（按主题整理的结论库，持续维护）
  *   │   └── YYYY-MM-DD.md      每日记录（按天分存，追加）
  *   └── rules.md             项目规则（内容注入系统提示词）
  *
@@ -240,12 +240,14 @@ export function appendMemory(
 /**
  * 长期记忆（MEMORY.md）的默认字符上限。
  *
- * 超过该值时会触发**精简**：先去除正文完全相同的重复块，仍然超限则从最旧的块
- * 开始丢弃。之所以要设上限：记忆是**只追加**的，长期使用后会把 MEMORY.md 撑得
- * 很长，而它每次启动都会注入系统提示词（节选 1500 字符）—— 过长会让真正重要的
- * 结论被截断掉。取 6000 是「内容足够丰富」与「可被有效节选」之间的折中。
+ * 超过该值时会触发**精简**：先去除正文完全相同的重复块，仍然超限则从最旧的
+ * **追加块**（`## 时间戳`）开始丢弃；按主题整理的稳定小节不动（见 `compactLongTermMemory`）。
+ * 之所以要设上限：长期记忆每次启动都会注入系统提示词（节选 1500 字符），
+ * 过长会让真正重要的结论被截断掉。取 12000 是「按主题整理的结论库能放下一个中型项目的
+ * 事实与口径」与「可被有效节选」之间的折中（早期是 6000，主题化之后偏紧：刚一整理好
+ * 就触发语义压缩，等于白整理一遍）。
  */
-export const DEFAULT_MEMORY_MAX_CHARS = 6_000;
+export const DEFAULT_MEMORY_MAX_CHARS = 12_000;
 
 export interface MemoryCompactResult {
   /** 精简前字符数 */
@@ -254,15 +256,34 @@ export interface MemoryCompactResult {
   after: number;
   /** 被去除的重复块数量 */
   removedDuplicates: number;
-  /** 因超出上限而被丢弃的最旧块数量 */
+  /** 因超出上限而被丢弃的最旧「追加块」数量 */
   removedOldest: number;
 }
 
 interface MemoryBlock {
-  /** 块标题行（`## 时间戳`） */
+  /** 块标题行：`## 时间戳`（memory_write 追加的流水块）或 `## 主题`（整理后的小节） */
   title: string;
   /** 块正文 */
   body: string;
+}
+
+/**
+ * 是否为 `memory_write`（scope=long）追加出来的流水块。
+ *
+ * 只有这类块的先后顺序带有「越早越可能过时」的含义，超限时可以自动裁剪；
+ * `## 环境与部署` 这类主题小节的顺序是**重要性排序**，自动删掉等于静默抹掉项目事实，
+ * 只能由模型在 `memory_compact` 时判断去留。
+ */
+function isAppendedBlock(title: string): boolean {
+  return /^##\s+\d{4}-\d{2}-\d{2}(\s+\d{2}:\d{2})?\s*$/.test(title);
+}
+
+/** 最后一块追加块的下标（没有追加块时返回 -1）—— 它永不参与自动裁剪 */
+function findLastAppendedIndex(blocks: MemoryBlock[]): number {
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    if (isAppendedBlock(blocks[i].title)) return i;
+  }
+  return -1;
 }
 
 /** 把长期记忆拆成「头部 + 若干 `## ` 块」 */
@@ -315,13 +336,19 @@ function blockKey(body: string): string {
 }
 
 /**
- * 精简长期记忆：去重 + 超限时丢弃最旧的块，仅在确有变化时写盘。
+ * 精简长期记忆：去重 + 超限时丢弃最旧的**追加块**，仅在确有变化时写盘。
  *
  * **只作用于长期记忆**，不碰每日日志：每日日志天然按天分存、总量有界，
  * 而长期记忆是无限追加的。
  *
  * 去重只认「正文完全相同」的块（模型重复记录同一结论很常见），不涉及语义判断；
  * 语义层面的合并由模型通过 `memory_compact` 工具完成。
+ *
+ * 裁剪**只删 `## 时间戳` 追加块**，且**永远保留最后一块追加块**：长期记忆的正确
+ * 形态是「文首维护说明 + 按主题整理的稳定小节」，主题小节的顺序是重要性而非时间，
+ * 自动删掉等于静默抹掉项目事实；而最新那块追加块往往是刚写进来、还没被并进主题的
+ * 结论，被自己的自动精简吃掉最难排查。若剩下的内容仍超限，这里就停下，改由
+ * `memory_write` 的返回与系统提示词的 ⚠ 段落要求模型用 `memory_compact` 做语义压缩。
  *
  * `maxChars <= 0` 表示**不限制长度**：此时只做去重（无损），不裁剪任何内容。
  */
@@ -358,19 +385,26 @@ export function compactLongTermMemory(
     kept.push(block);
   }
 
-  // 2. 仍然超限时从最旧的块开始丢弃（最新的结论优先保留）。
+  // 2. 仍然超限时从最旧的**追加块**开始丢弃（最新的结论优先保留）。
+  //    主题小节（`## 环境与部署` 之类）不参与自动裁剪，**最新的追加块也永不丢**
+  //    （刚写进 `memory_write` 的结论被自己的自动精简吃掉最难排查）—— 见函数注释。
   //    maxChars <= 0 = 不限制长度，跳过这一步、只保留上面的去重。
   //    下限 200 是防止误配置（如 1、10）把记忆裁得只剩标题。
   let removedOldest = 0;
   if (maxChars > 0) {
     const budget = Math.max(200, Math.floor(maxChars));
-    if (assembleMemoryBlocks(header, kept).trim().length > budget) {
-      let total = assembleMemoryBlocks(header, kept).trim().length;
-      while (kept.length > 1 && total > budget) {
-        const dropped = kept.shift()!;
-        total -= dropped.title.length + dropped.body.length + 4;
-        removedOldest++;
-      }
+    let total = assembleMemoryBlocks(header, kept).trim().length;
+    while (total > budget) {
+      // 找「可丢的」追加块：跳过主题小节，也跳过**最后一块**追加块
+      // （每轮重新定位：上一轮删除后下标会整体前移）
+      const lastAppended = findLastAppendedIndex(kept);
+      const index = kept.findIndex(
+        (block, i) => isAppendedBlock(block.title) && i !== lastAppended,
+      );
+      if (index < 0) break; // 只剩主题小节 + 最新追加块 → 交给语义层（memory_compact）
+      const dropped = kept.splice(index, 1)[0];
+      total -= dropped.title.length + dropped.body.length + 4;
+      removedOldest++;
     }
   }
 

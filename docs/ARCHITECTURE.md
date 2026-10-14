@@ -288,22 +288,46 @@ interface ToolDefinition {
 `任务 2/5` 与当前进行项（只展开前 3 项，其余以计数压缩，避免挤占头部空间）。
 `Agent.reset()`（`/clear`）会一并清空列表。
 
+### 长期记忆的形态
+
+`MEMORY.md` 的**目标形态不是流水账，而是按主题整理的结论库**（文首一行维护说明 +
+`## 环境与部署` / `## 权限机制` 之类的稳定小节）。这些要求写在系统提示词的「项目记忆」
+段落里（`src/core/prompt.ts::buildMemorySection`），要点：
+
+- 同一主题的新结论要**并进已有小节**（`memory_read` → `memory_compact` 重写），
+  `memory_write`（scope=long）只用于**全新主题**；
+- 只写跨会话稳定、可复用的内容：结论 + 依据（`file::func` / 命令 / 表名）+ 原因与解法，
+  危险操作标 `⚠`；版本叙事与长篇论证留在项目文档里，记忆只留**指针**；
+- 删除与写入同等重要：过时、被推翻、已进文档的内容要删掉；
+- 小节顺序 = **重要性**（注入提示词的只是开头 1500 字符节选），因此不能用
+  「越新越靠后」的时间序维护。
+
+> 这套写法是照着 CodeBuddy 在长期项目里沉淀出的 `MEMORY.md` 逆向归纳的：那种文件之所以
+> 越用越好用，靠的不是条目多，而是同主题持续合并、过时内容持续删除、细节外置只留指针。
+> 默认的自由追加会长成一串按时间堆叠的日期块，注入提示词时前半段全是过期结论。
+
 ### 记忆精简
 
-长期记忆（`MEMORY.md`）是**只追加**的，长期使用会无界增长，而它每次启动都要注入提示词。
-因此设阈值 `config.memoryMaxChars`（默认 `6000`，见 `workspace` 的 `DEFAULT_MEMORY_MAX_CHARS`），
-**达到阈值即自动触发**，不依赖模型主动调用：
+长期记忆会无界增长，而它每次启动都要注入提示词。因此设阈值 `config.memoryMaxChars`
+（默认 `12000`，见 `workspace` 的 `DEFAULT_MEMORY_MAX_CHARS`），**达到阈值即自动触发**，
+不依赖模型主动调用：
 
 1. **自动层**（`compactLongTermMemoryIfNeeded()`，确定性、无需模型参与）：
    - 未超阈值 → 直接返回 `null`，**不读内容、不改文件**；
-   - 超阈值 → 先去除正文完全相同的重复块（无损），仍超限则从**最旧的块**开始裁剪
-     （最新结论优先保留），仅在确有变化时原子重写文件。
+   - 超阈值 → 先去除正文完全相同的重复块（无损）；仍超限则从**最旧的追加块**
+     （`## 时间戳`，即 `memory_write` 追加的流水块）开始裁剪，仅在确有变化时原子重写文件。
+   - **按主题整理的稳定小节（`## 环境与部署` 之类）不参与自动裁剪**：它们的顺序是重要性
+     而非时间，自动删等于静默抹掉项目事实（`isAppendedBlock()` 判定块类型）。
+   - **最后一块追加块也永不丢**（`findLastAppendedIndex()`）：它往往是刚写进来、还没并进
+     主题的结论，被自己的自动精简吃掉最难排查。
    - 触发点：`Agent.composeSystemPrompt()`（会话构造 / `setCwd()`）与 `memory_write`
      （scope=long）写入之后。精简结果经 `Agent.pendingMemoryNotices` 攒起来、
      在首轮 `run()` 时提示（构造发生在终端接管之前，不能当场写输出区）。
    - `memoryMaxChars <= 0` = 不限制长度：仍然去重，但不裁剪。
-2. **语义层**（模型参与）：只有当**单条块本身就超限**（裁剪至少要保留一条、删无可删）时，
-   系统提示词才追加「⚠ 长期记忆仍然过长」段落，要求模型 `memory_read` 读全文、
+2. **语义层**（模型参与）：当自动层做不到收敛时（剩下的都是主题小节，或单条记录本身就超限），
+   两条确定性入口都会把请求送到模型眼前 ——
+   `memory_write` 的返回里直接给出「⚠ 仍有 N 字符，请立即用 memory_compact」，
+   系统提示词也会追加「⚠ 长期记忆仍然过长」段落，要求 `memory_read` 读全文、
    再用 `memory_compact` 提交精简后的完整版本（合并同主题、删除已过时条目）。
 
 > 分工的原因：去重与裁剪是确定性的、不该交给模型（也不该等模型「想起来」）；
@@ -493,8 +517,9 @@ AutoJs6 连接的三个必要策略（`autojs6/client.ts`）：**指数退避自
   `<cwd>/.xuanzhu`，**不做任何向上查找**——项目记忆与规则严格归属用户指定的项目路径，
   上级目录即使已有 `.xuanzhu` 也不复用。启动与 `/switch` 切换目录时，若该目录下尚无
   `.xuanzhu` 则自动创建，仅承载**项目记忆与项目规则**。细节：
-  - `memory/MEMORY.md`（长期记忆）与 `memory/YYYY-MM-DD.md`（每日日志）由 `memory_read` /
-    `memory_write` 工具读写，长期记忆还可由 `memory_compact` 整体重写（见「记忆精简」）；
+  - `memory/MEMORY.md`（长期记忆，**按主题整理的结论库**，见「长期记忆的形态」）与
+    `memory/YYYY-MM-DD.md`（每日日志）由 `memory_read` / `memory_write` 工具读写，
+    长期记忆还可由 `memory_compact` 整体重写（见「记忆精简」）；
     `Agent.composeSystemPrompt()` 在构造与 `setCwd()` 时读取并注入提示词（节选 1500 字符）。
   - `rules.md` 内容作为项目规则追加进系统提示词。
 - **使用**：模型通过 `list_skills` 查看可用技能，通过 `load_skill` 加载 `SKILL.md` 全文，
@@ -517,16 +542,17 @@ AutoJs6 连接的三个必要策略（`autojs6/client.ts`）：**指数退避自
   为此 `load_skill` 的返回**带上技能目录绝对路径**（`> 技能目录：…`）：拆出去的文件只能按相对路径
   指路，而技能在不同安装形态下路径不同（仓库内是 `dist/skills/<name>`，npm 安装后是
   `<node_modules>/xuanzhu/dist/skills/<name>`），**不能写死**，模型需要现成的目录才能拼出绝对路径
-  并用 `read_file` 取用。目前有五个技能采用这套写法：`autojs6`（api / patterns / screenshot /
+  并用 `read_file` 取用。目前有六个技能采用这套写法：`autojs6`（api / patterns / screenshot /
   input / troubleshooting）、`officecli`（l1-read / l2-edit / element-types / watch-selection /
   subskills）、`datadog`（commands / datadog-ci）、`playwright`（browser-choice / node-script）、
-  `telegram`（commands）。
+  `telegram`（commands）、`release`（checklist / pitfalls）。
 - **frontmatter 只有 `name` 与 `description` 会被读取**（`parseFrontmatter`）：`metadata.*` 里的
   `displayName` / `icon` / `category` / `version` 目前**不生效**，仅作标注；原 CodeBuddy 扩展遗留的
   `dependencies` / `config` / `auth` 三个键已从全部内置技能中清除（它们连同 `install.sh` 一起，
   属于"项目级 `.codebuddy/bin`"那套已废弃的机制）。
-- **内置技能**：18 个，涵盖 playwright（浏览器自动化）、officecli（Office 文档）、
-  github / gitlab、jira / linear、aws / kubernetes、数据库、监控与消息类。
+- **内置技能**：19 个，涵盖 playwright（浏览器自动化）、officecli（Office 文档）、
+  github / gitlab、jira / linear、aws / kubernetes、数据库、监控与消息类，
+  以及 `release`（发布流程：版本号 / 校验 / npm publish / 推送 GitHub，不依赖外部 CLI）。
 - **依赖自动安装**：`src/skills/dependencies.ts` 以 TS 常量声明每个技能所需的 CLI
   （检测命令、各平台安装命令、postInstall）；`src/skills/installer.ts` 负责检测、安装与安装后复核。
   同一套机制也承载**玄猪自身的依赖**（`runtimeRequirements()` / `clipboardRequirements()`）——

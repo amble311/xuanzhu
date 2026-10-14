@@ -138,10 +138,12 @@ export interface XuanZhuConfig {
    */
   confirmSensitiveRead?: boolean;
   /**
-   * 长期记忆（MEMORY.md）的字符上限。默认 6000（见 workspace 的 DEFAULT_MEMORY_MAX_CHARS）。
+   * 长期记忆（MEMORY.md）的字符上限。默认 12000（见 workspace 的 DEFAULT_MEMORY_MAX_CHARS）。
    *
-   * 超过后：`memory_write`（scope=long）会自动去重并丢弃最旧的条目；系统提示词也会
-   * 提示模型用 `memory_compact` 做一次语义精简。设为 0 表示不限制（仍会去重）。
+   * 超过后：`memory_write`（scope=long）会自动去重并丢弃最旧的**追加块**
+   * （`## 时间戳`；按主题整理的稳定小节与最新追加块不参与裁剪）；仍然超限时，
+   * `memory_write` 的返回与系统提示词都会要求模型用 `memory_compact` 做一次语义精简。
+   * 设为 0 表示不限制（仍会去重）。
    */
   memoryMaxChars?: number;
   /**
@@ -180,7 +182,7 @@ export const DEFAULT_CONFIG: XuanZhuConfig = {
   // 默认不拦凭据读取：autoApprove 为 true 时应当「完全自动放行」，
   // 否则「自动批准」的语义会被一个罕见的例外破坏。
   confirmSensitiveRead: false,
-  // 长期记忆超过 6000 字符即触发精简（去重 + 丢弃最旧条目 + 提示模型语义压缩）
+  // 长期记忆超过 12000 字符即触发精简（去重 + 丢弃最旧的追加块 + 提示模型语义压缩）
   memoryMaxChars: DEFAULT_MEMORY_MAX_CHARS,
   // 同一轮里并列的多个子代理最多同时跑 4 个：再多容易撞上服务商的速率限制，
   // 而收益有限（瓶颈通常就是那几个并发请求）。
