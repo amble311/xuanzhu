@@ -204,6 +204,7 @@ This is useful for running multiple environments side by side (local / remote / 
 | Call failure | Switches to the **next** model in the list (wrapping around at the end); each model is tried at most once per request |
 | All failed | It only gives up after every model has been tried, and says so explicitly |
 | Remembering | Every switch is written back to the config, so the next launch starts from the last working model |
+| Switching in-session | `/model` lists the configured models and lets you pick one (↑ ↓ or a digit, Enter to confirm, Esc to cancel); `/model 2` or `/model <id / model name>` switches directly. The choice is written back to the config — the same "last used" record the automatic fallback updates |
 | Config errors do not fall back | Invalid key / no permission / model or endpoint not found: **no switch, nothing written to disk** — an unfixed config will always fail, and switching would only walk the whole fallback chain for nothing |
 | Context overflow does not fall back | When the model's window is exceeded, it **trims history and retries automatically** instead of switching models (see the section above) |
 | `Ctrl+C` / `Ctrl+D` interrupts | Not failures; they never trigger a fallback |
@@ -222,6 +223,8 @@ xzh model remove openai/gpt-4o         # remove (id / model name / index all wor
 
 To keep a model **out of the fallback chain**, just `xzh model remove` it. The model in use is shown at the
 top of the interface and in the status bar, and every fallback is announced in the output pane.
+To switch temporarily, just pick one with `/model` in the conversation (`xzh model` remains the
+add / edit / remove entry point).
 
 > ⚠️ The positional arguments of `xzh model add` **all shifted by one** as of v0.5 (the old `[weight]` slot is
 > gone): it is now `add <provider> <model> [context window] [on|off]`.
@@ -233,6 +236,7 @@ top of the interface and in the status bar, and every fallback is announced in t
 - XuanZhu derives an input budget of `contextWindow × 80%` (the remainder is reserved for this reply and estimation error), then subtracts the system prompt's usage; whatever is left goes to the conversation history.
 - When the budget is exceeded it works in **layers**: it first compresses **old, large tool outputs** (keeping the head and tail, cutting the middle), and only discards whole messages from the oldest end if that still is not enough. This way it never drops "the requirement the user originally stated" just to free space while keeping a stale `ls` result. The most recent conversation is always preferred; if a single message alone exceeds the budget, its body is truncated rather than dropped entirely.
 - If the value is not configured, it is inferred from the model name (`xzh model all` and `xzh model list` show the inferred value). The inference table only covers common models, so obscure or self-hosted model names fall back to a conservative 32k — if your model's window is larger, set it explicitly with `xzh model context <id> <size>`, otherwise history will be trimmed shorter than necessary.
+- **Once history has been trimmed, the model is told "this is not the full history"**: from then on every request carries a note saying it must not resume a half-visible old task from the leftover fragments, but answer the user's **current** message. Trimming is silent, so a model looking at a conversation that starts mid-task easily reads the unfinished work as "the user is waiting for me to finish" — in one real case the user sent just "are you there?" and it went off to start services and look up credentials.
 
 > Trimming relies on **estimated** token counts (about 1 character/token for Chinese, about 3.5 characters/token for English and code). It does not use a tokenizer, so it is a conservative approximation. Project rules (`.xuanzhu/rules.md`) and `systemPromptExtra` are injected into the system prompt in full, so an overly long one eats into the history budget — the interface warns you when it takes up more than half the window.
 >
@@ -635,7 +639,7 @@ Where `keybindings.json` lives: in VS Code / CodeBuddy press `Ctrl+Shift+P` → 
 
 Other terminals: xterm / VTE-based ones (gnome-terminal and friends) are negotiated automatically and work out of the box; kitty / Ghostty map that xterm-compatible sequence to "report all keys as escape codes", which breaks normal input, so XuanZhu does not send the request to those two — use `Alt+Enter` instead or configure it on the terminal side.
 
-In-interface commands: `/help`, `/clear`, `/tools`, `/image`, `/copy [N|all]`, `/mouse`, `/reset`, `/cwd`, `/switch <dir>`, `/term`, `/model`, `/auto [on|off]`, `/intent [on|off]`, `/exit`.
+In-interface commands: `/help`, `/clear`, `/tools`, `/image`, `/copy [N|all]`, `/mouse`, `/reset`, `/cwd`, `/switch <dir>`, `/term`, `/model [index|id|model]`, `/auto [on|off]`, `/intent [on|off]`, `/exit`.
 
 ### Selecting and copying
 

@@ -241,6 +241,29 @@ const ABORT_NOTE_MAX_CALLS = 12;
 /** 「上一轮已中止」说明里单条工具调用参数的最大长度 */
 const ABORT_NOTE_ARG_CHARS = 120;
 
+/**
+ * 「更早的对话已被裁剪」说明（`role: system`）。
+ *
+ * 为什么必须有：裁剪是**静默**的 —— `trimHistory()` 裁完就把丢掉的段落忘了，而模型看到的是
+ * 一段从中途开始的历史：上文里一个没有结论的旧任务会显得像"用户正等我做完它"。
+ * 实测表现（2026-10-14）：用户只发了句「在吗」，模型却接着执行上一轮被中断的任务
+ * （起 API、查登录凭据），因为历史里那段"未完成"的痕迹看起来就是在等它继续。
+ *
+ * 因此一旦这次会话裁过历史，之后每次请求都附上这条说明：明确告诉模型"你看的不是完整历史"，
+ * 残缺的旧任务不是待办，当前消息才是要做的事。
+ */
+function contextTrimmedNote(): ChatMessage {
+  return {
+    role: "system",
+    content:
+      "[上下文提醒] 更早的对话已因超出上下文窗口被裁剪，你看到的**不是完整历史**：\n" +
+      "· 被裁掉的内容不要推测、不要补做；\n" +
+      "· 上文里那些没有结论的旧任务只是残片，**不代表要接着做**；\n" +
+      "· 只有当用户最新一条消息明确要求继续时才续做，否则先回答他当前这条消息；\n" +
+      "· 若当前消息指向你已经看不到的上下文，先问清楚，再动手。",
+  };
+}
+
 export class Agent {
   private provider: LLMProvider;
   private readonly config: XuanZhuConfig;
@@ -249,6 +272,13 @@ export class Agent {
   private systemPrompt: string;
   /** 是否已就「系统提示词撑满窗口」提示过（避免每条消息都刷一遍） */
   private warnedTightContext = false;
+  /**
+   * 本次会话的历史**是否被裁过**（裁剪是永久性的，裁掉的部分就没了）。
+   *
+   * 一旦为真，组装请求时会附上 `contextTrimmedNote()` —— 否则模型会把残缺的旧任务
+   * 当成"还没做完、正等我继续"。见该函数的注释。
+   */
+  private historyTrimmed = false;
   private history: ChatMessage[] = [];
   /** 当前使用的模型条目（多模型：默认上次使用的，失败后沿列表回退） */
   private activeModel: ModelEntry | null;
@@ -301,6 +331,27 @@ export class Agent {
   /** 当前使用的模型 */
   getActiveModel(): ModelEntry | null {
     return this.activeModel;
+  }
+
+  /**
+   * 会话内**手动**切换当前模型（界面里的 `/model`）。
+   *
+   * 与「调用失败自动回退」共用同一套状态更新：重建 provider → 更新 activeModel →
+   * `rememberModel()` 记住选择 → 写回配置文件，因此下次启动直接用它。
+   *
+   * 与回退的差别：**不做可用性校验**。这是用户主动选的，好不好用交给下一次调用的结果，
+   * 失败了仍旧照常走回退链（回退不会因为「手动选过」而停用）。
+   *
+   * @returns 是否真的发生了切换；选中的就是当前模型时返回 false。
+   * @throws 新模型的 provider 不可用时抛错（缺 API Key / 未知 provider 等），由调用方提示用户。
+   */
+  switchModel(entry: ModelEntry): boolean {
+    if (this.activeModel && this.activeModel.id === entry.id) return false;
+    this.provider = createProvider(this.config, entry);
+    this.activeModel = entry;
+    rememberModel(this.config, entry);
+    this.persistConfig();
+    return true;
   }
 
   /** 组合系统提示词（含当前工作目录下的项目规则与项目记忆） */
@@ -358,6 +409,7 @@ export class Agent {
 
   reset(): void {
     this.history = [];
+    this.historyTrimmed = false;
     // 任务列表属于本轮会话，清空对话时一并清掉，避免界面上残留上一轮的计划
     if (this.todos.length > 0) {
       this.todos = [];
@@ -382,6 +434,9 @@ export class Agent {
   restoreSession(messages: ChatMessage[], sessionFile: string): void {
     this.history = [...messages];
     this.sessionFile = sessionFile;
+    // 恢复的会话文件本身可能已经是被裁过的版本，无从判断，故按「未裁过」重来：
+    // 猜错只会少一条提醒，而凭空添加"历史不完整"的提醒会让模型无谓地畏手畏脚。
+    this.historyTrimmed = false;
     appendSessionMessages(sessionFile, messages);
   }
 
@@ -569,10 +624,13 @@ export class Agent {
       return {
         role: "system",
         content:
-          `[上一轮已中止] 上一轮${reason}，没有给出结论，该轮对话已作废。\n` +
-          `中止前**已经真实执行**过的操作（副作用仍然存在，不要重复执行）：\n` +
+          `[上一轮已中止] 上一轮${reason}，没有给出结论，该轮对话已作废 —— ` +
+          `**不会被自动接着做**，除非用户明确要求继续。\n` +
+          `中止前**已经真实执行**过的操作（以下是**已执行记录，不是待办清单**，` +
+          `副作用仍然存在，不要重复执行）：\n` +
           listed.join("\n") +
-          `\n请直接回应用户最新的消息，不要接着完成被中止的旧任务。`,
+          `\n请直接回应用户**最新的那条消息**：若它只是寒暄（「在吗」「你好」）或另一件事，` +
+          `就照它回答；不要接着完成被中止的旧任务。`,
       };
     };
 
@@ -1559,7 +1617,11 @@ export class Agent {
       all.length > MAX_HISTORY_MESSAGES ? all.slice(-MAX_HISTORY_MESSAGES) : all;
     // budgetRatio < 1 用于「上下文超限后收敛重试」
     const budget = Math.max(1, Math.floor(this.conversationBudget() * budgetRatio));
-    return trimMessagesToBudget(capped, budget);
+    const trimmed = trimMessagesToBudget(capped, budget);
+    // 本次请求自己丢了消息（条数上限或 token 预算）→ 记下来
+    if (trimmed.length < capped.length) this.historyTrimmed = true;
+    // 历史被裁过就附上说明：模型看到的不是完整历史，不能拿残缺的旧任务当待办
+    return this.historyTrimmed ? [contextTrimmedNote(), ...trimmed] : trimmed;
   }
 
   /**
@@ -1582,6 +1644,8 @@ export class Agent {
     if (kept.length === this.history.length) return 0;
     const removed = this.history.length - kept.length;
     this.history = kept;
+    // 裁剪是永久性的：记下来，之后每次请求都要提醒模型"这不是完整历史"
+    this.historyTrimmed = true;
     return removed;
   }
 }

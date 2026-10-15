@@ -129,5 +129,9 @@ describe("中断后本轮整体回滚", () => {
     // 交代清楚执行过什么，避免模型重复执行有副作用的操作
     expect(note.content).toContain("fake_tool({})");
     expect(agent.messages.some((m) => m.content === "旧问题")).toBe(false);
+    // 这份记录是「已执行」而不是待办：不许模型顺着它继续做被中止的任务
+    // （2026-10-14 回归：用户只发了句「在吗」，模型却接着把旧任务做完）
+    expect(note.content).toContain("不是待办清单");
+    expect(note.content).toContain("最新的那条消息");
   });
 });

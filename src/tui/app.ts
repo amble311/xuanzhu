@@ -8,6 +8,7 @@ import {
 } from "../core/sessions";
 import { undoLastChange } from "../utils/backups";
 import {
+  activeModelEntry,
   effectiveModels,
   saveConfig,
   type ModelEntry,
@@ -81,6 +82,26 @@ interface PendingConfirm {
   request: ConfirmRequest;
   resolve: (approved: boolean) => void;
   selected: boolean;
+}
+
+/** 输入区里的一次单选（当前只有 `/model`）：↑ ↓ 移动、数字直选、Enter 确认、Esc 取消 */
+interface PendingSelect {
+  title: string;
+  /** 列表上方的说明行（可省） */
+  detail?: string;
+  options: PendingSelectOption[];
+  /** 当前高亮的序号 */
+  index: number;
+  resolve: (value: string | undefined) => void;
+}
+
+interface PendingSelectOption {
+  /** 展示文本 */
+  label: string;
+  /** 追加在 label 后的灰色说明（如「当前使用中」） */
+  hint?: string;
+  /** 选中后交给调用方的值 */
+  value: string;
 }
 
 interface InputLayout {
@@ -174,6 +195,14 @@ export class TuiApp {
   private historyIndex = -1;
 
   private pendingConfirm?: PendingConfirm;
+  /**
+   * 输入区里打开的单选列表（`/model`）。
+   *
+   * 与 `pendingConfirm` 不同，它只由用户在输入框里主动触发，不会来自子代理，
+   * 因此不需要排队；两者也不会同时出现（确认框打开时输入框被占用，
+   * 而对话进行中 `submit()` 直接返回，压根进不到命令处理）。
+   */
+  private pendingSelect?: PendingSelect;
   /** 确认请求的串行链：并行子代理同时请求确认时排队，避免覆盖导致挂死 */
   private confirmChain: Promise<void> = Promise.resolve();
   private abortController?: AbortController;
@@ -609,6 +638,103 @@ export class TuiApp {
   }
 
   /**
+   * `/model` —— 查看 / 切换当前使用的模型。
+   *
+   * - 不带参数：列出已配置模型并**直接选**（↑ ↓ 或数字键，Enter 确认、Esc 取消）
+   * - 带参数：`/model 2`、`/model <id>`、`/model <模型名>` 一步到位
+   *
+   * 之所以两种都留：列表交互适合「看一眼再选」，而带参数的形式在记熟之后更快，
+   * 也方便脚本化（同 `/resume <编号>`）。
+   */
+  private async handleModelCommand(arg: string): Promise<void> {
+    // 顺序即回退优先级：当前模型调用失败会沿这张表往后找下一个
+    const entries = effectiveModels(this.options.config);
+    if (entries.length === 0) {
+      this.lines.push(
+        `${ansi.yellow}还没有配置任何模型${ansi.reset}${ansi.gray} —— 用 ${ansi.reset}xzh model${ansi.gray} 添加。${ansi.reset}`,
+      );
+      this.scheduleRender();
+      return;
+    }
+
+    const current = activeModelEntry(this.options.config);
+
+    if (arg) {
+      const entry = resolveModelChoice(entries, arg);
+      if (!entry) {
+        this.lines.push(
+          `${ansi.yellow}没找到模型「${arg}」${ansi.reset}${ansi.gray} —— 输入 ${ansi.reset}/model${ansi.gray} 查看列表。${ansi.reset}`,
+        );
+        this.scheduleRender();
+        return;
+      }
+      this.applyModelSwitch(entry);
+      return;
+    }
+
+    if (entries.length === 1) {
+      this.lines.push(
+        `${ansi.gray}只配置了一个模型：${ansi.reset}${entries[0].id}` +
+          `${ansi.gray}（用 ${ansi.reset}xzh model${ansi.gray} 添加更多）${ansi.reset}`,
+      );
+      this.scheduleRender();
+      return;
+    }
+
+    const defaultIndex = Math.max(
+      0,
+      entries.findIndex((entry) => entry.id === current?.id),
+    );
+    const picked = await this.requestSelect(
+      "选择模型",
+      entries.map((entry) => ({
+        label: entry.id,
+        hint: entry.id === current?.id ? "当前使用中" : undefined,
+        value: entry.id,
+      })),
+      "顺序即回退优先级；选中的模型会记入配置，下次启动继续用它",
+      defaultIndex,
+    );
+    if (picked === undefined) {
+      this.lines.push(`${ansi.gray}已取消，仍使用 ${current?.id ?? this.modelLabel}${ansi.reset}`);
+      this.scheduleRender();
+      return;
+    }
+    const entry = entries.find((item) => item.id === picked);
+    if (entry) this.applyModelSwitch(entry);
+  }
+
+  /** 真正执行一次「手动切换模型」：更新 Agent、界面标签，并把选择写回配置 */
+  private applyModelSwitch(entry: ModelEntry): void {
+    // 会话进行中不切：本轮正用旧 provider 流式输出，中途换掉会让这一轮的行为前后不一致
+    if (this.busy) {
+      this.lines.push(
+        `${ansi.yellow}本轮对话进行中 —— 先等它结束或 Ctrl+C 中断，再切换模型。${ansi.reset}`,
+      );
+      this.scheduleRender();
+      return;
+    }
+    try {
+      if (!this.agent.switchModel(entry)) {
+        this.lines.push(`${ansi.gray}已经是当前模型：${entry.id}${ansi.reset}`);
+        this.scheduleRender();
+        return;
+      }
+      // 复用回退那条提示路径：标签更新 + 输出「⇄ 模型已切换为 …」
+      this.handleModelChange({
+        provider: entry.provider,
+        model: entry.model,
+        reason: "手动切换",
+      });
+    } catch (err) {
+      this.lines.push(
+        `${ansi.yellow}切换模型失败：${ansi.reset}${friendlyError(err)}`,
+      );
+      this.scheduleRender();
+    }
+  }
+
+  /**
    * 请求用户确认。
    *
    * 确认框只有一个（`pendingConfirm`），而**并行的子代理可能同时请求确认** ——
@@ -794,6 +920,12 @@ export class TuiApp {
     const key = normalizeKey(rawKey);
     if (this.pendingConfirm) {
       this.handleConfirmKey(key);
+      return;
+    }
+    // 单选浮层（/model）优先吃掉按键：此时输入区已被列表取代，
+    // 否则输入框会一边显示列表、一边把按键当文本插入
+    if (this.pendingSelect) {
+      this.handleSelectKey(key);
       return;
     }
 
@@ -1253,6 +1385,70 @@ export class TuiApp {
     this.lines.push(`  ${approved ? ansi.green : ansi.yellow}${label}${ansi.reset}`);
     pending.resolve(approved);
     this.scheduleRender();
+  }
+
+  /**
+   * 在输入区打开一个单选列表，返回选中项的 value（Esc / Ctrl+C 取消时 undefined）。
+   *
+   * 为什么不用 CLI 的 `promptSelect`：它要 `stdin.setRawMode(true)` 接管按键，
+   * 而 TUI 已常驻 raw 模式、有自己的一套按键处理，两者会互相抢键
+   * （`/resume` 当年就是因此改成「先列表、再带编号」）。这里改为「把输入区换成浮层」，
+   * 复用 pendingConfirm 那套「界面内浮层 + 自己吃按键」的做法。
+   */
+  private requestSelect(
+    title: string,
+    options: PendingSelectOption[],
+    detail?: string,
+    defaultIndex = 0,
+  ): Promise<string | undefined> {
+    return new Promise<string | undefined>((resolve) => {
+      this.pendingSelect = {
+        title,
+        detail,
+        options,
+        index: Math.min(Math.max(0, defaultIndex), Math.max(0, options.length - 1)),
+        resolve,
+      };
+      this.scheduleRender();
+    });
+  }
+
+  private resolveSelect(value: string | undefined): void {
+    const pending = this.pendingSelect;
+    if (!pending) return;
+    this.pendingSelect = undefined;
+    pending.resolve(value);
+    this.scheduleRender();
+  }
+
+  private handleSelectKey(key: string): void {
+    const pending = this.pendingSelect!;
+    const count = pending.options.length;
+    switch (key) {
+      case "\x1b[A": // Up
+      case "k":
+        pending.index = (pending.index - 1 + count) % count;
+        this.scheduleRender();
+        return;
+      case "\x1b[B": // Down
+      case "j":
+        pending.index = (pending.index + 1) % count;
+        this.scheduleRender();
+        return;
+      case "\r":
+        this.resolveSelect(pending.options[pending.index]?.value);
+        return;
+      case "\x1b": // Esc
+      case "\x03": // Ctrl+C
+        this.resolveSelect(undefined);
+        return;
+      default:
+        // 数字键直选（1..9）：列表通常只有几个模型，比连按方向键快
+        if (/^[1-9]$/.test(key)) {
+          const index = Number(key) - 1;
+          if (index < count) this.resolveSelect(pending.options[index].value);
+        }
+    }
   }
 
   private insertText(text: string): void {
@@ -1817,26 +2013,10 @@ export class TuiApp {
         );
         break;
       }
-      case "model": {
-        this.lines.push(
-          `${ansi.gray}当前模型：${ansi.reset}${this.modelProviderLabel} / ${this.modelLabel}${ansi.reset}`,
-        );
-        // 顺序即回退优先级：当前模型调用失败会沿这张表往后找下一个
-        const entries = effectiveModels(this.options.config);
-        if (entries.length > 0) {
-          this.lines.push(`${ansi.gray}已配置模型（按回退顺序）：${ansi.reset}`);
-          entries.forEach((entry, index) => {
-            const current = entry.model === this.modelLabel ? " ← 当前" : "";
-            this.lines.push(
-              `${ansi.gray}  ${index + 1}. ${entry.id}${current}${ansi.reset}`,
-            );
-          });
-        }
-        this.lines.push(
-          `${ansi.gray}管理模型（新增 / 删除）：${ansi.reset}xzh model${ansi.reset}`,
-        );
+      case "model":
+        // 查看 / 切换当前模型；选中的模型会写回配置，下次启动继续用它
+        void this.handleModelCommand(arg);
         break;
-      }
       default:
         this.lines.push(`${ansi.yellow}未知命令：/${command}，输入 /help 查看帮助。${ansi.reset}`);
     }
@@ -2456,7 +2636,7 @@ export class TuiApp {
       `  /cwd           显示当前工作目录`,
       `  /switch <目录> 切换项目（载入该项目上次会话接着聊）`,
       `  /term          显示/隐藏右侧终端面板（/term clear 清空输出）`,
-      `  /model         显示当前模型与已配置模型（按回退顺序）`,
+      `  /model [编号|id|模型名]  查看 / 切换当前模型（不带参数：↑ ↓ 选择，Enter 确认）`,
       `  /auto [on|off] 切换自动批准（on：所有工具直接执行，写入配置）`,
       `  /intent [on|off] 切换意图分析（on：每条消息先做意图分析再处理，写入配置）`,
       `  /exit          退出玄猪`,
@@ -2578,7 +2758,9 @@ export class TuiApp {
 
     const inputBlock = this.pendingConfirm
       ? this.layoutConfirm(leftWidth)
-      : this.layoutInput(leftWidth);
+      : this.pendingSelect
+        ? this.layoutSelect(leftWidth)
+        : this.layoutInput(leftWidth);
     const inputRows = inputBlock.lines.length;
     const statusRows = 1;
 
@@ -2684,7 +2866,8 @@ export class TuiApp {
 
     out += cursor.to(rows, 1) + "\x1b[2K" + this.renderStatus(columns);
 
-    if (this.pendingConfirm) {
+    if (this.pendingConfirm || this.pendingSelect) {
+      // 浮层（确认框 / 单选列表）期间没有文本光标可定位
       out += cursor.hide;
     } else if (this.termFocus && termWidth > 0 && panel.cursorRow > 0) {
       // 焦点在右侧终端：光标定位到终端输入行（面板从 leftWidth+2 列开始）
@@ -2952,6 +3135,79 @@ export class TuiApp {
     lines.push(`  ${allow}  ${deny}   ${ansi.gray}← → 切换 · Enter 确认 · y/n 快捷${ansi.reset}`);
     return { lines, cursorRow: 0, cursorCol: 0 };
   }
+
+  /** 单选浮层（`/model`）：高亮当前项，选项多时围绕它开窗，保证它始终可见 */
+  private layoutSelect(width: number): InputLayout {
+    const pending = this.pendingSelect!;
+    const lines: string[] = [];
+    lines.push(`${ansi.bold}${pending.title}${ansi.reset}`);
+    if (pending.detail) {
+      for (const wrapped of wrapText(`${ansi.gray}${pending.detail}${ansi.reset}`, width - 4)) {
+        lines.push(`  ${wrapped}`);
+      }
+    }
+
+    const MAX_ROWS = 10;
+    const total = pending.options.length;
+    const { start, end } = selectWindow(total, pending.index, MAX_ROWS);
+    pending.options.slice(start, end).forEach((option, offset) => {
+      const index = start + offset;
+      const hint = option.hint ? `  ${ansi.gray}${option.hint}${ansi.reset}` : "";
+      const text = ` ${index + 1}. ${option.label}`;
+      lines.push(
+        index === pending.index
+          ? `${ansi.inverse}${text}${ansi.reset}${hint}`
+          : `${ansi.gray}${text}${ansi.reset}${hint}`,
+      );
+    });
+    if (total > MAX_ROWS) {
+      lines.push(`  ${ansi.gray}…共 ${total} 个模型${ansi.reset}`);
+    }
+    lines.push(
+      `  ${ansi.gray}↑ ↓ 选择 · 数字直选 · Enter 确认 · Esc 取消${ansi.reset}`,
+    );
+    return { lines, cursorRow: 0, cursorCol: 0 };
+  }
+}
+
+/**
+ * 单选列表的可视窗口：围绕高亮项开窗，保证它始终在屏上。
+ *
+ * 纯函数（而不是写在 layoutSelect 里）是因为这段下标的边界条件最容易写错，
+ * 而 TUI 本身没有可跑的测试环境。
+ */
+export function selectWindow(
+  total: number,
+  index: number,
+  maxRows: number,
+): { start: number; end: number } {
+  if (total <= maxRows) return { start: 0, end: Math.max(0, total) };
+  const start = Math.min(
+    Math.max(0, index - Math.floor(maxRows / 2)),
+    total - maxRows,
+  );
+  return { start, end: start + maxRows };
+}
+
+/**
+ * 把 `/model` 的参数解析成模型条目：先按序号，再按 id / 模型名（大小写不敏感）。
+ *
+ * 放在模块级（而不是 TUI 的私有方法）是为了能单独测 —— 它是这条命令里唯一
+ * 有分支逻辑、又最容易写错的部分。
+ */
+export function resolveModelChoice(
+  entries: ModelEntry[],
+  arg: string,
+): ModelEntry | undefined {
+  const text = arg.trim();
+  // 只有**纯数字**才当序号：否则 "gpt-4o" 这类名字会被 parseInt 误判成第 4 个
+  if (/^\d+$/.test(text)) return entries[Number(text) - 1];
+  const lower = text.toLowerCase();
+  return (
+    entries.find((entry) => entry.id === text) ??
+    entries.find((entry) => entry.model === text) ??
+    entries.find((entry) => entry.id.toLowerCase() === lower)
+  );
 }
 
 // ------------------------------------------------------------ 输入分片容错

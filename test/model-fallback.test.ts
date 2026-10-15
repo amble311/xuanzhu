@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import {
   DEFAULT_CONFIG,
   activeModelEntry,
   effectiveModels,
+  loadConfig,
   modelId,
   nextModelAfter,
   rememberModel,
@@ -11,6 +15,8 @@ import {
   type ModelEntry,
   type XuanZhuConfig,
 } from "../src/config/store";
+import { Agent, type AgentEvents } from "../src/core/agent";
+import { createProvider } from "../src/llm";
 import { getConfigDir } from "../src/utils/paths";
 
 /**
@@ -140,4 +146,49 @@ describe("删除模型时维护「当前使用」的指针", () => {
     expect(cfg.model).toBe(a.model);
     expect(activeModelEntry(cfg)?.id).toBe(a.id);
   });
+});
+
+/**
+ * 会话内 `/model`：用户主动切换（不是调用失败回退）。
+ *
+ * 覆盖两段：界面里的参数解析（`resolveModelChoice`）与真正切换状态并落盘的
+ * `Agent.switchModel`。用 ollama（本地 provider，不需要 API Key）以便完全离线执行。
+ */
+describe("会话内手动切换模型（/model）", () => {
+  const ollamaA = entry("ollama", "llama3");
+  const ollamaB = entry("ollama", "qwen2.5-coder");
+
+  const tmpCwd = (): string => fs.mkdtempSync(path.join(os.tmpdir(), "xzh-model-"));
+  const events = (): AgentEvents => ({
+    onText: () => undefined,
+    onToolStart: () => undefined,
+    onToolEnd: () => undefined,
+    onStatus: () => undefined,
+    confirm: async () => true,
+  });
+
+  it("切换后 Agent、内存配置与磁盘配置都指向新模型；已是当前模型时返回 false", () => {
+    const cfg = configOf([ollamaA, ollamaB], ollamaA);
+    const agent = new Agent(
+      createProvider(cfg, ollamaA),
+      cfg,
+      tmpCwd(),
+      events(),
+      ollamaA,
+    );
+    expect(agent.getActiveModel()?.id).toBe(ollamaA.id);
+
+    expect(agent.switchModel(ollamaB)).toBe(true);
+    expect(agent.getActiveModel()?.id).toBe(ollamaB.id);
+    // 记住选择：下次启动（activeModelEntry）直接用它
+    expect(activeModelEntry(cfg)?.id).toBe(ollamaB.id);
+    // 且已经落盘 —— 否则「切了但重启又变回去」
+    const saved = loadConfig();
+    expect(saved.provider).toBe("ollama");
+    expect(saved.model).toBe(ollamaB.model);
+
+    // 选中的就是当前模型：不算切换，不再重复写盘
+    expect(agent.switchModel(ollamaB)).toBe(false);
+  });
+
 });

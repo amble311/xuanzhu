@@ -130,6 +130,14 @@ Agent.run(text) ──► LLMProvider.chat({ messages, tools })
    两道安全网：`MAX_HISTORY_MESSAGES`（400 条）在**组装请求**（`buildConversation`）与
    **持久历史**（`trimHistory`）两侧都生效 —— 只作用于请求副本时，窗口配得很大的模型
    （1M 上下文）会让 `this.history` 一路堆到几十万 token 对应的条数，而每轮都要全量复制它。
+   - **裁剪必须告知模型**（`contextTrimmedNote()`）：裁剪是**静默且永久**的，而模型看到的是一段
+     从中途开始的历史 —— 上文里一个没有结论的旧任务会显得像"用户正等我做完它"。
+     实测（2026-10-14）：用户只发了句「在吗」，模型却接着执行上一轮的旧任务（起 API、查登录凭据）。
+     因此一旦本次会话裁过历史（`Agent.historyTrimmed`，由 `trimHistory()` 或被请求侧丢弃时置位），
+     之后每次请求都在最前面附一条 `system` 说明：**「更早的对话已被裁剪，你看到的不是完整历史；
+     残缺的旧任务不代表要接着做，先回应用户当前这条消息」**。
+     它只加在**请求副本**上（不进 `this.history`，避免每裁一次就往历史里堆一条）；
+     `reset()` / `restoreSession()` 会清掉标记（恢复的会话无从判断是否裁过，按未裁过处理）。
 8. **token 估算闭环**：每次流结束时（`done` 事件）若 Provider 带回了真实 `usage`，
    就用 `真实 prompt token / 本次估算` 更新该模型的校正器（`calibration.ts`，EWMA、
    进程内按模型共享），下一次计算会话预算时按比值**收紧**（`calibrateBudget()`）。
@@ -148,6 +156,9 @@ Agent.run(text) ──► LLMProvider.chat({ messages, tools })
      **重复执行**已经生效的写文件 / 执行命令。说明（`abortNote()`，`role: "system"`）列出
      中止前**真实执行过**的工具调用（`name(参数)`，最多 12 条、参数截断到 120 字符；
      被自我修正 / 重复检测**跳过**的占位不算），并要求模型直接回应最新消息、不要接着做旧任务。
+     措辞上必须点明这份清单**是已执行记录、不是待办**，并给出「用户只发来寒暄（「在吗」）
+     就照它回答」的明确指引 —— 光写「不要接着做旧任务」实测拦不住：清单本身太像一份待办，
+     模型会顺着它往下做。
      用 `system` 角色是因为它**不参与 user / assistant 的交替结构**（Anthropic 与 Gemini 会把它
      并入系统提示词），无论历史上被裁到哪一条都不会让请求结构非法。
    - 本轮什么都没真正执行时（纯聊天被打断）返回一条都不加 —— 无可交代，避免无谓噪音。
@@ -617,11 +628,20 @@ AutoJs6 连接的三个必要策略（`autojs6/client.ts`）：**指数退避自
 - **删除时维护指针**：`removeModel()` 若删掉的正是「上次使用」的那个，把指针切到剩下的第一项
   （直接读 `config.models` 判定，不能经 `effectiveModels()` —— 它在 `models` 为空时会回退到
   `provider` / `model` 兼容字段，导致刚删掉的模型被当成「仍然存在」写回去）。
+- **界面内切换（`/model`）**：`Agent.switchModel(entry)` 是**用户主动**切换的入口，
+  与回退共用同一套状态更新（重建 provider → 更新 `activeModel` → `rememberModel()` → 写盘），
+  差别是**不做可用性校验**（用户选的模型好不好用交给下一次调用，失败仍照常回退）。
+  选中的就是当前模型时返回 false（不重复写盘）；`busy` 期间拒绝切换。
+  界面侧走 TUI 自己的**单选浮层**（`pendingSelect` + `handleSelectKey()` + `layoutSelect()`），
+  而不是 CLI 的 `promptSelect` —— 后者要 `setRawMode(true)` 接管 stdin，会与 TUI 的按键处理抢键
+  （`/resume` 当年也是因此改成「先列表、再带编号」）。`/model <编号|id|模型名>` 的参数解析
+  （`resolveModelChoice()`）与列表窗口（`selectWindow()`）是纯函数，单独有测试覆盖。
 - **界面反馈**：回退通过 `AgentEvents.onModelChange` / `onNotice` 呈现，
-  顶部与状态栏显示当前模型（不再有 `w6` 一类的权重标记）。
+  顶部与状态栏显示当前模型（不再有 `w6` 一类的权重标记）；手动切换复用同一条提示路径
+  （理由写作「手动切换」）。
 - **序号语义**：`xzh model list` 按**配置顺序**展示（不排序 —— 这个顺序就是回退顺序），
   `remove` / `context` / `vision` 的序号参数按**同一顺序**解析
-  （`resolveModelKey` 优先精确匹配 id、再模型名、最后才是序号）。
+  （`resolveModelKey` 优先精确匹配 id、再模型名、最后才是序号）。`/model` 的编号同理。
 
 ## 8. 界面渲染
 
@@ -658,6 +678,11 @@ AutoJs6 连接的三个必要策略（`autojs6/client.ts`）：**指数退避自
   从而避免因折行触发整屏滚动而造成的「内容重复 / 光标错位」。
 - 显示宽度计算支持全角字符（中文占 2 列）。
 - 渲染节流：状态变化合并到 ~16ms 一次重绘，避免闪烁。
+- **输入区浮层**：确认框（`pendingConfirm`，二选一）与单选列表（`pendingSelect`，用于 `/model`）
+  都会把输入区整块替换掉，并在 `handleKey` 里**先吃掉本次按键**（不这样做，按键会漏进输入框，
+  表现为「浮层显示着、输入框同时在打字」），浮层期间隐藏光标。
+  单选列表刻意复用「界面内自己吃按键」的做法，而不用 CLI 的 `promptSelect` ——
+  后者 `setRawMode(true)` 接管 stdin，与 TUI 的 raw 模式互相抢键。
 - **Markdown 行渲染**（`src/tui/markdown.ts`）：逐行把模型输出转成带颜色的行，
   并跨 chunk 跟踪代码块状态。三条容易出错的约束：
   - **每一物理行必须自洽**：`wrapText()` 折行时在行尾补 `reset`、并在续行**重新打开**
