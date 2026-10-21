@@ -305,20 +305,30 @@ ${ansi.bold}用法${ansi.reset}
   ${ansi.green}xzh model add <provider> <model> [上下文窗口] [on|off]${ansi.reset}
                             新增模型（末尾 on/off = 是否支持图片输入）
   ${ansi.green}xzh model remove <id|序号>${ansi.reset}    删除模型
+  ${ansi.green}xzh model context <id|序号> [大小]${ansi.reset}
+                            调整上下文窗口（留空则自动推断）
+  ${ansi.green}xzh model vision <id|序号> <on|off>${ansi.reset}
+                            标注是否支持图片输入
   ${ansi.green}xzh config${ansi.reset}              查看当前配置（API Key 脱敏）
   ${ansi.green}xzh config edit${ansi.reset}         使用 nano 编辑配置文件
   ${ansi.green}xzh config path${ansi.reset}         打印配置文件路径
   ${ansi.green}xzh config init${ansi.reset}         生成默认配置文件
-  ${ansi.green}xzh setup${ansi.reset}               检查并自动安装技能依赖（playwright / officecli 等）
+  ${ansi.green}xzh setup${ansi.reset}               检查并安装依赖（剪贴板工具 + 技能 CLI）
   ${ansi.green}xzh skill${ansi.reset}               交互式管理技能（启用 / 禁用 / 删除，禁用的技能对模型不可见）
   ${ansi.green}xzh skill list${ansi.reset}          列出全部技能（含来源与状态）
   ${ansi.green}xzh skill enable/disable <名称>${ansi.reset}
                             启用 / 禁用技能
   ${ansi.green}xzh skill delete <名称>${ansi.reset} 删除技能（仅限用户技能；内置技能请用 disable）
-  ${ansi.green}xzh device${ansi.reset}              与手机上的 AutoX.js / Auto.js 通信（设备桥）
-  ${ansi.green}xzh device serve${ansi.reset}        启动设备桥并常驻（手机连上后可推送脚本并运行）
-  ${ansi.green}xzh device run <文件>${ansi.reset}   把脚本推到手机并运行（push 则只保存不运行）
+  ${ansi.green}xzh device${ansi.reset}              与手机上的 AutoJs6 / AutoX.js 通信（设备桥）
+  ${ansi.green}xzh device serve${ansi.reset}        等手机连过来并常驻（AutoX.js 9317 + AutoJs6 客户端模式 6347）
+  ${ansi.green}xzh device connect <手机IP>${ansi.reset}  反过来连手机上的 AutoJs6（服务器模式）
+  ${ansi.green}xzh device status|list${ansi.reset}  查看桥与已连接设备
+  ${ansi.green}xzh device push|run <文件>${ansi.reset}   把脚本推到手机（保存 / 保存并运行）
+  ${ansi.green}xzh device stop${ansi.reset}         停止手机上正在运行的脚本
   ${ansi.green}xzh device logs${ansi.reset}         查看手机上的脚本日志
+  ${ansi.green}xzh device check${ansi.reset}        体检：无障碍服务是否就绪、能否操作手机
+  ${ansi.green}xzh device shot [输出文件]${ansi.reset}   截取手机当前屏幕并保存为 JPEG
+  ${ansi.green}xzh device apk${ansi.reset}          查看/安装手机端 AutoJs6 的安装包
   ${ansi.green}xzh --help${ansi.reset}              显示本帮助
   ${ansi.green}xzh --version${ansi.reset}           显示版本
 
@@ -339,9 +349,11 @@ ${ansi.bold}多模型与回退${ansi.reset}
   **列表顺序即优先级**（${ansi.gray}xzh model list${ansi.reset} 的顺序），没有权重设置。
 
 ${ansi.bold}界面内快捷键${ansi.reset}
-  Enter 提交 · Ctrl+J 换行 · ↑/↓ 历史 · PgUp/PgDn 滚动
-  Ctrl+C 中断任务/退出 · Ctrl+L 清屏 · 输入 /help 查看内置命令
+  Enter 提交 · Alt+Enter（或 Ctrl/Shift+Enter）换行 · ↑/↓ 历史 · PgUp/PgDn 滚动
+  Ctrl+A / Ctrl+E 行首 / 行尾 · Ctrl+C 中断任务 / 退出 · Ctrl+D 结束本轮对话（不退出）
+  Ctrl+L 清屏 · Ctrl+V 粘贴图片 · Shift+Tab 切换右侧终端 · 输入 /help 查看内置命令
   切换项目目录：在界面中输入 ${ansi.green}/switch <目录>${ansi.reset}
+  临时换模型：${ansi.green}/model${ansi.reset}（↑ ↓ 选择，Enter 确认）
 `;
   process.stdout.write(help);
 }

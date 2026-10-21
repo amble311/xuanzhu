@@ -4,12 +4,15 @@
  * ```
  * src/device/
  *   protocol.ts        AutoX.js 的线协议（WebSocket 文本帧；手机连电脑）
- *   server.ts          DeviceBridge —— 设备注册表 / 日志缓冲 / 本地 HTTP 控制通道
+ *   server.ts          DeviceBridge —— 设备注册表 / 日志缓冲 / 本地 HTTP 控制通道（/shot 等）
  *   client.ts          控制通道客户端（一次性 CLI 命令与 Agent 工具共用）
  *   apk.ts             AutoJs6 安装包的 ABI 探测、本地缓存查找与安装引导
+ *   screenshot.ts      手机端截图脚本模板（点掉系统授权框 → 截屏 → POST 回 /shot）
+ *   ui-dump.ts         手机端「读界面」脚本模板（无障碍树转文字）
  *   autojs6/
- *     protocol.ts      AutoJs6 的线协议（裸 TCP + 8 字节分帧；xzh 连手机）
- *     client.ts        AutoJs6 出站连接（含断线重连与放弃策略）
+ *     protocol.ts      AutoJs6 的线协议（裸 TCP + 8 字节分帧、hello 握手）
+ *     server.ts        AutoJs6 客户端模式的服务端（手机连我们的 6347）
+ *     client.ts        AutoJs6 出站连接（xzh 连手机的 7347，含断线重连与放弃策略）
  * ```
  *
  * ⚠ `autojs6/protocol.ts` **不整体 re-export**：它的 `helloReply` / `commandMessage`

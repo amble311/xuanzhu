@@ -23,13 +23,14 @@ dist/
 # 不忽略就会把这些与发布无关的东西一起提交上去。
 tmp/
 
-# ── 项目级 AI 指南（只留本地，不入库、不进 npm 包）──────────
+# ── 项目级 AI 指南与设计文档（只留本地，不入库、不进 npm 包）──────
 # AGENTS.md 是给 AI 助手看的本项目约定（目录约定、分层、文档同步要求等），
-# 属于开发者的本地工作资产，不是要分发的内容。
-# release.sh 用的是 `git add -A`，不忽略就会每次发布都把它推上 GitHub。
-# npm 侧由 package.json 的 files 白名单拦住（只发 bin / dist / docs / README / LICENSE），
-# 这里不必重复排除；本条只管 git。
+# docs/ 是设计文档（架构说明 + 英文版 README）。两者都是开发者的本地工作资产，
+# 不是要分发的内容：npm 侧由 package.json 的 files 白名单拦住
+# （只发 bin / dist / README / LICENSE），git 侧由下面两条拦住 ——
+# release.sh 用的是 `git add -A`，不忽略就会每次发布都把它们推上 GitHub。
 AGENTS.md
+docs/
 
 # ── 根目录的 MEMORY.md（本地资产，不入库）──────────────────
 # 本项目的记忆在 .xuanzhu/ 下（已忽略）。根目录若出现 MEMORY.md，多半是从别的项目

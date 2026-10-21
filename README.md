@@ -1,7 +1,5 @@
 # 玄猪 XuanZhu
 
-[English](https://github.com/amble311/xuanzhu/blob/main/docs/README.en.md) | **中文**
-
 > 专为终端打造的 AI 编码 Agent —— 一条 `xzh` 命令，把 AI 编程助手带进你的终端。
 
 ## 快速上手
@@ -198,6 +196,8 @@ XZH_HOME=/path/to/dir xzh          # 改用 /path/to/dir/config.json
   "temperature": 0.2,
   "maxToolRounds": 200,
   "autoApprove": true,
+  "mouseCapture": true,
+  "confirmSensitiveRead": false,
   "memoryMaxChars": 12000,
   "maxParallelAgents": 4,
   "intent": { "enabled": false },
@@ -209,6 +209,21 @@ XZH_HOME=/path/to/dir xzh          # 改用 /path/to/dir/config.json
   }
 }
 ```
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `provider` / `model` | — | 「上次使用」的模型（每次切换由玄猪写回） |
+| `models` | `[]` | 已配置模型，**顺序即回退优先级** |
+| `temperature` | `0.2` | 采样温度 |
+| `maxToolRounds` | `200` | 单轮任务内工具调用轮数上限（用尽时询问是否追加） |
+| `autoApprove` | `true` | 自动批准工具（`false` 时写文件/执行命令前询问） |
+| `mouseCapture` | `true` | 接管鼠标：滚轮滚动 + 输出区拖拽选中复制（`/mouse` 切换） |
+| `confirmSensitiveRead` | `false` | 读取凭据类文件（`.env`、`~/.ssh`、`config.json` 等）时是否确认 |
+| `memoryMaxChars` | `12000` | 长期记忆字符上限，超出即自动精简（`0` = 不限制长度，仍去重） |
+| `maxParallelAgents` | `4` | 并行子代理数量上限（`1` = 串行，硬上限 16） |
+| `intent.enabled` | `false` | 意图分析（每条消息先分析再处理） |
+| `intent.prompt` | 内置模板 | 意图分析模板，占位符 `{{'用户发送过来的消息'}}` |
+| `systemPromptExtra` | — | 追加到系统提示词的额外内容 |
 
 > 旧版配置（只有 `provider` / `model`、没有 `models`）依然可用：会被视为唯一的一个模型。
 > 旧配置里的 `weight` / `decayed` 字段已废弃，读取时会被忽略、下次保存时自动清掉。
@@ -244,7 +259,7 @@ xzh model remove openai/gpt-4o         # 删除（id / 模型名 / 序号均可�
 想让某个模型**不参与回退**，直接 `xzh model remove` 删掉即可。当前使用的模型显示在界面顶部与状态栏，
 发生回退时输出区会给出提示；想临时换一个用，直接在对话里 `/model` 选（`xzh model` 仍是增删改的入口）。
 
-> ⚠️ `xzh model add` 的位置参数自 v0.5 起**整体前移一位**（原来的 `[权重]` 已取消）：
+> ⚠️ `xzh model add` 的位置参数自 **0.4.2** 起**整体前移一位**（原来的 `[权重]` 已取消）：
 > 现在是 `add <provider> <model> [上下文窗口] [on|off]`。
 
 ### 上下文窗口的作用
@@ -354,6 +369,8 @@ API Key 也可以来自环境变量，优先级低于配置文件：
 | `device_run` | 把脚本推到手机并立即运行 | 是 |
 | `device_stop` | 停止手机上的脚本（默认全部） | 是 |
 | `device_logs` | 读取手机上的脚本日志 | 否 |
+| `device_read_screen` | 读取手机当前界面（包名 / 控件文本与位置），**以文字返回** | 否 |
+| `device_screenshot` | 截取手机屏幕，**图片随结果附给模型**（控件读不到时用它，再按坐标点击） | 否 |
 
 ## 任务拆分与子代理
 
@@ -372,11 +389,12 @@ API Key 也可以来自环境变量，优先级低于配置文件：
 > 只有声明了 `parallelSafe` 的工具会进入并行批次（目前仅 `task`）。写文件、编辑、
 > 执行命令这类工具有副作用且可能互相依赖，始终按顺序串行执行，不会被并行化。
 
-内置一个子代理，通过 `subagent_name` 指定（默认即它）：
+内置两个子代理，通过 `subagent_name` 指定（默认 `code-explorer`）：
 
 | 子代理 | 能力 | 何时用 |
 | --- | --- | --- |
 | `code-explorer` | **只读**（`read_file` / `list_dir` / `glob` / `grep` / `list_skills` / `load_skill`） | 跨多个文件、目录或命名约定的搜索；单次 `read_file` / `grep` 覆盖不了的探索 |
+| `test-runner` | **只运行、不修改**（`bash` + 读取类工具）：跑全量或指定测试，汇报通过/失败清单、失败原因与可复跑命令 | 测试输出会很长时；改完代码想确认是否全绿；只想拿到「哪几条挂了、为什么」而不想自己翻日志 |
 
 `task` 的参数：
 
@@ -664,6 +682,7 @@ description: 一句话说明该技能的用途与适用场景
 | `Shift+Tab` | 切换焦点（对话 ⇄ 右侧终端） |
 | 鼠标点击 | 焦点跟随点击的栏 |
 | 鼠标滚轮 | 按区域滚动（左：对话区；右：终端输出） |
+| `Ctrl+A` / `Ctrl+E` | 光标移到行首 / 行尾 |
 | `Ctrl+C` | 中断当前任务 / 清空输入 / 退出（空闲且输入为空时退出） |
 | `Ctrl+D` | 结束本轮正在进行的对话（**任何情况下都不会退出玄猪**）；终端面板内为中断运行中的命令 |
 | `Ctrl+L` | 清屏（终端面板内为清空命令输出） |
@@ -694,7 +713,7 @@ description: 一句话说明该技能的用途与适用场景
 kitty / Ghostty 会把该 xterm 兼容序列映射成「所有按键都用转义码上报」而破坏普通输入，
 故玄猪对这两类终端不发送请求，请改用 `Alt+Enter` 或在终端侧自行配置。
 
-界面内命令：`/help`、`/clear`、`/tools`、`/image`、`/copy [N|all]`、`/mouse`、`/reset`、`/cwd`、`/switch <目录>`、`/term`、`/model [编号|id|模型名]`、`/auto [on|off]`、`/intent [on|off]`、`/exit`。
+界面内命令：`/help`、`/clear`、`/tools`、`/device`、`/image`（`/paste`）、`/copy [N|A-B|last|all]`、`/mouse`、`/reset`、`/undo`、`/resume [编号]`、`/cwd`、`/switch <目录>`、`/term`、`/model [编号|id|模型名]`、`/auto [on|off]`、`/intent [on|off]`、`/exit`。
 
 ### 选中与复制
 
@@ -764,17 +783,20 @@ XZH_KITTY_KEYS=1 xzh
 
 ```
 src/
-├── cli/      命令行入口与命令
-├── core/     Agent 循环与提示词
-├── llm/      LLM Provider 抽象与实现
-├── tools/    终端工具集（含 list_skills / load_skill）
-├── skills/   技能发现与加载
-├── tui/      全屏终端界面
-├── config/   配置读写
-└── utils/    ANSI 与路径工具
+├── cli/        命令行入口与子命令（model / config / skill / device / setup）
+├── core/       Agent 循环、系统提示词、会话持久化
+├── llm/        LLM Provider 抽象与实现、上下文裁剪、token 校正
+├── tools/      终端工具集（文件 / bash / 记忆 / 技能 / 任务列表 / 子代理 / 设备桥）
+├── subagents/  子代理注册表（code-explorer / test-runner）
+├── device/     手机设备桥（AutoJs6 协议、服务端、APK 探测、截图、界面树）
+├── skills/     技能发现、依赖检测与安装
+├── tui/        全屏终端界面
+├── workspace/  项目级工作区（.xuanzhu：记忆 + 规则）
+├── config/     配置读写
+└── utils/      ANSI / 备份 / 剪贴板 / 并发 / 崩溃诊断 / 路径
 ```
 
-详见 [docs/ARCHITECTURE.md](https://github.com/amble311/xuanzhu/blob/main/docs/ARCHITECTURE.md)。
+架构说明与设计取舍由开发者**本地维护**（`AGENTS.md` 与 `docs/`），**不随包分发、也不在 GitHub 仓库中**。
 
 ## 开发
 
@@ -791,12 +813,13 @@ node bin/xzh.js     # 本地运行
 ```bash
 ./release.sh                         # 版本尾号 +1（0.1.4 → 0.1.5）
 ./release.sh minor                   # 0.1.4 → 0.2.0
-./release.sh 1.0.0                   # 指定版本
+./release.sh major                   # 0.1.4 → 1.0.0
+./release.sh 1.2.3                   # 指定版本
 XZH_RELEASE_DRY_RUN=1 ./release.sh   # 先演练一遍，不做任何写入
 ```
 
-脚本会依次完成：**版本号 +1 → `npm publish` → 等待 registry 同步 → 提交并推送 GitHub
-→ 更新本机全局安装**。
+脚本会依次完成：**bump 版本号（含 lock）→ 把 `CHANGELOG.md` 的 `[未发布]` 段收成本次版本
+→ `npm publish` → 等待 registry 同步 → `git add -A` + 提交 + 推送 GitHub → 更新本机全局安装**。
 
 之所以需要脚本，是因为这条链路有几个反直觉的地方：`npm publish` 返回成功**不等于**
 registry 已可见（npm 有 staging 阶段，期间 `npm view` / `npm install` 会报 `notarget`），
@@ -808,7 +831,8 @@ registry 已可见（npm 有 staging 阶段，期间 `npm view` / `npm install` 
 | `XZH_RELEASE_YES=1` | 跳过发布前的确认提示 |
 | `XZH_RELEASE_SKIP_GIT=1` | 不推送 GitHub |
 | `XZH_RELEASE_SKIP_LOCAL=1` | 不更新本机全局安装 |
-| `XZH_RELEASE_WAIT=<秒>` | 等待 registry 同步的上限（默认 300） |
+| `XZH_RELEASE_WAIT=<秒>` | 等待 registry 同步的上限（默认 300；超时后仍可手工 `npm i -g xuanzhu@<版本>`） |
+| `NO_COLOR=1` | 输出不带颜色（适合日志 / CI） |
 
 ## 致谢
 

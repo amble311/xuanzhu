@@ -305,10 +305,12 @@ function actionResult(
 /**
  * 截取手机当前屏幕。
  *
- * ⚠ 关键限制：工具返回值是**纯文本**，模型**看不到图片内容**。因此这个工具的价值是
- * "给用户产出一个截图文件"，而不是"让模型看图"。想让模型自己判断界面上有什么，
- * 应该在脚本里用文本树（`text()` / `textMatches().find()`）把结果**打印成文字**，
- * 再用 `device_logs` 读回来 —— 那才是模型能"看见"的形式。
+ * 图片**会送给模型**：`ToolResult.images` 由 Agent 转成一条额外的 user 消息追加在工具
+ * 结果之后（各家的 `tool` 消息都不接受图片）。因此有两种"看屏幕"的方式：
+ *   - `device_read_screen`：文字界面树，最省 token，能读到控件就行它；
+ *   - 本工具：控件读不到（微信 / 应用分身 / 游戏）时看图，再按坐标 `click(x,y)`。
+ * 模型不支持视觉时，Agent 的「去掉图片重试」兜底照常生效，结果里也会提示改走
+ * `device_read_screen`。
  */
 const deviceScreenshotTool: ToolDefinition = {
   name: "device_screenshot",
