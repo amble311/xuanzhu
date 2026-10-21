@@ -14,6 +14,8 @@ import { memoryCompactTool, memoryReadTool, memoryWriteTool } from "./memory";
 import { listSkillsTool, loadSkillTool } from "./skills";
 import { todoWriteTool } from "./todo";
 import type { ToolContext, ToolDefinition, ToolResult } from "./types";
+import { recordErrorReport } from "../utils/error-reports";
+import { resolveProjectPaths } from "../workspace";
 
 export * from "./types";
 
@@ -150,6 +152,16 @@ export async function executeTool(
   try {
     return await tool.execute(args, ctx);
   } catch (err) {
+    // 工具内部**抛异常**说明实现有问题（可预期的失败应当返回 ok:false），
+    // 因此这里落一份错误报告；返回值仍是正常的失败结果，不影响对话继续。
+    recordErrorReport({
+      kind: "tool-error",
+      category: "bug",
+      error: err,
+      tool: name,
+      cwd: ctx.cwd,
+      project: resolveProjectPaths(ctx.cwd).dir,
+    });
     return {
       ok: false,
       content: `工具执行异常：${err instanceof Error ? err.message : String(err)}`,

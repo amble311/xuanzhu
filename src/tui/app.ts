@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { Agent, type AgentEvents } from "../core/agent";
 import {
+  appendSessionMessages,
   listSessions,
   loadSessionMessages,
   startSession,
@@ -187,6 +188,8 @@ export class TuiApp {
   private suspended = false;
   private busy = false;
   private exited = false;
+  /** 本次退出是被谁触发的（写进「上一轮已中止」说明，便于事后分辨断线 / 被终止） */
+  private shutdownReason?: string;
   private autoApprove: boolean;
   /** 是否启用意图分析（界面内用 /intent 切换并写回配置） */
   private intentEnabled: boolean;
@@ -406,6 +409,10 @@ export class TuiApp {
     process.stdin.resume();
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", this.onData);
+    // SSH 断线时 sshd 关闭 pty：正常会收到 SIGHUP（见 cli/index.ts），
+    // 这里再兜一层 stdin EOF —— 某些托管方式只关管道、不给信号。
+    process.stdin.on("end", this.onInputClosed);
+    process.stdin.on("close", this.onInputClosed);
     process.stdout.on("resize", this.onResize);
   }
 
@@ -462,21 +469,33 @@ export class TuiApp {
       this.escTimer = undefined;
     }
     process.stdin.off("data", this.onData);
+    process.stdin.off("end", this.onInputClosed);
+    process.stdin.off("close", this.onInputClosed);
     process.stdout.off("resize", this.onResize);
-    if (process.stdin.isTTY) {
-      process.stdin.setRawMode(false);
+    // 终端可能**已经不存在了**（SSH 断线后 pty 被关闭）：此时 setRawMode 会抛
+    // `EIO`、写 stdout 也会失败。退出路径上的这些失败必须吞掉 —— 否则一次正常的
+    // 断线退出会变成未捕获异常（退出码 1、session.lock 残留，下次启动还会误报
+    // 「上次异常退出」）。
+    try {
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+      process.stdin.pause();
+    } catch {
+      // 终端已消失
     }
-    process.stdin.pause();
-    process.stdout.write(
-      // 关闭括号粘贴与鼠标上报、恢复自动换行，并把 modifyOtherKeys 还原为终端初始设置，
-      // 再退出备用屏幕
-      "\x1b[?2004l" +
-        "\x1b[>4m" +
-        "\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?7h" +
-        ansi.reset +
-        cursor.show +
-        screen.exitAlt,
-    );
+    try {
+      process.stdout.write(
+        // 关闭括号粘贴与鼠标上报、恢复自动换行，并把 modifyOtherKeys 还原为终端初始设置，
+        // 再退出备用屏幕
+        "\x1b[?2004l" +
+          "\x1b[>4m" +
+          "\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?7h" +
+          ansi.reset +
+          cursor.show +
+          screen.exitAlt,
+      );
+    } catch {
+      // 写不出去也无所谓：终端已经没了
+    }
   }
 
   /**
@@ -514,9 +533,40 @@ export class TuiApp {
     return "\x1b[>4;2m";
   }
 
+  /**
+   * 由外部请求退出（`SIGTERM` / `SIGHUP` / stdin 关闭）。
+   *
+   * 必须走这条路径而不是直接 `process.exit()`：右侧终端里的命令是以 **detached 进程组**
+   * 启动的，直接退出会把它们留成孤儿进程；设备桥与终端状态也需要正常收尾。
+   * 典型场景就是 **SSH 断线**（sshd 关 pty → 内核发 SIGHUP）。
+   */
+  requestShutdown(reason: string): void {
+    if (this.exited) return;
+    this.shutdownReason = reason;
+    // 先中断在跑的请求：否则 provider 的流式回调会继续往已销毁的界面上写
+    this.abortController?.abort();
+    try {
+      this.shutdown();
+    } catch {
+      // 收尾阶段不该再抛异常（终端可能已经消失）：至少让等待 start() 的地方继续
+      this.exited = true;
+      try {
+        restoreTerminalSafely();
+      } catch {
+        // 忽略
+      }
+      this.resolveExit?.();
+    }
+  }
+
+  /** stdin 关闭（终端消失）—— 等同断线，按正常退出流程收尾 */
+  private readonly onInputClosed = () => this.requestShutdown("终端连接已关闭");
+
   private shutdown(): void {
     if (this.exited) return;
     this.exited = true;
+    // 本轮没收尾就退出：在会话文件里补一条说明，下次 /resume 才知道「上一轮没有结论」
+    this.noteInterruptedTurn();
     // 设备桥持有监听中的 http/ws 句柄 —— 不关掉事件循环不会空，进程会退不出去
     const bridge = this.deviceBridge;
     this.deviceBridge = undefined;
@@ -526,6 +576,32 @@ export class TuiApp {
     this.term.dispose();
     this.exitTerminal();
     this.resolveExit?.();
+  }
+
+  /**
+   * 若本轮对话还在进行中就把进程结束了（SSH 断线、`SIGTERM`、意外退出），
+   * 往会话文件里补一条「上一轮已中止」的说明。
+   *
+   * 为什么需要：本轮的用户提问与工具调用都还没提交（见 `Agent.run` 的整轮回滚语义），
+   * 会话文件里只有**上一轮**的内容 —— 下次 `/resume` 时模型会以为对话就停在那里，
+   * 于是可能对着一个旧任务继续做。这条 system 说明让它在恢复后知道该轮已作废。
+   */
+  private noteInterruptedTurn(): void {
+    if (!this.busy) return;
+    try {
+      appendSessionMessages(this.currentSessionFile, [
+        {
+          role: "system",
+          content:
+            `[上一轮已中止] ${this.shutdownReason ?? "会话在运行中被结束"}：` +
+            `上一轮没有给出结论，该轮对话已作废。\n` +
+            `中止前已经真实执行过的操作可能改变了文件或服务状态，不要凭假设重复执行；` +
+            `请回应用户最新的消息。`,
+        },
+      ]);
+    } catch {
+      // 退出路径上写失败也不能挡住退出
+    }
   }
 
   // ------------------------------------------------------------------ 事件流

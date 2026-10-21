@@ -16,6 +16,7 @@ import {
   IMAGE_FALLBACK_TEXT,
   isConfigError,
   isContextLengthError,
+  isRetryableError,
   isSystemPromptTight,
   isModelUnavailableError,
   isVisionUnsupportedError,
@@ -53,12 +54,14 @@ import type {
 import type { DeviceBridge } from "../device";
 import { findSubAgent, subAgentNames } from "../subagents";
 import { mapWithConcurrency } from "../utils/concurrency";
+import { recordErrorReport } from "../utils/error-reports";
 import { expandHome, getConfigPath } from "../utils/paths";
 import {
   compactLongTermMemoryIfNeeded,
   DEFAULT_MEMORY_MAX_CHARS,
   loadProjectRules,
   readProjectMemory,
+  resolveProjectPaths,
 } from "../workspace";
 import { buildSystemPrompt } from "./prompt";
 import * as path from "path";
@@ -1014,12 +1017,38 @@ export class Agent {
       );
       this.abortReason = "达到工具调用上限";
     } catch (err) {
+      // 先快照现场：rollbackTurn 会把 turn 清空（回滚语义），错误报告仍需要这轮消息
+      const recent = [...this.history, ...turn].map((message) => ({
+        role: message.role,
+        content: message.content ?? "",
+      }));
       // 中断也可能以异常形式到达（provider 在 abort 时 reject）
       rollbackTurn(signal?.aborted ? "被用户中断" : "因出错中止");
       if (signal?.aborted) {
         this.events.onStatus("已中断");
         this.abortReason = "已被用户中断";
         return;
+      }
+      // 本轮彻底失败（错误已走完整个回退链）：落一份错误报告供事后排查。
+      // 分类只做粗判 —— config / 服务端 是用户侧可自行解决的，其余归为「未知」，
+      // 由 `xzh errors` 里人工看堆栈判断是不是玄猪自己的 bug。
+      const report = recordErrorReport({
+        kind: "turn-failed",
+        category: isConfigError(err)
+          ? "config"
+          : isRetryableError(err)
+            ? "provider"
+            : "unknown",
+        error: err,
+        cwd: this.cwd,
+        project: resolveProjectPaths(this.cwd).dir,
+        model: this.activeModel?.id,
+        provider: this.activeModel?.provider,
+        note: "本轮对话失败（已尝试过全部回退模型）",
+        recent,
+      });
+      if (report) {
+        this.events.onNotice?.(`已记录错误报告：${report}（运行 xzh errors 查看）`);
       }
       throw err;
     }

@@ -25,9 +25,11 @@ import {
   recordCrash,
 } from "../utils/crash";
 import { configCommand } from "./commands/config";
+import { errorsCommand } from "./commands/errors";
 import { modelCommand } from "./commands/model";
 import { setupCommand } from "./commands/setup";
 import { skillCommand } from "./commands/skill";
+import { recordErrorReport } from "../utils/error-reports";
 
 // 版本号来自构建期注入（见 utils/version.ts），全项目只此一处来源
 
@@ -40,8 +42,23 @@ process.stderr.on("error", () => undefined);
 // TUI 运行期间终端处于备用屏 + raw mode + 鼠标/键盘上报状态。
 // 任何「非正常退出」都必须先还原，否则 shell 会残留坏状态（点鼠标吐转义码、
 // 输出不换行、光标隐藏等）。SIGINT 由 TUI 自己处理，这里不接管。
+//
+// SIGTERM / SIGHUP —— SSH 断线时 sshd 关闭 pty，内核会向会话的前台进程组发 SIGHUP，
+// 所以这条路径**必须**走界面的正常退出流程（`requestShutdown`）而不是直接 exit：
+// 右侧终端里的命令是以 detached 进程组起的，直接 exit 会把它们留成孤儿进程。
+let activeApp: TuiApp | undefined;
 for (const signal of ["SIGTERM", "SIGHUP"] as const) {
   process.on(signal, () => {
+    if (activeApp) {
+      activeApp.requestShutdown(signal === "SIGHUP" ? "终端连接已断开" : `收到 ${signal}`);
+      // 兜底：界面清理卡住（例如设备桥在关连接）时强制退出，不能挂在这里
+      setTimeout(() => {
+        markSessionEnd();
+        restoreTerminalSafely();
+        process.exit(0);
+      }, 1500).unref();
+      return;
+    }
     markSessionEnd(); // 用户/系统主动结束，不算崩溃
     restoreTerminalSafely();
     process.exit(0);
@@ -50,16 +67,30 @@ for (const signal of ["SIGTERM", "SIGHUP"] as const) {
 process.on("uncaughtException", (err) => {
   // 记日志：TUI 在备用屏里，界面消失后 stderr 容易被忽略，日志才是可追溯的
   recordCrash("未捕获异常", err);
+  const report = recordErrorReport({
+    kind: "uncaught-exception",
+    category: "bug",
+    error: err,
+    cwd: process.cwd(),
+  });
   restoreTerminalSafely();
   process.stderr.write(`\n未捕获异常：${err?.stack ?? String(err)}\n`);
   process.stderr.write(`详情已写入 ${crashLogPath()}\n`);
+  if (report) process.stderr.write(`错误报告：${report}\n`);
   process.exit(1);
 });
 process.on("unhandledRejection", (reason) => {
   recordCrash("未处理的 Promise 拒绝", reason);
+  const report = recordErrorReport({
+    kind: "unhandled-rejection",
+    category: "bug",
+    error: reason,
+    cwd: process.cwd(),
+  });
   restoreTerminalSafely();
   process.stderr.write(`\n未处理的 Promise 拒绝：${String(reason)}\n`);
   process.stderr.write(`详情已写入 ${crashLogPath()}\n`);
+  if (report) process.stderr.write(`错误报告：${report}\n`);
   process.exit(1);
 });
 
@@ -102,6 +133,9 @@ async function main(): Promise<void> {
       return;
     case "skill":
       await skillCommand(args.slice(1));
+      return;
+    case "errors":
+      await errorsCommand(args.slice(1));
       return;
     case "device":
       await deviceCommand(args.slice(1));
@@ -250,7 +284,9 @@ async function startChat(
     startupNotice: buildStartupNotice(),
   });
 
+  activeApp = app;
   await app.start();
+  activeApp = undefined;
   // 走到这里说明 TUI 是正常退出的，清掉会话标记与旧日志，
   // 这样下次启动若发现标记还在，就一定是异常退出。
   markSessionEnd();
@@ -319,6 +355,9 @@ ${ansi.bold}用法${ansi.reset}
   ${ansi.green}xzh skill enable/disable <名称>${ansi.reset}
                             启用 / 禁用技能
   ${ansi.green}xzh skill delete <名称>${ansi.reset} 删除技能（仅限用户技能；内置技能请用 disable）
+  ${ansi.green}xzh errors${ansi.reset}              查看玄猪记录的错误报告（~/.xzh/errors/）
+  ${ansi.green}xzh errors show <序号|签名>${ansi.reset}  查看一份报告的完整内容
+  ${ansi.green}xzh errors clear [--yes]${ansi.reset} 清空错误报告
   ${ansi.green}xzh device${ansi.reset}              与手机上的 AutoJs6 / AutoX.js 通信（设备桥）
   ${ansi.green}xzh device serve${ansi.reset}        等手机连过来并常驻（AutoX.js 9317 + AutoJs6 客户端模式 6347）
   ${ansi.green}xzh device connect <手机IP>${ansi.reset}  反过来连手机上的 AutoJs6（服务器模式）
