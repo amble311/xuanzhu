@@ -44,6 +44,7 @@ import {
 } from "../tools";
 import type {
   ConfirmRequest,
+  GoalStore,
   SubAgentInput,
   TodoItem,
   TodoStore,
@@ -63,6 +64,7 @@ import {
   readProjectMemory,
   resolveProjectPaths,
 } from "../workspace";
+import { goalSystemSection } from "./goal";
 import { buildSystemPrompt } from "./prompt";
 import * as path from "path";
 
@@ -108,6 +110,25 @@ export interface AgentEvents {
   onTodos?: (items: TodoItem[]) => void;
   /** 请求用户确认危险操作 */
   confirm: (request: ConfirmRequest) => Promise<boolean>;
+}
+
+/**
+ * 目标模式（`/goal`）的状态。
+ *
+ * 目标挂在 Agent 而不是界面上，原因有两点：
+ * 1. `goal_complete` 工具要能把它标记为完成（经 `ToolContext.goal` 注入）；
+ * 2. 系统提示词要在**每次请求**时注入目标与「不要中途停下」的规则 ——
+ *    历史会被裁剪，只有系统提示词能贯穿整个目标执行过程。
+ */
+export interface GoalState {
+  /** 目标正文 */
+  text: string;
+  /** 设定时间（ISO 字符串，界面展示用） */
+  startedAt: string;
+  /** 模型是否已通过 `goal_complete` 声明完成 */
+  completed: boolean;
+  /** 完成总结（来自 `goal_complete` 的 summary） */
+  summary?: string;
 }
 
 /**
@@ -235,6 +256,16 @@ const MAX_PARALLEL_AGENTS_CAP = 16;
 /** `config.maxParallelAgents` 未设置时的默认并发数 */
 const DEFAULT_PARALLEL_AGENTS = 4;
 
+/**
+ * 目标模式下，单次 `run` 允许「追加工具轮次配额」的次数。
+ *
+ * 目标模式里 `onRoundLimit` 会一直回答「继续」（这是「不完成不停」的实现方式），
+ * 因此必须在这里加一道上限 —— 否则一次 `run` 可能无限跑下去，外层的
+ * 自动继续循环（40 轮安全阀，见 `TuiApp`）根本没机会介入。
+ * 取 3：默认 200 轮配额下最多 800 轮工具调用，足够一次长任务收尾。
+ */
+const GOAL_ROUND_LIMIT_EXTENSIONS = 3;
+
 /** 被跳过（并未真正执行）的工具调用，其 `tool` 结果统一以此前缀开头 */
 const SKIPPED_CALL_PREFIX = "[系统] 本次调用已跳过";
 
@@ -295,6 +326,13 @@ export class Agent {
   private sessionFile: string | undefined;
   /** 当前会话的任务列表（todo_write 维护），随会话结束而丢弃 */
   private todos: TodoItem[] = [];
+  /**
+   * 目标模式（`/goal`）的目标；`undefined` 表示当前不在目标模式。
+   *
+   * 由界面设置 / 清除，界面在每轮 `run` 返回后据此判断「继续自动推进」还是「收尾」
+   * （完成由模型调用 `goal_complete` 标记，见 `markGoalComplete`）。
+   */
+  private goal?: GoalState;
   /**
    * 手机设备桥（由界面在 `/device serve` 时注入）。
    *
@@ -374,6 +412,18 @@ export class Agent {
   }
 
   /**
+   * 本次请求实际使用的系统提示词。
+   *
+   * 目标模式下追加目标段落 —— 必须在**每次请求**时拼进去而不是在 `setGoal` 里改
+   * `this.systemPrompt`：目标结束时只需清掉 `this.goal`，提示词自动恢复；
+   * 而 `this.systemPrompt` 是 `/switch`、记忆精简等逻辑的基线，不该混入临时状态。
+   */
+  private effectiveSystemPrompt(): string {
+    if (!this.goal || this.goal.completed) return this.systemPrompt;
+    return `${this.systemPrompt}\n\n${goalSystemSection(this.goal.text)}`;
+  }
+
+  /**
    * 长期记忆达到阈值即**自动精简**（去重 + 必要时裁剪最旧的追加块），不依赖模型主动调用。
    *
    * 触发点：会话构造、`/switch` 切换目录。之所以放在这两处而不是每轮：记忆文件只有几 KB，
@@ -418,6 +468,8 @@ export class Agent {
       this.todos = [];
       this.events.onTodos?.([]);
     }
+    // 目标同样属于这段对话：上下文都没了还继续推进，只会凭残缺历史乱做
+    this.clearGoal();
   }
 
   /**
@@ -440,12 +492,62 @@ export class Agent {
     // 恢复的会话文件本身可能已经是被裁过的版本，无从判断，故按「未裁过」重来：
     // 猜错只会少一条提醒，而凭空添加"历史不完整"的提醒会让模型无谓地畏手畏脚。
     this.historyTrimmed = false;
+    // 换了一段历史，旧目标不再有对应上下文
+    this.clearGoal();
     appendSessionMessages(sessionFile, messages);
   }
 
   /** 当前任务列表（供界面或测试查询） */
   getTodos(): TodoItem[] {
     return this.todos;
+  }
+
+  /**
+   * 设定目标（`/goal <目标>`）：进入目标模式。
+   *
+   * 只记录目标本身，**不**开始执行 —— 执行由界面循环驱动
+   * （每轮 `run` 结束后判断是否需要自动继续）。
+   */
+  setGoal(text: string): GoalState {
+    this.goal = {
+      text: text.trim(),
+      startedAt: new Date().toISOString(),
+      completed: false,
+    };
+    return this.goal;
+  }
+
+  /** 清除目标（`/goal off`，或目标完成后界面收尾时调用） */
+  clearGoal(): void {
+    this.goal = undefined;
+  }
+
+  /** 当前目标（供界面展示与测试查询） */
+  getGoal(): GoalState | undefined {
+    return this.goal;
+  }
+
+  /** 模型经 `goal_complete` 声明目标完成；返回是否真的在目标模式中 */
+  private markGoalComplete(summary: string): boolean {
+    if (!this.goal || this.goal.completed) return false;
+    this.goal.completed = true;
+    this.goal.summary = summary.trim();
+    return true;
+  }
+
+  /** 目标模式的状态出口：交给 `goal_complete` 工具的引用 */
+  private goalStore(): GoalStore {
+    return {
+      active: () => Boolean(this.goal && !this.goal.completed),
+      complete: (summary) => {
+        this.markGoalComplete(summary);
+      },
+    };
+  }
+
+  /** 本轮运行非正常收尾的原因（供界面判断是否该继续自动推进） */
+  getAbortReason(): string | undefined {
+    return this.abortReason;
   }
 
   /** 注入 / 撤销设备桥（界面在 `/device serve` 与 `/device stop` 时调用） */
@@ -534,7 +636,7 @@ export class Agent {
       isSystemPromptTight(
         this.activeModel?.contextWindow,
         this.activeModel?.model ?? "",
-        this.systemPrompt,
+        this.effectiveSystemPrompt(),
       )
     ) {
       this.warnedTightContext = true;
@@ -547,7 +649,9 @@ export class Agent {
 
     // 意图分析（默认关闭，由配置 / --intent 控制）：
     // 先发起一次独立请求把用户消息改写为意图分析结果，再以它作为本轮输入。
-    if (this.config.intent?.enabled) {
+    // 目标模式跳过：自动继续的输入本身就是结构化指令（见 core/goal.ts），
+    // 再被「帮我分析这段话的意图」改写一次只会稀释目标与「不要停」的约束。
+    if (this.config.intent?.enabled && !this.goal) {
       this.events.onStatus("分析意图中");
       const analysis = await this.analyzeIntent(userInput, signal);
       if (signal?.aborted) {
@@ -717,6 +821,8 @@ export class Agent {
     // 真实的大型重构（读完一个模块、重写、反复跑测试）很容易超过默认轮数，
     // 直接停掉会让任务断在半路。只有用户明确不再继续才收尾。
     let roundLimit = maxRounds;
+    // 目标模式下「自动继续」的已续期次数（见 GOAL_ROUND_LIMIT_EXTENSIONS）
+    let roundExtensions = 0;
 
     try {
       for (let round = 0; ; round++) {
@@ -726,12 +832,16 @@ export class Agent {
             this.events.onStatus("已中断");
             return;
           }
+          // 目标模式：口答「继续」是常态，但单次 run 不能无限续期
+          const goalActive = Boolean(this.goal && !this.goal.completed);
+          if (goalActive && roundExtensions >= GOAL_ROUND_LIMIT_EXTENSIONS) break;
           // 没有提供询问回调时（非交互场景）行为与以前一致：直接收尾
           const canContinue = this.events.onRoundLimit
             ? await this.events.onRoundLimit(round)
             : false;
           if (!canContinue) break;
           roundLimit += maxRounds;
+          roundExtensions += 1;
         }
 
         if (signal?.aborted) {
@@ -1116,7 +1226,7 @@ export class Agent {
     // 上一次因「模型不支持图片」失败 → 这次整条链路都不带图片
     if (dropImages) conversation = stripAllImages(conversation);
     const messages: ChatMessage[] = [
-      { role: "system", content: this.systemPrompt },
+      { role: "system", content: this.effectiveSystemPrompt() },
       ...conversation,
     ];
 
@@ -1422,6 +1532,7 @@ export class Agent {
       confirm: (request) => this.events.confirm(request),
       signal,
       todos: this.todoStore(),
+      goal: this.goalStore(),
       memoryMaxChars: this.config.memoryMaxChars,
       spawnAgent: (input) => this.spawnSubAgent(input, signal),
       deviceBridge: this.deviceBridge,
@@ -1618,7 +1729,7 @@ export class Agent {
     const raw = resolveConversationBudget(
       this.activeModel?.contextWindow,
       this.activeModel?.model ?? "",
-      this.systemPrompt,
+      this.effectiveSystemPrompt(),
     );
     return calibrateBudget(raw, this.tokenCalibrator().factor());
   }

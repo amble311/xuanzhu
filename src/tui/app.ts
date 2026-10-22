@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { Agent, type AgentEvents } from "../core/agent";
+import { goalContinuePrompt, goalStartPrompt } from "../core/goal";
 import {
   appendSessionMessages,
   listSessions,
@@ -55,6 +56,15 @@ import {
 } from "../utils/ansi";
 import { MarkdownRenderer } from "./markdown";
 import { completeTermInput, ShellPanel } from "./terminal";
+
+/**
+ * 目标模式（`/goal`）最多自动继续多少轮（含首轮）。
+ *
+ * 这是**安全阀**而不是正常结束条件：目标模式承诺「不完成不停」，但模型可能因为
+ * 目标本身模糊而无限打转。到上限后停下并保留目标（`/goal continue` 可再来一组），
+ * 避免无人值守时把 token 烧光。
+ */
+const GOAL_MAX_ITERATIONS = 40;
 
 export interface TuiAppOptions {
   provider: LLMProvider;
@@ -194,6 +204,18 @@ export class TuiApp {
   /** 是否启用意图分析（界面内用 /intent 切换并写回配置） */
   private intentEnabled: boolean;
 
+  /** 目标模式（`/goal`）的自动推进循环是否正在运行 */
+  private goalLoopActive = false;
+  /**
+   * 本轮目标执行是否被用户中断（Ctrl+C / Ctrl+D）。
+   *
+   * 循环看到它就不再自动继续，但**保留目标** —— 用户可以 `/goal continue`
+   * 接着推进，或 `/goal off` 清除。
+   */
+  private goalCancelled = false;
+  /** 目标模式已执行到第几轮（含首轮），用于展示与安全阀判断 */
+  private goalIterations = 0;
+
   private history: string[] = [];
   private historyIndex = -1;
 
@@ -316,8 +338,16 @@ export class TuiApp {
       confirm: (request) => this.requestConfirm(request),
       // 轮次配额用尽时问一次，而不是硬性中断 —— 真实的重构任务常常超过默认轮数，
       // 直接停掉会让工作断在半路。复用同一套确认弹窗（y 继续 / n 结束）。
-      onRoundLimit: (used) =>
-        this.requestConfirm({
+      // 目标模式例外：目标是「不完成不停」，这里直接追加配额；要停下来按 Ctrl+C。
+      onRoundLimit: (used) => {
+        if (this.goalLoopActive) {
+          this.lines.push(
+            `${ansi.gray}目标模式：已用满 ${used} 轮工具调用，自动追加配额继续。${ansi.reset}`,
+          );
+          this.scheduleRender();
+          return Promise.resolve(true);
+        }
+        return this.requestConfirm({
           tool: "round_limit",
           title: `已调用 ${used} 轮工具，是否继续？`,
           detail:
@@ -326,7 +356,8 @@ export class TuiApp {
             `· 按 n 结束：保留已有进展，本轮到此为止\n\n` +
             `想永久调整上限：编辑配置文件的 maxToolRounds 字段。`,
           danger: false,
-        }),
+        });
+      },
     };
     // 会话持久化：每次提交历史都会增量写入该 JSONL，崩溃 / 退出后可用 /resume 恢复
     const sessionFile = startSession(options.cwd, VERSION);
@@ -1026,6 +1057,9 @@ export class TuiApp {
     switch (key) {
       case "\x03": // Ctrl+C
         if (this.busy) {
+          // 目标模式下不能只中断当前一轮 —— 否则循环会立刻发下一条「继续」，
+          // 表现成「按了 Ctrl+C 却停不下来」。标记取消，循环退出后目标仍保留。
+          if (this.goalLoopActive) this.goalCancelled = true;
           this.abortController?.abort();
           this.statusText = "中断中…";
           this.scheduleRender();
@@ -1039,6 +1073,8 @@ export class TuiApp {
         return;
       case "\x04": // Ctrl+D：本轮对话正在进行时结束它；任何情况下都不退出界面
         if (this.busy) {
+          // 同 Ctrl+C：目标模式下「结束本轮」意味着暂停整个目标循环
+          if (this.goalLoopActive) this.goalCancelled = true;
           this.abortController?.abort();
           this.statusText = "中断中…";
           this.scheduleRender();
@@ -2004,7 +2040,9 @@ export class TuiApp {
         this.toggleMouseCapture();
         break;
       case "reset":
+        // Agent.reset() 会一并清除目标（目标属于这段对话）
         this.agent.reset();
+        this.goalIterations = 0;
         // 重置后开一个新的会话文件：旧文件保留为存档，/resume 仍能找回重置前的对话
         this.currentSessionFile = startSession(this.cwd, VERSION);
         this.agent.restoreSession([], this.currentSessionFile);
@@ -2093,10 +2131,261 @@ export class TuiApp {
         // 查看 / 切换当前模型；选中的模型会写回配置，下次启动继续用它
         void this.handleModelCommand(arg);
         break;
+      case "goal":
+        // 目标模式：设定目标后由自动循环持续推进，直到模型调用 goal_complete
+        this.handleGoalCommand(arg);
+        break;
       default:
         this.lines.push(`${ansi.yellow}未知命令：/${command}，输入 /help 查看帮助。${ansi.reset}`);
     }
     this.scheduleRender();
+  }
+
+  /**
+   * /goal —— 目标模式。
+   *
+   * - `/goal <目标>`：设定目标并**立刻开始**自动推进；
+   * - `/goal` / `/goal status`：查看当前目标与轮次；
+   * - `/goal continue`：继续一个已暂停的目标（中断 / 达到安全阀后）；
+   * - `/goal off`：清除目标（别名 stop / clear / cancel）。
+   *
+   * 「不完成不停」的实现不在 Agent 内部：`agent.run` 仍然是「一次请求 + 其工具轮」，
+   * 循环由界面驱动（见 `runGoalLoop`）。这样中断、渲染、确认框全部复用既有机制，
+   * 也不会让 Agent 的主循环变成无法从外部收手的死循环。
+   */
+  private handleGoalCommand(arg: string): void {
+    const text = arg.trim();
+    const sub = text.toLowerCase();
+    const goal = this.agent.getGoal();
+
+    if (!text || sub === "status") {
+      if (!goal) {
+        this.lines.push(`${ansi.bold}目标模式${ansi.reset} ${ansi.gray}（当前没有目标）${ansi.reset}`);
+        this.lines.push(
+          `${ansi.gray}用法：/goal <目标描述> —— 设定后玄猪会持续自动推进，` +
+            `直到它调用 goal_complete 声明完成；Ctrl+C 可随时中断。${ansi.reset}`,
+        );
+        return;
+      }
+      const state = goal.completed
+        ? "已完成"
+        : this.goalLoopActive
+          ? "执行中"
+          : "已暂停";
+      this.lines.push(
+        `${ansi.bold}当前目标${ansi.reset} ${ansi.gray}（${state} · 已执行 ${this.goalIterations} 轮）${ansi.reset}`,
+      );
+      for (const line of goal.text.split("\n")) {
+        this.lines.push(`  ${line}`);
+      }
+      if (!goal.completed) {
+        this.lines.push(
+          `${ansi.gray}  · /goal continue 继续自动执行 · /goal off 清除目标${ansi.reset}`,
+        );
+      }
+      return;
+    }
+
+    if (["off", "stop", "clear", "cancel", "end"].includes(sub)) {
+      if (this.goalLoopActive) {
+        // 循环正在跑：标记取消 + 中断当前这一轮，finally 里会收尾并提示
+        this.goalCancelled = true;
+        this.abortController?.abort();
+      }
+      this.agent.clearGoal();
+      this.lines.push(
+        `${ansi.gray}已清除目标${this.goalLoopActive ? "，正在中断执行…" : "。"}${ansi.reset}`,
+      );
+      return;
+    }
+
+    if (["continue", "resume", "go"].includes(sub)) {
+      if (!goal) {
+        this.lines.push(`${ansi.yellow}当前没有目标。用法：/goal <目标描述>${ansi.reset}`);
+        return;
+      }
+      if (goal.completed) {
+        this.lines.push(`${ansi.gray}该目标已完成；要开始新目标请用 /goal <目标描述>。${ansi.reset}`);
+        return;
+      }
+      if (this.busy) {
+        this.lines.push(
+          `${ansi.yellow}本轮对话进行中 —— 先等它结束，或按 Ctrl+C 中断后再继续目标。${ansi.reset}`,
+        );
+        return;
+      }
+      void this.runGoalLoop();
+      return;
+    }
+
+    // 其余情况：把整段参数当作新目标
+    if (this.busy) {
+      this.lines.push(
+        `${ansi.yellow}本轮对话进行中 —— 先等它结束，或按 Ctrl+C 中断后再设定目标。${ansi.reset}`,
+      );
+      return;
+    }
+    if (goal && !goal.completed) {
+      this.lines.push(`${ansi.gray}已用新目标替换原目标。${ansi.reset}`);
+    }
+    this.agent.setGoal(text);
+    this.goalCancelled = false;
+    this.goalIterations = 0;
+    this.printGoalBanner(text);
+    // 未开启自动批准时，写文件 / 执行命令仍会弹确认框 —— 提前说明，避免用户以为卡住了
+    if (!this.options.config.autoApprove) {
+      this.lines.push(
+        `${ansi.gray}  · 当前未开启自动批准：遇到写文件 / 执行命令时会请求确认，确认后继续自动推进。${ansi.reset}`,
+      );
+    }
+    void this.runGoalLoop();
+  }
+
+  /** 目标模式启动时的醒目横幅 */
+  private printGoalBanner(goal: string): void {
+    const badge = `${ansi.bgMagenta}${ansi.brightWhite}${ansi.bold} ◎ GOAL ${ansi.reset}`;
+    const [first, ...rest] = goal.split("\n");
+    this.lines.push(`${badge} ${ansi.brightMagenta}${ansi.bold}${first}${ansi.reset}`);
+    for (const line of rest) {
+      this.lines.push(`${ansi.brightMagenta}${ansi.bold}│${ansi.reset} ${line}`);
+    }
+    this.lines.push(
+      `${ansi.gray}  目标模式：玄猪会持续自动推进，直到调用 goal_complete 声明完成。` +
+        `Ctrl+C 中断（目标保留，/goal continue 可继续）。${ansi.reset}`,
+    );
+    this.lines.push("");
+  }
+
+  /**
+   * 目标模式的自动推进循环。
+   *
+   * 每一轮都是一次完整的 `agent.run`（含其内部的工具轮次）：
+   * 1. 首轮发 `goalStartPrompt`，之后每轮发 `goalContinuePrompt`；
+   * 2. 如果模型调用了 `goal_complete` → 收尾并清除目标；
+   * 3. 正常结束但没有完成标记 → 自动发下一条「继续」，**中间不停**；
+   * 4. 用户中断（`goalCancelled`）→ 退出循环，目标保留为「已暂停」；
+   * 5. 本轮因重复调用 / 模型错误中止（`getAbortReason`）→ 退出循环并提示，
+   *    不再盲目重试（否则同一个死循环会被无限自动继续放大）。
+   */
+  private async runGoalLoop(): Promise<void> {
+    const initial = this.agent.getGoal();
+    if (!initial || initial.completed || this.busy) return;
+    // 目标可能在本轮执行中被 /goal 替换，用文本快照判断是否还是同一个目标
+    const goalText = initial.text;
+
+    this.goalLoopActive = true;
+    this.goalCancelled = false;
+    this.busy = true;
+    this.statusText = "目标执行中";
+    this.statusDetail = "";
+    this.scheduleRender();
+
+    let done = false;
+    let paused = false;
+    let hitLimit = false;
+
+    try {
+      for (;;) {
+        const current = this.agent.getGoal();
+        if (this.goalCancelled || !current || current.completed || current.text !== goalText) {
+          break;
+        }
+        if (this.goalIterations >= GOAL_MAX_ITERATIONS) {
+          hitLimit = true;
+          break;
+        }
+
+        this.goalIterations += 1;
+        const first = this.goalIterations === 1;
+        if (!first) {
+          this.lines.push(
+            `${ansi.gray}▷ 目标未完成，自动继续（第 ${this.goalIterations} 轮）${ansi.reset}`,
+          );
+        }
+        const prompt = first
+          ? goalStartPrompt(goalText)
+          : goalContinuePrompt(goalText, this.goalIterations - 1, this.agent.getTodos());
+
+        this.statusText = first ? "目标执行中" : "目标自动继续";
+        this.statusDetail = `第 ${this.goalIterations} 轮`;
+        this.abortController = new AbortController();
+        this.scheduleRender();
+
+        let threw = false;
+        try {
+          await this.agent.run(prompt, this.abortController.signal);
+        } catch (err) {
+          threw = true;
+          const [firstLine, ...rest] = friendlyError(err).split("\n");
+          this.lines.push(`${ansi.red}✗ ${firstLine}${ansi.reset}`);
+          for (const extra of rest) {
+            this.lines.push(`${ansi.gray}  ${extra}${ansi.reset}`);
+          }
+        } finally {
+          this.abortController = undefined;
+          const tail = this.markdown.flush();
+          if (tail.length > 0) this.lines.push(...tail);
+          this.streamingPreview = "";
+          this.lines.push("");
+        }
+
+        const after = this.agent.getGoal();
+        if (after?.completed) {
+          done = true;
+          break;
+        }
+        if (this.goalCancelled) {
+          paused = true;
+          break;
+        }
+        if (!after || after.text !== goalText) {
+          // 目标在执行中已被替换 / 清除
+          break;
+        }
+        // 本轮非正常收尾（重复调用中止、模型调用失败等）不再自动继续
+        const abortReason = this.agent.getAbortReason();
+        if (threw || abortReason) {
+          paused = true;
+          this.lines.push(
+            `${ansi.yellow}⚠ 目标已暂停${abortReason ? `（${abortReason}）` : ""}：` +
+              `自动继续会放大同一个问题，故停下等你处理。${ansi.reset}`,
+          );
+          break;
+        }
+      }
+    } finally {
+      this.goalLoopActive = false;
+      this.busy = false;
+      this.abortController = undefined;
+      this.statusText = "就绪";
+      this.statusDetail = "";
+
+      const final = this.agent.getGoal();
+      if (done && final) {
+        this.lines.push(`${ansi.brightGreen}${ansi.bold}✓ 目标已完成${ansi.reset}`);
+        this.lines.push(`${ansi.gray}  共执行 ${this.goalIterations} 轮。${ansi.reset}`);
+        if (final.summary) {
+          for (const line of final.summary.split("\n")) {
+            this.lines.push(`${ansi.gray}  ${line}${ansi.reset}`);
+          }
+        }
+        // 完成即退出目标模式：后续普通对话不再注入目标提示词
+        this.agent.clearGoal();
+      } else if (final && !final.completed) {
+        if (hitLimit) {
+          this.lines.push(
+            `${ansi.yellow}已达目标模式的安全上限（${GOAL_MAX_ITERATIONS} 轮），已暂停。${ansi.reset}`,
+          );
+        }
+        if (paused && !hitLimit) {
+          this.lines.push(`${ansi.gray}目标已暂停：${final.text}${ansi.reset}`);
+        }
+        this.lines.push(
+          `${ansi.gray}  · /goal continue 继续自动执行 · /goal off 清除目标 · /goal 查看状态${ansi.reset}`,
+        );
+      }
+      this.scheduleRender();
+    }
   }
 
   /**
@@ -2150,7 +2439,9 @@ export class TuiApp {
 
     const file = startSession(this.cwd, VERSION);
     this.currentSessionFile = file;
+    // restoreSession 会一并清除目标（旧历史与旧目标无关）
     this.agent.restoreSession(messages, file);
+    this.goalIterations = 0;
     this.lines.push(
       `${ansi.green}✓ 已恢复 ${messages.length} 条消息的对话历史。${ansi.reset}`,
       `${ansi.gray}继续对话即可；此后内容会写入新的会话文件。${ansi.reset}`,
@@ -2212,7 +2503,9 @@ export class TuiApp {
     const messages = previous ? loadSessionMessages(previous.file) : [];
     const file = startSession(resolved, VERSION);
     this.currentSessionFile = file;
+    // restoreSession 会一并清除目标：切项目 = 在新项目重新开局
     this.agent.restoreSession(messages, file);
+    this.goalIterations = 0;
     if (messages.length > 0) {
       this.lines.push(
         `${ansi.gray}  已载入该项目上次会话（${messages.length} 条消息，${previous.startedAt ?? "未知时间"}），` +
@@ -2713,6 +3006,8 @@ export class TuiApp {
       `  /switch <目录> 切换项目（载入该项目上次会话接着聊）`,
       `  /term          显示/隐藏右侧终端面板（/term clear 清空输出）`,
       `  /model [编号|id|模型名]  查看 / 切换当前模型（不带参数：↑ ↓ 选择，Enter 确认）`,
+      `  /goal <目标>   目标模式：持续自动执行直到完成（Ctrl+C 中断；/goal off 清除）`,
+      `  /goal [status|continue|off]  查看当前目标 / 继续已暂停的目标 / 清除目标`,
       `  /auto [on|off] 切换自动批准（on：所有工具直接执行，写入配置）`,
       `  /intent [on|off] 切换意图分析（on：每条消息先做意图分析再处理，写入配置）`,
       `  /exit          退出玄猪`,
@@ -2757,10 +3052,26 @@ export class TuiApp {
     );
     const dirText = truncate(this.cwd, Math.max(10, width - 8));
     const divider = `${ansi.gray}${"─".repeat(Math.max(0, width))}${ansi.reset}`;
+    // 目标模式：始终占一行显示目标，便于随时看清「它现在为什么还在跑」
+    const goal = this.agent.getGoal();
+    const goalState = goal
+      ? goal.completed
+        ? "已完成"
+        : this.goalLoopActive
+          ? `执行中 · 第 ${this.goalIterations} 轮`
+          : "已暂停"
+      : "";
+    const goalLine = goal
+      ? `${ansi.gray}  目标：${ansi.reset}${ansi.brightMagenta}${truncate(
+          goal.text.replace(/\s+/g, " "),
+          Math.max(10, width - 18),
+        )}${ansi.reset}${ansi.gray}（${goalState}）${ansi.reset}`
+      : null;
     const info = [
       `${ansi.brightMagenta}${ansi.bold}  玄猪 XuanZhu${ansi.reset} ${ansi.gray}v${VERSION} · 终端 AI 编码 Agent${ansi.reset}`,
       `${ansi.gray}  模型：${ansi.reset}${modelText}${ansi.reset}`,
       `${ansi.gray}  目录：${ansi.reset}${dirText}${ansi.reset}`,
+      ...(goalLine ? [goalLine] : []),
       ...this.todoHeaderLines(width),
       `${ansi.gray}  输入 ${ansi.reset}${ansi.brightGreen}/help${ansi.reset}${ansi.gray} 查看命令与快捷键${ansi.reset}`,
       `${ansi.gray}  ${ansi.reset}Ctrl+D${ansi.gray} 结束本轮对话（不退出）· ${ansi.reset}Ctrl+C${ansi.gray} 中断/清空/退出${ansi.reset}`,
@@ -3082,6 +3393,8 @@ export class TuiApp {
     const left = ` 玄猪 `;
     const autoMark = this.autoApprove ? "⚡auto · " : "";
     const intentMark = this.intentEnabled ? "⌁intent · " : "";
+    // 目标模式标记：一眼看出当前处于「会自动继续」的状态
+    const goalMark = this.agent.getGoal() ? "◎goal · " : "";
     const focusMark = this.termVisible
       ? this.termFocus
         ? "终端▸ "
@@ -3103,7 +3416,7 @@ export class TuiApp {
             Math.abs(this.selectionHead - this.selectionAnchor) + 1
           } 行${this.dragging ? "（松开复制）" : "（已复制）"}${ansi.reset}${ansi.bgBlue} `
         : "";
-    const right = ` ${autoMark}${intentMark}${focusMark}${selectionMark}${scrollMark}${termScrollMark}${this.modelLabel} │ ${this.statusText}${this.statusDetail ? " · " + this.statusDetail : ""} `;
+    const right = ` ${autoMark}${intentMark}${goalMark}${focusMark}${selectionMark}${scrollMark}${termScrollMark}${this.modelLabel} │ ${this.statusText}${this.statusDetail ? " · " + this.statusDetail : ""} `;
     const middle = ` ${this.cwd} `;
     const elapsed = this.busy ? `${ansi.brightYellow}● 运行中${ansi.reset}${ansi.bgBlue}` : "";
     // elapsed 的显示宽度必须计入保留宽度，否则 busy 时状态栏必然超宽并走兜底截断

@@ -22,6 +22,19 @@ export interface TodoStore {
   set(items: TodoItem[]): void;
 }
 
+/**
+ * 目标模式（`/goal`）的状态出口（由 Agent 注入）。
+ *
+ * 目标本身挂在 Agent 上（界面要跨多轮 `run` 保持它），工具只负责把
+ * 「模型声明完成」这一事实写回去；工具不持有目标文本。
+ */
+export interface GoalStore {
+  /** 当前是否有进行中的目标（没有时 `goal_complete` 直接报错，避免空转） */
+  active(): boolean;
+  /** 标记目标完成并记下总结 */
+  complete(summary: string): void;
+}
+
 /** 派生子代理的请求 */
 export interface SubAgentInput {
   /** 要派生的子代理名称（见 src/subagents 注册表）；缺省用默认子代理 */
@@ -46,6 +59,8 @@ export interface ToolContext {
   signal?: AbortSignal;
   /** 当前会话的任务列表（由 Agent 注入），供 todo_write 使用 */
   todos?: TodoStore;
+  /** 目标模式状态（由 Agent 注入），供 goal_complete 使用 */
+  goal?: GoalStore;
   /** 长期记忆字符上限，超出时自动精简（由 Agent 注入） */
   memoryMaxChars?: number;
   /** 派生子代理执行子任务（由 Agent 注入），未提供时 task 工具不可用 */
