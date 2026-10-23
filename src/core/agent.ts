@@ -550,6 +550,21 @@ export class Agent {
     return this.abortReason;
   }
 
+  /** 最近一次 `run` 实际执行的工具调用数（目标模式判断「有没有推进」） */
+  getLastRunToolCallCount(): number {
+    return this.lastRunToolCalls;
+  }
+
+  /**
+   * 重新生成系统提示词（清空 / 改写项目记忆后调用）。
+   *
+   * 系统提示词在构造与 `/switch` 时就已定稿并缓存，`/memory clear` 之后若不刷新，
+   * 后续请求仍会带着**刚被删掉的旧记忆** —— 用户会以为清空没生效。
+   */
+  reloadSystemPrompt(): void {
+    this.systemPrompt = this.composeSystemPrompt();
+  }
+
   /** 注入 / 撤销设备桥（界面在 `/device serve` 与 `/device stop` 时调用） */
   setDeviceBridge(bridge?: DeviceBridge): void {
     this.deviceBridge = bridge;
@@ -611,13 +626,22 @@ export class Agent {
    */
   private abortReason: string | undefined;
 
+  /**
+   * 最近一次 `run` 中**实际执行**的工具调用数（被跳过 / 未执行的不算）。
+   *
+   * 目标模式据此判断「这一轮有没有实际推进」：模型可能连续多轮只输出文字、
+   * 不调用任何工具，此时自动继续只会无限重复客套话，应由界面暂停（见 `TuiApp`）。
+   */
+  private lastRunToolCalls = 0;
+
   async run(
     userInput: string,
     signal?: AbortSignal,
     images?: ImageAttachment[],
   ): Promise<void> {
-    // Agent 实例可能被复用（同一实例多次 run），先清掉上一轮的中止原因
+    // Agent 实例可能被复用（同一实例多次 run），先清掉上一轮的中止原因与工具计数
     this.abortReason = undefined;
+    this.lastRunToolCalls = 0;
     let content = userInput;
 
     // 补发构造 / 切换目录期间攒下的提示（构造时终端尚未接管，不能当场写输出区）
@@ -1018,6 +1042,7 @@ export class Agent {
                   toolCallId: item.id,
                   name: item.name,
                 });
+                this.lastRunToolCalls += 1;
                 this.events.onToolEnd(item, outcome);
               }
 
@@ -1064,6 +1089,7 @@ export class Agent {
             toolCallId: call.id,
             name: call.name,
           });
+          this.lastRunToolCalls += 1;
 
           // 工具产出的图片（如手机截图）→ 收集起来，等本轮的 tool 消息**全部**写完后
           // 再作为一条额外的 user 消息追加（见上面 imageNotes 的说明）。

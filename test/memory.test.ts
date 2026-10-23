@@ -3,7 +3,9 @@ import * as os from "os";
 import * as path from "path";
 import { describe, expect, it } from "vitest";
 import {
+  clearProjectMemory,
   compactLongTermMemory,
+  inspectProjectMemory,
   readProjectMemory,
   resolveProjectPaths,
 } from "../src/workspace";
@@ -122,5 +124,55 @@ describe("长期记忆精简：只裁追加块", () => {
     expect(after.match(/## 环境与部署/g)).toHaveLength(1);
     expect(after.match(/结论丙/g)).toHaveLength(1);
     expect(after).toContain("## 权限机制");
+  });
+});
+
+describe("项目记忆清空（/memory clear）", () => {
+  it("只删长期记忆与每日日志，保留目录里的其它文件", () => {
+    const cwd = tmpProject();
+    const paths = resolveProjectPaths(cwd);
+    fs.mkdirSync(paths.memoryDir, { recursive: true });
+    fs.writeFileSync(paths.longTermFile, "# 项目长期记忆\n\n- 结论甲\n", "utf8");
+    fs.writeFileSync(path.join(paths.memoryDir, "2026-10-01.md"), "# 每日记录\n", "utf8");
+    fs.writeFileSync(path.join(paths.memoryDir, "2026-10-02.md"), "# 每日记录\n", "utf8");
+    // 用户自己放进来的文件不属于「记忆」，必须保留
+    fs.writeFileSync(path.join(paths.memoryDir, "notes.txt"), "keep me", "utf8");
+
+    const before = inspectProjectMemory(cwd);
+    expect(before.hasLongTerm).toBe(true);
+    expect(before.longTermChars).toBeGreaterThan(0);
+    expect(before.dailyFiles.map((file) => file.name)).toEqual([
+      "2026-10-01.md",
+      "2026-10-02.md",
+    ]);
+
+    const cleared = clearProjectMemory(cwd);
+    expect(cleared.files.map((file) => file.name).sort()).toEqual([
+      "2026-10-01.md",
+      "2026-10-02.md",
+      "MEMORY.md",
+    ]);
+    // 统计口径一致：notes.txt 不计入记忆总量
+    expect(cleared.totalBytes).toBe(before.totalBytes);
+
+    expect(fs.existsSync(paths.longTermFile)).toBe(false);
+    expect(fs.readdirSync(paths.memoryDir)).toEqual(["notes.txt"]);
+
+    const after = inspectProjectMemory(cwd);
+    expect(after.hasLongTerm).toBe(false);
+    expect(after.dailyFiles).toHaveLength(0);
+    expect(after.totalBytes).toBe(0);
+  });
+
+  it("目录不存在或已经为空时安全返回空结果", () => {
+    const cwd = tmpProject();
+    const cleared = clearProjectMemory(cwd);
+    expect(cleared.files).toHaveLength(0);
+    expect(cleared.totalBytes).toBe(0);
+
+    const status = inspectProjectMemory(cwd);
+    expect(status.hasLongTerm).toBe(false);
+    expect(status.dailyFiles).toHaveLength(0);
+    expect(status.totalBytes).toBe(0);
   });
 });

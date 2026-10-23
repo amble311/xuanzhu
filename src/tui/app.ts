@@ -43,7 +43,11 @@ import {
 } from "../utils/clipboard";
 import { expandHome, getConfigDir } from "../utils/paths";
 import { VERSION } from "../utils/version";
-import { ensureProjectDir } from "../workspace";
+import {
+  clearProjectMemory,
+  ensureProjectDir,
+  inspectProjectMemory,
+} from "../workspace";
 import {
   ansi,
   cursor,
@@ -65,6 +69,32 @@ import { completeTermInput, ShellPanel } from "./terminal";
  * 避免无人值守时把 token 烧光。
  */
 const GOAL_MAX_ITERATIONS = 40;
+
+/**
+ * 目标模式允许「连续多少轮没有任何工具调用」后暂停。
+ *
+ * 自动继续的前提是模型每轮都有实际动作（改文件、跑命令、调研）。若它连续几轮
+ * 只输出「好的，我接下来会…」这类文字，继续发「继续」只会得到同样的客套话 ——
+ * 及时暂停并把原因说清楚，比烧满 40 轮更有用。
+ */
+const GOAL_MAX_IDLE_ROUNDS = 3;
+
+/** 时长的紧凑写法（`45s` / `12m` / `1h05m`），用于目标模式的进度展示 */
+function formatDuration(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+/** 文件大小的紧凑写法（用于 /memory 的确认框与结果提示） */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
 
 export interface TuiAppOptions {
   provider: LLMProvider;
@@ -215,6 +245,8 @@ export class TuiApp {
   private goalCancelled = false;
   /** 目标模式已执行到第几轮（含首轮），用于展示与安全阀判断 */
   private goalIterations = 0;
+  /** 目标模式连续「零工具调用」的轮数（达到阈值即暂停，见 GOAL_MAX_IDLE_ROUNDS） */
+  private goalIdleRounds = 0;
 
   private history: string[] = [];
   private historyIndex = -1;
@@ -849,11 +881,20 @@ export class TuiApp {
    * 整个工具批次（`Promise.all`）也跟着卡死。因此这里把请求串成一条链：
    * 后来的排队等待，前一个答复后才显示。
    */
-  private requestConfirm(request: ConfirmRequest): Promise<boolean> {
+  private requestConfirm(
+    request: ConfirmRequest,
+    approveByDefault = true,
+  ): Promise<boolean> {
     const next = this.confirmChain.then(
       () =>
         new Promise<boolean>((resolve) => {
-          this.pendingConfirm = { request, resolve, selected: true };
+          // 高危且不可恢复的操作（如清空项目记忆）默认停在「拒绝」，
+          // 必须显式按 y 或 ← → 切到「允许」才生效 —— 防止一个回车就把数据删了。
+          this.pendingConfirm = {
+            request,
+            resolve,
+            selected: approveByDefault,
+          };
           this.scheduleRender();
         }),
     );
@@ -1465,8 +1506,12 @@ export class TuiApp {
     switch (key) {
       case "y":
       case "Y":
-      case "\r":
         this.resolveConfirm(true);
+        return;
+      case "\r":
+        // 确认高亮项，而不是无条件「允许」—— 否则 ← → 切到「拒绝」后按 Enter
+        // 反而会执行操作，与界面上写的「Enter 确认」矛盾。
+        this.resolveConfirm(pending.selected);
         return;
       case "\x04": // Ctrl+D：拒绝该操作并立即终止当前对话
         this.abortController?.abort();
@@ -2135,6 +2180,10 @@ export class TuiApp {
         // 目标模式：设定目标后由自动循环持续推进，直到模型调用 goal_complete
         this.handleGoalCommand(arg);
         break;
+      case "memory":
+        // 项目记忆（.xuanzhu/memory）：查看现状 / 清空（清空需再次确认）
+        void this.handleMemoryCommand(arg);
+        break;
       default:
         this.lines.push(`${ansi.yellow}未知命令：/${command}，输入 /help 查看帮助。${ansi.reset}`);
     }
@@ -2173,7 +2222,8 @@ export class TuiApp {
           ? "执行中"
           : "已暂停";
       this.lines.push(
-        `${ansi.bold}当前目标${ansi.reset} ${ansi.gray}（${state} · 已执行 ${this.goalIterations} 轮）${ansi.reset}`,
+        `${ansi.bold}当前目标${ansi.reset} ${ansi.gray}（${state} · 第 ${this.goalIterations} 轮 · ` +
+          `已用 ${this.goalElapsedText()}）${ansi.reset}`,
       );
       for (const line of goal.text.split("\n")) {
         this.lines.push(`  ${line}`);
@@ -2256,6 +2306,15 @@ export class TuiApp {
     this.lines.push("");
   }
 
+  /** 目标已运行时长（从设定时刻起算，含暂停时间） */
+  private goalElapsedText(): string {
+    const goal = this.agent.getGoal();
+    if (!goal) return "—";
+    const started = Date.parse(goal.startedAt);
+    if (!Number.isFinite(started)) return "—";
+    return formatDuration(Date.now() - started);
+  }
+
   /**
    * 目标模式的自动推进循环。
    *
@@ -2275,6 +2334,8 @@ export class TuiApp {
 
     this.goalLoopActive = true;
     this.goalCancelled = false;
+    // 每次（重新）进入循环都重置「零推进」计数：/goal continue 本身就是再给一次机会
+    this.goalIdleRounds = 0;
     this.busy = true;
     this.statusText = "目标执行中";
     this.statusDetail = "";
@@ -2307,7 +2368,7 @@ export class TuiApp {
           : goalContinuePrompt(goalText, this.goalIterations - 1, this.agent.getTodos());
 
         this.statusText = first ? "目标执行中" : "目标自动继续";
-        this.statusDetail = `第 ${this.goalIterations} 轮`;
+        this.statusDetail = `第 ${this.goalIterations} 轮 · ${this.goalElapsedText()}`;
         this.abortController = new AbortController();
         this.scheduleRender();
 
@@ -2352,18 +2413,39 @@ export class TuiApp {
           );
           break;
         }
+
+        // 零推进检测：连续若干轮一次工具都没调用，说明它只在重复表态。
+        // 继续发「继续」只会得到同样的文字，及时暂停比烧满安全阀更有用。
+        if (this.agent.getLastRunToolCallCount() === 0) {
+          this.goalIdleRounds += 1;
+        } else {
+          this.goalIdleRounds = 0;
+        }
+        if (this.goalIdleRounds >= GOAL_MAX_IDLE_ROUNDS) {
+          paused = true;
+          this.lines.push(
+            `${ansi.yellow}⚠ 目标已暂停：连续 ${this.goalIdleRounds} 轮没有执行任何工具` +
+              `（只输出文字），自动继续已无意义。${ansi.reset}`,
+          );
+          this.lines.push(
+            `${ansi.gray}  · 请补充更具体的要求后 /goal continue，或 /goal off 结束目标。${ansi.reset}`,
+          );
+          break;
+        }
       }
     } finally {
       this.goalLoopActive = false;
       this.busy = false;
       this.abortController = undefined;
-      this.statusText = "就绪";
-      this.statusDetail = "";
 
       const final = this.agent.getGoal();
       if (done && final) {
+        this.statusText = "就绪";
+        this.statusDetail = "";
         this.lines.push(`${ansi.brightGreen}${ansi.bold}✓ 目标已完成${ansi.reset}`);
-        this.lines.push(`${ansi.gray}  共执行 ${this.goalIterations} 轮。${ansi.reset}`);
+        this.lines.push(
+          `${ansi.gray}  共执行 ${this.goalIterations} 轮 · 用时 ${this.goalElapsedText()}。${ansi.reset}`,
+        );
         if (final.summary) {
           for (const line of final.summary.split("\n")) {
             this.lines.push(`${ansi.gray}  ${line}${ansi.reset}`);
@@ -2372,6 +2454,9 @@ export class TuiApp {
         // 完成即退出目标模式：后续普通对话不再注入目标提示词
         this.agent.clearGoal();
       } else if (final && !final.completed) {
+        // 状态栏保留「已暂停」，用户一眼能看出目标没结束（下一次操作会覆盖它）
+        this.statusText = "目标已暂停";
+        this.statusDetail = `第 ${this.goalIterations} 轮 · ${this.goalElapsedText()}`;
         if (hitLimit) {
           this.lines.push(
             `${ansi.yellow}已达目标模式的安全上限（${GOAL_MAX_ITERATIONS} 轮），已暂停。${ansi.reset}`,
@@ -2383,9 +2468,123 @@ export class TuiApp {
         this.lines.push(
           `${ansi.gray}  · /goal continue 继续自动执行 · /goal off 清除目标 · /goal 查看状态${ansi.reset}`,
         );
+      } else {
+        this.statusText = "就绪";
+        this.statusDetail = "";
       }
       this.scheduleRender();
     }
+  }
+
+  /**
+   * /memory —— 项目记忆（`<项目>/.xuanzhu/memory/`）。
+   *
+   * - 不带参数 / `status`：显示长期记忆与每日日志的现状；
+   * - `clear`：清空长期记忆与全部每日日志，**必须二次确认**。
+   *
+   * 为什么清空要走确认框而不是直接执行：`memory_write` 是模型自己写的，
+   * 攒下来的结论往往没法从别处恢复；而且这条命令常常是「先清干净再重来」，
+   * 误触的代价是整段项目背景丢失。确认框默认停在「拒绝」（`requestConfirm` 第二参），
+   * 只有显式按 y / 切到「允许」才删除。
+   *
+   * 清空后必须 `reloadSystemPrompt()`：系统提示词是构造时缓存的一份快照，
+   * 不刷新的话后续请求仍会带着刚删掉的旧记忆。
+   */
+  private async handleMemoryCommand(arg: string): Promise<void> {
+    const sub = arg.trim().toLowerCase();
+    const status = inspectProjectMemory(this.cwd);
+
+    if (!sub || sub === "status") {
+      if (!status.hasLongTerm && status.dailyFiles.length === 0) {
+        this.lines.push(
+          `${ansi.bold}项目记忆${ansi.reset} ${ansi.gray}（为空）${ansi.reset}`,
+        );
+        this.lines.push(`${ansi.gray}  目录：${status.dir}${ansi.reset}`);
+      } else {
+        const daily =
+          status.dailyFiles.length > 0
+            ? `${status.dailyFiles.length} 份（${status.dailyFiles[0].name.replace(/\.md$/, "")} ~ ` +
+              `${status.dailyFiles[status.dailyFiles.length - 1].name.replace(/\.md$/, "")}）`
+            : "无";
+        this.lines.push(`${ansi.bold}项目记忆${ansi.reset} ${ansi.gray}${status.dir}${ansi.reset}`);
+        this.lines.push(
+          `${ansi.gray}  长期记忆 MEMORY.md：${ansi.reset}` +
+            (status.hasLongTerm
+              ? `${status.longTermChars} 字符 / ${formatBytes(status.longTermBytes)}`
+              : `${ansi.gray}未创建${ansi.reset}`),
+        );
+        this.lines.push(`${ansi.gray}  每日日志：${ansi.reset}${daily}`);
+        this.lines.push(`${ansi.gray}  合计：${ansi.reset}${formatBytes(status.totalBytes)}`);
+      }
+      this.lines.push(
+        `${ansi.gray}  · /memory clear 清空记忆（需再次确认；不会删除 ~/.xzh/sessions 的会话存档）${ansi.reset}`,
+      );
+      return;
+    }
+
+    if (["clear", "reset", "rm", "delete"].includes(sub)) {
+      if (!status.hasLongTerm && status.dailyFiles.length === 0) {
+        this.lines.push(`${ansi.gray}项目记忆已经是空的（${status.dir}）。${ansi.reset}`);
+        return;
+      }
+
+      const files = [
+        ...(status.hasLongTerm
+          ? [{ name: "MEMORY.md", bytes: status.longTermBytes }]
+          : []),
+        ...status.dailyFiles,
+      ];
+      const MAX_SHOWN = 8;
+      const shown = files
+        .slice(0, MAX_SHOWN)
+        .map((file) => `  ${file.name}  ${formatBytes(file.bytes)}`)
+        .join("\n");
+      const more =
+        files.length > MAX_SHOWN ? `\n  …还有 ${files.length - MAX_SHOWN} 个文件` : "";
+      const approved = await this.requestConfirm(
+        {
+          tool: "memory_clear",
+          title: "清空项目记忆？",
+          detail:
+            `目录：${status.dir}\n` +
+            `将删除 ${files.length} 个文件（共 ${formatBytes(status.totalBytes)}）：\n` +
+            `${shown}${more}\n\n` +
+            `⚠ 此操作不可恢复；不会删除 ~/.xzh/sessions 里的会话存档。\n` +
+            `按 y（或 ← → 切到「允许」再回车）才会执行。`,
+          danger: true,
+        },
+        // 默认停在「拒绝」：一个回车不能把项目记忆删掉
+        false,
+      );
+      if (!approved) {
+        this.lines.push(`${ansi.gray}已取消，项目记忆未改动。${ansi.reset}`);
+        return;
+      }
+
+      const cleared = clearProjectMemory(this.cwd);
+      this.agent.reloadSystemPrompt();
+      if (cleared.files.length === 0) {
+        this.lines.push(
+          `${ansi.yellow}⚠ 没有删除任何文件（可能没有写权限）：${status.dir}${ansi.reset}`,
+        );
+        return;
+      }
+      this.lines.push(
+        `${ansi.green}✓ 已清空项目记忆：删除 ${cleared.files.length} 个文件` +
+          `（${formatBytes(cleared.totalBytes)}）。${ansi.reset}`,
+      );
+      this.lines.push(
+        `${ansi.gray}  后续请求不再注入旧记忆；会话存档仍保留，可用 /resume 找回历史对话。${ansi.reset}`,
+      );
+      return;
+    }
+
+    this.lines.push(
+      `${ansi.yellow}未知用法：/memory ${arg}${ansi.reset}`,
+    );
+    this.lines.push(
+      `${ansi.gray}  · /memory 查看现状 · /memory clear 清空（需确认）${ansi.reset}`,
+    );
   }
 
   /**
@@ -3008,6 +3207,7 @@ export class TuiApp {
       `  /model [编号|id|模型名]  查看 / 切换当前模型（不带参数：↑ ↓ 选择，Enter 确认）`,
       `  /goal <目标>   目标模式：持续自动执行直到完成（Ctrl+C 中断；/goal off 清除）`,
       `  /goal [status|continue|off]  查看当前目标 / 继续已暂停的目标 / 清除目标`,
+      `  /memory        查看项目记忆（长期记忆 / 每日日志）；/memory clear 清空（需确认）`,
       `  /auto [on|off] 切换自动批准（on：所有工具直接执行，写入配置）`,
       `  /intent [on|off] 切换意图分析（on：每条消息先做意图分析再处理，写入配置）`,
       `  /exit          退出玄猪`,
@@ -3058,8 +3258,8 @@ export class TuiApp {
       ? goal.completed
         ? "已完成"
         : this.goalLoopActive
-          ? `执行中 · 第 ${this.goalIterations} 轮`
-          : "已暂停"
+          ? `执行中 · 第 ${this.goalIterations} 轮 · ${this.goalElapsedText()}`
+          : `已暂停 · 第 ${this.goalIterations} 轮 · ${this.goalElapsedText()}`
       : "";
     const goalLine = goal
       ? `${ansi.gray}  目标：${ansi.reset}${ansi.brightMagenta}${truncate(

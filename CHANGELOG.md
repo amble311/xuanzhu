@@ -4,6 +4,25 @@
 
 ## [未发布]
 
+## [0.6.0] — 2026-10-23
+
+### 变更
+
+- **目标模式继续打磨**：顶部信息区与状态栏增加「第 N 轮 · 已用时长」；新增**零推进检测** ——
+  连续 3 轮没有执行任何工具（只输出「好的，我接下来会…」这类文字）时自动暂停并说明原因，
+  优于对着同样的表态烧满 40 轮安全阀。`Agent.getLastRunToolCallCount()` 提供该判定所需的
+  确定性信号。
+- **`/memory` 项目记忆查看与清空**：`/memory` 显示记忆目录、`MEMORY.md` 字符数与每日日志份数；
+  `/memory clear` 清空长期记忆与全部每日日志。清空**必须二次确认**：确认框默认停在「拒绝」，
+  按 `y`（或 ← → 切到「允许」再回车）才执行；只删 `<项目>/.xuanzhu/memory/` 下的记忆文件，
+  **不动** `~/.xzh/sessions/` 会话存档，清空后立即刷新系统提示词（后续请求不再注入旧记忆）。
+- **确认框 Enter 语义修正**：Enter 现在确认**当前高亮的选项**，而不是无条件「允许」——
+  此前用 ← → 切到「拒绝」后按 Enter 反而会执行操作，与界面提示矛盾。
+- **`--help` 补齐遗漏命令**：补上 `xzh errors list` / `xzh errors path`、`xzh help` / `xzh version`
+  的单词形式、`xzh skill delete --yes`，以及 `device` 的通用参数（`--port` / `--device`）说明；
+  README（中 / 英）的命令表同步补齐 `errors list/path`、`device status|push|stop|check|shot`、
+  `--intent` / `--no-intent`、`help` / `version`。
+
 ## [0.5.0] — 2026-10-22
 
 ### 变更

@@ -458,3 +458,123 @@ export function writeLongTermMemory(cwd: string, content: string): string {
   fs.renameSync(tmp, paths.longTermFile);
   return paths.longTermFile;
 }
+
+// ------------------------------------------------------------ 项目记忆清空
+
+/** 记忆目录里的一个文件（清空 / 展示时用） */
+export interface MemoryFileInfo {
+  name: string;
+  bytes: number;
+}
+
+/** 项目记忆的现状（`/memory` 展示、清空前确认框使用） */
+export interface ProjectMemoryStatus {
+  /** 记忆目录：<项目>/.xuanzhu/memory */
+  dir: string;
+  /** MEMORY.md 是否存在 */
+  hasLongTerm: boolean;
+  /** MEMORY.md 的字符数（trim 后） */
+  longTermChars: number;
+  /** 每日日志（YYYY-MM-DD.md），按日期升序 */
+  dailyFiles: MemoryFileInfo[];
+  /** 所有记忆文件的总字节数（含 MEMORY.md） */
+  totalBytes: number;
+  /** MEMORY.md 的字节数（不存在为 0） */
+  longTermBytes: number;
+}
+
+/** 只认这两类文件：长期记忆与每日日志。其它文件不参与清空，避免误删用户放进去的东西 */
+function isMemoryFile(name: string): boolean {
+  return name === LONG_TERM_FILE || /^\d{4}-\d{2}-\d{2}\.md$/.test(name);
+}
+
+/** 查看项目记忆现状（不修改任何文件） */
+export function inspectProjectMemory(cwd: string): ProjectMemoryStatus {
+  const paths = resolveProjectPaths(cwd);
+  const status: ProjectMemoryStatus = {
+    dir: paths.memoryDir,
+    hasLongTerm: false,
+    longTermChars: 0,
+    dailyFiles: [],
+    totalBytes: 0,
+    longTermBytes: 0,
+  };
+
+  try {
+    if (fs.existsSync(paths.longTermFile)) {
+      const raw = fs.readFileSync(paths.longTermFile, "utf8");
+      status.hasLongTerm = true;
+      status.longTermChars = raw.trim().length;
+      status.longTermBytes = Buffer.byteLength(raw, "utf8");
+      status.totalBytes += status.longTermBytes;
+    }
+  } catch {
+    // 读不了就当作不存在
+  }
+
+  try {
+    const names = fs
+      .readdirSync(paths.memoryDir)
+      .filter((name) => /^\d{4}-\d{2}-\d{2}\.md$/.test(name))
+      .sort();
+    for (const name of names) {
+      try {
+        const file = path.join(paths.memoryDir, name);
+        const stat = fs.statSync(file);
+        if (!stat.isFile()) continue;
+        status.dailyFiles.push({ name, bytes: stat.size });
+        status.totalBytes += stat.size;
+      } catch {
+        // 单个文件读不了就跳过
+      }
+    }
+  } catch {
+    // 目录不存在 = 没有记忆
+  }
+
+  return status;
+}
+
+export interface ClearedProjectMemory {
+  /** 实际删除成功的文件 */
+  files: MemoryFileInfo[];
+  /** 实际删除的总字节数 */
+  totalBytes: number;
+}
+
+/**
+ * 清空当前项目的记忆（`/memory clear`）。
+ *
+ * 只删 `MEMORY.md` 与 `YYYY-MM-DD.md`，**不碰**目录里的其它文件、也不动
+ * `~/.xzh/sessions` 的会话存档（两者是不同概念：记忆是给模型的结论库，
+ * 会话是可 `/resume` 的原始记录）。
+ *
+ * 失败（权限等）不抛异常：返回实际删掉的文件，调用方据此如实告知用户。
+ */
+export function clearProjectMemory(cwd: string): ClearedProjectMemory {
+  const paths = resolveProjectPaths(cwd);
+  const files: MemoryFileInfo[] = [];
+  let totalBytes = 0;
+
+  let names: string[];
+  try {
+    names = fs.readdirSync(paths.memoryDir).filter(isMemoryFile).sort();
+  } catch {
+    return { files, totalBytes };
+  }
+
+  for (const name of names) {
+    const file = path.join(paths.memoryDir, name);
+    try {
+      const stat = fs.statSync(file);
+      if (!stat.isFile()) continue;
+      fs.unlinkSync(file);
+      files.push({ name, bytes: stat.size });
+      totalBytes += stat.size;
+    } catch {
+      // 删不掉就留在原地；返回值反映真实结果
+    }
+  }
+
+  return { files, totalBytes };
+}

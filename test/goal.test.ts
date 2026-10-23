@@ -189,6 +189,59 @@ describe("目标模式", () => {
     expect(internals.lines.join("\n")).toContain("✓ 目标已完成");
   });
 
+  it("记录本轮实际执行的工具调用数（目标模式据此判断空转）", async () => {
+    const { llm } = goalProvider();
+    const agent = new Agent(llm, configOf(), tmpCwd(), events(), model);
+    agent.setGoal("完成 X");
+
+    await agent.run("开始");
+    // 本轮执行了 goal_complete
+    expect(agent.getLastRunToolCallCount()).toBe(1);
+
+    await agent.run("再来一次");
+    // 纯文字轮次：没有任何工具调用
+    expect(agent.getLastRunToolCallCount()).toBe(0);
+  });
+
+  it("界面循环：连续零工具调用会暂停，而不是继续烧轮次", async () => {
+    let call = 0;
+    const llm: LLMProvider = {
+      id: "fake",
+      model: "fake",
+      async *chat(): AsyncGenerator<StreamChunk> {
+        call += 1;
+        // 每轮都只是「表态」，不调用任何工具
+        yield { type: "text", text: "好的，我接下来会继续处理。" };
+        yield { type: "done", finishReason: "stop" };
+      },
+    };
+
+    const app = new TuiApp({
+      provider: llm,
+      config: configOf(),
+      cwd: tmpCwd(),
+      providerLabel: "fake",
+      model: "fake",
+      autoApprove: true,
+    });
+    const internals = app as unknown as {
+      runGoalLoop(): Promise<void>;
+      lines: string[];
+      agent: Agent;
+      exited: boolean;
+    };
+
+    internals.agent.setGoal("完成 X");
+    await internals.runGoalLoop();
+    internals.exited = true;
+
+    // 阈值是 3 轮：到第 3 轮结束就停下（不会跑满 40 轮安全阀）
+    expect(call).toBe(3);
+    expect(internals.agent.getGoal()?.completed).toBe(false);
+    expect(internals.lines.join("\n")).toContain("没有执行任何工具");
+    expect(internals.lines.join("\n")).toContain("/goal continue");
+  });
+
   it("reset / restoreSession 会清掉目标（目标绑定对话上下文）", async () => {
     const { llm } = goalProvider();
     const agent = new Agent(llm, configOf(), tmpCwd(), events(), model);

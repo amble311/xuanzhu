@@ -354,9 +354,12 @@ ${ansi.bold}用法${ansi.reset}
   ${ansi.green}xzh skill list${ansi.reset}          列出全部技能（含来源与状态）
   ${ansi.green}xzh skill enable/disable <名称>${ansi.reset}
                             启用 / 禁用技能
-  ${ansi.green}xzh skill delete <名称>${ansi.reset} 删除技能（仅限用户技能；内置技能请用 disable）
-  ${ansi.green}xzh errors${ansi.reset}              查看玄猪记录的错误报告（~/.xzh/errors/）
+  ${ansi.green}xzh skill delete <名称> [--yes]${ansi.reset}
+                            删除技能（仅限用户技能；内置技能请用 disable）
+  ${ansi.green}xzh errors${ansi.reset}              查看玄猪记录的错误报告（~/.xzh/errors/，等价 errors list）
+  ${ansi.green}xzh errors list${ansi.reset}         列出全部报告（最近的在前）
   ${ansi.green}xzh errors show <序号|签名>${ansi.reset}  查看一份报告的完整内容
+  ${ansi.green}xzh errors path${ansi.reset}         打印报告目录
   ${ansi.green}xzh errors clear [--yes]${ansi.reset} 清空错误报告
   ${ansi.green}xzh device${ansi.reset}              与手机上的 AutoJs6 / AutoX.js 通信（设备桥）
   ${ansi.green}xzh device serve${ansi.reset}        等手机连过来并常驻（AutoX.js 9317 + AutoJs6 客户端模式 6347）
@@ -368,6 +371,9 @@ ${ansi.bold}用法${ansi.reset}
   ${ansi.green}xzh device check${ansi.reset}        体检：无障碍服务是否就绪、能否操作手机
   ${ansi.green}xzh device shot [输出文件]${ansi.reset}   截取手机当前屏幕并保存为 JPEG
   ${ansi.green}xzh device apk${ansi.reset}          查看/安装手机端 AutoJs6 的安装包
+  ${ansi.gray}  · device 通用参数：--port <端口>（默认 9317）· --device <名称> 只对某台设备下发${ansi.reset}
+  ${ansi.green}xzh help${ansi.reset}                显示本帮助（同 --help）
+  ${ansi.green}xzh version${ansi.reset}             显示版本（同 --version）
   ${ansi.green}xzh --help${ansi.reset}              显示本帮助
   ${ansi.green}xzh --version${ansi.reset}           显示版本
 

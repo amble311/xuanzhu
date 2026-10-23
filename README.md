@@ -166,14 +166,24 @@ xzh
 | `xzh skill list` | 列出全部技能（来源与状态，含已禁用项） |
 | `xzh skill enable/disable <名称>` | 启用 / 禁用技能 |
 | `xzh skill delete <名称> [--yes]` | 删除技能（仅限用户技能；内置技能请用 disable） |
-| `xzh errors` | 查看玄猪自动记录的错误报告（`~/.xzh/errors/`） |
+| `xzh errors` | 列出玄猪自动记录的错误报告（`~/.xzh/errors/`，等价 `errors list`） |
+| `xzh errors list` | 列出全部报告（最近的在前） |
 | `xzh errors show <序号\|签名>` | 查看一份报告的完整内容（JSON） |
+| `xzh errors path` | 打印报告目录 |
 | `xzh errors clear [--yes]` | 清空错误报告 |
 | `xzh device connect <手机IP>` | 连接手机上的 AutoJs6（服务器模式）并常驻 |
 | `xzh device serve` | 反向：等手机上的 AutoX.js 连过来 |
-| `xzh device run <文件>` | 把脚本推到手机并运行（`push` 则只保存不运行） |
+| `xzh device status\|list` | 查看桥与已连接设备 |
+| `xzh device push <文件>` | 把脚本保存到手机（不运行） |
+| `xzh device run <文件>` | 把脚本推到手机并运行 |
+| `xzh device stop` | 停止手机上正在运行的脚本 |
 | `xzh device logs` | 查看手机上的脚本日志 |
+| `xzh device check` | 体检：无障碍服务是否就绪、能否操作手机 |
+| `xzh device shot [输出文件]` | 截取手机当前屏幕并保存为 JPEG |
 | `xzh device apk` | 该装哪个 AutoJs6 安装包、去哪里下载 |
+| `xzh --intent` / `--no-intent` | 仅本次运行启用 / 关闭意图分析（不写回配置） |
+| `xzh help` | 查看帮助（同 `--help`） |
+| `xzh version` | 查看版本（同 `--version`） |
 | `xzh --help` | 查看帮助 |
 | `xzh --version` | 查看版本 |
 
@@ -463,8 +473,11 @@ API Key 也可以来自环境变量，优先级低于配置文件：
   （缺凭据、外部依赖不可用）它也应当调用它并写明阻塞原因，而不是无限空转。
 - **随时可停**：`Ctrl+C`（或 `Ctrl+D`）中断当前轮并暂停循环，**目标会保留**；
   输入 `/goal continue` 接着跑，`/goal off` 清除。
-- **进度可见**：顶部信息区与状态栏显示 `◎goal`、目标与当前轮次；多步任务仍由 `todo_write`
-  维护清单，自动继续时会带着清单提示模型「从没做完的地方接着做」。
+- **进度可见**：顶部信息区与状态栏显示 `◎goal`、目标、当前轮次与已用时长；多步任务仍由
+  `todo_write` 维护清单，自动继续时会带着清单提示模型「从没做完的地方接着做」。
+- **零推进自动暂停**：连续 3 轮**没有执行任何工具**（只输出「好的，我接下来会…」这类文字）时
+  自动暂停并说明原因 —— 这种情况下继续发「继续」只会得到同样的表态。
+  补充更具体的要求后 `/goal continue` 即可继续。
 - **安全阀**：最多自动继续 40 轮，到上限会暂停并提示（避免目标本身含糊时无限烧 token）。
 - **确认框仍然生效**：目标模式**不会**自动打开 `/auto`。未开启自动批准时，写文件 / 执行命令
   仍会弹确认，确认后循环继续；想全程无人值守请先 `/auto on`。
@@ -620,6 +633,11 @@ AutoX.js 那侧也可用环境变量 `XZH_DEVICE_PORT` 指定端口。
 - **启动时**与 **`/switch` 切换目录时**，若该目录下尚无 `.xuanzhu`，会自动创建
 - 因此每个项目目录各自拥有独立的记忆与规则；`~/.xzh` 仅作**全局配置目录**
   （config.json / 会话 / 日志 / 技能），不参与项目记忆
+- **查看 / 清空**：`/memory` 显示记忆目录、长期记忆字符数与每日日志份数；
+  `/memory clear` 清空长期记忆与全部每日日志。清空**必须二次确认**：确认框默认停在「拒绝」，
+  要按 `y`（或 ← → 切到「允许」再回车）才会执行，一个回车不会误删。它只删
+  `.xuanzhu/memory/` 下的记忆文件，**不会**删除 `~/.xzh/sessions/` 的会话存档，
+  清空后系统提示词立即刷新（后续请求不再注入旧记忆）
 
 > 技能与 CLI 为**全局通用**：技能位于 `~/.xzh/skills`（叠加内置），CLI 安装在系统，均不受项目限制。
 
@@ -750,7 +768,7 @@ description: 一句话说明该技能的用途与适用场景
 kitty / Ghostty 会把该 xterm 兼容序列映射成「所有按键都用转义码上报」而破坏普通输入，
 故玄猪对这两类终端不发送请求，请改用 `Alt+Enter` 或在终端侧自行配置。
 
-界面内命令：`/help`、`/clear`、`/tools`、`/device`、`/image`（`/paste`）、`/copy [N|A-B|last|all]`、`/mouse`、`/reset`、`/undo`、`/resume [编号]`、`/cwd`、`/switch <目录>`、`/term`、`/model [编号|id|模型名]`、`/goal <目标>`（`/goal [status|continue|off]`）、`/auto [on|off]`、`/intent [on|off]`、`/exit`。
+界面内命令：`/help`、`/clear`、`/tools`、`/device`、`/image`（`/paste`）、`/copy [N|A-B|last|all]`、`/mouse`、`/reset`、`/undo`、`/resume [编号]`、`/cwd`、`/switch <目录>`、`/term`、`/model [编号|id|模型名]`、`/goal <目标>`（`/goal [status|continue|off]`）、`/memory [clear]`、`/auto [on|off]`、`/intent [on|off]`、`/exit`。
 
 ### 选中与复制
 
