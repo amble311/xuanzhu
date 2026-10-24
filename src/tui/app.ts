@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { Agent, type AgentEvents } from "../core/agent";
 import { goalContinuePrompt, goalStartPrompt } from "../core/goal";
+import { applyInit, planInit, summarizePlan } from "../init";
 import {
   appendSessionMessages,
   listSessions,
@@ -33,7 +34,7 @@ import type { LLMProvider, ToolCall } from "../llm/types";
 import { clipboardRequirements, currentPlatform } from "../skills/dependencies";
 import { isRequirementMet, runShellInteractive } from "../skills/installer";
 import { getToolSpecs, type ExecuteToolResult } from "../tools";
-import type { ConfirmRequest, TodoItem } from "../tools/types";
+import type { ConfirmRequest, RunStatus, TodoItem } from "../tools/types";
 import {
   MAX_CLIPBOARD_IMAGE_BYTES,
   readClipboardImage,
@@ -2045,6 +2046,9 @@ export class TuiApp {
       const tail = this.markdown.flush();
       if (tail.length > 0) this.lines.push(...tail);
       this.streamingPreview = "";
+      // 普通对话里也展示 report_status 的结果（目标模式由 runGoalLoop 自己处理）
+      const runStatus = this.agent.getRunStatus();
+      if (runStatus) this.printRunStatus(runStatus);
       this.lines.push("");
       this.busy = false;
       this.abortController = undefined;
@@ -2184,10 +2188,109 @@ export class TuiApp {
         // 项目记忆（.xuanzhu/memory）：查看现状 / 清空（清空需再次确认）
         void this.handleMemoryCommand(arg);
         break;
+      case "init":
+        // 项目规范：扫描并生成 / 补全 AGENTS.md 与 docs/（写入前确认）
+        void this.handleInitCommand(arg);
+        break;
       default:
         this.lines.push(`${ansi.yellow}未知命令：/${command}，输入 /help 查看帮助。${ansi.reset}`);
     }
     this.scheduleRender();
+  }
+
+  /**
+   * /init —— 项目开发规范（AGENTS.md + docs/）。
+   *
+   * 只做扫描与「补齐缺失小节」：已有文件不会被覆盖，`--force` 才整体覆盖（覆盖前备份）。
+   * 写入前必须确认；已有需要覆盖的文件时确认框默认停在「拒绝」。
+   */
+  private async handleInitCommand(arg: string): Promise<void> {
+    const flags = new Set(arg.split(/\s+/).filter(Boolean));
+    const allowed = new Set(["--dry-run", "-n", "--force", "-f"]);
+    const unknown = [...flags].filter((flag) => !allowed.has(flag));
+    if (unknown.length > 0) {
+      this.lines.push(
+        `${ansi.yellow}未知参数：${unknown.join(" ")}${ansi.reset}`,
+      );
+      this.lines.push(
+        `${ansi.gray}  · 用法：/init [--dry-run|--force]${ansi.reset}`,
+      );
+      return;
+    }
+
+    const dryRun = flags.has("--dry-run") || flags.has("-n");
+    const force = flags.has("--force") || flags.has("-f");
+    const plan = planInit(this.cwd, { force });
+
+    const colorize = (line: string): string => {
+      if (line.startsWith("+")) return `${ansi.green}${line}${ansi.reset}`;
+      if (line.startsWith("~")) return `${ansi.cyan}${line}${ansi.reset}`;
+      if (line.startsWith("!")) return `${ansi.brightYellow}${line}${ansi.reset}`;
+      if (line.startsWith("·")) return `${ansi.gray}${line}${ansi.reset}`;
+      return `${ansi.gray}${line}${ansi.reset}`;
+    };
+    for (const line of summarizePlan(plan)) {
+      this.lines.push(colorize(line));
+    }
+
+    if (plan.files.every((file) => file.action === "skip")) {
+      this.lines.push(`${ansi.gray}项目规范已是最新，未修改任何文件。${ansi.reset}`);
+      return;
+    }
+
+    if (dryRun) {
+      this.lines.push(
+        `${ansi.gray}  · 未写入任何文件；要看完整预览请在命令行运行 ${ansi.reset}xzh init --dry-run${ansi.reset}`,
+      );
+      return;
+    }
+
+    const destructive = plan.files.some((file) => file.action === "overwrite");
+    const changed = plan.files.filter((file) => file.action !== "skip");
+    const approved = await this.requestConfirm(
+      {
+        tool: "init",
+        title: "写入项目规范？",
+        detail:
+          `目录：${this.cwd}\n` +
+          `将写入 ${changed.length} 个文件：\n` +
+          changed.map((file) => `  ${file.relPath}`).join("\n") +
+          `\n\n已有文件只会补充缺失小节，不会覆盖原内容` +
+          (destructive
+            ? "；`--force` 会整体覆盖，覆盖前自动备份。"
+            : "。"),
+        danger: destructive,
+      },
+      // 只有新建 / 补充时默认「允许」；涉及覆盖时默认「拒绝」
+      !destructive,
+    );
+    if (!approved) {
+      this.lines.push(`${ansi.gray}已取消，未修改任何文件。${ansi.reset}`);
+      return;
+    }
+
+    try {
+      const result = applyInit(plan);
+      for (const item of result.written) {
+        const verb =
+          item.action === "create"
+            ? "已新建"
+            : item.action === "append"
+              ? "已补充"
+              : "已覆盖";
+        this.lines.push(`${ansi.green}✓ ${verb} ${item.relPath}${ansi.reset}`);
+      }
+      for (const backup of result.backups) {
+        this.lines.push(`${ansi.gray}  备份：${backup}${ansi.reset}`);
+      }
+      this.lines.push(
+        `${ansi.gray}  后续可直接编辑 AGENTS.md 与 docs/；再次 /init 只补充缺失小节。${ansi.reset}`,
+      );
+    } catch (err) {
+      this.lines.push(
+        `${ansi.red}✗ 写入失败：${err instanceof Error ? err.message : String(err)}${ansi.reset}`,
+      );
+    }
   }
 
   /**
@@ -2306,6 +2409,40 @@ export class TuiApp {
     this.lines.push("");
   }
 
+  /**
+   * 展示模型经 `report_status` 上报的状态。
+   *
+   * 三种类型对用户的意义完全不同，措辞必须区分：
+   * - blocked：外部条件不满足，用户补齐后可以继续；
+   * - needs_input：需要用户做选择；
+   * - low_confidence：任务照常结束，但要提醒结论不可靠。
+   */
+  private printRunStatus(status: RunStatus): void {
+    const label =
+      status.kind === "blocked"
+        ? "受阻"
+        : status.kind === "needs_input"
+          ? "需要你的决定"
+          : "置信度低";
+    const color =
+      status.kind === "low_confidence" ? ansi.yellow : ansi.brightYellow;
+    this.lines.push(`${color}⚠ ${label}：${status.summary}${ansi.reset}`);
+    if (status.detail) {
+      for (const line of status.detail.split("\n").slice(0, 6)) {
+        this.lines.push(`${ansi.gray}  ${line}${ansi.reset}`);
+      }
+    }
+    if (status.kind === "needs_input") {
+      this.lines.push(
+        `${ansi.gray}  · 直接回复你的选择即可${this.agent.getGoal() ? "；之后 /goal continue 继续目标" : ""}${ansi.reset}`,
+      );
+    } else if (status.kind === "blocked") {
+      this.lines.push(
+        `${ansi.gray}  · ${this.agent.getGoal() ? "补齐条件后 /goal continue 继续目标" : "补齐条件后直接回复即可"}${ansi.reset}`,
+      );
+    }
+  }
+
   /** 目标已运行时长（从设定时刻起算，含暂停时间） */
   private goalElapsedText(): string {
     const goal = this.agent.getGoal();
@@ -2403,6 +2540,16 @@ export class TuiApp {
           // 目标在执行中已被替换 / 清除
           break;
         }
+
+        // 模型主动上报「受阻 / 需要你决定」→ 暂停目标（目标保留，补齐条件后可继续）。
+        // low_confidence 不打断：它不改变能否推进，只做标注。
+        const runStatus = this.agent.getRunStatus();
+        if (runStatus && runStatus.kind !== "low_confidence") {
+          paused = true;
+          this.printRunStatus(runStatus);
+          break;
+        }
+
         // 本轮非正常收尾（重复调用中止、模型调用失败等）不再自动继续
         const abortReason = this.agent.getAbortReason();
         if (threw || abortReason) {
@@ -2451,11 +2598,22 @@ export class TuiApp {
             this.lines.push(`${ansi.gray}  ${line}${ansi.reset}`);
           }
         }
+        // 完成但模型自评置信度低：照常结束，但要把不可靠的部分说清楚
+        const doneStatus = this.agent.getRunStatus();
+        if (doneStatus?.kind === "low_confidence") {
+          this.printRunStatus(doneStatus);
+        }
         // 完成即退出目标模式：后续普通对话不再注入目标提示词
         this.agent.clearGoal();
       } else if (final && !final.completed) {
         // 状态栏保留「已暂停」，用户一眼能看出目标没结束（下一次操作会覆盖它）
-        this.statusText = "目标已暂停";
+        const pausedStatus = this.agent.getRunStatus();
+        this.statusText =
+          pausedStatus?.kind === "needs_input"
+            ? "目标等待决定"
+            : pausedStatus?.kind === "blocked"
+              ? "目标受阻"
+              : "目标已暂停";
         this.statusDetail = `第 ${this.goalIterations} 轮 · ${this.goalElapsedText()}`;
         if (hitLimit) {
           this.lines.push(
@@ -3208,6 +3366,7 @@ export class TuiApp {
       `  /goal <目标>   目标模式：持续自动执行直到完成（Ctrl+C 中断；/goal off 清除）`,
       `  /goal [status|continue|off]  查看当前目标 / 继续已暂停的目标 / 清除目标`,
       `  /memory        查看项目记忆（长期记忆 / 每日日志）；/memory clear 清空（需确认）`,
+      `  /init [--dry-run|--force]  扫描项目并生成 / 补全 AGENTS.md 与 docs/（写入前确认）`,
       `  /auto [on|off] 切换自动批准（on：所有工具直接执行，写入配置）`,
       `  /intent [on|off] 切换意图分析（on：每条消息先做意图分析再处理，写入配置）`,
       `  /exit          退出玄猪`,

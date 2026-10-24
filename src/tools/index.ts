@@ -12,6 +12,7 @@ import {
 import { deviceTools } from "./device";
 import { goalCompleteTool } from "./goal";
 import { memoryCompactTool, memoryReadTool, memoryWriteTool } from "./memory";
+import { reportStatusTool } from "./status";
 import { listSkillsTool, loadSkillTool } from "./skills";
 import { todoWriteTool } from "./todo";
 import type { ToolContext, ToolDefinition, ToolResult } from "./types";
@@ -29,6 +30,7 @@ export const TOOLS: ToolDefinition[] = [
   memoryCompactTool,
   todoWriteTool,
   goalCompleteTool,
+  reportStatusTool,
   taskTool,
   readFileTool,
   listDirTool,
@@ -47,6 +49,8 @@ export const TOOLS: ToolDefinition[] = [
  * - `todo_write`：任务列表属于主会话，子代理的任务不展示给用户，写上只会造成混乱；
  * - `goal_complete`：目标模式属于主会话 —— 子代理调用它既结束不了目标，
  *   还会让主代理误以为整体已完成；
+ * - `report_status`：状态上报由界面消费，子代理上报没人看得见 ——
+ *   它的受阻/不确定应写进结论文本，由主代理转述；
  * - `memory_write` / `memory_compact`：记忆由主代理统一维护 —— 子代理只了解一件
  *   子任务，不具备判断「什么值得跨会话保留」的全局视角，两边同时写还容易重复；
  * - `device_*`：手机只有一台，多个子代理并行推脚本会互相打断（一个跑起来就把上一个顶掉），
@@ -57,6 +61,7 @@ export const SUBAGENT_FORBIDDEN_TOOLS = new Set([
   "task",
   "todo_write",
   "goal_complete",
+  "report_status",
   "memory_write",
   "memory_compact",
   ...deviceTools.map((tool) => tool.name),

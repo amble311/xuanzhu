@@ -26,6 +26,7 @@ import {
 } from "../utils/crash";
 import { configCommand } from "./commands/config";
 import { errorsCommand } from "./commands/errors";
+import { initCommand } from "./commands/init";
 import { modelCommand } from "./commands/model";
 import { setupCommand } from "./commands/setup";
 import { skillCommand } from "./commands/skill";
@@ -130,6 +131,9 @@ async function main(): Promise<void> {
       return;
     case "setup":
       await setupCommand();
+      return;
+    case "init":
+      await initCommand(args.slice(1));
       return;
     case "skill":
       await skillCommand(args.slice(1));
@@ -350,6 +354,9 @@ ${ansi.bold}用法${ansi.reset}
   ${ansi.green}xzh config path${ansi.reset}         打印配置文件路径
   ${ansi.green}xzh config init${ansi.reset}         生成默认配置文件
   ${ansi.green}xzh setup${ansi.reset}               检查并安装依赖（剪贴板工具 + 技能 CLI）
+  ${ansi.green}xzh init${ansi.reset}                扫描项目并生成 / 补全 AGENTS.md 与 docs/（只追加缺失小节）
+  ${ansi.green}xzh init --dry-run${ansi.reset}      只预览将生成的内容，不写文件
+  ${ansi.green}xzh init --force${ansi.reset}        整体覆盖已有规范文件（覆盖前备份）
   ${ansi.green}xzh skill${ansi.reset}               交互式管理技能（启用 / 禁用 / 删除，禁用的技能对模型不可见）
   ${ansi.green}xzh skill list${ansi.reset}          列出全部技能（含来源与状态）
   ${ansi.green}xzh skill enable/disable <名称>${ansi.reset}

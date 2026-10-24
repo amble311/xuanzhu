@@ -45,6 +45,8 @@ import {
 import type {
   ConfirmRequest,
   GoalStore,
+  RunStatus,
+  StatusStore,
   SubAgentInput,
   TodoItem,
   TodoStore,
@@ -66,6 +68,11 @@ import {
 } from "../workspace";
 import { goalSystemSection } from "./goal";
 import { buildSystemPrompt } from "./prompt";
+import {
+  buildSelfState,
+  finishGatePrompt,
+  isVerificationCommand,
+} from "./state";
 import * as path from "path";
 
 /** 只读类工具：默认免确认，但落在工作区外或敏感路径时需要确认 */
@@ -334,6 +341,38 @@ export class Agent {
    */
   private goal?: GoalState;
   /**
+   * 最近执行过的工具（只留名称与成败），供只读状态块（`core/state.ts`）使用。
+   *
+   * 只记「实际执行过」的调用：被跳过 / 被用户拒绝的不算，否则状态块会显示
+   * 一堆没有真正发生过的「动作」。
+   */
+  private recentActions: Array<{ name: string; ok: boolean }> = [];
+  /** 本次会话改动过的文件（write_file / edit_file） */
+  private sessionChangedFiles = new Set<string>();
+  /** 上一次请求的上下文占用比例（0–1）；模型未返回 usage 时按估算值 */
+  private contextUsage?: number;
+  /** 本轮改动过的文件（验证门只看本轮，避免对着旧改动反复提醒） */
+  private runChangedFiles = new Set<string>();
+  /**
+   * 本轮的动作序号：用来判断「改动之后有没有跑过验证」。
+   *
+   * 不能用布尔值：先跑测试、再改文件的情况下，布尔值会错误地认为已经验证过。
+   */
+  private runActionSeq = 0;
+  private runLastChangeSeq = 0;
+  private runLastVerifySeq = 0;
+  /** 本轮是否已经发出过收尾提醒（验证 + 未完成清单合计，每次 run 最多一次） */
+  private finishGateUsed = false;
+  /** 本轮是否调用过 `todo_write`（未完成门只看本轮自己列的计划，避免对旧清单唠叨） */
+  private runTouchedTodos = false;
+  /**
+   * 本轮模型主动上报的状态（`report_status`）。
+   *
+   * 每次 `run` 重置 —— 它是「这一轮发生了什么」的结论，不该跨轮累积。
+   * 界面据此暂停目标（blocked / needs_input）或标注置信度（low_confidence）。
+   */
+  private runStatus?: RunStatus;
+  /**
    * 手机设备桥（由界面在 `/device serve` 时注入）。
    *
    * 为空表示"xzh 进程内没有桥"—— 工具会回退到本地 HTTP 控制通道，
@@ -470,6 +509,11 @@ export class Agent {
     }
     // 目标同样属于这段对话：上下文都没了还继续推进，只会凭残缺历史乱做
     this.clearGoal();
+    // 状态块与验证门的数据同样按会话计：重置后不该再提旧动作 / 旧改动
+    this.recentActions = [];
+    this.sessionChangedFiles.clear();
+    this.contextUsage = undefined;
+    this.runStatus = undefined;
   }
 
   /**
@@ -494,6 +538,10 @@ export class Agent {
     this.historyTrimmed = false;
     // 换了一段历史，旧目标不再有对应上下文
     this.clearGoal();
+    this.recentActions = [];
+    this.sessionChangedFiles.clear();
+    this.contextUsage = undefined;
+    this.runStatus = undefined;
     appendSessionMessages(sessionFile, messages);
   }
 
@@ -553,6 +601,34 @@ export class Agent {
   /** 最近一次 `run` 实际执行的工具调用数（目标模式判断「有没有推进」） */
   getLastRunToolCallCount(): number {
     return this.lastRunToolCalls;
+  }
+
+  /** 本轮模型主动上报的状态（`report_status`）；没有则为 `undefined` */
+  getRunStatus(): RunStatus | undefined {
+    return this.runStatus;
+  }
+
+  /** 状态上报出口：交给 `report_status` 工具的引用 */
+  private statusStore(): StatusStore {
+    return {
+      report: (status) => {
+        this.runStatus = { ...status, at: new Date().toISOString() };
+      },
+      toolCalls: () => this.lastRunToolCalls,
+      goalActive: () => Boolean(this.goal && !this.goal.completed),
+    };
+  }
+
+  /** 生成只读状态块（没有可写内容时返回 `null`） */
+  private buildSelfStateBlock(): string | null {
+    return buildSelfState({
+      goal: this.goal,
+      todos: this.todos,
+      recentActions: this.recentActions,
+      changedFiles: [...this.sessionChangedFiles],
+      contextUsage: this.contextUsage,
+      status: this.runStatus,
+    });
   }
 
   /**
@@ -642,6 +718,14 @@ export class Agent {
     // Agent 实例可能被复用（同一实例多次 run），先清掉上一轮的中止原因与工具计数
     this.abortReason = undefined;
     this.lastRunToolCalls = 0;
+    // 验证门只看**本轮**的改动与验证；每次 run 允许提醒一次
+    this.runChangedFiles.clear();
+    this.runActionSeq = 0;
+    this.runLastChangeSeq = 0;
+    this.runLastVerifySeq = 0;
+    this.finishGateUsed = false;
+    this.runTouchedTodos = false;
+    this.runStatus = undefined;
     let content = userInput;
 
     // 补发构造 / 切换目录期间攒下的提示（构造时终端尚未接管，不能当场写输出区）
@@ -901,6 +985,48 @@ export class Agent {
         });
 
         if (toolCalls.length === 0) {
+          // 收尾检查 = 验证门 + 未完成门，合计**只提醒一次**（第二次仍直接答复就尊重它）。
+          // 模型已通过 report_status 声明受阻 / 待输入时不再拦截：它已经给过结构化原因了。
+          const goalActive = Boolean(this.goal && !this.goal.completed);
+          // 经方法读取：`runStatus` 在 run 开头被置为 undefined，直接读字段会被
+          // 控制流分析窄化成 undefined（它实际由工具回调写入）。
+          const currentStatus = this.getRunStatus();
+          const reportedStop =
+            currentStatus !== undefined && currentStatus.kind !== "low_confidence";
+          if (!this.finishGateUsed && !reportedStop) {
+            const verificationFiles =
+              this.runChangedFiles.size > 0 &&
+              this.runLastChangeSeq > this.runLastVerifySeq
+                ? [...this.runChangedFiles]
+                : [];
+            // 未完成门只在普通对话生效：目标模式本来就由 goal 循环继续，
+            // 再插一条「还有未完成项」只会重复打断。
+            // 也只认**本轮自己列过**的计划，避免对上一件事留下的旧清单唠叨。
+            const incompleteTodos =
+              !goalActive && this.runTouchedTodos
+                ? this.todos.filter(
+                    (item) =>
+                      item.status === "in_progress" || item.status === "pending",
+                  )
+                : [];
+            if (verificationFiles.length > 0 || incompleteTodos.length > 0) {
+              this.finishGateUsed = true;
+              turn.push({
+                role: "user",
+                content: finishGatePrompt({ verificationFiles, incompleteTodos }),
+              });
+              const parts: string[] = [];
+              if (incompleteTodos.length > 0) {
+                parts.push(`${incompleteTodos.length} 项任务未完成`);
+              }
+              if (verificationFiles.length > 0) parts.push("改动尚未验证");
+              this.events.onStatus("收尾检查", parts.join(" · "));
+              this.events.onNotice?.(
+                `收尾前检测到 ${parts.join("、")}，已要求模型继续完成或说明停下原因。`,
+              );
+              continue;
+            }
+          }
           commitTurn();
           this.events.onStatus("就绪");
           return;
@@ -1251,8 +1377,15 @@ export class Agent {
     let conversation = this.buildConversation(extra, budgetRatio);
     // 上一次因「模型不支持图片」失败 → 这次整条链路都不带图片
     if (dropImages) conversation = stripAllImages(conversation);
+    // 只读状态块：每轮按当前事实重新生成，**不写入历史**（与 contextTrimmedNote 同一套做法）。
+    // 直接并入系统提示词而不是另起一条 system 消息：各家最终都会把它并进系统提示词，
+    // 单独一条还会改变「对话首条 system 是裁剪提醒」的既有结构（历史裁剪提醒依赖该位置）。
+    const stateBlock = this.buildSelfStateBlock();
+    const systemContent = stateBlock
+      ? `${this.effectiveSystemPrompt()}\n\n${stateBlock}`
+      : this.effectiveSystemPrompt();
     const messages: ChatMessage[] = [
-      { role: "system", content: this.effectiveSystemPrompt() },
+      { role: "system", content: systemContent },
       ...conversation,
     ];
 
@@ -1321,6 +1454,15 @@ export class Agent {
             // 下一次组装请求时据此收紧预算（只收紧、不放宽）。
             if (chunk.usage?.inputTokens) {
               this.tokenCalibrator().observe(estimatedInput, chunk.usage.inputTokens);
+            }
+            // 上下文占用：有真实 usage 用真实值，否则用本次估算；
+            // 超过一半时状态块才会展示（见 core/state.ts）。
+            {
+              const window = this.activeModel?.contextWindow;
+              if (window && window > 0) {
+                const used = chunk.usage?.inputTokens ?? estimatedInput;
+                this.contextUsage = Math.min(1, used / window);
+              }
             }
             break;
         }
@@ -1559,12 +1701,63 @@ export class Agent {
       signal,
       todos: this.todoStore(),
       goal: this.goalStore(),
+      status: this.statusStore(),
       memoryMaxChars: this.config.memoryMaxChars,
       spawnAgent: (input) => this.spawnSubAgent(input, signal),
       deviceBridge: this.deviceBridge,
     };
 
-    return executeTool(call.name, call.arguments, ctx, this.tools);
+    const outcome = await executeTool(call.name, call.arguments, ctx, this.tools);
+    this.recordToolResult(call.name, call.arguments, outcome);
+    return outcome;
+  }
+
+  /**
+   * 记录一次**真实执行**的工具调用：只读状态块与验证门的数据源。
+   *
+   * 只从 `runTool` 的成功路径调用（用户拒绝 / 中断的早退不会走到这里），
+   * 因此状态块里的「最近动作」都是确实发生过的。
+   */
+  private recordToolResult(
+    name: string,
+    argsJson: string,
+    outcome: ExecuteToolResult,
+  ): void {
+    this.recentActions.push({ name, ok: outcome.ok });
+    // 只留最近几条：状态块要短，旧动作对当前判断没有价值
+    if (this.recentActions.length > 8) this.recentActions.shift();
+    this.runActionSeq += 1;
+
+    let args: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(argsJson);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        args = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // 参数不是合法 JSON 时只记动作名，不影响主流程
+    }
+
+    if (name === "write_file" || name === "edit_file") {
+      const file = typeof args.path === "string" ? args.path.trim() : "";
+      if (file) {
+        this.sessionChangedFiles.add(file);
+        this.runChangedFiles.add(file);
+        this.runLastChangeSeq = this.runActionSeq;
+      }
+    }
+
+    if (name === "bash") {
+      const command = typeof args.command === "string" ? args.command : "";
+      // 跑过验证即算（失败也算）：失败结果模型已经看到，重复提醒没有意义
+      if (command && isVerificationCommand(command)) {
+        this.runLastVerifySeq = this.runActionSeq;
+      }
+    }
+
+    if (name === "todo_write" && outcome.ok) {
+      this.runTouchedTodos = true;
+    }
   }
 
   /** 该工具是否可与其它可并行工具同时执行 */

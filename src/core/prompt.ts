@@ -56,6 +56,9 @@ export function buildSystemPrompt(
 - edit_file：精确替换文本（危险，需确认）
 - bash：执行 shell 命令（危险，需确认）
 - todo_write：创建 / 更新任务列表（每次提交完整列表）
+- report_status：卡住 / 必须由用户决定 / 把握不足时**结构化上报**
+  （blocked / needs_input / low_confidence）。能用工具自己解决的事不要上报，
+  更不要用编造的结论或反复重试来掩盖问题；只有真的无法推进时才用它
 - task：派生子代理（默认 code-explorer）执行子任务，只返回结论
 - memory_compact：用精简后的完整内容重写长期记忆 —— 把新结论并进已有主题小节，或整体压缩
 - device_list / device_push / device_run / device_stop / device_logs：把脚本推到**手机**

@@ -35,6 +35,38 @@ export interface GoalStore {
   complete(summary: string): void;
 }
 
+/** 状态上报的三种类型（`report_status` 工具） */
+export type RunStatusKind = "blocked" | "needs_input" | "low_confidence";
+
+/** 模型主动上报的状态 */
+export interface RunStatusInput {
+  /** blocked=外部条件不满足；needs_input=必须用户决定；low_confidence=能继续但结论不可靠 */
+  kind: RunStatusKind;
+  /** 一句话说明 */
+  summary: string;
+  /** 已尝试什么、缺什么、建议的选项（可选） */
+  detail?: string;
+}
+
+/** 带时间戳的状态记录（挂在 Agent 上） */
+export interface RunStatus extends RunStatusInput {
+  at: string;
+}
+
+/**
+ * 状态上报出口（由 Agent 注入）。
+ *
+ * `toolCalls()` / `goalActive()` 用于**防滥用**：目标模式下一轮工具都没调就报
+ * 「受阻 / 需要决定」，多半是想逃避困难步骤 —— 工具会直接拒绝并要求先实际尝试。
+ */
+export interface StatusStore {
+  report(status: RunStatusInput): void;
+  /** 本轮已执行的工具调用数 */
+  toolCalls(): number;
+  /** 当前是否在目标模式 */
+  goalActive(): boolean;
+}
+
 /** 派生子代理的请求 */
 export interface SubAgentInput {
   /** 要派生的子代理名称（见 src/subagents 注册表）；缺省用默认子代理 */
@@ -61,6 +93,8 @@ export interface ToolContext {
   todos?: TodoStore;
   /** 目标模式状态（由 Agent 注入），供 goal_complete 使用 */
   goal?: GoalStore;
+  /** 状态上报出口（由 Agent 注入），供 report_status 使用 */
+  status?: StatusStore;
   /** 长期记忆字符上限，超出时自动精简（由 Agent 注入） */
   memoryMaxChars?: number;
   /** 派生子代理执行子任务（由 Agent 注入），未提供时 task 工具不可用 */
