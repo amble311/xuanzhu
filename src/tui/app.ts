@@ -306,6 +306,22 @@ export class TuiApp {
    * 做字符级映射的复杂度远高于收益；而实际使用中要复制的基本都是整段内容。
    */
   private selectionAnchor?: number;
+  /** 选区锁定的区域：只在**这一个区域**内选（拖出边界不越界，改为自动滚动）。 */
+  private selectionRegion?: "output" | "term";
+  /** 输出区在当前屏幕上的行范围（1-based，含端点）；每次 render 更新。 */
+  private outputTopRow = 0;
+  private outputBottomRow = 0;
+  /** 拖到区域边界外时的自动滚动（跟随光标上拉/下拉）。 */
+  private autoScrollTimer?: ReturnType<typeof setInterval>;
+  private autoScrollDir: -1 | 0 | 1 = 0;
+  private autoScrollRegion: "output" | "term" = "output";
+  /** 右栏终端：屏幕行(0-based) → 逻辑行索引（与左栏 screenToLogical 同构）。 */
+  private termScreenToLogical: (number | undefined)[] = [];
+  /** 右栏终端当前可见的逻辑行快照（复制时用，避免滚动后取到别的行）。 */
+  private termLogicalSnapshot: string[] = [];
+  /** 右栏输出区在整屏上的行范围（1-based，含端点）。 */
+  private termTopRow = 0;
+  private termBottomRow = 0;
   private selectionHead?: number;
   /** 是否正在拖拽选择（用于区分「单击」与「拖选」） */
   private dragging = false;
@@ -637,6 +653,7 @@ export class TuiApp {
     this.agent.setDeviceBridge(undefined);
     void bridge?.stop();
     // 右侧终端里的命令以 detached 独立进程组运行，不主动终止会成为孤儿进程
+    this.stopAutoScroll();
     this.term.dispose();
     this.exitTerminal();
     this.resolveExit?.();
@@ -1210,7 +1227,7 @@ export class TuiApp {
     if (process.env.XZH_DEBUG_KEYS) {
       this.logRawKeys(
         `MOUSE btn=${button} col=${column} row=${row} ` +
-          `${pressed ? "press" : "release"} inTerm=${inTerm} ` +
+          `${pressed ? "press" : "release"} shift=${(button & 4) === 4 ? "y" : "n"} inTerm=${inTerm} ` +
           `logical=${this.logicalAtScreenRow(row)} mapLen=${this.screenToLogical.length} ` +
           `anchor=${this.selectionAnchor} head=${this.selectionHead} drag=${this.dragging}`,
       );
@@ -1239,9 +1256,25 @@ export class TuiApp {
       if (!inTerm && logical !== undefined) {
         this.selectionAnchor = logical;
         this.selectionHead = logical;
+        this.selectionRegion = "output";
         this.dragging = false;
+        this.stopAutoScroll();
         this.scheduleRender();
         return;
+      }
+      // 右栏（终端面板）按下 → 同样开始框选（选区锁在右栏内）
+      if (inTerm) {
+        const tLogical = this.termLogicalAtScreenRow(row);
+        if (tLogical !== undefined) {
+          this.selectionRegion = "term";
+          this.selectionAnchor = tLogical;
+          this.selectionHead = tLogical;
+          this.dragging = false;
+          this.stopAutoScroll();
+          this.termFocus = true;
+          this.scheduleRender();
+          return;
+        }
       }
       // 否则仍按原逻辑：焦点跟随点击的栏目
       if (inTerm !== this.termFocus) {
@@ -1252,8 +1285,20 @@ export class TuiApp {
     }
 
     // 拖拽移动（button 带 32 标志）：扩展选区
+    // ⚠️ 2026-10-25：选区**锁定在一个区域**里（当前是左输出区）——
+    // 拖出上下边界不越界选中，而是夹到边界并**自动滚动**（跟随光标上拉/下拉 ✓）。
     if (pressed && (button & 32) === 32 && this.selectionAnchor !== undefined) {
-      const logical = this.logicalAtScreenRow(row);
+      const region = this.selectionRegion ?? "output";
+      const top = region === "term" ? this.termTopRow : this.outputTopRow;
+      const bottom = region === "term" ? this.termBottomRow : this.outputBottomRow;
+      const clamped = clampSelectRow(row, top, bottom);
+      if (clamped.scroll !== 0) this.startAutoScroll(clamped.scroll, region);
+      else this.stopAutoScroll();
+
+      const logical =
+        region === "term"
+          ? this.termLogicalAtScreenRow(clamped.row)
+          : this.logicalAtScreenRow(clamped.row);
       if (logical !== undefined && logical !== this.selectionHead) {
         this.selectionHead = logical;
         this.dragging = true;
@@ -1264,8 +1309,13 @@ export class TuiApp {
 
     // 松开左键：结束选择。真的拖过才复制，单纯点击则取消选区
     if (!pressed && this.selectionAnchor !== undefined) {
-      if (this.dragging) this.finishSelection();
-      else this.clearSelection();
+      this.stopAutoScroll();
+      if (this.dragging) {
+        if (this.selectionRegion === "term") this.finishTermSelection();
+        else this.finishSelection();
+      } else {
+        this.clearSelection();
+      }
     }
   }
 
@@ -1274,13 +1324,91 @@ export class TuiApp {
     return this.screenToLogical[row - 1];
   }
 
+  /** 屏幕行（1-based）→ 右栏终端的逻辑行索引；不在右栏输出区时为 undefined */
+  private termLogicalAtScreenRow(row: number): number | undefined {
+    return this.termScreenToLogical[row - 1];
+  }
+
+  /**
+   * 结束右栏框选：把选中的**终端逻辑行**写进剪贴板。
+   *
+   * 与左栏一致：复制的是逻辑行（不是折行后的碎片），并保留选区高亮。
+   */
+  private finishTermSelection(): void {
+    const from = Math.min(this.selectionAnchor!, this.selectionHead!);
+    const to = Math.max(this.selectionAnchor!, this.selectionHead!);
+    const count = to - from + 1;
+    const plain = sanitizeControl(this.termLogicalSnapshot.slice(from, to + 1).join("\n")).trim();
+    this.dragging = false;
+
+    if (!plain) {
+      this.scheduleRender();
+      return;
+    }
+
+    const payload = Buffer.from(plain, "utf8").toString("base64");
+    process.stdout.write(`\x1b]52;c;${payload}\x07`);
+    this.lines.push(
+      `${ansi.green}✓ 已从终端面板复制 ${count} 行到剪贴板${ansi.reset}` +
+        `${ansi.gray}（选中处仍保持高亮）。若粘贴出来是空的，说明本终端禁用了 OSC 52，` +
+        `请改用 ${ansi.reset}/copy${ansi.gray} 或 Shift+拖拽。${ansi.reset}`,
+    );
+    this.scheduleRender();
+  }
+
   /** 清除选区 */
   private clearSelection(): void {
+    this.stopAutoScroll();
     if (this.selectionAnchor === undefined) return;
     this.selectionAnchor = undefined;
     this.selectionHead = undefined;
+    this.selectionRegion = undefined;
     this.dragging = false;
     this.scheduleRender();
+  }
+
+  /**
+   * 拖到区域边界外时开始**持续滚动**（跟随光标上拉/下拉）。
+   *
+   * ⚠️ 为什么需要定时器：终端只在鼠标**移动**时才发事件 —— 光标停在边界上不动时
+   * 就再没有事件了 ✗，所以要自己每 60ms 滚一行，并把 `selectionHead` 定在边界行上 ✓。
+   */
+  private startAutoScroll(dir: 1 | -1, region: "output" | "term" = "output"): void {
+    if (this.autoScrollDir === dir && this.autoScrollRegion === region && this.autoScrollTimer) return;
+    this.stopAutoScroll();
+    this.autoScrollDir = dir;
+    this.autoScrollRegion = region;
+    this.autoScrollTimer = setInterval(() => {
+      if (this.selectionAnchor === undefined) {
+        this.stopAutoScroll();
+        return;
+      }
+      // +1 = 看更早的行（向上滚）；-1 = 看更新的行（向下滚）
+      if (region === "term") {
+        this.scrollTermBy(dir);
+      } else {
+        this.setScrollOffset(this.scrollOffset + dir);
+      }
+      const edgeRow = dir > 0 ? (region === "term" ? this.termTopRow : this.outputTopRow)
+                              : (region === "term" ? this.termBottomRow : this.outputBottomRow);
+      const logical =
+        region === "term" ? this.termLogicalAtScreenRow(edgeRow) : this.logicalAtScreenRow(edgeRow);
+      if (logical !== undefined) {
+        this.selectionHead = logical;
+        this.dragging = true;
+      }
+      this.scheduleRender();
+    }, 60);
+    this.autoScrollTimer.unref?.();
+  }
+
+  /** 停止自动滚动（松开鼠标、离开边界、清选区、退出时都要调）。 */
+  private stopAutoScroll(): void {
+    if (this.autoScrollTimer) {
+      clearInterval(this.autoScrollTimer);
+      this.autoScrollTimer = undefined;
+    }
+    this.autoScrollDir = 0;
   }
 
   /**
@@ -3545,6 +3673,11 @@ export class TuiApp {
 
     const bodyRows = rows - 1;
 
+    // 选区夹紧用：输出区在**整个屏幕**上的行范围（1-based，含端点）。
+    // headerRows 是头部占的行数，outputRows 是可见输出行数。
+    this.outputTopRow = headerRows + 1;
+    this.outputBottomRow = headerRows + outputRows;
+
     // 记录「屏幕行(0-based 整屏) → 逻辑行」映射，供鼠标拖拽选择反查。
     // visible 前面可能被补过空行（unshift），用 pad 校正偏移。
     const pad = Math.max(0, outputRows - (end - start));
@@ -3580,6 +3713,13 @@ export class TuiApp {
       termWidth > 0
         ? this.buildTermPanel(termWidth, bodyRows)
         : { rows: [] as string[], cursorRow: 0, cursorCol: 0 };
+    if (termWidth <= 0) {
+      // 面板隐藏 → 右栏不可选
+      this.termScreenToLogical = [];
+      this.termTopRow = 0;
+      this.termBottomRow = 0;
+      if (this.selectionRegion === "term") this.clearSelection();
+    }
 
     const inputStart = headerRows + outputRows;
 
@@ -3667,9 +3807,17 @@ export class TuiApp {
     // 输出区（物理行，按高度裁切，支持滚动）
     const outputHeight = Math.max(1, height - 3);
     const physical: string[] = [];
-    for (const line of this.term.visibleLines()) {
-      physical.push(...wrapText(line, width));
+    /** 物理行 → 逻辑行索引（拖拽选择反查用，与左栏 lastPhysicalMap 同构）。 */
+    const physToLogical: number[] = [];
+    const termLogical = this.term.visibleLines();
+    for (let li = 0; li < termLogical.length; li++) {
+      for (const piece of wrapText(termLogical[li], width)) {
+        physical.push(piece);
+        physToLogical.push(li);
+      }
     }
+    // 复制时用快照，避免松手前后又滚动导致取错行
+    this.termLogicalSnapshot = termLogical;
     // 视口锚定：与左栏同理，命令持续输出时保持用户正在查看的历史不动
     if (
       this.lastTermPhysicalCount >= 0 &&
@@ -3685,6 +3833,38 @@ export class TuiApp {
     const start = Math.max(0, end - outputHeight);
     const slice = physical.slice(start, end);
     while (slice.length < outputHeight) slice.unshift("");
+
+    // 记录「屏幕行(0-based) → 终端逻辑行」映射：面板从整屏第 0 行开始，
+    // 输出区占面板第 1..outputHeight 行（第 0 行是标题）。
+    const padTerm = Math.max(0, outputHeight - (end - start));
+    this.termScreenToLogical = [];
+    for (let i = 0; i < height; i++) this.termScreenToLogical.push(undefined);
+    for (let k = 0; k < outputHeight; k++) {
+      const phys = start + k - padTerm;
+      const logical = phys >= 0 && phys < physToLogical.length ? physToLogical[phys] : -1;
+      this.termScreenToLogical[1 + k] = logical >= 0 ? logical : undefined;
+    }
+    this.termTopRow = 2; // 面板第 1 行（0-based）→ 整屏 1-based 第 2 行
+    this.termBottomRow = 1 + outputHeight;
+
+    // 右栏选区高亮（与左栏同款反色）
+    if (
+      this.selectionRegion === "term" &&
+      this.selectionAnchor !== undefined &&
+      this.selectionHead !== undefined
+    ) {
+      const selFrom = Math.min(this.selectionAnchor, this.selectionHead);
+      const selTo = Math.max(this.selectionAnchor, this.selectionHead);
+      for (let k = 0; k < slice.length; k++) {
+        const phys = start + k - padTerm;
+        if (phys < 0 || phys >= physToLogical.length) continue;
+        const logical = physToLogical[phys];
+        if (logical >= selFrom && logical <= selTo) {
+          slice[k] = `${ansi.inverse}${slice[k]}${ansi.reset}`;
+        }
+      }
+    }
+
     rows.push(...slice);
 
     // 分隔线 + 输入行（超宽时从左侧滚动，保证光标可见）
@@ -3924,6 +4104,32 @@ export class TuiApp {
  * 纯函数（而不是写在 layoutSelect 里）是因为这段下标的边界条件最容易写错，
  * 而 TUI 本身没有可跑的测试环境。
  */
+/**
+ * 拖拽选择时把鼠标所在**屏幕行**夹紧到「当前区域」内，并给出自动滚动方向。
+ *
+ * 为什么需要（2026-10-25 用户反馈）：界面分三块（左输出区 / 右终端区 / 底部输入+状态），
+ * 用鼠标拖拽选文本时选区会**跨区域**（尤其终端原生 Shift 选择是按整屏文本算的 ✗）。
+ * 现在程序内选择锁在**一个区域**里：拖到区域上下边界之外时，不再越界选中，
+ * 而是把行夹在边界上并**朝那个方向自动滚动**（= 跟随光标上拉/下拉 ✓）。
+ *
+ * @param row    鼠标所在屏幕行（1-based）
+ * @param top    区域首行（1-based，含）
+ * @param bottom 区域末行（1-based，含）
+ * @returns `row` 夹紧后的屏幕行；`scroll` +1=向上滚（看更早的行）、-1=向下滚、0=不动
+ */
+export function clampSelectRow(
+  row: number,
+  top: number,
+  bottom: number,
+): { row: number; scroll: -1 | 0 | 1 } {
+  if (!Number.isFinite(row)) return { row: top, scroll: 0 };
+  // 区域本身就是空/异常时，别把行夹到负数
+  if (bottom < top) return { row: top, scroll: 0 };
+  if (row < top) return { row: top, scroll: 1 };
+  if (row > bottom) return { row: bottom, scroll: -1 };
+  return { row, scroll: 0 };
+}
+
 export function selectWindow(
   total: number,
   index: number,

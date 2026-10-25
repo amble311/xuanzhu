@@ -4,7 +4,7 @@ import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
-import { createNonPoolingAgent } from "./http";
+import { createNonPoolingAgent, llmIdleTimeoutMs, withIdleTimeout } from "./http";
 import { StreamEmitter, withRetry } from "./stream-retry";
 import type {
   ChatOptions,
@@ -55,7 +55,11 @@ export class OpenAICompatProvider implements LLMProvider {
   }
 
   async *chat(options: ChatOptions): AsyncIterable<StreamChunk> {
-    yield* withRetry(options, (emit) => this.streamOnce(options, emit));
+    /* ⚠️ 每次尝试都套一层**空闲超时**：端点卡死（连上不吐数据）时能及时中断并重试，
+     * 否则 `agent.run()` 永不返回 → TUI 的 busy 永不释放 → 界面卡死 ✗（2026-10-25 实测）。 */
+    yield* withRetry(options, (emit) =>
+      withIdleTimeout(this.streamOnce(options, emit), llmIdleTimeoutMs()),
+    );
   }
 
   private async *streamOnce(

@@ -4,6 +4,7 @@ import type {
   MessageParam,
   Tool,
 } from "@anthropic-ai/sdk/resources/messages";
+import { llmIdleTimeoutMs, withIdleTimeout } from "./http";
 import { StreamEmitter, withRetry } from "./stream-retry";
 import type {
   ChatMessage,
@@ -42,7 +43,10 @@ export class AnthropicProvider implements LLMProvider {
   }
 
   async *chat(options: ChatOptions): AsyncIterable<StreamChunk> {
-    yield* withRetry(options, (emit) => this.streamOnce(options, emit));
+    /* 同 openai-compat：每次尝试都套一层空闲超时，避免端点卡死时界面一直挂着 ✗ */
+    yield* withRetry(options, (emit) =>
+      withIdleTimeout(this.streamOnce(options, emit), llmIdleTimeoutMs()),
+    );
   }
 
   private async *streamOnce(

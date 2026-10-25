@@ -12,12 +12,92 @@ import * as https from "https";
  *
  * 禁用 keep-alive 后每次请求重建连接，彻底规避该问题。
  */
+/**
+ * LLM 请求的**空闲超时**（socket 多久没有任何数据就判定卡死）。
+ *
+ * ⚠️⚠️ 2026-10-25 用户实测事故：调用本地 OpenAI 兼容端点（`http://127.0.0.1:8181/v1`）时
+ * 遇到 `Connection error.`，之后**整个 TUI 卡住不动** ✗。
+ *
+ * 根因：`createNonPoolingAgent` 只设了 `keepAlive: false`，**没有任何超时** ✗。
+ * 当端点「TCP 连上了但迟迟不吐数据」（本地模型加载中 / new-api 之类的中转卡住 /
+ * 代理半关闭）时，socket 会**永远挂着** → `agent.run()` 永不返回 →
+ * TUI 的 `busy` 一直是 true（它在 `finally` 里才释放）→ 用户所有输入都被
+ * `if (this.busy) return` 吃掉 ✗ —— 表现就是「一直卡在那里」。
+ *
+ * 这里用 **socket 空闲超时**（而不是请求总超时）：流式输出期间只要有数据就不会被误杀 ✓，
+ * 真正卡死时才中断 ✓。默认 120s，可用 `XZH_LLM_TIMEOUT_MS` 覆盖。
+ */
+export const DEFAULT_LLM_IDLE_TIMEOUT_MS = 120_000;
+
+/** 读取空闲超时（每次调用都读 env，方便测试与运行时调整）。 */
+export function llmIdleTimeoutMs(): number {
+  const raw = Number(process.env.XZH_LLM_TIMEOUT_MS);
+  // 太小的值会把正常的慢响应误杀，给个下限
+  return Number.isFinite(raw) && raw >= 5_000 ? raw : DEFAULT_LLM_IDLE_TIMEOUT_MS;
+}
+
 export function createNonPoolingAgent(
   targetUrl: string,
 ): http.Agent | https.Agent {
   const isHttps = !/^http:\/\//i.test(targetUrl);
-  const options: http.AgentOptions = { keepAlive: false };
+  // ⚠️ `timeout` 是**socket 空闲超时**：Agent 会在超时时销毁 socket 并让请求报错，
+  // 于是 withRetry 能重试、`agent.run()` 也能返回 → `busy` 得以释放 ✓
+  const options: http.AgentOptions = {
+    keepAlive: false,
+    timeout: llmIdleTimeoutMs(),
+  };
   return isHttps ? new https.Agent(options) : new http.Agent(options);
+}
+
+/**
+ * 给「流式请求」加**空闲超时**：超过 `ms` 没有任何数据就中断并抛可重试错误。
+ *
+ * ⚠️ 为什么需要（2026-10-25 用户实测）：本地 OpenAI 兼容端点在「TCP 连上但不吐数据」
+ * 时，`create()` 会一直挂着 → `agent.run()` 永不返回 → TUI 的 `busy` 永不释放 →
+ * 用户看到的就是**界面卡死、输入无响应** ✗。
+ *
+ * 为什么用 `Promise.race(iterator.next(), timer)` 而不是 AbortSignal：
+ * 它同时覆盖两种卡死 —— ① 等响应头（首字节）阶段 ② 流中途不再来数据；
+ * 而 AbortSignal 对「已经拿到响应、后续 chunk 不再到达」不生效 ✗。
+ *
+ * 抛出的消息里带 `timeout` 关键字，`isRetryableError` 会判定为可重试 ✓。
+ */
+export async function* withIdleTimeout<T>(
+  source: AsyncIterable<T>,
+  ms: number,
+): AsyncIterable<T> {
+  const iterator = source[Symbol.asyncIterator]();
+  try {
+    for (;;) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), ms);
+        timer.unref?.();
+      });
+      try {
+        const next = await Promise.race([iterator.next(), timeout]);
+        if (next === "timeout") {
+          throw new Error(
+            `LLM request timeout：${Math.round(ms / 1000)}s 内没有收到任何数据（连接可能卡死）`,
+          );
+        }
+        if (next.done) return;
+        yield next.value;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+  } finally {
+    /* 让被包装的生成器有机会清理（关闭底层连接 / 释放锁）。
+     * ⚠️ **绝不能 await**：生成器可能正卡在一个永不 resolve 的 await 里 ✗，
+     * 一旦 await 这里就会跟着永远挂住（2026-10-25 自测时就是这么卡死的）——
+     * 那正好抵消掉这个超时的意义。发起即可，不等待结果。 */
+    try {
+      void iterator.return?.(undefined)?.catch?.(() => undefined);
+    } catch {
+      // 忽略
+    }
+  }
 }
 
 const RETRYABLE_CODES = new Set([
