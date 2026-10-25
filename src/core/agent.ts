@@ -305,6 +305,44 @@ function contextTrimmedNote(): ChatMessage {
   };
 }
 
+/**
+ * 把历史**中间**的 system 消息提前出来，交给系统提示词承载。
+ *
+ * 为什么必须做（2026-10-25 实测）：上一轮被 Ctrl+D 中止后，`rollbackTurn()` 会往历史里
+ * 追加一条 `role: system` 的「[上一轮已中止]」说明；下一轮请求的消息序列变成
+ * `system → user → assistant → system → user`。llama.cpp 的 chat template 严格要求
+ * system 必须在最前面，于是直接返回 HTTP 500：
+ * `Jinja Exception: System message must be at the beginning.`
+ *
+ * 为什么不直接把说明改成 user：那样会伪造一轮用户发言，也会让「系统指令」与用户意图混在一起。
+ * 规范化到系统提示词既保持语义，又对三家 Provider 都合法（它们本来就会合并 system 消息）。
+ *
+ * 只提升**非开头**的 system：开头的裁剪提醒保持原位（`trim-notice.test.ts` 依赖该位置）。
+ */
+export function hoistSystemNotes(conversation: ChatMessage[]): {
+  conversation: ChatMessage[];
+  notes: string[];
+} {
+  const notes: string[] = [];
+  const kept: ChatMessage[] = [];
+  let leading = true;
+
+  for (const message of conversation) {
+    if (message.role === "system") {
+      if (leading) {
+        kept.push(message);
+      } else {
+        notes.push(message.content);
+      }
+      continue;
+    }
+    leading = false;
+    kept.push(message);
+  }
+
+  return { conversation: kept, notes };
+}
+
 export class Agent {
   private provider: LLMProvider;
   private readonly config: XuanZhuConfig;
@@ -804,10 +842,11 @@ export class Agent {
     /**
      * 生成「上一轮已中止」的说明；本轮什么都没真正执行时返回 `null`（无可奉告）。
      *
-     * 用 `system` 角色承载：它**不参与 user / assistant 的交替结构** —— Anthropic 与
-     * Gemini 会把 history 里的 system 消息并入系统提示词（见各自的 `to*Messages()`），
-     * OpenAI 兼容端点也允许一次请求里出现多条 system 消息。因此无论历史被裁到哪一条，
-     * 这条说明都不会让请求结构非法。
+     * 用 `system` 角色承载：它**不参与 user / assistant 的交替结构**。
+     *
+     * ⚠️ 但不能让它留在历史中间：llama.cpp 的 chat template 严格要求 system 必须在
+     * 最前面，否则整轮 HTTP 500（2026-10-25 实测：`System message must be at the beginning`）。
+     * 因此请求组装时由 `hoistSystemNotes()` 把这类消息提前并入系统提示词。
      */
     const abortNote = (reason: string): ChatMessage | null => {
       // 先建立 id → 参数 的索引：`tool` 消息本身不带参数，得回到 assistant 的 tool_calls 取
@@ -1377,15 +1416,19 @@ export class Agent {
     let conversation = this.buildConversation(extra, budgetRatio);
     // 上一次因「模型不支持图片」失败 → 这次整条链路都不带图片
     if (dropImages) conversation = stripAllImages(conversation);
+    // 历史中间的 system 消息（如「[上一轮已中止]」）必须提前：llama.cpp 等严格模板
+    // 只允许 system 出现在最前面，否则整轮 500（见 hoistSystemNotes 的说明）。
+    const hoisted = hoistSystemNotes(conversation);
+    conversation = hoisted.conversation;
     // 只读状态块：每轮按当前事实重新生成，**不写入历史**（与 contextTrimmedNote 同一套做法）。
     // 直接并入系统提示词而不是另起一条 system 消息：各家最终都会把它并进系统提示词，
     // 单独一条还会改变「对话首条 system 是裁剪提醒」的既有结构（历史裁剪提醒依赖该位置）。
     const stateBlock = this.buildSelfStateBlock();
-    const systemContent = stateBlock
-      ? `${this.effectiveSystemPrompt()}\n\n${stateBlock}`
-      : this.effectiveSystemPrompt();
+    const systemParts = [this.effectiveSystemPrompt()];
+    if (hoisted.notes.length > 0) systemParts.push(...hoisted.notes);
+    if (stateBlock) systemParts.push(stateBlock);
     const messages: ChatMessage[] = [
-      { role: "system", content: systemContent },
+      { role: "system", content: systemParts.join("\n\n") },
       ...conversation,
     ];
 

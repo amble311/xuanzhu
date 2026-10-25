@@ -4,6 +4,17 @@
 
 ## [未发布]
 
+## [0.6.3] — 2026-10-25
+
+### 修复
+
+- **兼容严格 chat template：system 消息不再留在历史中间**。上一轮被 `Ctrl+D` 中止后，
+  历史里会追加一条 `role: system` 的「[上一轮已中止]」说明；llama.cpp 的 chat template
+  要求 system 必须出现在最前面，否则下一轮直接 HTTP 500：
+  `Jinja Exception: System message must be at the beginning.`
+  现在请求组装时由 `hoistSystemNotes()` 把**非开头**的 system 消息提前并入系统提示词
+  （开头的「历史已裁剪」提醒保持原位），OpenAI 兼容 / Anthropic / Gemini 均合法。
+
 ## [0.6.2] — 2026-10-25
 
 ### 修复
