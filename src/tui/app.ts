@@ -228,6 +228,16 @@ export class TuiApp {
    */
   private suspended = false;
   private busy = false;
+  /**
+   * 本轮请求的进度计时（状态栏每 500ms 刷新）。
+   *
+   * 本地大模型的首 token 可能要等几秒到几十秒；如果界面一直只显示「思考中」，
+   * 用户会以为卡死。计时 + 已接收字数是最便宜、最直接的「它还活着」信号。
+   */
+  private busySince = 0;
+  private busyTimer?: ReturnType<typeof setInterval>;
+  private receivedChars = 0;
+  private reasoningChars = 0;
   private exited = false;
   /** 本次退出是被谁触发的（写进「上一轮已中止」说明，便于事后分辨断线 / 被终止） */
   private shutdownReason?: string;
@@ -369,7 +379,11 @@ export class TuiApp {
     }
     const events: AgentEvents = {
       onText: (delta) => this.handleTextDelta(delta),
-      onReasoning: () => undefined,
+      onReasoning: (delta) => {
+        // 推理内容不直接展示（会淹没输出区），但字数能让用户看到「模型确实在思考」
+        this.reasoningChars += delta.length;
+        this.updateBusyDetail();
+      },
       onToolStart: (call) => this.handleToolStart(call),
       onToolEnd: (call, result) => this.handleToolEnd(call, result),
       onStatus: (status, detail) => {
@@ -654,6 +668,7 @@ export class TuiApp {
     void bridge?.stop();
     // 右侧终端里的命令以 detached 独立进程组运行，不主动终止会成为孤儿进程
     this.stopAutoScroll();
+    this.stopBusyProgress();
     this.term.dispose();
     this.exitTerminal();
     this.resolveExit?.();
@@ -688,12 +703,45 @@ export class TuiApp {
   // ------------------------------------------------------------------ 事件流
 
   private handleTextDelta(delta: string): void {
+    this.receivedChars += delta.length;
     // 模型正文可能含终端控制序列（清屏 / 退出备用屏等），渲染前必须剥掉
     const completed = this.markdown.push(sanitizeControl(delta));
     if (completed.length > 0) {
       this.lines.push(...completed);
     }
     this.streamingPreview = this.markdown.peek();
+    this.scheduleRender();
+  }
+
+  /** 开始一轮请求的进度计时（submit 与目标循环各调一次） */
+  private startBusyProgress(): void {
+    this.stopBusyProgress();
+    this.busySince = Date.now();
+    this.receivedChars = 0;
+    this.reasoningChars = 0;
+    this.updateBusyDetail();
+    this.busyTimer = setInterval(() => this.updateBusyDetail(), 500);
+    this.busyTimer.unref?.();
+  }
+
+  /** 停止进度计时（finally / 退出时调用） */
+  private stopBusyProgress(): void {
+    if (this.busyTimer) {
+      clearInterval(this.busyTimer);
+      this.busyTimer = undefined;
+    }
+    this.busySince = 0;
+  }
+
+  /** 刷新状态栏的「本轮 12s · 思考 320 字 · 输出 80 字」 */
+  private updateBusyDetail(): void {
+    if (!this.busy || this.busySince === 0) return;
+    this.statusDetail = formatBusyDetail({
+      elapsedMs: Date.now() - this.busySince,
+      reasoningChars: this.reasoningChars,
+      textChars: this.receivedChars,
+      round: this.goalLoopActive ? this.goalIterations : undefined,
+    });
     this.scheduleRender();
   }
 
@@ -2147,6 +2195,7 @@ export class TuiApp {
     this.busy = true;
     this.statusText = "思考中";
     this.statusDetail = "";
+    this.startBusyProgress();
     this.abortController = new AbortController();
     this.scheduleRender();
 
@@ -2178,6 +2227,7 @@ export class TuiApp {
       const runStatus = this.agent.getRunStatus();
       if (runStatus) this.printRunStatus(runStatus);
       this.lines.push("");
+      this.stopBusyProgress();
       this.busy = false;
       this.abortController = undefined;
       this.statusText = "就绪";
@@ -2604,6 +2654,7 @@ export class TuiApp {
     this.busy = true;
     this.statusText = "目标执行中";
     this.statusDetail = "";
+    this.startBusyProgress();
     this.scheduleRender();
 
     let done = false;
@@ -2710,6 +2761,7 @@ export class TuiApp {
       }
     } finally {
       this.goalLoopActive = false;
+      this.stopBusyProgress();
       this.busy = false;
       this.abortController = undefined;
 
@@ -4117,6 +4169,28 @@ export class TuiApp {
  * @param bottom 区域末行（1-based，含）
  * @returns `row` 夹紧后的屏幕行；`scroll` +1=向上滚（看更早的行）、-1=向下滚、0=不动
  */
+/**
+ * 状态栏的请求进度文案。
+ *
+ * 把时间与已接收字数显式写出来：本地模型首 token 可能等很久，用户需要「它还活着」的信号。
+ * 纯函数，便于单测（时间/计数边界很多）。
+ */
+export function formatBusyDetail(input: {
+  elapsedMs: number;
+  reasoningChars: number;
+  textChars: number;
+  /** 目标模式的第几轮 */
+  round?: number;
+}): string {
+  const seconds = Math.max(0, Math.floor(input.elapsedMs / 1000));
+  const parts: string[] = [];
+  if (input.round && input.round > 0) parts.push(`第 ${input.round} 轮`);
+  parts.push(`${seconds}s`);
+  if (input.reasoningChars > 0) parts.push(`思考 ${input.reasoningChars} 字`);
+  if (input.textChars > 0) parts.push(`输出 ${input.textChars} 字`);
+  return parts.join(" · ");
+}
+
 export function clampSelectRow(
   row: number,
   top: number,

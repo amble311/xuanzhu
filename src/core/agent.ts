@@ -39,6 +39,7 @@ import {
   executeTool,
   findTool,
   getToolSpecs,
+  TOOLS,
   toolsForSubAgent,
   type ExecuteToolResult,
 } from "../tools";
@@ -485,6 +486,7 @@ export class Agent {
       loadProjectRules(this.cwd),
       readProjectMemory(this.cwd),
       this.config.memoryMaxChars,
+      Boolean(this.deviceBridge),
     );
   }
 
@@ -681,7 +683,29 @@ export class Agent {
 
   /** 注入 / 撤销设备桥（界面在 `/device serve` 与 `/device stop` 时调用） */
   setDeviceBridge(bridge?: DeviceBridge): void {
+    const changed = Boolean(this.deviceBridge) !== Boolean(bridge);
     this.deviceBridge = bridge;
+    // 工具集与系统提示词都随桥的状态变化：重新生成，避免提示词里还在讲不可用的工具
+    if (changed) this.reloadSystemPrompt();
+  }
+
+  /**
+   * 本次请求实际下发的工具集。
+   *
+   * 未连接设备桥时**不暴露** `device_*`：这 7 个工具的 schema 约 2.2KB，
+   * 每轮都发会白白增加提示词（本地模型 prefill 很贵），模型也可能去调用
+   * 一个根本连不上的设备。连接后再恢复。
+   */
+  private requestTools(): ToolDefinition[] {
+    const tools = this.tools ?? TOOLS;
+    const goalActive = Boolean(this.goal && !this.goal.completed);
+    return tools.filter((tool) => {
+      // 未连接设备桥：不下发 device_*（schema 约 2.2KB，且模型调用必然失败）
+      if (!this.deviceBridge && tool.name.startsWith("device_")) return false;
+      // 非目标模式：不下发 goal_complete（模型没有目标可完成）
+      if (!goalActive && tool.name === "goal_complete") return false;
+      return true;
+    });
   }
 
   /**
@@ -1455,7 +1479,7 @@ export class Agent {
     try {
       const stream = this.provider.chat({
         messages,
-        tools: getToolSpecs(this.tools),
+        tools: getToolSpecs(this.requestTools()),
         temperature: this.config.temperature,
         signal,
         onRetry: (retryAttempt, maxAttempts, error, info) => {
