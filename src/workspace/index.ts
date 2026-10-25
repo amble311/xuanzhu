@@ -235,6 +235,97 @@ export function appendMemory(
   return target;
 }
 
+// ------------------------------------------------------------ 自动记录（按主题）
+
+export interface TopicMemoryEntryResult {
+  file: string;
+  /** 实际使用的主题名 */
+  topic: string;
+  /** 是否真的写入了（重复 / 超限 / 空内容时为 false） */
+  added: boolean;
+  /** 写入后触发的自动精简结果（未触发为 null） */
+  compacted: MemoryCompactResult | null;
+}
+
+/**
+ * 把一条自动摘要**按主题**并入长期记忆。
+ *
+ * 为什么不用 `appendMemory(scope="long")`：那会写成 `## 时间戳` 的追加块，
+ * 与「长期记忆是按主题整理的结论库」相反，越用越乱；`compactLongTermMemory`
+ * 也只把时间戳块当成可丢弃的旧记录。这里改为：
+ *
+ * - 找到 `## 自动记录 · <topic>` 小节，把条目插到该小节末尾；
+ * - 没有该小节才新建；
+ * - 完全相同的条目行不重复写；
+ * - 写入前按 `memoryMaxChars` 预判，超限就跳过（自动摘要不能把长期记忆顶爆，
+ *   语义压缩仍交给模型的 `memory_compact`）。
+ */
+export function appendLongTermTopicEntry(
+  cwd: string,
+  topic: string,
+  entry: string,
+  maxChars = DEFAULT_MEMORY_MAX_CHARS,
+): TopicMemoryEntryResult {
+  const paths = resolveProjectPaths(cwd);
+  fs.mkdirSync(paths.memoryDir, { recursive: true });
+
+  const cleanTopic =
+    topic.replace(/\s+/g, " ").replace(/^#+/, "").trim().slice(0, 60) || "项目";
+  const cleanEntry = entry.trim();
+  const heading = `## 自动记录 · ${cleanTopic}`;
+  const base = { file: paths.longTermFile, topic: cleanTopic, compacted: null };
+
+  if (!cleanEntry) return { ...base, added: false };
+
+  let text = "";
+  try {
+    text = fs.readFileSync(paths.longTermFile, "utf8");
+  } catch {
+    // 不存在：下面按新文件处理
+  }
+  if (!text.trim()) text = "# 项目长期记忆\n";
+
+  // 完全相同的条目行不重复写（同一天重复运行、重试都可能产生相同摘要）
+  if (text.split("\n").some((line) => line.trim() === cleanEntry)) {
+    return { ...base, added: false };
+  }
+
+  // 预判上限：自动摘要只做增量，不能把长期记忆顶到需要模型语义压缩的程度
+  if (maxChars > 0 && text.trim().length + cleanEntry.length + heading.length + 8 > maxChars) {
+    return { ...base, added: false };
+  }
+
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const headingIndex = lines.findIndex((line) => line.trim() === heading);
+
+  if (headingIndex >= 0) {
+    // 插到该小节末尾（下一个 ## 之前），跳过末尾空行
+    let end = lines.length;
+    for (let i = headingIndex + 1; i < lines.length; i++) {
+      if (/^##\s+/.test(lines[i])) {
+        end = i;
+        break;
+      }
+    }
+    let insertAt = end;
+    while (insertAt > headingIndex + 1 && lines[insertAt - 1].trim() === "") {
+      insertAt -= 1;
+    }
+    lines.splice(insertAt, 0, cleanEntry);
+  } else {
+    while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
+    lines.push("", heading, "", cleanEntry, "");
+  }
+
+  const next = `${lines.join("\n").trimEnd()}\n`;
+  const tmp = `${paths.longTermFile}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, next, "utf8");
+  fs.renameSync(tmp, paths.longTermFile);
+
+  const compacted = compactLongTermMemoryIfNeeded(cwd, maxChars);
+  return { ...base, added: true, compacted };
+}
+
 // ------------------------------------------------------------ 长期记忆精简
 
 /**

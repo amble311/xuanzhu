@@ -27,7 +27,7 @@ import {
   type TokenCalibrator,
   trimMessagesToBudget,
 } from "../llm";
-import { friendlyError } from "../llm/http";
+import { friendlyError, redactSecrets } from "../llm/http";
 import type {
   ChatMessage,
   ImageAttachment,
@@ -61,6 +61,8 @@ import { mapWithConcurrency } from "../utils/concurrency";
 import { recordErrorReport } from "../utils/error-reports";
 import { expandHome, getConfigPath } from "../utils/paths";
 import {
+  appendLongTermTopicEntry,
+  appendMemory,
   compactLongTermMemoryIfNeeded,
   DEFAULT_MEMORY_MAX_CHARS,
   loadProjectRules,
@@ -162,6 +164,13 @@ export interface AgentOptions {
    * **增量追加**到该文件，退出 / 崩溃后可用 `/resume` 恢复。只有主代理会传。
    */
   sessionFile?: string;
+  /**
+   * 是否在每轮结束时自动记录项目记忆（当日摘要，必要时并入长期记忆）。
+   *
+   * 子代理传 `false`：它的工作会由主代理汇总，自己写记忆既可能污染项目，
+   * 也会在并行子代理之间产生重复条目。
+   */
+  autoMemory?: boolean;
 }
 
 /**
@@ -320,6 +329,53 @@ function contextTrimmedNote(): ChatMessage {
  *
  * 只提升**非开头**的 system：开头的裁剪提醒保持原位（`trim-notice.test.ts` 依赖该位置）。
  */
+function localDateStamp(): string {
+  const now = new Date();
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
+/**
+ * 从改动文件推导长期记忆的主题（按目录归并，最多两级）。
+ *
+ * 例：`src/core/a.ts` + `src/core/b.ts` → `src/core`；
+ * 全在项目根（如 `README.md`）→ `项目`；文件在项目外也归到 `项目`。
+ */
+function deriveMemoryTopic(cwd: string, files: string[]): string {
+  const dirs = files
+    .map((file) => {
+      const rel = path.relative(cwd, path.resolve(cwd, file));
+      if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+        return [] as string[];
+      }
+      return path.dirname(rel).split(path.sep).filter(Boolean);
+    })
+    .filter((segments) => segments.length > 0);
+
+  if (dirs.length === 0) return "项目";
+  const common: string[] = [];
+  for (let i = 0; ; i++) {
+    const segment = dirs[0][i];
+    if (!segment) break;
+    if (dirs.every((segments) => segments[i] === segment)) common.push(segment);
+    else break;
+  }
+  return common.length > 0 ? common.slice(0, 2).join("/") : "项目";
+}
+
+/** 从最终答复里提取一行适合写入记忆的结论 */
+function summarizeMemoryConclusion(text: string): string {
+  const cleaned = text
+    .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+    .replace(/\r/g, "")
+    .split("\n")
+    // 标题本身不是结论（否则「## 结论」会把真正的第一段挤掉）
+    .filter((line) => !/^\s*#{1,6}\s/.test(line))
+    .map((line) => line.replace(/^\s*(?:[>*+-]+|\d+\.)\s*/, "").trim())
+    .find((line) => line.length > 0 && !/^```/.test(line));
+  return (cleaned ?? "").replace(/\s+/g, " ").slice(0, 180);
+}
+
 export function hoistSystemNotes(conversation: ChatMessage[]): {
   conversation: ChatMessage[];
   notes: string[];
@@ -411,6 +467,15 @@ export class Agent {
    * 界面据此暂停目标（blocked / needs_input）或标注置信度（low_confidence）。
    */
   private runStatus?: RunStatus;
+  /** 本轮各工具的真实执行次数（自动记忆摘要用） */
+  private runToolCounts = new Map<string, number>();
+  /** 本轮最后一次验证命令与结果（自动记忆摘要用） */
+  private runVerifyCommand?: string;
+  private runVerifyOk = false;
+  /** 本轮模型是否已经主动写过记忆（写过就不再自动补一条） */
+  private runWroteMemory = false;
+  /** 是否启用自动记忆（子代理关闭） */
+  private autoMemory: boolean;
   /**
    * 手机设备桥（由界面在 `/device serve` 时注入）。
    *
@@ -444,6 +509,7 @@ export class Agent {
     this.systemPromptOverride = options?.systemPrompt;
     this.maxToolRoundsOverride = options?.maxToolRounds;
     this.sessionFile = options?.sessionFile;
+    this.autoMemory = options?.autoMemory ?? true;
     this.systemPrompt = this.composeSystemPrompt();
   }
 
@@ -659,6 +725,95 @@ export class Agent {
     };
   }
 
+  /**
+   * 自动记录本轮记忆。
+   *
+   * 两层，目的不同：
+   * 1. **当日日志**：每次有实际动作（≥2 次工具调用 / 改过文件 / 跑过验证）就写一条
+   *    确定性摘要 —— 解决「下次开新会话不知道上次做到哪」；
+   * 2. **长期记忆**：只有**代码真的被改动**时才写，并按改动目录归入
+   *    `## 自动记录 · <topic>` 小节 —— 只读问答与调研不污染结论库。
+   *
+   * 模型已经主动 `memory_write` 时不再补写，避免同一轮出现两份记录。
+   * 目标模式的中间轮次跳过（避免每轮都写），完成那一轮用 `goal.summary` 记一次。
+   */
+  private autoRecordRunMemory(finalText: string): void {
+    if (!this.autoMemory) return;
+    const goalCompleted = this.goal?.completed === true;
+    if (this.goal && !goalCompleted) return;
+    if (this.runWroteMemory) return;
+    if (this.lastRunToolCalls === 0 && !goalCompleted) return;
+    if (
+      !goalCompleted &&
+      this.lastRunToolCalls < 2 &&
+      this.runChangedFiles.size === 0 &&
+      !this.runVerifyCommand
+    ) {
+      return;
+    }
+
+    const conclusion = summarizeMemoryConclusion(
+      goalCompleted ? (this.goal?.summary ?? finalText) : finalText,
+    );
+    if (!conclusion) return;
+    // 自动写入会长期保留：先过一遍凭据脱敏，避免把模型复述的 Key 存进项目记忆
+    const safeConclusion = redactSecrets(conclusion);
+    const safeVerify = this.runVerifyCommand
+      ? redactSecrets(this.runVerifyCommand)
+      : undefined;
+
+    const counts = [...this.runToolCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 4)
+      .map(([name, count]) => `${name}×${count}`);
+    const runFiles = [...this.runChangedFiles];
+    const longTermFiles = goalCompleted ? [...this.sessionChangedFiles] : runFiles;
+
+    const daily = [
+      `- 工具：${counts.length > 0 ? counts.join("、") : "无"}`,
+      runFiles.length > 0
+        ? `- 改动：${runFiles.slice(0, 4).join("、")}` +
+          (runFiles.length > 4 ? ` 等 ${runFiles.length} 个` : "")
+        : "",
+      `- 验证：${
+        safeVerify ? `${safeVerify}（${this.runVerifyOk ? "通过" : "失败"}）` : "未运行"
+      }`,
+      `- 结论：${safeConclusion}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    let topic: string | undefined;
+    try {
+      appendMemory(this.cwd, daily, "daily");
+      if (longTermFiles.length > 0) {
+        topic = deriveMemoryTopic(this.cwd, longTermFiles);
+        const filesShown = longTermFiles.slice(0, 3).join("、");
+        const more =
+          longTermFiles.length > 3 ? ` 等 ${longTermFiles.length} 个` : "";
+        const entry =
+          `- ${localDateStamp()}：${safeConclusion}（改动 ${filesShown}${more}）` +
+          (safeVerify ? `；验证 ${safeVerify}` : "；未验证");
+        const result = appendLongTermTopicEntry(
+          this.cwd,
+          topic,
+          entry,
+          this.config.memoryMaxChars,
+        );
+        if (!result.added) topic = undefined;
+      }
+    } catch {
+      // 记忆是尽力而为：写不进去不能影响本轮答复
+      return;
+    }
+
+    this.events.onNotice?.(
+      topic
+        ? `已自动记录当日摘要，并更新长期记忆（${topic}）`
+        : "已自动记录当日摘要",
+    );
+  }
+
   /** 生成只读状态块（没有可写内容时返回 `null`） */
   private buildSelfStateBlock(): string | null {
     return buildSelfState({
@@ -788,6 +943,10 @@ export class Agent {
     this.finishGateUsed = false;
     this.runTouchedTodos = false;
     this.runStatus = undefined;
+    this.runToolCounts.clear();
+    this.runVerifyCommand = undefined;
+    this.runVerifyOk = false;
+    this.runWroteMemory = false;
     let content = userInput;
 
     // 补发构造 / 切换目录期间攒下的提示（构造时终端尚未接管，不能当场写输出区）
@@ -1090,6 +1249,9 @@ export class Agent {
               continue;
             }
           }
+          // 自动记忆：当日摘要必写；代码有实际改动时再按主题并入长期记忆。
+          // 放在收尾门之后、提交之前 —— 只记录最终接受的那一版答复。
+          this.autoRecordRunMemory(text);
           commitTurn();
           this.events.onStatus("就绪");
           return;
@@ -1794,6 +1956,8 @@ export class Agent {
     // 只留最近几条：状态块要短，旧动作对当前判断没有价值
     if (this.recentActions.length > 8) this.recentActions.shift();
     this.runActionSeq += 1;
+    this.runToolCounts.set(name, (this.runToolCounts.get(name) ?? 0) + 1);
+    if (name === "memory_write" && outcome.ok) this.runWroteMemory = true;
 
     let args: Record<string, unknown> = {};
     try {
@@ -1819,6 +1983,8 @@ export class Agent {
       // 跑过验证即算（失败也算）：失败结果模型已经看到，重复提醒没有意义
       if (command && isVerificationCommand(command)) {
         this.runLastVerifySeq = this.runActionSeq;
+        this.runVerifyCommand = command;
+        this.runVerifyOk = outcome.ok;
       }
     }
 
@@ -1949,6 +2115,8 @@ export class Agent {
         prompt: input.prompt,
       }),
       maxToolRounds: SUBAGENT_MAX_TOOL_ROUNDS,
+      // 子代理的工作由主代理汇总；自己写记忆会污染项目、并在并行子代理之间重复
+      autoMemory: false,
     });
 
     try {

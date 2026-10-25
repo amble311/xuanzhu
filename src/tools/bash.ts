@@ -158,6 +158,35 @@ function runCommand(
   });
 }
 
+/**
+ * 明显需要交互式输入的命令。
+ *
+ * xzh 的 bash 是**非交互 shell**（没有 TTY）：`su` / `passwd` / `vim` 这类命令会
+ * 一直等密码或按键，直到工具超时才被杀掉 —— 用户看到的就是「命令超时」+
+ * 一段 `Password:`，既浪费时间又容易误判成网络/工具故障（2026-10-25 实测）。
+ * 这里在启动前直接拒绝，并给出非交互的替代做法。
+ */
+export function interactiveCommandName(command: string): string | undefined {
+  // 按 shell 分隔符切段，只看每段的第一个词（避免把 `echo su` / `grep passwd` 也拦掉）
+  const segments = command.split(/(?:&&|\|\||[;|\n(){}])/);
+  for (const raw of segments) {
+    const segment = raw
+      .trim()
+      // 去掉前置的环境变量赋值（FOO=bar sudo ...）
+      .replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"]*"|\S+)\s+)+/, "");
+    const name = /^([A-Za-z0-9_.-]+)/.exec(segment)?.[1]?.toLowerCase();
+    if (!name) continue;
+    if (
+      ["su", "passwd", "vim", "vi", "nano", "less", "more", "top", "htop"].includes(
+        name,
+      )
+    ) {
+      return name;
+    }
+  }
+  return undefined;
+}
+
 export const bashTool: ToolDefinition = {
   name: "bash",
   description:
@@ -184,6 +213,19 @@ export const bashTool: ToolDefinition = {
     const command = typeof args.command === "string" ? args.command : "";
     if (!command.trim()) {
       return { ok: false, content: "错误：command 不能为空" };
+    }
+
+    // 交互式命令没有 TTY，会一直等到超时（如 `su` 等密码）。提前失败并给出替代方案。
+    const interactive = interactiveCommandName(command);
+    if (interactive) {
+      return {
+        ok: false,
+        content:
+          `错误：\`${interactive}\` 需要交互式输入（密码 / 按键），而 xzh 的 bash 是` +
+          `非交互 shell，会一直等待直到超时。\n` +
+          `请在终端里手动执行；需要提权时改用已配置 NOPASSWD 的 \`sudo -n <命令>\`，` +
+          `不要依赖 xzh 输入密码。`,
+      };
     }
 
     let cwd = ctx.cwd;

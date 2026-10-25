@@ -11,7 +11,10 @@ import {
   trimMessagesToBudget,
 } from "../src/llm";
 import type { ChatMessage, ImageAttachment } from "../src/llm/types";
-import { bashTool } from "../src/tools/bash";
+import {
+  bashTool,
+  interactiveCommandName,
+} from "../src/tools/bash";
 import { editFileTool, writeFileTool } from "../src/tools/filesystem";
 import type { ToolContext } from "../src/tools/types";
 
@@ -164,6 +167,25 @@ describe("D18：bash 输出截断必须有提示", () => {
     expect(result.content).not.toContain("[输出被截断]");
     fs.rmSync(cwd, { recursive: true, force: true });
   }, 30_000);
+
+  it("交互式命令（su / passwd / vim）提前失败，不再等到超时", async () => {
+    const cwd = tmpDir("xzh-bash-");
+    const result = await bashTool.execute(
+      { command: 'su root -c "id"', timeout: 30_000 },
+      toolCtx(cwd),
+    );
+    expect(result.ok).toBe(false);
+    expect(result.content).toContain("需要交互式输入");
+    expect(result.content).toContain("sudo -n");
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }, 30_000);
+
+  it("只匹配命令位置，不误伤 echo / grep 里的同名文本", async () => {
+    expect(interactiveCommandName("echo su root")).toBeUndefined();
+    expect(interactiveCommandName("grep passwd README.md")).toBeUndefined();
+    expect(interactiveCommandName("echo hi && su root")).toBe("su");
+    expect(interactiveCommandName("FOO=bar vim a.txt")).toBe("vim");
+  });
 });
 
 describe("D20：同毫秒开启两个会话不能互相覆盖", () => {
