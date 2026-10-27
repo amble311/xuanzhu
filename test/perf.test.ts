@@ -4,7 +4,8 @@ import * as os from "os";
 import * as path from "path";
 import { Agent, type AgentEvents } from "../src/core/agent";
 import { buildSystemPrompt } from "../src/core/prompt";
-import { formatBusyDetail } from "../src/tui/app";
+import { consumeStreamingLine, formatBusyDetail } from "../src/tui/app";
+import { MarkdownRenderer } from "../src/tui/markdown";
 import { DEFAULT_CONFIG, type ModelEntry, type XuanZhuConfig } from "../src/config/store";
 import type { DeviceBridge } from "../src/device";
 import type { ChatOptions, LLMProvider, StreamChunk } from "../src/llm/types";
@@ -108,6 +109,22 @@ describe("设备工具按需下发", () => {
     agent.setGoal("完成 X");
     await agent.run("第三轮");
     expect(seen[2].tools.map((tool) => tool.name)).toContain("goal_complete");
+  });
+});
+
+describe("通知打断流式输出", () => {
+  it("落定最后一行后，结束时不会重复同一段正文", () => {
+    const renderer = new MarkdownRenderer();
+    // 没有换行：内容留在缓冲里，peek() 用于流式预览
+    expect(renderer.push("最后一段（未换行）")).toEqual([]);
+    const preview = renderer.peek();
+    expect(preview).toContain("最后一段");
+
+    // 通知（如「已自动记录当日摘要」）到达时必须消费缓冲
+    const settled = consumeStreamingLine(renderer, Boolean(preview));
+    expect(settled.join("\n")).toContain("最后一段");
+    // 结束时再 flush 不能再吐出同一段
+    expect(renderer.flush()).toEqual([]);
   });
 });
 

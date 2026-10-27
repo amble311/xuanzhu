@@ -83,6 +83,8 @@ export interface ChatOptions {
   messages: ChatMessage[];
   tools: ToolSpec[];
   temperature?: number;
+  /** 单次回复的最大输出 token 数（不设则由 Provider 默认值决定） */
+  maxTokens?: number;
   signal?: AbortSignal;
   /** 因瞬时网络错误而重试时回调（attempt 从 1 开始） */
   onRetry?: (

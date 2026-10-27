@@ -383,6 +383,9 @@ API Key 也可以来自环境变量，优先级低于配置文件：
 | `goal_complete` | 目标模式（`/goal`）下声明目标已全部完成（仅主代理可用） | 否 |
 | `report_status` | 结构化上报受阻 / 需要用户决定 / 置信度低（仅主代理可用） | 否 |
 | `task` | 派生子代理（默认 `code-explorer`）执行子任务，只返回结论；一轮内多个调用**并行**执行 | 否 |
+| `repo_map` | 仓库地图：按查询返回相关文件 / 符号，或目录概览 | 否 |
+| `find_symbol` | 按名称查找函数 / 类 / 类型定义，返回 `文件:行号` 与签名 | 否 |
+| `read_symbol` | 只读某个符号的代码范围（比整文件更省上下文） | 否 |
 | `read_file` | 读取文件（带行号，支持偏移与行数限制） | 否 |
 | `list_dir` | 列出目录内容 | 否 |
 | `glob` | 按 `**` / `*` / `?` 模式查找文件 | 否 |
@@ -534,6 +537,89 @@ API Key 也可以来自环境变量，优先级低于配置文件：
 防滥用：目标模式下本轮一次工具都没调用就报 `blocked` / `needs_input`，会被直接拒绝
 （要求先实际尝试）；`low_confidence` 不受限制。`goal_complete` 只用于「真正完成」，
 受阻不再被当成完成。
+
+## 任务账本与上下文压缩
+
+长任务的状态不只存在对话历史里，还落在 `<项目>/.xuanzhu/state/task.json`：
+
+- 当前任务、状态、计划、已完成步骤、决策、改动文件、验证结果、未决问题、工作集；
+- **新会话不会自动继续旧任务**：加载时把遗留的 `active` 降级为 `paused`；
+  只有用户说「继续」或 `/focus` 等显式操作才会恢复；
+- 用户中断且本轮 **0 次工具调用** → `abandoned`（大概率误发）；有工具副作用 → `paused`；
+- 历史被裁剪时，任务账本摘要会并入 `[上下文提醒]`，模型不必从残片猜进度。
+
+```text
+/compact          # 用一次模型调用把旧历史压成摘要，保留最近几轮原文
+/focus src/app.ts # 把文件加入工作集（/focus 列出，rm 移除，clear 清空）
+```
+
+`/compact` 的摘要会同时写入任务账本；它只压缩**内存里的对话**，不重写
+`~/.xzh/sessions` 存档，`/resume` 恢复的仍是原始会话。
+
+## 仓库地图与符号检索
+
+大项目里「先读整文件」是最贵的操作。第三期提供三个确定性工具（不调用模型）：
+
+```text
+repo_map query="agent loop"   # 相关文件/符号，或目录概览
+find_symbol name="buildConversation"  # 文件:行号 + 签名
+read_symbol name="buildConversation"  # 只读该符号的代码范围
+```
+
+索引按文件扩展名解析函数 / 类 / 类型 / 变量 / Markdown 标题，跳过
+`node_modules`、`.git`、`dist` 等目录；进程内缓存 60 秒，`refresh: true` 可重建。
+适合先用 `repo_map` / `find_symbol` 定位，再 `read_symbol` 或 `read_file offset/limit`。
+
+子代理报告也有统一约束：结论最前、引用用 `文件:行号`、不贴完整文件/日志；
+报告进入主上下文时按档位截断（small 档 4000 字符，full 档默认 12000）。
+
+## 基准（bench）
+
+第四期提供可重复的合成大仓库基准：默认生成 300 个无关模块 + 一个带 bug 的
+`src/math.mjs`，用三个任务比较不同上下文窗口 / 档位的**成功率、模型调用次数、工具调用、
+输入/输出 token 与耗时**。
+
+```bash
+npm run bench -- --mock                 # 不调用模型，验证基准回路
+npm run bench -- \
+  --endpoint=http://127.0.0.1:8181/v1 --model=local \
+  --windows=8192,16384 --profiles=small,full --runs=3
+```
+
+任务：
+
+| 任务 | 验收方式 |
+| --- | --- |
+| `fix-add` | 修复 `add` 后 `node test.mjs` 通过 |
+| `add-multiply` | 新增 `multiply` 并验证 `multiply(3,4)===12` |
+| `find-add` | 不改文件，答案包含 `src/math.mjs` 与问题判断 |
+
+输出：按 window/profile 的成功率汇总、按任务类型的汇总、逐项明细；同时写
+`/tmp/xzh-bench-results.json`。`--modules`、`--tasks`、`--timeout` 可调。
+端点未返回 `usage` 时，token 数使用本地估算（用于比较趋势，不当作精确计费）。
+
+## 小上下文模型（small 档）
+
+模型窗口 ≤ 32k（或配置 `contextProfile: "small"`）时自动切精简档：
+
+- **提示词更短**：只保留「先读后改、改完验证、只做最新消息、少轮次」等硬规则；
+- **工具更少**：只下发读写 / 检索（含 `repo_map` / `find_symbol` / `read_symbol`）/
+  执行 / 计划 / 状态 / 记忆等核心工具，隐藏 `task`、`load_skill`、`memory_compact`
+  等低频 schema；
+- **读取更小**：`read_file` 默认且最多 300 行，大文件用 `offset/limit` 分段；
+- **输出有上限**：默认 2048 tokens（`maxOutputTokens` 可覆盖）；
+- **大输出落盘**：`bash` 结果超过 6000 字符时，完整内容保存到
+  `.xuanzhu/artifacts/`，上下文只留头尾摘要与文件路径，需要时再用 `read_file` 回查；
+- **预算可视化**：`/context` 显示系统提示词、工具 schema、历史、状态块各占多少，
+  以及是否已裁剪。
+
+配置：
+
+```json
+{ "contextProfile": "auto", "maxOutputTokens": 2048 }
+```
+
+`auto` 按窗口自动判断，`small` / `full` 可强制档位。
 
 ## 图片输入（Ctrl+V）
 
@@ -850,7 +936,7 @@ description: 一句话说明该技能的用途与适用场景
 kitty / Ghostty 会把该 xterm 兼容序列映射成「所有按键都用转义码上报」而破坏普通输入，
 故玄猪对这两类终端不发送请求，请改用 `Alt+Enter` 或在终端侧自行配置。
 
-界面内命令：`/help`、`/clear`、`/tools`、`/device`、`/image`（`/paste`）、`/copy [N|A-B|last|all]`、`/mouse`、`/reset`、`/undo`、`/resume [编号]`、`/cwd`、`/switch <目录>`、`/term`、`/model [编号|id|模型名]`、`/goal <目标>`（`/goal [status|continue|off]`）、`/memory [clear]`、`/init [--dry-run|--force]`、`/auto [on|off]`、`/intent [on|off]`、`/exit`。
+界面内命令：`/help`、`/clear`、`/tools`、`/context`、`/compact`、`/focus [文件]`、`/device`、`/image`（`/paste`）、`/copy [N|A-B|last|all]`、`/mouse`、`/reset`、`/undo`、`/resume [编号]`、`/cwd`、`/switch <目录>`、`/term`、`/model [编号|id|模型名]`、`/goal <目标>`（`/goal [status|continue|off]`）、`/memory [clear]`、`/init [--dry-run|--force]`、`/auto [on|off]`、`/intent [on|off]`、`/exit`。
 
 ### 选中与复制
 

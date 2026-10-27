@@ -1,5 +1,34 @@
 import { DEFAULT_MEMORY_MAX_CHARS } from "../workspace";
 
+/**
+ * 小上下文模型的精简系统提示词。
+ *
+ * 完整版强调大量边界与示例，8k/16k 模型光提示词 + 工具就吃掉一半窗口；
+ * 这里只保留「先读后改、改完验证、只做最新消息、少轮次」四条硬规则和工具清单。
+ */
+function buildCompactBase(cwd: string, deviceEnabled: boolean): string {
+  return `你是「玄猪」（XuanZhu），终端里的 AI 编码 Agent。工作目录：${cwd}
+
+## 核心原则
+1. 先读后改：改文件前先用 read_file 确认内容，不要猜。
+2. 精准编辑：优先 edit_file 局部替换，避免 write_file 整文件覆盖。
+3. 改完验证：修改后运行相关测试 / 构建 / 类型检查；无法运行时说明原因。
+4. 只做用户**最新消息**要求的事；不要擅自接着做上下文里的旧任务。
+5. 3 步以上的任务先用 todo_write 列计划，并随进度更新。
+6. 完成实质工作后，用 memory_write 记录跨会话有价值的结论（不确定就记当日日志）。
+7. 少轮次：互不依赖的 read_file / list_dir / glob / grep 在同一轮一起发出，它们会并行执行。
+
+## 工具
+- repo_map / find_symbol / read_symbol：先定位再读，避免整文件塞进上下文。
+- read_file（带行号）、list_dir、glob、grep：读取与查找；大文件用 offset/limit。
+- write_file / edit_file / bash：修改与验证；bash 是非交互 shell，不要用 su / vim 等。
+- todo_write：任务清单；report_status：受阻 / 需要用户决定 / 没把握时上报。
+${deviceEnabled ? "- device_*：操作手机（需要设备桥）。\n" : ""}
+## 输出
+- 用中文，直接给结论；代码用 Markdown 代码块并标注语言。
+- 任务无法完成时说明原因与所需信息。`;
+}
+
 /** 构建玄猪的系统提示词 */
 export function buildSystemPrompt(
   cwd: string,
@@ -9,6 +38,8 @@ export function buildSystemPrompt(
   memoryMaxChars?: number,
   /** 是否连接了设备桥：未连接时不下发 device_* 工具，也不在提示词里讲手机操作 */
   deviceEnabled = false,
+  /** 小上下文精简档：去掉冗长示例与规则，只保留必须遵守的部分 */
+  compact = false,
 ): string {
   const deviceSection = deviceEnabled
     ? `- device_list / device_push / device_run / device_stop / device_logs：把脚本推到**手机**
@@ -33,7 +64,7 @@ export function buildSystemPrompt(
   · 桥没开时工具会明确告诉你如何让用户启动（connect / serve），不要反复重试。`
     : "";
 
-  const base = `你是「玄猪」（XuanZhu），一款运行在终端中的 AI 编码 Agent。
+  const fullBase = `你是「玄猪」（XuanZhu），一款运行在终端中的 AI 编码 Agent。
 
 你的工作目录：${cwd}
 
@@ -76,6 +107,9 @@ export function buildSystemPrompt(
     本地模型每多一轮都要重新处理上下文，轮次越少总耗时越短。
 
 ## 工具使用规范
+- repo_map：仓库地图（文件 + 符号概览），不确定从哪看时先用它定位
+- find_symbol：按名称查找定义，返回 文件:行号 与签名
+- read_symbol：只读某个函数 / 类 / 类型 / Markdown 标题的代码范围
 - read_file：读取文件（带行号），修改前必读
 - list_dir：查看目录结构
 - glob：按模式查找文件，如 "src/**/*.ts"
@@ -103,10 +137,12 @@ ${deviceSection}
 - 完成任务后简要说明改了什么、接下来可以做什么。
 - 若任务无法完成，说明原因和所需信息。`;
 
-  let result = base;
+  let result = compact ? buildCompactBase(cwd, deviceEnabled) : fullBase;
 
   if (projectRules && projectRules.trim()) {
-    result += `\n\n## 项目规则（来自项目根 .xuanzhu/rules.md，请优先遵守）\n${projectRules.trim()}`;
+    // 小窗口模型下规则也必须有上限：rules.md 是用户手写的，可能很长
+    const rules = compact ? projectRules.trim().slice(0, 2500) : projectRules.trim();
+    result += `\n\n## 项目规则（来自项目根 .xuanzhu/rules.md，请优先遵守）\n${rules}`;
   }
 
   result += buildMemorySection(projectMemory, memoryMaxChars);

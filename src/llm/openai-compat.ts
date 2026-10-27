@@ -78,6 +78,7 @@ export class OpenAICompatProvider implements LLMProvider {
         messages,
         tools,
         temperature: options.temperature,
+        ...(options.maxTokens ? { max_tokens: options.maxTokens } : {}),
         stream: true,
       },
       { signal: options.signal },

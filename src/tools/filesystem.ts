@@ -202,7 +202,12 @@ export const readFileTool: ToolDefinition = {
 
     const allLines = buffer.toString("utf8").split("\n");
     const offset = Math.max(1, asNumber(args.offset, 1));
-    const limit = Math.max(1, asNumber(args.limit, MAX_READ_LINES));
+    // 小上下文档由 Agent 注入更低的默认值与硬上限（大文件必须分段读）
+    const maxLines = ctx.limits?.maxReadLines ?? MAX_READ_LINES;
+    const limit = Math.min(
+      Math.max(1, asNumber(args.limit, maxLines)),
+      Math.max(1, maxLines),
+    );
     const slice = allLines.slice(offset - 1, offset - 1 + limit);
 
     const body = slice

@@ -62,6 +62,7 @@ export class GeminiProvider implements LLMProvider {
         tools,
         generationConfig: {
           temperature: options.temperature,
+          ...(options.maxTokens ? { maxOutputTokens: options.maxTokens } : {}),
         },
       },
       // 传入 requestOptions：让配置的 baseUrl 与中断信号真正生效

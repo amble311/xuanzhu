@@ -27,6 +27,8 @@ export interface SelfStateInput {
   contextUsage?: number;
   /** 本轮模型主动上报的状态（`report_status`） */
   status?: RunStatus;
+  /** 任务账本摘要（由 Agent 从 task-ledger 生成，已含 `-` 前缀） */
+  taskDigest?: string;
 }
 
 const STATUS_LABEL: Record<RunStatus["kind"], string> = {
@@ -79,6 +81,12 @@ export function buildSelfState(input: SelfStateInput): string | null {
     lines.push(
       `- 状态：${STATUS_LABEL[input.status.kind]} —— ${clip(input.status.summary, 100)}`,
     );
+  }
+
+  if (input.taskDigest) {
+    for (const line of input.taskDigest.split("\n")) {
+      if (line.trim()) lines.push(line.trim());
+    }
   }
 
   const active = input.todos.filter((item) => item.status !== "cancelled");

@@ -19,6 +19,8 @@ import {
   isRetryableError,
   isSystemPromptTight,
   isModelUnavailableError,
+  estimateTokens,
+  inferContextWindow,
   isVisionUnsupportedError,
   keepFromValidStart,
   resolveConversationBudget,
@@ -57,6 +59,10 @@ import type {
 } from "../tools/types";
 import type { DeviceBridge } from "../device";
 import { findSubAgent, subAgentNames } from "../subagents";
+import {
+  normalizeSubagentReport,
+  SUBAGENT_OUTPUT_RULE,
+} from "../subagents/report";
 import { mapWithConcurrency } from "../utils/concurrency";
 import { recordErrorReport } from "../utils/error-reports";
 import { expandHome, getConfigPath } from "../utils/paths";
@@ -69,6 +75,17 @@ import {
   readProjectMemory,
   resolveProjectPaths,
 } from "../workspace";
+import {
+  addTaskDecision,
+  addTaskDone,
+  clearTaskLedger,
+  createTaskLedger,
+  formatTaskDigest,
+  loadTaskLedger,
+  saveTaskLedger,
+  touchTaskLedger,
+  type TaskLedger,
+} from "./task-ledger";
 import { goalSystemSection } from "./goal";
 import { buildSystemPrompt } from "./prompt";
 import {
@@ -76,6 +93,7 @@ import {
   finishGatePrompt,
   isVerificationCommand,
 } from "./state";
+import * as fs from "fs";
 import * as path from "path";
 
 /** 只读类工具：默认免确认，但落在工作区外或敏感路径时需要确认 */
@@ -130,6 +148,43 @@ export interface AgentEvents {
  * 2. 系统提示词要在**每次请求**时注入目标与「不要中途停下」的规则 ——
  *    历史会被裁剪，只有系统提示词能贯穿整个目标执行过程。
  */
+/** `/compact` 的结果 */
+export interface CompactResult {
+  compacted: boolean;
+  before: number;
+  after: number;
+  summary?: string;
+  reason?: string;
+}
+
+/** `/compact` 后保留的最近消息条数（从 user 边界开始） */
+const COMPACT_KEEP_MESSAGES = 6;
+
+/** `/context` 展示的上下文预算报告 */
+export interface ContextReport {
+  model: string;
+  /** 模型窗口（token） */
+  window: number;
+  profile: "small" | "full";
+  /** 系统提示词占用（不含只读状态块） */
+  systemTokens: number;
+  /** 工具 schema 占用 */
+  toolsTokens: number;
+  /** 已提交历史占用 */
+  historyTokens: number;
+  /** 只读状态块占用 */
+  stateTokens: number;
+  /** 上述四项合计 */
+  inputTokens: number;
+  /** 会话部分可用的 token 预算（不含系统提示词） */
+  conversationBudget: number;
+  /** inputTokens / window（0–1） */
+  ratio: number;
+  /** 历史是否已被裁剪过 */
+  trimmed: boolean;
+  maxOutputTokens?: number;
+}
+
 export interface GoalState {
   /** 目标正文 */
   text: string;
@@ -171,6 +226,13 @@ export interface AgentOptions {
    * 也会在并行子代理之间产生重复条目。
    */
   autoMemory?: boolean;
+  /**
+   * 是否维护项目任务账本（默认 true）。
+   *
+   * 子代理传 `false`：否则每个子代理都会覆盖主任务账本，主代理的「做到哪了」
+   * 会被子任务的 prompt/结论替换。
+   */
+  taskLedger?: boolean;
 }
 
 /**
@@ -249,7 +311,7 @@ const EXPLORATION_REMINDER_CHARS = 40_000;
  * 正常调研报告远小于此值；设上限是为了兜住失控输出（子代理陷入重复时可能吐几十万字），
  * 一旦发生，宁可截断报告也不要把主对话挤爆。
  */
-const MAX_SUBAGENT_REPORT_CHARS = 20_000;
+
 
 /**
  * 子代理的**默认**工具轮数上限（覆盖 config.maxToolRounds，可用
@@ -272,6 +334,31 @@ const MAX_PARALLEL_AGENTS_CAP = 16;
 
 /** `config.maxParallelAgents` 未设置时的默认并发数 */
 const DEFAULT_PARALLEL_AGENTS = 4;
+
+/** 窗口不超过该值视为「小上下文模型」，自动使用精简档 */
+const SMALL_CONTEXT_WINDOW = 32_768;
+/** 小上下文档的默认输出上限（给输入留空间） */
+const SMALL_MAX_OUTPUT_TOKENS = 2048;
+/**
+ * 小上下文档保留的工具：读写、检索、执行、计划、状态与记忆。
+ * 子代理 / 技能 / 记忆压缩等低频工具暂不下发，节省 schema token。
+ */
+const SMALL_TOOL_NAMES = new Set([
+  "repo_map",
+  "find_symbol",
+  "read_symbol",
+  "read_file",
+  "list_dir",
+  "glob",
+  "grep",
+  "write_file",
+  "edit_file",
+  "bash",
+  "todo_write",
+  "memory_read",
+  "memory_write",
+  "report_status",
+]);
 
 /**
  * 目标模式下，单次 `run` 允许「追加工具轮次配额」的次数。
@@ -303,16 +390,20 @@ const ABORT_NOTE_ARG_CHARS = 120;
  * 因此一旦这次会话裁过历史，之后每次请求都附上这条说明：明确告诉模型"你看的不是完整历史"，
  * 残缺的旧任务不是待办，当前消息才是要做的事。
  */
-function contextTrimmedNote(): ChatMessage {
-  return {
-    role: "system",
-    content:
-      "[上下文提醒] 更早的对话已因超出上下文窗口被裁剪，你看到的**不是完整历史**：\n" +
-      "· 被裁掉的内容不要推测、不要补做；\n" +
-      "· 上文里那些没有结论的旧任务只是残片，**不代表要接着做**；\n" +
-      "· 只有当用户最新一条消息明确要求继续时才续做，否则先回答他当前这条消息；\n" +
-      "· 若当前消息指向你已经看不到的上下文，先问清楚，再动手。",
-  };
+function contextTrimmedNote(taskDigest?: string | null): ChatMessage {
+  let content =
+    "[上下文提醒] 更早的对话已因超出上下文窗口被裁剪，你看到的**不是完整历史**：\n" +
+    "· 被裁掉的内容不要推测、不要补做；\n" +
+    "· 上文里那些没有结论的旧任务只是残片，**不代表要接着做**；\n" +
+    "· 只有当用户最新一条消息明确要求继续时才续做，否则先回答他当前这条消息；\n" +
+    "· 若当前消息指向你已经看不到的上下文，先问清楚，再动手。";
+  if (taskDigest) {
+    content +=
+      "\n\n[任务账本 · 历史裁剪后重建]\n" +
+      taskDigest +
+      "\n（以这份账本为准继续当前任务，不要重做已完成的部分。）";
+  }
+  return { role: "system", content };
 }
 
 /**
@@ -469,6 +560,9 @@ export class Agent {
   private runStatus?: RunStatus;
   /** 本轮各工具的真实执行次数（自动记忆摘要用） */
   private runToolCounts = new Map<string, number>();
+  /** 当前任务账本（持久化到 <项目>/.xuanzhu/state/task.json） */
+  private task?: TaskLedger;
+  private taskLoaded = false;
   /** 本轮最后一次验证命令与结果（自动记忆摘要用） */
   private runVerifyCommand?: string;
   private runVerifyOk = false;
@@ -476,6 +570,8 @@ export class Agent {
   private runWroteMemory = false;
   /** 是否启用自动记忆（子代理关闭） */
   private autoMemory: boolean;
+  /** 是否维护任务账本（子代理关闭，避免覆盖主任务） */
+  private taskLedgerEnabled: boolean;
   /**
    * 手机设备桥（由界面在 `/device serve` 时注入）。
    *
@@ -510,6 +606,7 @@ export class Agent {
     this.maxToolRoundsOverride = options?.maxToolRounds;
     this.sessionFile = options?.sessionFile;
     this.autoMemory = options?.autoMemory ?? true;
+    this.taskLedgerEnabled = options?.taskLedger ?? true;
     this.systemPrompt = this.composeSystemPrompt();
   }
 
@@ -553,6 +650,7 @@ export class Agent {
       readProjectMemory(this.cwd),
       this.config.memoryMaxChars,
       Boolean(this.deviceBridge),
+      this.contextProfile() === "small",
     );
   }
 
@@ -620,6 +718,10 @@ export class Agent {
     this.sessionChangedFiles.clear();
     this.contextUsage = undefined;
     this.runStatus = undefined;
+    // 新对话 = 新任务：旧账本不再适用于这段历史
+    clearTaskLedger(this.cwd);
+    this.task = undefined;
+    this.taskLoaded = true;
   }
 
   /**
@@ -648,6 +750,10 @@ export class Agent {
     this.sessionChangedFiles.clear();
     this.contextUsage = undefined;
     this.runStatus = undefined;
+    // 恢复的是另一段历史，旧任务账本不应再注入
+    clearTaskLedger(this.cwd);
+    this.task = undefined;
+    this.taskLoaded = true;
     appendSessionMessages(sessionFile, messages);
   }
 
@@ -668,6 +774,13 @@ export class Agent {
       startedAt: new Date().toISOString(),
       completed: false,
     };
+    if (this.taskLedgerEnabled) {
+      this.ensureTaskLoaded();
+      if (!this.task) this.task = createTaskLedger(text);
+      this.task.goal = text.trim();
+      this.task.status = "active";
+      touchTaskLedger(this.cwd, this.task);
+    }
     return this.goal;
   }
 
@@ -686,6 +799,11 @@ export class Agent {
     if (!this.goal || this.goal.completed) return false;
     this.goal.completed = true;
     this.goal.summary = summary.trim();
+    if (this.task) {
+      addTaskDone(this.task, summary.trim());
+      this.task.status = "completed";
+      touchTaskLedger(this.cwd, this.task);
+    }
     return true;
   }
 
@@ -709,6 +827,150 @@ export class Agent {
     return this.lastRunToolCalls;
   }
 
+  // ------------------------------------------------------------ 任务账本
+
+  /** 懒加载任务账本；新进程启动时把上次的 active 降级为 paused（绝不自动继续） */
+  private ensureTaskLoaded(): void {
+    if (!this.taskLedgerEnabled || this.taskLoaded) return;
+    this.taskLoaded = true;
+    const loaded = loadTaskLedger(this.cwd);
+    if (!loaded) return;
+    if (loaded.status === "active") {
+      loaded.status = "paused";
+      saveTaskLedger(this.cwd, loaded);
+    }
+    this.task = loaded;
+  }
+
+  /** 当前任务账本（供界面展示；不存在时为 undefined） */
+  getTaskLedger(): TaskLedger | undefined {
+    this.ensureTaskLoaded();
+    return this.task;
+  }
+
+  /** 每个用户轮次开始时确定「当前任务」；不自动恢复暂停任务 */
+  private beginTask(userInput: string): void {
+    if (!this.taskLedgerEnabled) return;
+    this.ensureTaskLoaded();
+    const continuation =
+      /(^|[\s，,。])(继续|接着|继续吧|接着做|resume|continue|go on)\b/i.test(
+        userInput,
+      );
+    // 目标模式自动继续时 even if task is paused (blocked) must not start a new task
+    const goalRunning = Boolean(this.goal && !this.goal.completed);
+    if (
+      !this.task ||
+      this.task.status === "completed" ||
+      this.task.status === "abandoned" ||
+      (this.task.status === "paused" && !continuation && !goalRunning)
+    ) {
+      this.task = createTaskLedger(userInput);
+    } else {
+      this.task.status = "active";
+      this.task.lastUserMessage = userInput.slice(0, 500);
+      // /focus 可能在任务开始前创建了占位账本；第一条用户消息用来定标题
+      if (this.task.title === "未命名任务") {
+        this.task.title = userInput.trim().slice(0, 120) || "未命名任务";
+      }
+    }
+    this.task.status = "active";
+    touchTaskLedger(this.cwd, this.task);
+  }
+
+  /** 把 todo 快照写进账本（todo_write 每次 set 都会调用） */
+  private syncTaskTodos(): void {
+    if (!this.taskLedgerEnabled || !this.task) return;
+    this.task.plan = this.todos.map((item) => ({ ...item }));
+    touchTaskLedger(this.cwd, this.task);
+  }
+
+  /** 一次 run 正常结束：记录结论 / 未决问题 / 目标完成状态 */
+  private recordTaskConclusion(finalText: string): void {
+    if (!this.taskLedgerEnabled || !this.task) return;
+    const conclusion = summarizeMemoryConclusion(finalText);
+    if (conclusion) {
+      this.task.lastConclusion = conclusion;
+      addTaskDone(this.task, conclusion);
+    }
+    // 从答复里提取显式写出的「决策：/ 决定：」，其余语义判断交给模型的 memory_write
+    for (const line of finalText.split("\n")) {
+      const match = /^\s*(?:[-*]\s*)?(?:决策|决定)[：:]\s*(.+)$/.exec(line);
+      if (match?.[1]) addTaskDecision(this.task, match[1]);
+    }
+    const status = this.getRunStatus();
+    if (status && (status.kind === "blocked" || status.kind === "needs_input")) {
+      this.task.openQuestions = [status.summary];
+      this.task.status = "paused";
+    } else {
+      this.task.openQuestions = [];
+      this.task.status = this.goal?.completed ? "completed" : "active";
+    }
+    touchTaskLedger(this.cwd, this.task);
+  }
+
+  /** 中断 / 回滚：用户中断且 0 次工具调用视为误发放弃；出错或已产生副作用则暂停 */
+  private markTaskInterrupted(reason = ""): void {
+    if (!this.taskLedgerEnabled || !this.task || this.task.status !== "active") return;
+    const userAbort = reason.includes("中断");
+    this.task.status =
+      userAbort && this.lastRunToolCalls === 0 ? "abandoned" : "paused";
+    touchTaskLedger(this.cwd, this.task);
+  }
+
+  // ------------------------------------------------------------ 工作集（/focus）
+
+  getFocusFiles(): string[] {
+    if (!this.taskLedgerEnabled) return [];
+    this.ensureTaskLoaded();
+    return [...(this.task?.focusFiles ?? [])];
+  }
+
+  addFocusFile(file: string): { ok: boolean; message: string } {
+    if (!this.taskLedgerEnabled) {
+      return { ok: false, message: "子代理不维护工作集" };
+    }
+    this.ensureTaskLoaded();
+    const raw = file.trim();
+    if (!raw) return { ok: false, message: "用法：/focus <文件路径>" };
+    const abs = path.isAbsolute(raw) ? raw : path.resolve(this.cwd, raw);
+    if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) {
+      return { ok: false, message: `文件不存在：${raw}` };
+    }
+    if (!this.task) this.task = createTaskLedger("");
+    const rel = path.relative(this.cwd, abs) || raw;
+    if (this.task.focusFiles.includes(rel)) {
+      return { ok: true, message: `已在工作集：${rel}` };
+    }
+    this.task.focusFiles.push(rel);
+    if (this.task.focusFiles.length > 20) {
+      this.task.focusFiles.splice(0, this.task.focusFiles.length - 20);
+    }
+    touchTaskLedger(this.cwd, this.task);
+    return { ok: true, message: `已加入工作集：${rel}` };
+  }
+
+  removeFocusFile(file: string): boolean {
+    if (!this.taskLedgerEnabled) return false;
+    this.ensureTaskLoaded();
+    if (!this.task) return false;
+    const raw = file.trim();
+    const before = this.task.focusFiles.length;
+    this.task.focusFiles = this.task.focusFiles.filter(
+      (item) => item !== raw && path.resolve(this.cwd, item) !== path.resolve(this.cwd, raw),
+    );
+    if (this.task.focusFiles.length === before) return false;
+    touchTaskLedger(this.cwd, this.task);
+    return true;
+  }
+
+  clearFocusFiles(): void {
+    if (!this.taskLedgerEnabled) return;
+    this.ensureTaskLoaded();
+    if (!this.task || this.task.focusFiles.length === 0) return;
+    this.task.focusFiles = [];
+    touchTaskLedger(this.cwd, this.task);
+  }
+
   /** 本轮模型主动上报的状态（`report_status`）；没有则为 `undefined` */
   getRunStatus(): RunStatus | undefined {
     return this.runStatus;
@@ -719,6 +981,11 @@ export class Agent {
     return {
       report: (status) => {
         this.runStatus = { ...status, at: new Date().toISOString() };
+        if (this.task && (status.kind === "blocked" || status.kind === "needs_input")) {
+          this.task.openQuestions = [status.summary];
+          this.task.status = "paused";
+          touchTaskLedger(this.cwd, this.task);
+        }
       },
       toolCalls: () => this.lastRunToolCalls,
       goalActive: () => Boolean(this.goal && !this.goal.completed),
@@ -814,8 +1081,154 @@ export class Agent {
     );
   }
 
+  /** 当前上下文策略：配置优先，否则按模型窗口自动判断 */
+  private contextProfile(): "small" | "full" {
+    if (this.config.contextProfile === "small") return "small";
+    if (this.config.contextProfile === "full") return "full";
+    const window =
+      this.activeModel?.contextWindow ??
+      inferContextWindow(this.activeModel?.model ?? "");
+    return window > 0 && window <= SMALL_CONTEXT_WINDOW ? "small" : "full";
+  }
+
+  /** 本次请求的输出上限（配置优先，small 档默认 2048） */
+  private requestMaxTokens(): number | undefined {
+    const configured = this.config.maxOutputTokens;
+    if (typeof configured === "number" && configured > 0) {
+      return Math.floor(configured);
+    }
+    return this.contextProfile() === "small" ? SMALL_MAX_OUTPUT_TOKENS : undefined;
+  }
+
+  /** `/context` 的数据源：各区块的估算占用与实际窗口 */
+  getContextReport(): ContextReport {
+    const model = this.activeModel?.model ?? "";
+    const window = this.activeModel?.contextWindow ?? inferContextWindow(model);
+    const stateBlock = this.buildSelfStateBlock();
+    const systemTokens = estimateMessageTokens({
+      role: "system",
+      content: this.effectiveSystemPrompt(),
+    });
+    const stateTokens = stateBlock
+      ? estimateMessageTokens({ role: "system", content: stateBlock })
+      : 0;
+    const toolsTokens = estimateTokens(
+      JSON.stringify(getToolSpecs(this.requestTools())),
+    );
+    const historyTokens = this.history.reduce(
+      (sum, message) => sum + estimateMessageTokens(message),
+      0,
+    );
+    const inputTokens = systemTokens + toolsTokens + historyTokens + stateTokens;
+    return {
+      model,
+      window,
+      profile: this.contextProfile(),
+      systemTokens,
+      toolsTokens,
+      historyTokens,
+      stateTokens,
+      inputTokens,
+      conversationBudget: this.conversationBudget(),
+      ratio: window > 0 ? Math.min(1, inputTokens / window) : 0,
+      trimmed: this.historyTrimmed,
+      maxOutputTokens: this.requestMaxTokens(),
+    };
+  }
+
+  /**
+   * `/compact` —— 用一次模型调用把旧历史压成滚动摘要，保留最近几轮原文。
+   *
+   * 这是**显式**操作而不是自动触发：本地模型每次调用都贵，自动压缩会在用户
+   * 不知情时多一轮请求；日常裁剪已由「任务账本 + contextTrimmedNote」兜底。
+   * 摘要同时写入任务账本，`/resume`/下次会话仍能看到结论。
+   */
+  async compactHistory(signal?: AbortSignal): Promise<CompactResult> {
+    const before = this.history.length;
+    if (before <= COMPACT_KEEP_MESSAGES) {
+      return {
+        compacted: false,
+        before,
+        after: before,
+        reason: "历史较短，无需压缩",
+      };
+    }
+
+    this.ensureTaskLoaded();
+    if (this.taskLedgerEnabled && !this.task) {
+      const firstUser = this.history.find((message) => message.role === "user");
+      this.task = createTaskLedger(firstUser?.content ?? "上下文压缩");
+    }
+    const digest = this.task ? formatTaskDigest(this.task, 900) : null;
+    const transcript = this.history
+      .map((message) => {
+        let line = `[${message.role}] ${message.content}`;
+        if (message.toolCalls?.length) {
+          line += `\n(调用工具：${message.toolCalls.map((call) => call.name).join("、")})`;
+        }
+        return line;
+      })
+      .join("\n\n");
+
+    const prompt =
+      "把下面这段编码任务的对话压缩成一份可继续工作的摘要。要求：\n" +
+      "1. 用中文，分点写：已完成、关键决策、改动文件、验证结果、未决问题、下一步；\n" +
+      "2. 只保留事实与结论，不要复述寒暄、工具原始输出和代码全文；\n" +
+      "3. 总长度不超过 600 字；没有内容的项可省略。\n\n" +
+      (digest ? `当前任务账本（可参考，不要照抄）：\n${digest}\n\n` : "") +
+      `对话：\n${transcript.length > 14000 ? `…（前文已省略）\n${transcript.slice(-14000)}` : transcript}`;
+
+    let summary = "";
+    const stream = this.provider.chat({
+      messages: [
+        { role: "system", content: "你是上下文压缩器，只输出摘要正文。" },
+        { role: "user", content: prompt },
+      ],
+      tools: [],
+      temperature: 0.2,
+      maxTokens: Math.min(this.requestMaxTokens() ?? 900, 1200),
+      signal,
+    });
+    for await (const chunk of stream) {
+      if (chunk.type === "text") summary += chunk.text;
+    }
+    if (signal?.aborted) throw new Error("上下文压缩已被用户中断");
+    summary = summary.trim();
+    if (!summary) throw new Error("模型没有返回摘要内容");
+
+    // 从 user 边界保留最近几轮，避免留下半截 tool / assistant
+    let start = Math.max(0, this.history.length - COMPACT_KEEP_MESSAGES);
+    while (start > 0 && this.history[start]?.role !== "user") start -= 1;
+    const recent = this.history.slice(start);
+    this.history = [
+      {
+        role: "system",
+        content:
+          "[对话摘要] 更早的逐字消息已被 /compact 压缩；最近几轮原文仍保留。\n\n" +
+          summary,
+      },
+      ...recent,
+    ];
+    // 这是有意的摘要，不需要再附「历史被裁剪」的警告
+    this.historyTrimmed = false;
+
+    if (this.taskLedgerEnabled && this.task) {
+      this.task.summary = summary;
+      addTaskDone(this.task, summary.slice(0, 240));
+      touchTaskLedger(this.cwd, this.task);
+    }
+
+    return {
+      compacted: true,
+      before,
+      after: this.history.length,
+      summary,
+    };
+  }
+
   /** 生成只读状态块（没有可写内容时返回 `null`） */
   private buildSelfStateBlock(): string | null {
+    this.ensureTaskLoaded();
     return buildSelfState({
       goal: this.goal,
       todos: this.todos,
@@ -823,6 +1236,7 @@ export class Agent {
       changedFiles: [...this.sessionChangedFiles],
       contextUsage: this.contextUsage,
       status: this.runStatus,
+      taskDigest: this.task ? (formatTaskDigest(this.task) ?? undefined) : undefined,
     });
   }
 
@@ -854,11 +1268,17 @@ export class Agent {
   private requestTools(): ToolDefinition[] {
     const tools = this.tools ?? TOOLS;
     const goalActive = Boolean(this.goal && !this.goal.completed);
+    const small = this.contextProfile() === "small";
     return tools.filter((tool) => {
       // 未连接设备桥：不下发 device_*（schema 约 2.2KB，且模型调用必然失败）
       if (!this.deviceBridge && tool.name.startsWith("device_")) return false;
       // 非目标模式：不下发 goal_complete（模型没有目标可完成）
       if (!goalActive && tool.name === "goal_complete") return false;
+      if (small) {
+        // 小窗口下只保留核心工具；目标完成工具仅在目标模式保留
+        if (tool.name === "goal_complete" && goalActive) return true;
+        if (!SMALL_TOOL_NAMES.has(tool.name)) return false;
+      }
       return true;
     });
   }
@@ -884,6 +1304,7 @@ export class Agent {
           return { ...item, status: "pending" as const };
         });
         this.events.onTodos?.(this.todos);
+        this.syncTaskTodos();
       },
     };
   }
@@ -901,6 +1322,9 @@ export class Agent {
   setCwd(cwd: string): void {
     this.cwd = cwd;
     this.systemPrompt = this.composeSystemPrompt();
+    // 换项目：重新加载该项目的任务账本（旧的 active 会被降级为 paused）
+    this.task = undefined;
+    this.taskLoaded = false;
   }
 
   /**
@@ -947,6 +1371,8 @@ export class Agent {
     this.runVerifyCommand = undefined;
     this.runVerifyOk = false;
     this.runWroteMemory = false;
+    // 用户最新一条消息定义当前任务；旧任务暂停时不会自动继续
+    this.beginTask(userInput);
     let content = userInput;
 
     // 补发构造 / 切换目录期间攒下的提示（构造时终端尚未接管，不能当场写输出区）
@@ -1094,6 +1520,8 @@ export class Agent {
         this.appendHistory([note]);
         this.trimHistory();
       }
+      // 用户中断：0 次工具调用视为误发放弃；有副作用则暂停，等显式继续
+      this.markTaskInterrupted(reason);
     };
 
     // 死循环检测的跨轮状态：记录上一次的工具调用签名与连续出现次数。
@@ -1249,8 +1677,9 @@ export class Agent {
               continue;
             }
           }
+          // 任务账本只记录最终接受的那版结论；自动记忆随后执行
+          this.recordTaskConclusion(text);
           // 自动记忆：当日摘要必写；代码有实际改动时再按主题并入长期记忆。
-          // 放在收尾门之后、提交之前 —— 只记录最终接受的那一版答复。
           this.autoRecordRunMemory(text);
           commitTurn();
           this.events.onStatus("就绪");
@@ -1643,6 +2072,7 @@ export class Agent {
         messages,
         tools: getToolSpecs(this.requestTools()),
         temperature: this.config.temperature,
+        maxTokens: this.requestMaxTokens(),
         signal,
         onRetry: (retryAttempt, maxAttempts, error, info) => {
           // 区分「还没输出就失败」与「输出到一半断连后续传」——
@@ -1932,6 +2362,11 @@ export class Agent {
       goal: this.goalStore(),
       status: this.statusStore(),
       memoryMaxChars: this.config.memoryMaxChars,
+      limits: {
+        maxReadLines: this.contextProfile() === "small" ? 300 : undefined,
+        maxOutputChars: this.contextProfile() === "small" ? 6000 : undefined,
+        artifactDir: path.join(this.cwd, ".xuanzhu", "artifacts"),
+      },
       spawnAgent: (input) => this.spawnSubAgent(input, signal),
       deviceBridge: this.deviceBridge,
     };
@@ -1990,6 +2425,30 @@ export class Agent {
 
     if (name === "todo_write" && outcome.ok) {
       this.runTouchedTodos = true;
+    }
+
+    // 任务账本：改动文件 / 验证状态是确定性事实，逐次落盘
+    if (this.task) {
+      if (
+        (name === "write_file" || name === "edit_file") &&
+        typeof args.path === "string" &&
+        args.path.trim() &&
+        !this.task.changedFiles.includes(args.path.trim())
+      ) {
+        this.task.changedFiles.push(args.path.trim());
+        if (this.task.changedFiles.length > 50) {
+          this.task.changedFiles.splice(0, this.task.changedFiles.length - 50);
+        }
+        touchTaskLedger(this.cwd, this.task);
+      }
+      if (this.runVerifyCommand) {
+        this.task.verification = {
+          command: redactSecrets(this.runVerifyCommand),
+          ok: this.runVerifyOk,
+          at: new Date().toISOString(),
+        };
+        touchTaskLedger(this.cwd, this.task);
+      }
     }
   }
 
@@ -2109,14 +2568,17 @@ export class Agent {
 
     const child = new Agent(this.provider, this.config, this.cwd, childEvents, this.activeModel, {
       tools: toolsForSubAgent(definition.toolNames),
-      systemPrompt: definition.systemPrompt({
-        cwd: this.cwd,
-        description: input.description,
-        prompt: input.prompt,
-      }),
+      systemPrompt:
+        definition.systemPrompt({
+          cwd: this.cwd,
+          description: input.description,
+          prompt: input.prompt,
+        }) +
+        `\n\n## 输出约束\n${SUBAGENT_OUTPUT_RULE}`,
       maxToolRounds: SUBAGENT_MAX_TOOL_ROUNDS,
-      // 子代理的工作由主代理汇总；自己写记忆会污染项目、并在并行子代理之间重复
+      // 子代理的工作由主代理汇总；自己写记忆 / 账本会污染项目，并在并行子代理之间重复
       autoMemory: false,
+      taskLedger: false,
     });
 
     try {
@@ -2137,7 +2599,12 @@ export class Agent {
         `必要时用更聚焦的 prompt 重试，或由你自己完成。\n\n`
       : "";
 
-    const report = output.trim();
+    const limit =
+      this.contextProfile() === "small"
+        ? 4000
+        : (definition.maxReportChars ?? 12_000);
+    const normalized = normalizeSubagentReport(output, limit);
+    const report = normalized.text;
     if (!report) {
       return {
         ok: false,
@@ -2148,16 +2615,12 @@ export class Agent {
         summary: `子代理未返回结论：${input.description}`,
       };
     }
-    // 报告是要进主上下文的，失控输出（模型陷入重复）同样会把它撑爆，
-    // 因此设一道上限；截断总比把主对话挤掉好。
-    const clipped =
-      report.length > MAX_SUBAGENT_REPORT_CHARS
-        ? `${report.slice(0, MAX_SUBAGENT_REPORT_CHARS)}\n\n…（子代理报告过长，已截断 ${report.length - MAX_SUBAGENT_REPORT_CHARS} 字符）`
-        : report;
     return {
       ok: true,
-      content: `${abortedNotice}${definition.name} 子代理「${input.description}」的结论：\n\n${clipped}`,
-      summary: `${child.abortReason ? `子代理中止（${child.abortReason}）` : `子代理完成`}：${input.description}`,
+      content: `${abortedNotice}${definition.name} 子代理「${input.description}」的结论：\n\n${report}`,
+      summary:
+        `${child.abortReason ? `子代理中止（${child.abortReason}）` : `子代理完成`}：${input.description}` +
+        (normalized.truncated ? "（报告已按上下文预算截断）" : ""),
     };
   }
 
@@ -2185,6 +2648,31 @@ export class Agent {
       this.activeModel?.model ?? "",
       this.effectiveSystemPrompt(),
     );
+    // 小窗口模型：system + tools + state + 输出预留必须先扣掉，否则
+    // 「会话预算」看似 55% 窗口，加上工具 schema 后总量会超过窗口。
+    const window =
+      this.activeModel?.contextWindow ??
+      inferContextWindow(this.activeModel?.model ?? "");
+    if (this.contextProfile() === "small" && window > 0) {
+      const fixed =
+        estimateMessageTokens({
+          role: "system",
+          content: this.effectiveSystemPrompt(),
+        }) +
+        estimateTokens(JSON.stringify(getToolSpecs(this.requestTools()))) +
+        (this.buildSelfStateBlock()
+          ? estimateMessageTokens({
+              role: "system",
+              content: this.buildSelfStateBlock() ?? "",
+            })
+          : 0) +
+        (this.requestMaxTokens() ?? 0);
+      const available = Math.max(1, window - fixed);
+      return calibrateBudget(
+        Math.min(raw, available),
+        this.tokenCalibrator().factor(),
+      );
+    }
     return calibrateBudget(raw, this.tokenCalibrator().factor());
   }
 
@@ -2214,8 +2702,13 @@ export class Agent {
     const trimmed = trimMessagesToBudget(capped, budget);
     // 本次请求自己丢了消息（条数上限或 token 预算）→ 记下来
     if (trimmed.length < capped.length) this.historyTrimmed = true;
-    // 历史被裁过就附上说明：模型看到的不是完整历史，不能拿残缺的旧任务当待办
-    return this.historyTrimmed ? [contextTrimmedNote(), ...trimmed] : trimmed;
+    // 历史被裁过就附上说明 + 任务账本摘要：模型看到的不是完整历史，
+    // 但「做到哪了 / 还差什么」由代码维护，不依赖它从残片里猜。
+    this.ensureTaskLoaded();
+    const digest = this.task ? formatTaskDigest(this.task) : null;
+    return this.historyTrimmed
+      ? [contextTrimmedNote(digest), ...trimmed]
+      : trimmed;
   }
 
   /**

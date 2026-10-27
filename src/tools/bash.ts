@@ -1,4 +1,5 @@
 import { spawn } from "child_process";
+import * as fs from "fs";
 import * as path from "path";
 import { expandHome } from "../utils/paths";
 import type { ToolDefinition, ToolResult } from "./types";
@@ -187,6 +188,39 @@ export function interactiveCommandName(command: string): string | undefined {
   return undefined;
 }
 
+/**
+ * 把超长输出完整落盘，上下文里只留摘要。
+ *
+ * 为什么不能直接丢掉：测试/构建日志的真正报错常在末尾，截断后模型容易误判成功。
+ * 落盘后给模型一个路径，需要时用 read_file / grep 回查，既不占窗口也不丢证据。
+ */
+function saveOutputArtifact(
+  dir: string | undefined,
+  command: string,
+  stdout: string,
+  stderr: string,
+  truncated = false,
+): string | undefined {
+  if (!dir) return undefined;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const file = path.join(
+      dir,
+      `${stamp}-bash-${Math.random().toString(36).slice(2, 8)}.log`,
+    );
+    fs.writeFileSync(
+      file,
+      `$ ${command}\n\n${stdout}${stderr ? `\n[stderr]\n${stderr}` : ""}\n` +
+        (truncated ? "\n[note] 原始输出超过单次捕获上限，artifact 也只含已捕获的部分。\n" : ""),
+      "utf8",
+    );
+    return file;
+  } catch {
+    return undefined;
+  }
+}
+
 export const bashTool: ToolDefinition = {
   name: "bash",
   description:
@@ -240,10 +274,48 @@ export const bashTool: ToolDefinition = {
 
     const result = await runCommand(command, cwd, timeout, ctx.signal);
 
+    const limit = Math.max(1000, ctx.limits?.maxOutputChars ?? MAX_OUTPUT);
+    const stdout = result.stdout.trimEnd();
+    const stderr = result.stderr.trimEnd();
+    const full = [stdout, stderr ? `[stderr]\n${stderr}` : ""]
+      .filter(Boolean)
+      .join("\n\n");
+
+    const artifact =
+      full.length > limit
+        ? saveOutputArtifact(
+            ctx.limits?.artifactDir,
+            command,
+            stdout,
+            stderr,
+            result.truncated,
+          )
+        : undefined;
+
     const parts: string[] = [];
-    if (result.stdout.trim()) parts.push(result.stdout.trimEnd());
-    if (result.stderr.trim()) {
-      parts.push(`[stderr]\n${result.stderr.trimEnd()}`);
+    if (artifact) {
+      // 大输出只给摘要 + 路径：既保住报错证据，又不占上下文
+      const shorten = (line: string): string =>
+        line.length > 200 ? `${line.slice(0, 200)}…` : line;
+      const lines = stdout.split("\n");
+      const head = lines.slice(0, 8).map(shorten).join("\n");
+      const tail =
+        lines.length > 16 ? lines.slice(-8).map(shorten).join("\n") : "";
+      parts.push(
+        `[完整输出已保存] ${full.length} 字符 → ${artifact}\n` +
+          `[摘要]\n${head}${tail ? `\n…\n${tail}` : ""}`,
+      );
+      if (stderr) {
+        parts.push(
+          `[stderr 摘要]\n${stderr.split("\n").slice(0, 4).map(shorten).join("\n")}`,
+        );
+      }
+      if (result.truncated) {
+        parts.push("[捕获上限] 原始输出超过单次捕获上限，artifact 也只含已捕获部分。");
+      }
+    } else {
+      if (stdout) parts.push(stdout);
+      if (stderr) parts.push(`[stderr]\n${stderr}`);
     }
     if (result.aborted) {
       parts.push("[中断] 命令已被用户中断，其进程组已终止。");
@@ -256,11 +328,11 @@ export const bashTool: ToolDefinition = {
     const output = parts.join("\n\n");
     return {
       ok: result.code === 0 && !result.timedOut && !result.aborted,
-      // 截断提示必须放在**最前面**：正文本身已经顶到 MAX_OUTPUT，
+      // 截断提示必须放在**最前面**：正文本身已经顶到上限，
       // 放在末尾会被下面的 slice 直接切掉，等于没提示。
       content:
-        (result.truncated ? `${TRUNCATED_NOTE}\n\n` : "") +
-        output.slice(0, MAX_OUTPUT),
+        (!artifact && result.truncated ? `${TRUNCATED_NOTE}\n\n` : "") +
+        output.slice(0, artifact ? limit : MAX_OUTPUT),
       summary: result.aborted
         ? "已中断"
         : result.timedOut

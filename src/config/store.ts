@@ -138,6 +138,12 @@ export interface XuanZhuConfig {
    */
   confirmSensitiveRead?: boolean;
   /**
+   * 上下文策略：`auto`（默认）按模型窗口自动判断；`small` 强制精简档；`full` 强制完整档。
+   */
+  contextProfile?: "auto" | "small" | "full";
+  /** 单次回复的最大输出 token 数；不设则用 Provider 默认值（small 档默认 2048） */
+  maxOutputTokens?: number;
+  /**
    * 长期记忆（MEMORY.md）的字符上限。默认 12000（见 workspace 的 DEFAULT_MEMORY_MAX_CHARS）。
    *
    * 超过后：`memory_write`（scope=long）会自动去重并丢弃最旧的**追加块**

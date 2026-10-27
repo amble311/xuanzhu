@@ -17,7 +17,7 @@ import {
   type ModelEntry,
   type XuanZhuConfig,
 } from "../config/store";
-import { findProvider } from "../llm";
+import { findProvider, formatContextWindow } from "../llm";
 import { friendlyError } from "../llm/http";
 import {
   AUTOJS6_APP_SERVER_PORT,
@@ -516,12 +516,19 @@ export class TuiApp {
    * streamingPreview 是渲染时追加在**最末尾**的临时行，而工具调用 / 提示等事件
    * 会把新行 push 进 lines（位置在预览之前）。若不先落定，就会出现
    * 「工具行在上、它前面那句还没换行的正文被挤到下面」的顺序错乱。
+   *
+   * ⚠️ 必须**消费 markdown 缓冲**，不能只 push `streamingPreview`：
+   * 预览只是 `peek()` 的渲染结果，缓冲里的原文仍然存在；如果只 push 预览，
+   * 之后 finally 的 `markdown.flush()` 会把同一段正文再输出一次。实测
+   * 「自动记录当日摘要」通知正好落在最后一段未换行的正文之后，导致该段重复。
    */
   private flushStreamingPreview(): void {
-    if (this.streamingPreview) {
-      this.lines.push(this.streamingPreview);
-      this.streamingPreview = "";
-    }
+    const tail = consumeStreamingLine(
+      this.markdown,
+      Boolean(this.streamingPreview),
+    );
+    if (tail.length > 0) this.lines.push(...tail);
+    this.streamingPreview = "";
   }
 
   /** 输出区保留的最大行数（超出丢弃最旧的，避免长会话内存无界增长） */
@@ -2249,6 +2256,15 @@ export class TuiApp {
       case "tools":
         this.printTools();
         break;
+      case "context":
+        this.handleContextCommand();
+        break;
+      case "compact":
+        void this.handleCompactCommand();
+        break;
+      case "focus":
+        this.handleFocusCommand(arg);
+        break;
       case "device":
         // 手机设备桥（AutoX.js）：启动 / 查看 / 推脚本 / 看日志。异步，故不阻塞按键处理。
         void this.handleDeviceCommand(arg);
@@ -3505,6 +3521,143 @@ export class TuiApp {
    * 玄猪把**全部内置工具**写进每次请求的 tools 字段，没有任何开关 ——
    * 如果列表里有它，那么用不用就完全取决于模型对工具描述与系统提示词的理解。
    */
+  /**
+   * /context —— 上下文预算可视化。
+   *
+   * 小窗口模型能否跑长任务，首先取决于「系统 + 工具」是否已经吃掉了半壁江山；
+   * 把各区块的实际占用与档位摊开，用户才知道该换模型、切 small 档，还是少读点文件。
+   */
+  private handleContextCommand(): void {
+    const report = this.agent.getContextReport();
+    const percent = Math.round(report.ratio * 100);
+    const barWidth = 20;
+    const filled = Math.min(barWidth, Math.round(report.ratio * barWidth));
+    const bar =
+      `${ansi.brightCyan}${"█".repeat(filled)}${ansi.gray}${"░".repeat(barWidth - filled)}${ansi.reset}`;
+
+    this.lines.push(
+      `${ansi.bold}上下文预算${ansi.reset} ${ansi.gray}（${report.profile === "small" ? "small 档" : "full 档"}）${ansi.reset}`,
+    );
+    this.lines.push(
+      `  模型：${report.model || "?"} · 窗口 ${formatContextWindow(report.window)} tokens`,
+    );
+    this.lines.push(`  ${bar} ${percent}%`);
+    this.lines.push(`${ansi.gray}  系统提示词${ansi.reset}  ${report.systemTokens} tokens`);
+    this.lines.push(`${ansi.gray}  工具 schema${ansi.reset}  ${report.toolsTokens} tokens`);
+    this.lines.push(`${ansi.gray}  历史对话${ansi.reset}    ${report.historyTokens} tokens`);
+    this.lines.push(`${ansi.gray}  只读状态块${ansi.reset}  ${report.stateTokens} tokens`);
+    this.lines.push(
+      `${ansi.gray}  会话预算${ansi.reset}    ${report.conversationBudget} tokens` +
+        ` · 输出上限 ${report.maxOutputTokens ?? "Provider 默认"}`,
+    );
+    if (report.trimmed) {
+      this.lines.push(
+        `${ansi.yellow}  ⚠ 历史已被裁剪；更早的对话只保留摘要。${ansi.reset}`,
+      );
+    }
+    if (report.ratio >= 0.8) {
+      this.lines.push(
+        `${ansi.yellow}  ⚠ 已用 ${percent}% 窗口：建议 /compact（后续版本）或减少读取量。${ansi.reset}`,
+      );
+    }
+    this.lines.push(
+      `${ansi.gray}  · small 档自动在窗口 ≤ ${formatContextWindow(32768)} 时启用；可用配置 contextProfile 强制 small / full${ansi.reset}`,
+    );
+  }
+
+  /** `/compact` —— 用一次模型调用把旧历史压成摘要，保留最近几轮。 */
+  private async handleCompactCommand(): Promise<void> {
+    if (this.busy) return;
+    if (this.agent.messageCount <= 6) {
+      this.lines.push(`${ansi.gray}历史较短，无需压缩。${ansi.reset}`);
+      return;
+    }
+
+    const before = this.agent.messageCount;
+    this.busy = true;
+    this.statusText = "压缩上下文";
+    this.statusDetail = "";
+    this.abortController = new AbortController();
+    this.scheduleRender();
+    try {
+      const result = await this.agent.compactHistory(this.abortController.signal);
+      if (!result.compacted) {
+        this.lines.push(`${ansi.gray}${result.reason ?? "无需压缩"}${ansi.reset}`);
+        return;
+      }
+      this.lines.push(
+        `${ansi.green}✓ 已压缩上下文：${result.before} → ${result.after} 条消息${ansi.reset}`,
+      );
+      if (result.summary) {
+        for (const line of result.summary.split("\n").slice(0, 12)) {
+          this.lines.push(`${ansi.gray}  ${line}${ansi.reset}`);
+        }
+      }
+      this.lines.push(
+        `${ansi.gray}  · 摘要已写入任务账本；后续请求以摘要 + 最近几轮为上下文${ansi.reset}`,
+      );
+    } catch (err) {
+      this.lines.push(
+        `${ansi.red}✗ 压缩失败：${err instanceof Error ? err.message : String(err)}${ansi.reset}`,
+      );
+    } finally {
+      this.busy = false;
+      this.abortController = undefined;
+      this.statusText = "就绪";
+      this.statusDetail = "";
+      this.scheduleRender();
+    }
+  }
+
+  /** `/focus` —— 维护工作集（只存路径，内容按需读取）。 */
+  private handleFocusCommand(arg: string): void {
+    const sub = arg.trim();
+    if (!sub || sub === "list") {
+      const files = this.agent.getFocusFiles();
+      const task = this.agent.getTaskLedger();
+      if (task) {
+        this.lines.push(
+          `${ansi.bold}当前任务${ansi.reset} ${ansi.gray}（${task.status}）${ansi.reset} ${task.title}`,
+        );
+      }
+      if (files.length === 0) {
+        this.lines.push(`${ansi.gray}工作集为空。${ansi.reset}`);
+      } else {
+        this.lines.push(`${ansi.bold}工作集${ansi.reset}`);
+        for (const file of files) this.lines.push(`${ansi.gray}  · ${file}${ansi.reset}`);
+      }
+      this.lines.push(
+        `${ansi.gray}  · /focus <文件> 加入 · /focus rm <文件> 移除 · /focus clear 清空${ansi.reset}`,
+      );
+      return;
+    }
+
+    if (sub === "clear") {
+      this.agent.clearFocusFiles();
+      this.lines.push(`${ansi.green}✓ 工作集已清空${ansi.reset}`);
+      return;
+    }
+
+    if (sub.startsWith("rm ")) {
+      const file = sub.slice(3).trim();
+      const removed = this.agent.removeFocusFile(file);
+      this.lines.push(
+        removed
+          ? `${ansi.green}✓ 已移出工作集：${file}${ansi.reset}`
+          : `${ansi.yellow}工作集里没有：${file}${ansi.reset}`,
+      );
+      return;
+    }
+
+    const file = sub.startsWith("add ") ? sub.slice(4).trim() : sub;
+    const result = this.agent.addFocusFile(file);
+    this.lines.push(
+      result.ok
+        ? `${ansi.green}✓ ${result.message}${ansi.reset}`
+        : `${ansi.yellow}${result.message}${ansi.reset}`,
+    );
+  }
+
   private printTools(): void {
     const specs = getToolSpecs();
     this.lines.push(
@@ -3529,6 +3682,9 @@ export class TuiApp {
       `  /help          显示本帮助`,
       `  /clear         清空屏幕`,
       `  /tools         列出本轮发给模型的工具（排查「某个工具似乎没被调用过」）`,
+      `  /context       查看上下文预算（系统 / 工具 / 历史 / 状态各占多少）`,
+      `  /compact       将旧历史压缩成摘要（用一次模型调用，保留最近几轮）`,
+      `  /focus [文件]  查看 / 维护工作集（/focus <文件>、rm、clear）`,
       `  /device        手机设备桥（先 /device serve 或 /device connect <手机IP>）`,
       `                 子命令：connect｜serve｜stop｜list｜push <文件>｜run <文件>｜logs [N]`,
       `                 体检与截图请用命令行：xzh device check / xzh device shot`,
@@ -4175,6 +4331,21 @@ export class TuiApp {
  * 把时间与已接收字数显式写出来：本地模型首 token 可能等很久，用户需要「它还活着」的信号。
  * 纯函数，便于单测（时间/计数边界很多）。
  */
+/**
+ * 落定流式正文的**最后一行**。
+ *
+ * 预览（`peek()`）只是渲染视图，原文还在 `MarkdownRenderer` 缓冲里；
+ * 事件（工具调用 / 通知）打断流式输出时必须**消费缓冲**，否则请求结束时的
+ * `flush()` 会把同一段正文再输出一次 —— 2026-10-27 实测「已自动记录当日摘要」
+ * 通知后重复了最后一段。
+ */
+export function consumeStreamingLine(
+  renderer: MarkdownRenderer,
+  hasPreview: boolean,
+): string[] {
+  return hasPreview ? renderer.flush() : [];
+}
+
 export function formatBusyDetail(input: {
   elapsedMs: number;
   reasoningChars: number;

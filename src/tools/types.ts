@@ -77,6 +77,21 @@ export interface SubAgentInput {
   prompt: string;
 }
 
+/**
+ * 当前上下文档位对工具的限制。
+ *
+ * 小窗口模型（8k/16k）一次读 2000 行或一条 30k 输出的 bash 就会把上下文打满，
+ * 因此由 Agent 按档位注入更紧的默认值；工具不自己猜模型大小。
+ */
+export interface ToolLimits {
+  /** read_file 默认 / 最大读取行数 */
+  maxReadLines?: number;
+  /** bash 单次结果进入上下文的字符上限，超出则落 artifact */
+  maxOutputChars?: number;
+  /** artifact 存放目录（完整输出落盘，上下文只留摘要） */
+  artifactDir?: string;
+}
+
 /** 工具执行上下文 */
 export interface ToolContext {
   /** 当前工作目录 */
@@ -97,6 +112,8 @@ export interface ToolContext {
   status?: StatusStore;
   /** 长期记忆字符上限，超出时自动精简（由 Agent 注入） */
   memoryMaxChars?: number;
+  /** 上下文档位对应的工具限额（由 Agent 注入） */
+  limits?: ToolLimits;
   /** 派生子代理执行子任务（由 Agent 注入），未提供时 task 工具不可用 */
   spawnAgent?: (input: SubAgentInput) => Promise<ToolResult>;
   /**

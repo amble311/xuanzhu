@@ -1,6 +1,6 @@
 {
   "name": "xuanzhu",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "玄猪（XuanZhu）— 专为终端打造的 AI 编码 Agent",
   "keywords": [
     "ai",
@@ -39,6 +39,7 @@
     "dev": "node esbuild.js --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "bench": "node bench/run.mjs",
     "start": "node bin/xzh.js",
     "clean": "rm -rf dist",
     "prepare": "node esbuild.js --production"

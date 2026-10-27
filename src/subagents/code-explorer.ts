@@ -21,6 +21,9 @@ export const codeExplorer: SubAgentDefinition = {
     "它是**只读**子代理：只回报发现与证据，不会修改任何文件；" +
     "需要实际改代码时不要派它，自己动手。",
   toolNames: [
+    "repo_map",
+    "find_symbol",
+    "read_symbol",
     "read_file",
     "list_dir",
     "glob",

@@ -13,6 +13,11 @@ import { deviceTools } from "./device";
 import { goalCompleteTool } from "./goal";
 import { memoryCompactTool, memoryReadTool, memoryWriteTool } from "./memory";
 import { reportStatusTool } from "./status";
+import {
+  findSymbolTool,
+  readSymbolTool,
+  repoMapTool,
+} from "./repo-map";
 import { listSkillsTool, loadSkillTool } from "./skills";
 import { todoWriteTool } from "./todo";
 import type { ToolContext, ToolDefinition, ToolResult } from "./types";
@@ -32,6 +37,9 @@ export const TOOLS: ToolDefinition[] = [
   goalCompleteTool,
   reportStatusTool,
   taskTool,
+  repoMapTool,
+  findSymbolTool,
+  readSymbolTool,
   readFileTool,
   listDirTool,
   globTool,
