@@ -171,6 +171,33 @@ export interface FinishGateInput {
  * 与目标模式的区别：这里允许模型第二次直接收尾（用户可能就是要先停），
  * 只要求它说清是「受阻 / 需要用户决定 / 有意暂停」中的哪种。
  */
+/**
+ * 模型是否在**征求用户确认/选择**。
+ *
+ * 未完成门只看到「todo 还有 pending」就催模型继续，会误伤一种正常收尾：
+ * 模型列了计划，但方案需要用户拍板（例如「方案 A/B 是否可行，确认后我继续」）。
+ * 这不是偷懒，而是正确的暂停。这里只认「最后几行是问句 + 明确的确认/选择词」，
+ * 避免把代码里的 `?` 或普通反问误判成等待用户。
+ */
+export function isAwaitingUserConfirmation(text: string): boolean {
+  const lines = text
+    .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return false;
+  const tail = lines.slice(-3).join(" ");
+  // 问号，或明确的「请确认 / 等你 / 需要你」等请求；不把普通陈述里的「确认」当等待
+  const asks =
+    /[?？]/.test(tail) ||
+    /(请确认|确认后|等你|需要你|请选择|请回复|回复后|需要确认)/.test(tail);
+  if (!asks) return false;
+  return /(是否|能否|可否|要不要|确认|同意|可以吗|可行|批准|请选择|选择哪|哪个|哪种|等你|需要你|请回复|回复后|确认后|继续吗|开始吗|执行吗|吗|么)/i.test(
+    tail,
+  );
+}
+
 export function finishGatePrompt(input: FinishGateInput): string {
   const sections: string[] = [];
 

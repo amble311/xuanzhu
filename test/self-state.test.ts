@@ -6,6 +6,7 @@ import { Agent, type AgentEvents } from "../src/core/agent";
 import {
   buildSelfState,
   finishGatePrompt,
+  isAwaitingUserConfirmation,
   isVerificationCommand,
 } from "../src/core/state";
 import { DEFAULT_CONFIG, type ModelEntry, type XuanZhuConfig } from "../src/config/store";
@@ -356,6 +357,35 @@ describe("验证门（Agent.run）", () => {
 describe("未完成门（普通对话）", () => {
   const todoCall = (todos: Array<{ content: string; status: string }>): StreamChunk[] =>
     toolCall("todo_write", { todos });
+
+  it("列了计划但在征求用户确认 → 不催继续", async () => {
+    const { llm, seen, calls } = scriptProvider([
+      todoCall(
+        Array.from({ length: 8 }, (_, i) => ({
+          content: `步骤 ${i + 1}`,
+          status: "pending",
+        })),
+      ),
+      textReply(
+        "方案 A 与方案 B 都可行，但实现方式不同。\n是否按方案 A 继续？请确认后我开始执行。",
+      ),
+    ]);
+    const agent = new Agent(llm, configOf(), tmpCwd(), events(), model, {
+      tools: [writeFileTool, editFileTool, bashTool, todoWriteTool],
+    });
+
+    await agent.run("先给方案，等我确认");
+
+    // 第二轮就是最终答复：等待用户确认是合法收尾，不应注入未完成门
+    expect(calls()).toBe(2);
+    expect(
+      seen.every((request) =>
+        request.messages.every(
+          (message) => !message.content.includes("[系统检查]"),
+        ),
+      ),
+    ).toBe(true);
+  });
 
   it("本轮列了计划却没做完 → 提醒一次再收尾", async () => {
     const { llm, seen, calls } = scriptProvider([

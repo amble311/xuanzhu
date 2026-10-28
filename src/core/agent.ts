@@ -91,6 +91,7 @@ import { buildSystemPrompt } from "./prompt";
 import {
   buildSelfState,
   finishGatePrompt,
+  isAwaitingUserConfirmation,
   isVerificationCommand,
 } from "./state";
 import * as fs from "fs";
@@ -1659,15 +1660,24 @@ export class Agent {
                       item.status === "in_progress" || item.status === "pending",
                   )
                 : [];
-            if (verificationFiles.length > 0 || incompleteTodos.length > 0) {
+            // 模型在明确征求用户确认/选择时，未完成门不应催它继续 ——
+            // 这正是在等用户拍板，强行继续反而会让它猜。验证门仍然生效。
+            const awaitingUser =
+              incompleteTodos.length > 0 &&
+              isAwaitingUserConfirmation(text);
+            const gateTodos = awaitingUser ? [] : incompleteTodos;
+            if (verificationFiles.length > 0 || gateTodos.length > 0) {
               this.finishGateUsed = true;
               turn.push({
                 role: "user",
-                content: finishGatePrompt({ verificationFiles, incompleteTodos }),
+                content: finishGatePrompt({
+                  verificationFiles,
+                  incompleteTodos: gateTodos,
+                }),
               });
               const parts: string[] = [];
-              if (incompleteTodos.length > 0) {
-                parts.push(`${incompleteTodos.length} 项任务未完成`);
+              if (gateTodos.length > 0) {
+                parts.push(`${gateTodos.length} 项任务未完成`);
               }
               if (verificationFiles.length > 0) parts.push("改动尚未验证");
               this.events.onStatus("收尾检查", parts.join(" · "));
