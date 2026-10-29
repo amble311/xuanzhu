@@ -4,6 +4,17 @@
 
 ## [未发布]
 
+## [0.8.2] — 2026-10-29
+
+### 变更
+
+- **自定义模型支持展示别名**：`xzh model add custom` 交互式添加时先询问「模型别名」
+  （仅用于列表 / 状态栏 / `/model` 展示，可留空），再询问「模型 ID（API model 字段）」；
+  条目内部 ID 仍为 `custom/<模型ID>`。新增命令：
+  `xzh model alias <id|序号> [别名]`、`xzh model baseurl <id|序号> <url>`、
+  `xzh model modelid <id|序号> <模型ID>`；修改模型 ID 会同步内部 ID 与当前使用指针，
+  冲突时拒绝。`xzh model remove` / `context` / `vision` 也支持用别名定位。
+
 ## [0.8.1] — 2026-10-28
 
 ### 修复

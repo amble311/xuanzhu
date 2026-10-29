@@ -13,6 +13,7 @@ import { undoLastChange } from "../utils/backups";
 import {
   activeModelEntry,
   effectiveModels,
+  modelDisplayName,
   saveConfig,
   type ModelEntry,
   type XuanZhuConfig,
@@ -369,7 +370,8 @@ export class TuiApp {
       enabled: this.intentEnabled,
     };
     this.modelProviderLabel = options.providerLabel;
-    this.modelLabel = options.model;
+    this.modelLabel =
+      modelDisplayName(activeModelEntry(options.config)) || options.model;
     this.term = new ShellPanel(options.cwd, () => this.scheduleRender());
 
     // 首次运行时初始化项目目录（<项目>/.xuanzhu）
@@ -842,9 +844,15 @@ export class TuiApp {
   }): void {
     this.modelProviderLabel =
       findProvider(info.provider)?.label ?? info.provider;
-    this.modelLabel = info.model;
+    const matched = effectiveModels(this.options.config).find(
+      (entry) => entry.provider === info.provider && entry.model === info.model,
+    );
+    this.modelLabel = modelDisplayName(matched) || info.model;
+    const shown = matched?.alias
+      ? `${matched.alias} (${matched.id})`
+      : `${info.provider}/${info.model}`;
     this.lines.push(
-      `${ansi.yellow}⇄ 模型已切换为 ${info.provider}/${info.model}（${info.reason}）${ansi.reset}`,
+      `${ansi.yellow}⇄ 模型已切换为 ${shown}（${info.reason}）${ansi.reset}`,
     );
     this.scheduleRender();
   }
@@ -900,7 +908,9 @@ export class TuiApp {
     const picked = await this.requestSelect(
       "选择模型",
       entries.map((entry) => ({
-        label: entry.id,
+        label:
+          modelDisplayName(entry) +
+          (entry.alias ? ` (${entry.id})` : ""),
         hint: entry.id === current?.id ? "当前使用中" : undefined,
         value: entry.id,
       })),
@@ -908,7 +918,11 @@ export class TuiApp {
       defaultIndex,
     );
     if (picked === undefined) {
-      this.lines.push(`${ansi.gray}已取消，仍使用 ${current?.id ?? this.modelLabel}${ansi.reset}`);
+      this.lines.push(
+        `${ansi.gray}已取消，仍使用 ${
+          current ? modelDisplayName(current) : this.modelLabel
+        }${ansi.reset}`,
+      );
       this.scheduleRender();
       return;
     }
@@ -4405,7 +4419,9 @@ export function resolveModelChoice(
   return (
     entries.find((entry) => entry.id === text) ??
     entries.find((entry) => entry.model === text) ??
-    entries.find((entry) => entry.id.toLowerCase() === lower)
+    entries.find((entry) => entry.alias === text) ??
+    entries.find((entry) => entry.id.toLowerCase() === lower) ??
+    entries.find((entry) => entry.alias?.toLowerCase() === lower)
   );
 }
 

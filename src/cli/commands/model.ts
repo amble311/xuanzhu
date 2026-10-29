@@ -3,9 +3,13 @@ import {
   effectiveModels,
   loadConfig,
   materializeModels,
+  modelDisplayName,
   modelId,
   removeModel,
   saveConfig,
+  setModelAlias,
+  setModelBaseUrl,
+  setModelModelId,
   upsertModel,
   type ModelEntry,
   type XuanZhuConfig,
@@ -65,6 +69,15 @@ export async function modelCommand(args: string[]): Promise<void> {
     case "vision":
     case "image":
       return setVisionCommand(args.slice(1));
+    case "alias":
+    case "name":
+      return setAliasCommand(args.slice(1));
+    case "baseurl":
+    case "url":
+      return setBaseUrlCommand(args.slice(1));
+    case "modelid":
+    case "mid":
+      return setModelIdCommand(args.slice(1));
     case "help":
     case "-h":
     case "--help":
@@ -100,11 +113,21 @@ async function addModel(args: string[]): Promise<void> {
     return;
   }
 
-  const model = args[1] ?? (await chooseModel(meta.id, meta.models, config));
+  // 自定义端点的交互顺序：先取展示别名，再输入真正的模型 ID（API model 字段）。
+  // 位置参数模式（args[1] 已给出模型 ID）不额外打扰用户，别名可稍后用 `xzh model alias` 设置。
+  const modelArg = args[1];
+  let alias: string | undefined;
+  if (!modelArg && meta.id === "custom") {
+    alias = await chooseAlias(meta.id);
+  }
+  const model = modelArg ?? (await chooseModel(meta.id, meta.models, config));
   // 在模型列表里选了「返回」
   if (!model) {
     process.stdout.write(`${ansi.gray}已取消。${ansi.reset}\n`);
     return;
+  }
+  if (!modelArg && meta.id !== "custom") {
+    alias = await chooseAlias(meta.id);
   }
   const baseUrl = await chooseBaseUrl(meta.id, meta.requiresBaseUrl === true, config);
   const apiKey = await chooseApiKey(meta.id, meta.envKey, config);
@@ -131,6 +154,7 @@ async function addModel(args: string[]): Promise<void> {
   const entry = upsertModel(config, {
     provider: meta.id,
     model,
+    ...(alias !== undefined ? { alias } : {}),
     contextWindow,
     vision,
     ...(baseUrl ? { baseUrl } : {}),
@@ -142,7 +166,10 @@ async function addModel(args: string[]): Promise<void> {
   process.stdout.write(
     `\n${ansi.green}✓ ${existed ? "已更新" : "已新增"}模型${ansi.reset} ${ansi.bold}${entry.id}${ansi.reset}\n` +
       `  ${ansi.gray}provider：${ansi.reset}${meta.label}\n` +
-      `  ${ansi.gray}model   ：${ansi.reset}${entry.model}\n` +
+      (entry.alias
+        ? `  ${ansi.gray}别名    ：${ansi.reset}${entry.alias}\n`
+        : "") +
+      `  ${ansi.gray}模型 ID ：${ansi.reset}${entry.model}\n` +
       `  ${ansi.gray}上下文  ：${ansi.reset}${formatContextWindow(entry.contextWindow ?? DEFAULT_CONTEXT_WINDOW)} token\n` +
       `  ${ansi.gray}图片输入：${ansi.reset}${modelSupportsVision(entry) ? "支持（Ctrl+V 粘贴图片）" : "不支持"}\n` +
       (baseUrl ? `  ${ansi.gray}baseUrl ：${ansi.reset}${baseUrl}\n` : "") +
@@ -307,6 +334,120 @@ async function setVisionCommand(args: string[]): Promise<void> {
   );
 }
 
+/** 修改展示别名 */
+async function setAliasCommand(args: string[]): Promise<void> {
+  const config = loadConfig();
+  const models = effectiveModels(config);
+  if (models.length === 0) {
+    process.stdout.write(`${ansi.yellow}尚未配置任何模型。${ansi.reset}\n`);
+    return;
+  }
+  const key = args[0] || (await chooseFromList(models, "选择要设置别名的模型："));
+  if (!key) return;
+  const id = resolveModelKey(config, key);
+  const target = id ? models.find((entry) => entry.id === id) : undefined;
+  if (!target) {
+    process.stdout.write(`${ansi.red}未找到模型：${key}${ansi.reset}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const input =
+    args[1] ??
+    (await promptInput(
+      `请输入 ${modelDisplayName(target)} 的展示别名（留空清除）`,
+      target.alias ?? "",
+    ));
+  const entry = setModelAlias(config, target.id, input);
+  if (!entry) {
+    process.stdout.write(`${ansi.red}修改失败：模型已不存在。${ansi.reset}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  saveConfig(config);
+  process.stdout.write(
+    `\n${ansi.green}✓ 已更新别名${ansi.reset} ${entry.id} → ${
+      entry.alias ?? "（无，显示模型 ID）"
+    }\n`,
+  );
+}
+
+/** 修改模型条目的 API 地址（baseUrl） */
+async function setBaseUrlCommand(args: string[]): Promise<void> {
+  const config = loadConfig();
+  const models = effectiveModels(config);
+  if (models.length === 0) {
+    process.stdout.write(`${ansi.yellow}尚未配置任何模型。${ansi.reset}\n`);
+    return;
+  }
+  const key = args[0] || (await chooseFromList(models, "选择要修改地址的模型："));
+  if (!key) return;
+  const id = resolveModelKey(config, key);
+  const target = id ? models.find((entry) => entry.id === id) : undefined;
+  if (!target) {
+    process.stdout.write(`${ansi.red}未找到模型：${key}${ansi.reset}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const current = target.baseUrl ?? config.providers[target.provider]?.baseUrl ?? "";
+  const input =
+    args[1] ??
+    (await promptInput(`请输入 ${target.id} 的 API 地址 baseUrl`, current));
+  const meta = findProvider(target.provider);
+  if (!input.trim() && meta?.requiresBaseUrl) {
+    process.stdout.write(
+      `${ansi.red}该 provider 需要 baseUrl，不能留空。${ansi.reset}\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  const entry = setModelBaseUrl(config, target.id, input);
+  if (!entry) {
+    process.stdout.write(`${ansi.red}修改失败：模型已不存在。${ansi.reset}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  saveConfig(config);
+  process.stdout.write(
+    `\n${ansi.green}✓ 已更新地址${ansi.reset} ${entry.id} → ${
+      entry.baseUrl ?? config.providers[entry.provider]?.baseUrl ?? "（未设置）"
+    }\n`,
+  );
+}
+
+/** 修改真正的模型 ID（API 的 model 字段） */
+async function setModelIdCommand(args: string[]): Promise<void> {
+  const config = loadConfig();
+  const models = effectiveModels(config);
+  if (models.length === 0) {
+    process.stdout.write(`${ansi.yellow}尚未配置任何模型。${ansi.reset}\n`);
+    return;
+  }
+  const key = args[0] || (await chooseFromList(models, "选择要修改模型 ID 的模型："));
+  if (!key) return;
+  const id = resolveModelKey(config, key);
+  const target = id ? models.find((entry) => entry.id === id) : undefined;
+  if (!target) {
+    process.stdout.write(`${ansi.red}未找到模型：${key}${ansi.reset}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const input =
+    args[1] ??
+    (await promptInput(`请输入 ${target.id} 的模型 ID（API model 字段）`, target.model));
+  const result = setModelModelId(config, target.id, input);
+  if (result.error || !result.entry) {
+    process.stdout.write(`${ansi.red}修改失败：${result.error ?? "未知错误"}${ansi.reset}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  saveConfig(config);
+  process.stdout.write(
+    `\n${ansi.green}✓ 已更新模型 ID${ansi.reset} ${target.id} → ${result.entry.id}\n` +
+      `  ${ansi.gray}模型 ID：${result.entry.model}${ansi.reset}\n`,
+  );
+  printActiveHint(config);
+}
+
 /** 打印已配置的模型列表 */
 function listModels(): void {
   const config = loadConfig();
@@ -372,7 +513,8 @@ function listAvailableModels(): void {
     );
     for (const entry of extra) {
       process.stdout.write(
-        `    ${ansi.brightGreen}❯${ansi.reset} ${entry.id}\n`,
+        `    ${ansi.brightGreen}❯${ansi.reset} ${modelDisplayName(entry)}` +
+          `${entry.alias ? ` ${ansi.gray}(${entry.id})${ansi.reset}` : ""}\n`,
       );
     }
   }
@@ -400,6 +542,9 @@ async function interactiveMenu(): Promise<void> {
         { label: "查看已配置的模型", value: "list", hint: "list" },
         { label: "删除模型", value: "remove", hint: "remove" },
         { label: "调整上下文窗口", value: "context", hint: "context" },
+        { label: "修改显示别名", value: "alias", hint: "alias" },
+        { label: "修改 API 地址", value: "baseurl", hint: "baseurl" },
+        { label: "修改模型 ID", value: "modelid", hint: "modelid" },
         { label: "退出", value: "exit" },
       ],
       0,
@@ -417,6 +562,15 @@ async function interactiveMenu(): Promise<void> {
         break;
       case "context":
         await setContextCommand([]);
+        break;
+      case "alias":
+        await setAliasCommand([]);
+        break;
+      case "baseurl":
+        await setBaseUrlCommand([]);
+        break;
+      case "modelid":
+        await setModelIdCommand([]);
         break;
       default:
         process.stdout.write(`\n${ansi.gray}已退出模型管理。${ansi.reset}\n`);
@@ -454,8 +608,10 @@ function printModelTable(config: XuanZhuConfig): void {
     const vision = modelSupportsVision(entry)
       ? ` ${ansi.cyan}视觉${ansi.reset}`
       : "";
+    const display = modelDisplayName(entry);
+    const idSuffix = entry.alias ? ` ${ansi.gray}(${entry.id})${ansi.reset}` : "";
     process.stdout.write(
-      `  ${marker} ${index + 1}. ${entry.id.padEnd(34)}` +
+      `  ${marker} ${index + 1}. ${display.padEnd(24)}${idSuffix}` +
         ` ${ansi.gray}ctx ${context.padStart(5)}${ansi.reset}${vision}${suffix}\n`,
     );
   });
@@ -469,7 +625,8 @@ function printActiveHint(config: XuanZhuConfig): void {
   const active = activeModelEntry(config);
   if (active) {
     process.stdout.write(
-      `${ansi.gray}下次启动将使用上次用过的模型：${ansi.reset}${ansi.bold}${active.id}${ansi.reset}\n`,
+      `${ansi.gray}下次启动将使用上次用过的模型：${ansi.reset}${ansi.bold}${modelDisplayName(active)}${ansi.reset}` +
+        `${active.alias ? ` ${ansi.gray}(${active.id})${ansi.reset}` : ""}\n`,
     );
   } else if ((config.models ?? []).length === 0) {
     process.stdout.write(
@@ -490,7 +647,10 @@ function printModelHelp(): void {
       `                                                 新增模型（末尾 on/off = 是否支持图片输入）\n` +
       `  ${ansi.green}xzh model remove <id|序号>${ansi.reset}            删除模型（不再参与回退）\n` +
       `  ${ansi.green}xzh model context <id|序号> <大小>${ansi.reset}    调整上下文窗口（token，如 128000）\n` +
-      `  ${ansi.green}xzh model vision <id|序号> <on|off>${ansi.reset}   标注是否支持图片输入（视觉）\n\n` +
+      `  ${ansi.green}xzh model vision <id|序号> <on|off>${ansi.reset}   标注是否支持图片输入（视觉）\n` +
+      `  ${ansi.green}xzh model alias <id|序号> [别名]${ansi.reset}      修改展示别名（留空清除）\n` +
+      `  ${ansi.green}xzh model baseurl <id|序号> <url>${ansi.reset}     修改该模型的 API 地址\n` +
+      `  ${ansi.green}xzh model modelid <id|序号> <模型ID>${ansi.reset}  修改真正的模型 ID（API model 字段）\n\n` +
       `${ansi.bold}多模型与回退${ansi.reset}\n` +
       `  默认使用**上次用过的**模型（记住在配置里）；它调用失败时按列表顺序自动切换到下一个，\n` +
       `  直到所有模型都试过才报错。**列表顺序即优先级**，不再有权重设置 ——\n` +
@@ -537,8 +697,23 @@ async function chooseModel(
     );
     if (selected !== "__custom__") return selected; // 空串即「返回」，由调用方处理
   }
-  const input = await promptInput("请输入模型名称", current);
+  // 自定义端点没有内置模型列表，这里的输入就是 OpenAI 兼容协议里的 `model` 字段。
+  // 之前提示只写「模型名称」，用户会以为缺少「模型 ID」——两者其实是同一个值。
+  const input = await promptInput(
+    providerId === "custom"
+      ? "请输入模型 ID（API 的 model 字段，例如 qwen3.6-35b）"
+      : "请输入模型名称 / ID",
+    current,
+  );
   return input;
+}
+
+/** 展示别名（可选）：为空表示不设置，列表/标题回退显示模型 ID。 */
+async function chooseAlias(providerId: string): Promise<string | undefined> {
+  const input = await promptInput(
+    `请输入模型别名（用于显示，可留空；provider ${providerId}）`,
+  );
+  return input.trim() || undefined;
 }
 
 async function chooseBaseUrl(
@@ -699,6 +874,8 @@ function resolveModelKey(config: XuanZhuConfig, key: string): string | null {
   if (byId) return byId.id;
   const byModel = models.find((entry) => entry.model === key);
   if (byModel) return byModel.id;
+  const byAlias = models.find((entry) => entry.alias === key);
+  if (byAlias) return byAlias.id;
   if (/^\d+$/.test(key.trim())) {
     const index = Number.parseInt(key, 10);
     if (index >= 1 && index <= models.length) return models[index - 1].id;
@@ -722,9 +899,11 @@ async function chooseFromList(
     label,
     [
       ...models.map((entry) => ({
-        label: `${entry.id}  ctx ${formatContextWindow(
-          entry.contextWindow ?? inferContextWindow(entry.model),
-        )}`,
+        label:
+          `${modelDisplayName(entry)}` +
+          `${entry.alias ? ` (${entry.id})` : ""}  ctx ${formatContextWindow(
+            entry.contextWindow ?? inferContextWindow(entry.model),
+          )}`,
         value: entry.id,
       })),
       { label: "返回", value: "" },

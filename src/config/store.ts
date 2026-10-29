@@ -17,10 +17,12 @@ export interface ProviderSettings {
  * 旧配置里的 `weight` / `decayed` 在读取时会被直接丢弃。
  */
 export interface ModelEntry {
-  /** 唯一标识：`<provider>/<model>` */
+  /** 唯一标识：`<provider>/<model>`（内部用；展示优先用 alias） */
   id: string;
   provider: string;
   model: string;
+  /** 展示别名（可选）；为空时展示 model */
+  alias?: string;
   /** 可选：仅对该模型生效的 API Key（否则沿用 providers[provider].apiKey） */
   apiKey?: string;
   /** 可选：仅对该模型生效的 baseUrl */
@@ -231,6 +233,9 @@ function sanitizeModelEntry(entry: ModelEntry): ModelEntry {
   };
   if (entry.apiKey) clean.apiKey = entry.apiKey;
   if (entry.baseUrl) clean.baseUrl = entry.baseUrl;
+  if (typeof entry.alias === "string" && entry.alias.trim()) {
+    clean.alias = entry.alias.trim().slice(0, 80);
+  }
   if (hasContextWindow(entry.contextWindow)) {
     clean.contextWindow = Math.floor(entry.contextWindow!);
   }
@@ -324,6 +329,7 @@ export function redactConfig(config: XuanZhuConfig): unknown {
     model: config.model,
     models: effectiveModels(config).map((entry) => ({
       id: entry.id,
+      ...(entry.alias ? { alias: entry.alias } : {}),
       ...(entry.contextWindow ? { contextWindow: entry.contextWindow } : {}),
       ...(entry.vision === undefined ? {} : { vision: entry.vision }),
       ...(entry.baseUrl ? { baseUrl: entry.baseUrl } : {}),
@@ -349,6 +355,12 @@ export function redactConfig(config: XuanZhuConfig): unknown {
 /** 模型唯一标识：`<provider>/<model>` */
 export function modelId(provider: string, model: string): string {
   return `${provider}/${model}`;
+}
+
+/** 展示名：优先 alias，其次真正的模型 ID。 */
+export function modelDisplayName(entry?: ModelEntry | null): string {
+  if (!entry) return "";
+  return entry.alias?.trim() || entry.model || entry.id;
 }
 
 /**
@@ -452,6 +464,7 @@ export function upsertModel(
   input: {
     provider: string;
     model: string;
+    alias?: string | null;
     apiKey?: string;
     baseUrl?: string;
     contextWindow?: number;
@@ -465,6 +478,11 @@ export function upsertModel(
   if (existing) {
     if (input.apiKey) existing.apiKey = input.apiKey;
     if (input.baseUrl) existing.baseUrl = input.baseUrl;
+    if (input.alias !== undefined) {
+      const alias = input.alias?.trim().slice(0, 80);
+      if (alias) existing.alias = alias;
+      else delete existing.alias;
+    }
     if (hasContextWindow(input.contextWindow)) {
       existing.contextWindow = Math.floor(input.contextWindow!);
     }
@@ -476,6 +494,7 @@ export function upsertModel(
     id,
     provider: input.provider,
     model: input.model,
+    ...(input.alias?.trim() ? { alias: input.alias.trim().slice(0, 80) } : {}),
     ...(input.apiKey ? { apiKey: input.apiKey } : {}),
     ...(input.baseUrl ? { baseUrl: input.baseUrl } : {}),
     ...(hasContextWindow(input.contextWindow)
@@ -493,11 +512,87 @@ export function findModelIndex(models: ModelEntry[], key: string): number {
   if (byId >= 0) return byId;
   const byModel = models.findIndex((entry) => entry.model === key);
   if (byModel >= 0) return byModel;
+  const byAlias = models.findIndex((entry) => entry.alias === key);
+  if (byAlias >= 0) return byAlias;
   const index = Number.parseInt(key, 10);
   if (!Number.isNaN(index) && index >= 1 && index <= models.length) {
     return index - 1;
   }
   return -1;
+}
+
+/** 设置展示别名；空字符串表示清除。返回被修改的条目，未找到返回 null。 */
+export function setModelAlias(
+  config: XuanZhuConfig,
+  key: string,
+  alias: string,
+): ModelEntry | null {
+  const models = materializeModels(config);
+  const index = findModelIndex(models, key);
+  if (index < 0) return null;
+  const entry = models[index];
+  const clean = alias.trim().slice(0, 80);
+  if (clean) entry.alias = clean;
+  else delete entry.alias;
+  return entry;
+}
+
+/** 修改模型条目的 baseUrl；空字符串表示清除条目级覆盖。 */
+export function setModelBaseUrl(
+  config: XuanZhuConfig,
+  key: string,
+  baseUrl: string,
+): ModelEntry | null {
+  const models = materializeModels(config);
+  const index = findModelIndex(models, key);
+  if (index < 0) return null;
+  const entry = models[index];
+  const clean = baseUrl.trim();
+  if (clean) entry.baseUrl = clean;
+  else delete entry.baseUrl;
+  return entry;
+}
+
+export interface SetModelModelIdResult {
+  entry?: ModelEntry;
+  error?: string;
+}
+
+/**
+ * 修改真正的模型 ID（API 的 `model` 字段）。
+ *
+ * 条目的内部 id 跟着变成 `<provider>/<新 model>`；如果它正是「当前使用」的模型，
+ * 同步更新 config.provider / config.model，避免下次启动找不到它。
+ * 若新 id 与另一个条目冲突则拒绝，防止覆盖别人的 baseUrl / key。
+ */
+export function setModelModelId(
+  config: XuanZhuConfig,
+  key: string,
+  nextModel: string,
+): SetModelModelIdResult {
+  const models = materializeModels(config);
+  const index = findModelIndex(models, key);
+  if (index < 0) return { error: "未找到模型" };
+  const entry = models[index];
+  const clean = nextModel.trim();
+  if (!clean) return { error: "模型 ID 不能为空" };
+
+  const oldModel = entry.model;
+  const nextId = modelId(entry.provider, clean);
+  if (models.some((item, i) => i !== index && item.id === nextId)) {
+    return { error: `模型 ID 已存在：${nextId}` };
+  }
+
+  entry.model = clean;
+  entry.id = nextId;
+  if (config.provider === entry.provider && config.model === oldModel) {
+    config.model = clean;
+  }
+  const providerSettings = config.providers[entry.provider];
+  if (providerSettings?.model === oldModel) {
+    config.providers[entry.provider] = { ...providerSettings, model: clean };
+  }
+  return { entry };
 }
 
 /**

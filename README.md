@@ -163,6 +163,9 @@ xzh
 | `xzh model remove <id\|序号>` | 删除模型 |
 | `xzh model context <id\|序号> <大小>` | 调整上下文窗口（token，如 `128000`） |
 | `xzh model vision <id\|序号> <on\|off>` | 标注是否支持图片输入 |
+| `xzh model alias <id\|序号> [别名]` | 修改展示别名（留空清除） |
+| `xzh model baseurl <id\|序号> <url>` | 修改该模型的 API 地址 |
+| `xzh model modelid <id\|序号> <模型ID>` | 修改真正的模型 ID（API `model` 字段） |
 | `xzh config` | 查看当前配置（API Key 脱敏） |
 | `xzh config edit` | 使用 `nano` 编辑配置文件 |
 | `xzh config path` | 打印配置文件路径 |
@@ -277,11 +280,24 @@ xzh model add openai gpt-4o 128000     # 顺带指定上下文窗口
 xzh model add openai gpt-4o 128000 on  # 再顺带标注支持图片输入
 xzh model context openai/gpt-4o 128000 # 调整上下文窗口（留空则自动推断）
 xzh model vision openai/gpt-4o on      # 标注支持图片输入（推断不出来时用）
-xzh model remove openai/gpt-4o         # 删除（id / 模型名 / 序号均可）
+xzh model alias custom/qwen3.6-35b 本地Qwen  # 展示别名（列表 / 状态栏 / /model）
+xzh model baseurl custom/qwen3.6-35b http://127.0.0.1:8181/v1
+xzh model modelid custom/qwen3.6-35b qwen3.6-35b-new
+xzh model remove openai/gpt-4o         # 删除（id / 模型名 / 序号 / 别名均可）
 ```
 
 想让某个模型**不参与回退**，直接 `xzh model remove` 删掉即可。当前使用的模型显示在界面顶部与状态栏，
 发生回退时输出区会给出提示；想临时换一个用，直接在对话里 `/model` 选（`xzh model` 仍是增删改的入口）。
+
+**自定义模型的别名与模型 ID**：交互式 `xzh model add custom` 会先问「模型别名」（仅用于展示，
+可留空），再问「模型 ID」——后者就是 OpenAI 兼容协议里的 `model` 字段（例如 `qwen3.6-35b`）。
+配置条目的内部 ID 自动生成为 `custom/<模型ID>`，不随别名变化。
+
+- 显示优先级：别名 → 模型 ID；`xzh model list`、`/model`、状态栏都用别名；
+- `/model <别名>` 也能直接切换；
+- 地址、模型 ID 可单独修改：
+  `xzh model baseurl <id|序号> <url>`、`xzh model modelid <id|序号> <新模型ID>`；
+- 修改模型 ID 会同步更新内部 ID 和「当前使用」指针；与已有条目冲突时拒绝修改。
 
 > ⚠️ `xzh model add` 的位置参数自 **0.4.2** 起**整体前移一位**（原来的 `[权重]` 已取消）：
 > 现在是 `add <provider> <model> [上下文窗口] [on|off]`。
