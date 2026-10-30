@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { getConfigDir } from "../utils/paths";
 
 /**
  * 项目级目录（对应 CodeBuddy 的 `.codebuddy`）。
@@ -95,6 +96,34 @@ function buildRulesTemplate(root: string): string {
   return `${RULES_FROM_AGENTS_HEADER}\n`;
 }
 
+/**
+ * 记忆存储位置。
+ *
+ * 项目记忆与全局记忆的读写逻辑完全相同（长期记忆 + 每日日志 + 精简 + 清空），
+ * 区别只有目录与标题；抽成这个结构后，两套记忆不会再出现「项目修了、全局忘了」。
+ */
+export interface MemoryPaths {
+  /** 记忆目录 */
+  memoryDir: string;
+  /** MEMORY.md */
+  longTermFile: string;
+  /** 新建长期记忆时写进文首的标题 */
+  longTermTitle: string;
+  /** 新建每日日志时写进文首的标题 */
+  dailyTitle: string;
+}
+
+/** 全局记忆：~/.xzh/memory/（跨项目，随 XZH_HOME 重定向） */
+export function resolveGlobalMemoryPaths(): MemoryPaths {
+  const memoryDir = path.join(getConfigDir(), "memory");
+  return {
+    memoryDir,
+    longTermFile: path.join(memoryDir, LONG_TERM_FILE),
+    longTermTitle: "全局长期记忆",
+    dailyTitle: "全局每日记录",
+  };
+}
+
 function buildPaths(root: string): ProjectPaths {
   const dir = path.join(root, PROJECT_DIR_NAME);
   const memoryDir = path.join(dir, "memory");
@@ -113,6 +142,22 @@ function buildPaths(root: string): ProjectPaths {
  */
 export function resolveProjectPaths(cwd: string): ProjectPaths {
   return buildPaths(path.resolve(cwd));
+}
+
+/** 项目记忆路径（供记忆工具按 target 选择） */
+export function resolveProjectMemoryPaths(cwd: string): MemoryPaths {
+  return projectMemoryPaths(cwd);
+}
+
+/** 项目记忆路径（有 rulesFile 等额外字段，读取时只用记忆字段） */
+function projectMemoryPaths(cwd: string): MemoryPaths {
+  const paths = resolveProjectPaths(cwd);
+  return {
+    memoryDir: paths.memoryDir,
+    longTermFile: paths.longTermFile,
+    longTermTitle: "项目长期记忆",
+    dailyTitle: "每日记录",
+  };
 }
 
 /** 确保项目目录存在（记忆目录 + 规则模板）；返回是否本次新建 */
@@ -148,10 +193,15 @@ export function loadProjectRules(cwd: string): string | null {
   return readTextFile(resolveProjectPaths(cwd).rulesFile);
 }
 
+/** 当日日志文件路径（项目或全局记忆目录下） */
+export function dailyMemoryFileAt(paths: MemoryPaths, date = new Date()): string {
+  const stamp = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  return path.join(paths.memoryDir, `${stamp}.md`);
+}
+
 /** 当日日志文件路径：<项目>/.xuanzhu/memory/YYYY-MM-DD.md */
 export function dailyMemoryFile(cwd: string, date = new Date()): string {
-  const stamp = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-  return path.join(resolveProjectPaths(cwd).memoryDir, `${stamp}.md`);
+  return dailyMemoryFileAt(projectMemoryPaths(cwd), date);
 }
 
 export interface ProjectMemory {
@@ -162,9 +212,8 @@ export interface ProjectMemory {
   recentDaily: string;
 }
 
-/** 读取项目记忆：长期记忆 + 最近的每日日志 */
-export function readProjectMemory(cwd: string): ProjectMemory {
-  const paths = resolveProjectPaths(cwd);
+/** 读取任意记忆目录：长期记忆 + 最近的每日日志 */
+export function readMemoryAt(paths: MemoryPaths): ProjectMemory {
   let longTerm = "";
   let recentDaily = "";
   let recentDailyName = "";
@@ -198,15 +247,24 @@ export function readProjectMemory(cwd: string): ProjectMemory {
   return { longTerm, recentDailyName, recentDaily };
 }
 
+/** 读取项目记忆：长期记忆 + 最近的每日日志 */
+export function readProjectMemory(cwd: string): ProjectMemory {
+  return readMemoryAt(projectMemoryPaths(cwd));
+}
+
+/** 读取全局记忆：~/.xzh/memory/MEMORY.md + 最近一份日志 */
+export function readGlobalMemory(): ProjectMemory {
+  return readMemoryAt(resolveGlobalMemoryPaths());
+}
+
 export type MemoryScope = "long" | "daily";
 
-/** 追加写入项目记忆，返回写入的文件路径 */
-export function appendMemory(
-  cwd: string,
+/** 追加写入任意记忆目录，返回写入的文件路径 */
+export function appendMemoryAt(
+  paths: MemoryPaths,
   content: string,
   scope: MemoryScope,
 ): string {
-  const paths = resolveProjectPaths(cwd);
   fs.mkdirSync(paths.memoryDir, { recursive: true });
 
   // 只取一次当前时间：文件名用本地日期，块内时间戳也必须用本地时间，
@@ -219,7 +277,7 @@ export function appendMemory(
     `${pad(now.getHours())}:${pad(now.getMinutes())}`;
 
   const target =
-    scope === "long" ? paths.longTermFile : dailyMemoryFile(cwd, now);
+    scope === "long" ? paths.longTermFile : dailyMemoryFileAt(paths, now);
   const block = `\n\n## ${stamp}\n\n${content.trim()}\n`;
 
   // 用 append 完成「新建 + 追加」：早先是 existsSync 判定后分别 write/append，
@@ -228,11 +286,20 @@ export function appendMemory(
   const header = fs.existsSync(target)
     ? ""
     : scope === "long"
-      ? "# 项目长期记忆\n"
-      : "# 每日记录\n";
+      ? `# ${paths.longTermTitle}\n`
+      : `# ${paths.dailyTitle}\n`;
   fs.appendFileSync(target, `${header}${block}`, "utf8");
 
   return target;
+}
+
+/** 追加写入项目记忆，返回写入的文件路径 */
+export function appendMemory(
+  cwd: string,
+  content: string,
+  scope: MemoryScope,
+): string {
+  return appendMemoryAt(projectMemoryPaths(cwd), content, scope);
 }
 
 // ------------------------------------------------------------ 自动记录（按主题）
@@ -260,20 +327,23 @@ export interface TopicMemoryEntryResult {
  * - 写入前按 `memoryMaxChars` 预判，超限就跳过（自动摘要不能把长期记忆顶爆，
  *   语义压缩仍交给模型的 `memory_compact`）。
  */
-export function appendLongTermTopicEntry(
-  cwd: string,
+export function appendLongTermTopicEntryAt(
+  paths: MemoryPaths,
   topic: string,
   entry: string,
   maxChars = DEFAULT_MEMORY_MAX_CHARS,
 ): TopicMemoryEntryResult {
-  const paths = resolveProjectPaths(cwd);
   fs.mkdirSync(paths.memoryDir, { recursive: true });
 
   const cleanTopic =
     topic.replace(/\s+/g, " ").replace(/^#+/, "").trim().slice(0, 60) || "项目";
   const cleanEntry = entry.trim();
   const heading = `## 自动记录 · ${cleanTopic}`;
-  const base = { file: paths.longTermFile, topic: cleanTopic, compacted: null };
+  const base = {
+    file: paths.longTermFile,
+    topic: cleanTopic,
+    compacted: null as MemoryCompactResult | null,
+  };
 
   if (!cleanEntry) return { ...base, added: false };
 
@@ -283,7 +353,7 @@ export function appendLongTermTopicEntry(
   } catch {
     // 不存在：下面按新文件处理
   }
-  if (!text.trim()) text = "# 项目长期记忆\n";
+  if (!text.trim()) text = `# ${paths.longTermTitle}\n`;
 
   // 完全相同的条目行不重复写（同一天重复运行、重试都可能产生相同摘要）
   if (text.split("\n").some((line) => line.trim() === cleanEntry)) {
@@ -322,8 +392,22 @@ export function appendLongTermTopicEntry(
   fs.writeFileSync(tmp, next, "utf8");
   fs.renameSync(tmp, paths.longTermFile);
 
-  const compacted = compactLongTermMemoryIfNeeded(cwd, maxChars);
+  const compacted = compactLongTermMemoryIfNeededAt(paths, maxChars);
   return { ...base, added: true, compacted };
+}
+
+export function appendLongTermTopicEntry(
+  cwd: string,
+  topic: string,
+  entry: string,
+  maxChars = DEFAULT_MEMORY_MAX_CHARS,
+): TopicMemoryEntryResult {
+  return appendLongTermTopicEntryAt(
+    projectMemoryPaths(cwd),
+    topic,
+    entry,
+    maxChars,
+  );
 }
 
 // ------------------------------------------------------------ 长期记忆精简
@@ -339,6 +423,14 @@ export function appendLongTermTopicEntry(
  * 就触发语义压缩，等于白整理一遍）。
  */
 export const DEFAULT_MEMORY_MAX_CHARS = 12_000;
+
+/**
+ * 全局长期记忆的字符上限。
+ *
+ * 比项目记忆更小：全局记忆每次启动都会注入所有项目的提示词，必须短到
+ * 「一眼能看完」；4000 字符足够放跨项目偏好、环境事实、代理地址与常用命令。
+ */
+export const DEFAULT_GLOBAL_MEMORY_MAX_CHARS = 4_000;
 
 export interface MemoryCompactResult {
   /** 精简前字符数 */
@@ -443,11 +535,10 @@ function blockKey(body: string): string {
  *
  * `maxChars <= 0` 表示**不限制长度**：此时只做去重（无损），不裁剪任何内容。
  */
-export function compactLongTermMemory(
-  cwd: string,
+export function compactLongTermMemoryAt(
+  paths: MemoryPaths,
   maxChars = DEFAULT_MEMORY_MAX_CHARS,
 ): MemoryCompactResult | null {
-  const paths = resolveProjectPaths(cwd);
   if (!fs.existsSync(paths.longTermFile)) return null;
 
   let original: string;
@@ -504,13 +595,20 @@ export function compactLongTermMemory(
   }
 
   const compacted = assembleMemoryBlocks(header, kept);
-  writeLongTermMemory(cwd, compacted);
+  writeLongTermMemoryAt(paths, compacted);
   return {
     before,
     after: compacted.trim().length,
     removedDuplicates,
     removedOldest,
   };
+}
+
+export function compactLongTermMemory(
+  cwd: string,
+  maxChars = DEFAULT_MEMORY_MAX_CHARS,
+): MemoryCompactResult | null {
+  return compactLongTermMemoryAt(projectMemoryPaths(cwd), maxChars);
 }
 
 /**
@@ -522,12 +620,11 @@ export function compactLongTermMemory(
  * `maxChars <= 0` 表示**不限制长度**：此时仍然会做无损的**去重**，
  * 但不会裁剪任何内容。
  */
-export function compactLongTermMemoryIfNeeded(
-  cwd: string,
+export function compactLongTermMemoryIfNeededAt(
+  paths: MemoryPaths,
   maxChars = DEFAULT_MEMORY_MAX_CHARS,
 ): MemoryCompactResult | null {
   const unlimited = !(maxChars > 0);
-  const paths = resolveProjectPaths(cwd);
   let size: number;
   try {
     if (!fs.existsSync(paths.longTermFile)) return null;
@@ -536,18 +633,31 @@ export function compactLongTermMemoryIfNeeded(
     return null;
   }
   if (!unlimited && size <= maxChars) return null;
-  return compactLongTermMemory(cwd, maxChars);
+  return compactLongTermMemoryAt(paths, maxChars);
+}
+
+export function compactLongTermMemoryIfNeeded(
+  cwd: string,
+  maxChars = DEFAULT_MEMORY_MAX_CHARS,
+): MemoryCompactResult | null {
+  return compactLongTermMemoryIfNeededAt(projectMemoryPaths(cwd), maxChars);
 }
 
 /** 覆盖写入长期记忆（原子写：先写临时文件再 rename，避免半截文件） */
-export function writeLongTermMemory(cwd: string, content: string): string {
-  const paths = resolveProjectPaths(cwd);
+export function writeLongTermMemoryAt(
+  paths: MemoryPaths,
+  content: string,
+): string {
   fs.mkdirSync(paths.memoryDir, { recursive: true });
   const data = content.trim() ? `${content.trim()}\n` : "";
   const tmp = `${paths.longTermFile}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, data, "utf8");
   fs.renameSync(tmp, paths.longTermFile);
   return paths.longTermFile;
+}
+
+export function writeLongTermMemory(cwd: string, content: string): string {
+  return writeLongTermMemoryAt(projectMemoryPaths(cwd), content);
 }
 
 // ------------------------------------------------------------ 项目记忆清空
@@ -579,9 +689,8 @@ function isMemoryFile(name: string): boolean {
   return name === LONG_TERM_FILE || /^\d{4}-\d{2}-\d{2}\.md$/.test(name);
 }
 
-/** 查看项目记忆现状（不修改任何文件） */
-export function inspectProjectMemory(cwd: string): ProjectMemoryStatus {
-  const paths = resolveProjectPaths(cwd);
+/** 查看记忆现状（不修改任何文件） */
+export function inspectMemoryAt(paths: MemoryPaths): ProjectMemoryStatus {
   const status: ProjectMemoryStatus = {
     dir: paths.memoryDir,
     hasLongTerm: false,
@@ -626,6 +735,10 @@ export function inspectProjectMemory(cwd: string): ProjectMemoryStatus {
   return status;
 }
 
+export function inspectProjectMemory(cwd: string): ProjectMemoryStatus {
+  return inspectMemoryAt(projectMemoryPaths(cwd));
+}
+
 export interface ClearedProjectMemory {
   /** 实际删除成功的文件 */
   files: MemoryFileInfo[];
@@ -642,8 +755,7 @@ export interface ClearedProjectMemory {
  *
  * 失败（权限等）不抛异常：返回实际删掉的文件，调用方据此如实告知用户。
  */
-export function clearProjectMemory(cwd: string): ClearedProjectMemory {
-  const paths = resolveProjectPaths(cwd);
+export function clearMemoryAt(paths: MemoryPaths): ClearedProjectMemory {
   const files: MemoryFileInfo[] = [];
   let totalBytes = 0;
 
@@ -668,4 +780,57 @@ export function clearProjectMemory(cwd: string): ClearedProjectMemory {
   }
 
   return { files, totalBytes };
+}
+
+export function clearProjectMemory(cwd: string): ClearedProjectMemory {
+  return clearMemoryAt(projectMemoryPaths(cwd));
+}
+
+// ------------------------------------------------------------ 全局记忆
+
+/** 追加写入全局记忆（~/.xzh/memory） */
+export function appendGlobalMemory(
+  content: string,
+  scope: MemoryScope,
+): string {
+  return appendMemoryAt(resolveGlobalMemoryPaths(), content, scope);
+}
+
+/** 按主题并入全局长期记忆 */
+export function appendGlobalTopicEntry(
+  topic: string,
+  entry: string,
+  maxChars = DEFAULT_MEMORY_MAX_CHARS,
+): TopicMemoryEntryResult {
+  return appendLongTermTopicEntryAt(
+    resolveGlobalMemoryPaths(),
+    topic,
+    entry,
+    maxChars,
+  );
+}
+
+/** 全局长期记忆超限时自动精简 */
+export function compactGlobalMemoryIfNeeded(
+  maxChars = DEFAULT_MEMORY_MAX_CHARS,
+): MemoryCompactResult | null {
+  return compactLongTermMemoryIfNeededAt(
+    resolveGlobalMemoryPaths(),
+    maxChars,
+  );
+}
+
+/** 覆盖写入全局长期记忆 */
+export function writeGlobalMemory(content: string): string {
+  return writeLongTermMemoryAt(resolveGlobalMemoryPaths(), content);
+}
+
+/** 查看全局记忆现状 */
+export function inspectGlobalMemory(): ProjectMemoryStatus {
+  return inspectMemoryAt(resolveGlobalMemoryPaths());
+}
+
+/** 清空全局记忆 */
+export function clearGlobalMemory(): ClearedProjectMemory {
+  return clearMemoryAt(resolveGlobalMemoryPaths());
 }

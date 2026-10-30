@@ -1,6 +1,9 @@
 import * as fs from "fs";
 import { ensureDir, getConfigDir, getConfigPath } from "../utils/paths";
-import { DEFAULT_MEMORY_MAX_CHARS } from "../workspace";
+import {
+  DEFAULT_GLOBAL_MEMORY_MAX_CHARS,
+  DEFAULT_MEMORY_MAX_CHARS,
+} from "../workspace";
 
 /** 单个 Provider 的配置 */
 export interface ProviderSettings {
@@ -155,6 +158,13 @@ export interface XuanZhuConfig {
    */
   memoryMaxChars?: number;
   /**
+   * 全局长期记忆（~/.xzh/memory/MEMORY.md）的字符上限。默认 4000。
+   *
+   * 全局记忆会注入**每个项目**的系统提示词，因此上限比项目记忆更紧；
+   * 设为 0 表示不限制（仍会去重）。
+   */
+  globalMemoryMaxChars?: number;
+  /**
    * 并行执行的子代理数量上限。默认 4。
    *
    * 主代理在一轮里并列发出多个 `task` 调用时，这些子代理会**并发运行**；
@@ -192,6 +202,8 @@ export const DEFAULT_CONFIG: XuanZhuConfig = {
   confirmSensitiveRead: false,
   // 长期记忆超过 12000 字符即触发精简（去重 + 丢弃最旧的追加块 + 提示模型语义压缩）
   memoryMaxChars: DEFAULT_MEMORY_MAX_CHARS,
+  // 全局记忆注入每个项目，默认 4000 字符，避免跨项目把提示词顶爆
+  globalMemoryMaxChars: DEFAULT_GLOBAL_MEMORY_MAX_CHARS,
   // 同一轮里并列的多个子代理最多同时跑 4 个：再多容易撞上服务商的速率限制，
   // 而收益有限（瓶颈通常就是那几个并发请求）。
   maxParallelAgents: 4,
@@ -271,6 +283,8 @@ function mergeConfig(partial: Partial<XuanZhuConfig>): XuanZhuConfig {
     confirmSensitiveRead:
       partial.confirmSensitiveRead ?? DEFAULT_CONFIG.confirmSensitiveRead,
     memoryMaxChars: partial.memoryMaxChars ?? DEFAULT_CONFIG.memoryMaxChars,
+    globalMemoryMaxChars:
+      partial.globalMemoryMaxChars ?? DEFAULT_CONFIG.globalMemoryMaxChars,
     maxParallelAgents:
       partial.maxParallelAgents ?? DEFAULT_CONFIG.maxParallelAgents,
     temperature: partial.temperature ?? DEFAULT_CONFIG.temperature,
@@ -343,6 +357,8 @@ export function redactConfig(config: XuanZhuConfig): unknown {
     maxToolRounds: config.maxToolRounds,
     autoApprove: config.autoApprove,
     memoryMaxChars: config.memoryMaxChars ?? DEFAULT_CONFIG.memoryMaxChars,
+    globalMemoryMaxChars:
+      config.globalMemoryMaxChars ?? DEFAULT_CONFIG.globalMemoryMaxChars,
     maxParallelAgents:
       config.maxParallelAgents ?? DEFAULT_CONFIG.maxParallelAgents,
     systemPromptExtra: config.systemPromptExtra ?? "",

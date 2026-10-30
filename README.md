@@ -170,6 +170,10 @@ xzh
 | `xzh config edit` | 使用 `nano` 编辑配置文件 |
 | `xzh config path` | 打印配置文件路径 |
 | `xzh config init` | 生成默认配置文件 |
+| `xzh secret set <名称>` | 保存密码到 `~/.xzh/secrets/`（输入不回显，权限 0600，不进入对话） |
+| `xzh secret list` | 列出凭据名称（不显示内容） |
+| `xzh secret remove <名称>` | 删除凭据 |
+| `xzh sudo <命令>` | 用已保存的 sudo 密码执行命令（密码经 stdin 传给 `sudo -S`） |
 | `xzh setup` | 检查并自动安装依赖（玄猪自身 + 技能：playwright / officecli / 剪贴板工具等） |
 | `xzh init` | 扫描项目并生成 / 补全 `AGENTS.md` 与 `docs/`（已有内容只补缺失小节） |
 | `xzh init --dry-run` | 只预览将生成的内容，不写文件 |
@@ -226,6 +230,7 @@ XZH_HOME=/path/to/dir xzh          # 改用 /path/to/dir/config.json
   "mouseCapture": true,
   "confirmSensitiveRead": false,
   "memoryMaxChars": 12000,
+  "globalMemoryMaxChars": 4000,
   "maxParallelAgents": 4,
   "intent": { "enabled": false },
   "providers": {
@@ -246,7 +251,8 @@ XZH_HOME=/path/to/dir xzh          # 改用 /path/to/dir/config.json
 | `autoApprove` | `true` | 自动批准工具（`false` 时写文件/执行命令前询问） |
 | `mouseCapture` | `true` | 接管鼠标：滚轮滚动 + 输出区拖拽选中复制（`/mouse` 切换） |
 | `confirmSensitiveRead` | `false` | 读取凭据类文件（`.env`、`~/.ssh`、`config.json` 等）时是否确认 |
-| `memoryMaxChars` | `12000` | 长期记忆字符上限，超出即自动精简（`0` = 不限制长度，仍去重） |
+| `memoryMaxChars` | `12000` | **项目**长期记忆字符上限，超出即自动精简（`0` = 不限制长度，仍去重） |
+| `globalMemoryMaxChars` | `4000` | **全局**长期记忆字符上限；全局记忆注入每个项目，默认更紧 |
 | `maxParallelAgents` | `4` | 并行子代理数量上限（`1` = 串行，硬上限 16） |
 | `intent.enabled` | `false` | 意图分析（每条消息先分析再处理） |
 | `intent.prompt` | 内置模板 | 意图分析模板，占位符 `{{'用户发送过来的消息'}}` |
@@ -392,9 +398,9 @@ API Key 也可以来自环境变量，优先级低于配置文件：
 | --- | --- | --- |
 | `list_skills` | 列出玄猪可用的全部技能 | 否 |
 | `load_skill` | 加载指定技能的完整指南 | 否 |
-| `memory_read` | 读取项目记忆（长期记忆 + 最近日志） | 否 |
-| `memory_write` | 写入项目记忆（长期记忆 / 当日日志），长期记忆超限时自动精简 | 否 |
-| `memory_compact` | 用精简后的完整内容重写长期记忆（把新结论并入主题小节 / 语义压缩） | 否 |
+| `memory_read` | 读取项目 / 全局记忆（`target=project\|global\|all`；长期记忆 + 最近日志） | 否 |
+| `memory_write` | 写入项目 / 全局记忆（`target` + `scope`），长期记忆超限时自动精简 | 否 |
+| `memory_compact` | 用精简后的完整内容重写项目 / 全局长期记忆（把新结论并入主题小节 / 语义压缩） | 否 |
 | `todo_write` | 创建 / 更新任务列表（每次提交完整列表） | 否 |
 | `goal_complete` | 目标模式（`/goal`）下声明目标已全部完成（仅主代理可用） | 否 |
 | `report_status` | 结构化上报受阻 / 需要用户决定 / 置信度低（仅主代理可用） | 否 |
@@ -791,13 +797,51 @@ AutoX.js 那侧也可用环境变量 `XZH_DEVICE_PORT` 指定端口。
 - `.xuanzhu` **始终**位于当前项目路径之下，**不做任何向上查找**：在 `/a/b/c` 工作就只用
   `/a/b/c/.xuanzhu`，即使 `/a` 或 `/a/b` 下已有 `.xuanzhu` 也不会复用
 - **启动时**与 **`/switch` 切换目录时**，若该目录下尚无 `.xuanzhu`，会自动创建
-- 因此每个项目目录各自拥有独立的记忆与规则；`~/.xzh` 仅作**全局配置目录**
-  （config.json / 会话 / 日志 / 技能），不参与项目记忆
-- **查看 / 清空**：`/memory` 显示记忆目录、长期记忆字符数与每日日志份数；
-  `/memory clear` 清空长期记忆与全部每日日志。清空**必须二次确认**：确认框默认停在「拒绝」，
-  要按 `y`（或 ← → 切到「允许」再回车）才会执行，一个回车不会误删。它只删
-  `.xuanzhu/memory/` 下的记忆文件，**不会**删除 `~/.xzh/sessions/` 的会话存档，
+- 因此每个项目目录各自拥有独立的记忆与规则；`~/.xzh` 保存**全局配置、全局记忆、会话、日志与技能**，
+  不保存项目记忆
+- **查看 / 清空**：`/memory` 显示项目记忆目录、长期记忆字符数与每日日志份数；
+  `/memory global` 查看全局记忆；`/memory clear [global]` 清空对应记忆。
+  清空**必须二次确认**：确认框默认停在「拒绝」，要按 `y`（或 ← → 切到「允许」再回车）才会执行，
+  一个回车不会误删。它只删对应 `memory/` 下的记忆文件，**不会**删除 `~/.xzh/sessions/` 的会话存档，
   清空后系统提示词立即刷新（后续请求不再注入旧记忆）
+
+### 全局记忆（跨项目）
+
+除项目记忆外，`~/.xzh/memory/` 还有一份**全局记忆**，对所有项目生效：
+
+| 路径 | 用途 |
+| --- | --- |
+| `~/.xzh/memory/MEMORY.md` | 跨项目长期记忆：用户偏好、环境约定、sudo 使用方式、本机代理地址等 |
+| `~/.xzh/memory/YYYY-MM-DD.md` | 全局每日日志（可选） |
+
+- 启动时先注入全局记忆，再注入项目记忆；全局记忆默认上限 `globalMemoryMaxChars=4000`，
+  超限自动去重/裁剪，仍超限时用 `memory_compact target=global` 语义精简。
+- 当用户说「全局 / 所有项目 / 跨项目 / 以后都 / 统一用」时，系统提示词会额外提醒模型用
+  `memory_write target=global` 记录；只属于当前项目的内容仍写项目记忆。
+- **密码、Token、UUID、API Key 原文绝不能写入记忆**（记忆会进入每次请求的上下文）。
+  用 `xzh secret set <名称>` 存到 `~/.xzh/secrets/`（目录 0700 / 文件 0600），
+  记忆里只写「凭据存放在哪里、怎么用」。例如 sudo：
+
+  ```bash
+  xzh secret set sudo        # 输入不回显
+  xzh sudo apt update        # 密码经 stdin 传给 sudo -S，不出现在命令行/对话
+  ```
+
+  全局记忆会自动记录一条「sudo 密码存放在 `~/.xzh/secrets/sudo`，使用 `xzh sudo`」的指针。
+- `memory_read` / `memory_write` / `memory_compact` 都支持 `target=project|global`
+  （`memory_read` 还支持 `all`）。
+
+### 外网与本地代理
+
+内置 `v2ray` 技能用于「需要外网但直连失败」的场景：探测本机已有的
+v2ray / Clash / mihomo / sing-box **本地 SOCKS/HTTP 入站端口**，验证后**只对当前命令**
+临时设置 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`，不修改系统代理或全局配置；
+成功后把本地端点写入全局记忆，下次优先复用。节点 UUID、订阅地址、密码不会被读取或记录。
+
+- 触发方式：系统提示词要求外网失败时先 `load_skill v2ray`；`bash` 检测到
+  `Could not resolve host` / 连接超时等错误时也会追加提示。
+- 代理只在单条命令的进程内生效，命令结束自动还原；`NO_PROXY` 始终包含
+  `127.0.0.1,localhost,::1`，不会把本地模型端点绕进代理。
 
 > 技能与 CLI 为**全局通用**：技能位于 `~/.xzh/skills`（叠加内置），CLI 安装在系统，均不受项目限制。
 
@@ -833,13 +877,14 @@ AutoX.js 那侧也可用环境变量 `XZH_DEVICE_PORT` 指定端口。
 当任务涉及某个领域时，玄猪会先 `list_skills` 查看可用技能、再 `load_skill` 加载完整指南
 （加载时自动安装并验证其依赖），然后借助 `bash` 执行指南中描述的命令。
 
-随包内置 19 个技能，常用如下：
+随包内置 20 个技能，常用如下：
 
 | 技能 | 领域 | 依赖 |
 | --- | --- | --- |
 | `playwright` | 浏览器自动化、端到端测试、网页验证（**默认用系统已安装的 Chrome**，减少反爬拦截） | `playwright-cli`（`npm i -g @playwright/cli@latest`） |
 | `officecli` | Word / Excel / PowerPoint 文档创建与读写 | `officecli`（单二进制，见技能内安装说明） |
 | `autojs6` | **操作真实 Android 手机**：点击、滑动、输入、读界面、启动应用（脚本由设备桥推到手机上执行） | 无（手机需装 AutoJs6，见「手机设备桥」） |
+| `v2ray` | **本机代理发现与临时使用**：外网直连失败时探测本机 v2ray / Clash / sing-box 入站端口，验证后只对当前命令生效，并把端点写入全局记忆 | 无（需用户已启动代理客户端） |
 | `release` | **发版流程**：版本号 / CHANGELOG / 构建与测试 / `npm publish` / 等 registry 同步 / 推送 GitHub / 发布后校验（含逐步清单与踩坑） | 无（用 `npm` / `git`） |
 | `github` / `gitlab` | 仓库、Issue、PR / MR | `gh` / `glab` |
 | `jira` / `linear` | 项目管理 | 对应 CLI |
@@ -954,7 +999,7 @@ description: 一句话说明该技能的用途与适用场景
 kitty / Ghostty 会把该 xterm 兼容序列映射成「所有按键都用转义码上报」而破坏普通输入，
 故玄猪对这两类终端不发送请求，请改用 `Alt+Enter` 或在终端侧自行配置。
 
-界面内命令：`/help`、`/clear`、`/tools`、`/context`、`/compact`、`/focus [文件]`、`/device`、`/image`（`/paste`）、`/copy [N|A-B|last|all]`、`/mouse`、`/reset`、`/undo`、`/resume [编号]`、`/cwd`、`/switch <目录>`、`/term`、`/model [编号|id|模型名]`、`/goal <目标>`（`/goal [status|continue|off]`）、`/memory [clear]`、`/init [--dry-run|--force]`、`/auto [on|off]`、`/intent [on|off]`、`/exit`。
+界面内命令：`/help`、`/clear`、`/tools`、`/context`、`/compact`、`/focus [文件]`、`/device`、`/image`（`/paste`）、`/copy [N|A-B|last|all]`、`/mouse`、`/reset`、`/undo`、`/resume [编号]`、`/cwd`、`/switch <目录>`、`/term`、`/model [编号|id|模型名]`、`/goal <目标>`（`/goal [status|continue|off]`）、`/memory [global|clear [global]]`、`/init [--dry-run|--force]`、`/auto [on|off]`、`/intent [on|off]`、`/exit`。
 
 ### 选中与复制
 

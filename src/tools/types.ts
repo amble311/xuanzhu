@@ -112,6 +112,8 @@ export interface ToolContext {
   status?: StatusStore;
   /** 长期记忆字符上限，超出时自动精简（由 Agent 注入） */
   memoryMaxChars?: number;
+  /** 全局长期记忆字符上限（由 Agent 注入） */
+  globalMemoryMaxChars?: number;
   /** 上下文档位对应的工具限额（由 Agent 注入） */
   limits?: ToolLimits;
   /** 派生子代理执行子任务（由 Agent 注入），未提供时 task 工具不可用 */

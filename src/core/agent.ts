@@ -69,9 +69,12 @@ import { expandHome, getConfigPath } from "../utils/paths";
 import {
   appendLongTermTopicEntry,
   appendMemory,
+  compactGlobalMemoryIfNeeded,
   compactLongTermMemoryIfNeeded,
+  DEFAULT_GLOBAL_MEMORY_MAX_CHARS,
   DEFAULT_MEMORY_MAX_CHARS,
   loadProjectRules,
+  readGlobalMemory,
   readProjectMemory,
   resolveProjectPaths,
 } from "../workspace";
@@ -358,6 +361,8 @@ const SMALL_TOOL_NAMES = new Set([
   "todo_write",
   "memory_read",
   "memory_write",
+  "memory_compact",
+  "load_skill",
   "report_status",
 ]);
 
@@ -652,6 +657,8 @@ export class Agent {
       this.config.memoryMaxChars,
       Boolean(this.deviceBridge),
       this.contextProfile() === "small",
+      readGlobalMemory(),
+      this.config.globalMemoryMaxChars,
     );
   }
 
@@ -663,8 +670,46 @@ export class Agent {
    * 而 `this.systemPrompt` 是 `/switch`、记忆精简等逻辑的基线，不该混入临时状态。
    */
   private effectiveSystemPrompt(): string {
-    if (!this.goal || this.goal.completed) return this.systemPrompt;
-    return `${this.systemPrompt}\n\n${goalSystemSection(this.goal.text)}`;
+    let prompt = this.systemPrompt;
+    if (this.goal && !this.goal.completed) {
+      prompt += `\n\n${goalSystemSection(this.goal.text)}`;
+    }
+    const hint = this.globalMemoryHint();
+    return hint ? `${prompt}\n\n${hint}` : prompt;
+  }
+
+  /**
+   * 当用户本轮消息明确提到「全局 / 所有项目 / 跨项目」时，追加一条记忆提醒。
+   *
+   * 这是**提示词层的确定性触发器**，不自动替用户写记忆：
+   * 全局记忆会影响所有项目，误提取（尤其把密码原文写进去）代价很大，
+   * 因此只提醒模型在本轮结束前判断并调用 memory_write target=global。
+   */
+  private globalMemoryHint(): string | undefined {
+    const lastUser = [...this.history]
+      .reverse()
+      .find(
+        (message) =>
+          message.role === "user" && typeof message.content === "string",
+      );
+    if (!lastUser || typeof lastUser.content !== "string") return undefined;
+    const text = lastUser.content;
+    if (
+      !/(全局|所有项目|每个项目|跨项目|以后都|以后每次|统一用|统一使用|sudo|v2ray|本机代理|密码|凭据|all projects|across projects)/i.test(
+        text,
+      )
+    ) {
+      return undefined;
+    }
+    return (
+      "## 本轮全局记忆提醒\n" +
+      "用户这条消息提到了「全局 / 跨项目」。如果其中包含跨项目稳定事实" +
+      "（用户偏好、sudo 使用方式、代理地址、统一安装/构建方式），" +
+      "请在本轮结束前用 `memory_write target=global` 记录；" +
+      "只属于当前项目的内容仍写项目记忆。\n" +
+      "**密码 / Token / UUID / API Key 原文绝对不能写入任何记忆**：" +
+      "用 `xzh secret set <名称>` 存入 0600 凭据文件，记忆里只写指针。"
+    );
   }
 
   /**
@@ -677,26 +722,42 @@ export class Agent {
    * `memoryMaxChars <= 0` 表示不限制长度，此时仍会去重（去重是无损的）。
    */
   private autoCompactMemory(): void {
-    const limit = this.config.memoryMaxChars ?? DEFAULT_MEMORY_MAX_CHARS;
-    const result = compactLongTermMemoryIfNeeded(this.cwd, limit);
-    if (
-      !result ||
-      (result.removedDuplicates === 0 && result.removedOldest === 0)
-    ) {
-      return;
-    }
+    const report = (
+      label: string,
+      result: ReturnType<typeof compactLongTermMemoryIfNeeded>,
+    ): void => {
+      if (
+        !result ||
+        (result.removedDuplicates === 0 && result.removedOldest === 0)
+      ) {
+        return;
+      }
+      const parts: string[] = [];
+      if (result.removedDuplicates > 0) {
+        parts.push(`去除 ${result.removedDuplicates} 条重复记录`);
+      }
+      if (result.removedOldest > 0) {
+        parts.push(`裁剪 ${result.removedOldest} 条最旧的追加记录`);
+      }
+      this.pendingMemoryNotices.push(
+        `${label}长期记忆已自动精简（${parts.join("、")}，${result.before} → ${result.after} 字符）。` +
+          `按主题整理的稳定小节不受自动裁剪影响；` +
+          `若需要更彻底的压缩，可让玄猪用 memory_compact 重写为精简版本。`,
+      );
+    };
 
-    const parts: string[] = [];
-    if (result.removedDuplicates > 0) {
-      parts.push(`去除 ${result.removedDuplicates} 条重复记录`);
-    }
-    if (result.removedOldest > 0) {
-      parts.push(`裁剪 ${result.removedOldest} 条最旧的追加记录`);
-    }
-    this.pendingMemoryNotices.push(
-      `长期记忆已自动精简（${parts.join("、")}，${result.before} → ${result.after} 字符）。` +
-        `按主题整理的稳定小节不受自动裁剪影响；` +
-        `若需要更彻底的压缩，可让玄猪用 memory_compact 重写为精简版本。`,
+    report(
+      "项目",
+      compactLongTermMemoryIfNeeded(
+        this.cwd,
+        this.config.memoryMaxChars ?? DEFAULT_MEMORY_MAX_CHARS,
+      ),
+    );
+    report(
+      "全局",
+      compactGlobalMemoryIfNeeded(
+        this.config.globalMemoryMaxChars ?? DEFAULT_GLOBAL_MEMORY_MAX_CHARS,
+      ),
     );
   }
 
@@ -2372,6 +2433,7 @@ export class Agent {
       goal: this.goalStore(),
       status: this.statusStore(),
       memoryMaxChars: this.config.memoryMaxChars,
+      globalMemoryMaxChars: this.config.globalMemoryMaxChars,
       limits: {
         maxReadLines: this.contextProfile() === "small" ? 300 : undefined,
         maxOutputChars: this.contextProfile() === "small" ? 6000 : undefined,

@@ -28,6 +28,7 @@ import { configCommand } from "./commands/config";
 import { errorsCommand } from "./commands/errors";
 import { initCommand } from "./commands/init";
 import { modelCommand } from "./commands/model";
+import { secretCommand, sudoCommand } from "./commands/secret";
 import { setupCommand } from "./commands/setup";
 import { skillCommand } from "./commands/skill";
 import { recordErrorReport } from "../utils/error-reports";
@@ -140,6 +141,12 @@ async function main(): Promise<void> {
       return;
     case "errors":
       await errorsCommand(args.slice(1));
+      return;
+    case "secret":
+      await secretCommand(args.slice(1));
+      return;
+    case "sudo":
+      await sudoCommand(args.slice(1));
       return;
     case "device":
       await deviceCommand(args.slice(1));
@@ -353,6 +360,9 @@ ${ansi.bold}用法${ansi.reset}
   ${ansi.green}xzh config edit${ansi.reset}         使用 nano 编辑配置文件
   ${ansi.green}xzh config path${ansi.reset}         打印配置文件路径
   ${ansi.green}xzh config init${ansi.reset}         生成默认配置文件
+  ${ansi.green}xzh secret set <名称>${ansi.reset}    保存密码到 ~/.xzh/secrets（输入不回显，不进对话）
+  ${ansi.green}xzh secret list${ansi.reset}         列出凭据名称（不显示内容）
+  ${ansi.green}xzh sudo <命令>${ansi.reset}          使用已保存的 sudo 密码执行命令（密码经 stdin 传入）
   ${ansi.green}xzh setup${ansi.reset}               检查并安装依赖（剪贴板工具 + 技能 CLI）
   ${ansi.green}xzh init${ansi.reset}                扫描项目并生成 / 补全 AGENTS.md 与 docs/（只追加缺失小节）
   ${ansi.green}xzh init --dry-run${ansi.reset}      只预览将生成的内容，不写文件

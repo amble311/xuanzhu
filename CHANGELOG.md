@@ -4,6 +4,28 @@
 
 ## [未发布]
 
+## [0.8.3] — 2026-10-30
+
+### 变更
+
+- **全局记忆（跨项目）**：新增 `~/.xzh/memory/`（`MEMORY.md` + 每日日志），启动时先注入
+  全局记忆、再注入项目记忆；`memory_read` / `memory_write` / `memory_compact` 增加
+  `target=project|global`（read 额外支持 `all`）；新增 `globalMemoryMaxChars`（默认 4000）。
+  用户消息提到「全局 / 所有项目 / 跨项目 / 以后都 / 统一用」时，系统提示词会追加一次
+  「本轮全局记忆提醒」，促使模型用 `memory_write target=global` 记录。
+- **本地凭据与 `xzh sudo`**：新增 `xzh secret set/list/remove`，密码存入 `~/.xzh/secrets/`
+  （目录 0700、文件 0600、输入不回显）；`xzh sudo <命令>` 通过 stdin 把密码交给
+  `sudo -S`，密码不进入 argv / 环境变量 / 对话。记忆工具拒绝写入密码/Token 原文（项目与
+  全局都适用），只允许 `~/.xzh/secrets/...` 指针；`bash` 遇到不带 `-n`/`-S` 的 `sudo`
+  会提前引导改用 `xzh sudo`，也不能代跑 `xzh secret set`。
+- **本地代理技能 v2ray**：新增内置 `v2ray` 技能，外网直连失败时探测本机 v2ray / Clash /
+  sing-box 的 SOCKS/HTTP 入站端口，验证后只对当前命令临时设置代理环境变量；
+  `bash` 检测到 DNS/连接超时等错误时追加提示，系统提示词也要求先 `load_skill v2ray`。
+  成功端点写入全局记忆；不读取节点 UUID/订阅，不修改系统代理。
+- **small 档工具集**：保留 `load_skill` 与 `memory_compact`，使小窗口下代理技能与
+  全局记忆精简仍可用（仍隐藏 `task` 等低频工具）。
+- `/memory` 支持 `global` 查看与 `clear global` 清空（清空仍需二次确认）。
+
 ## [0.8.2] — 2026-10-29
 
 ### 变更

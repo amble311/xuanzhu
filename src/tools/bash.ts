@@ -184,8 +184,42 @@ export function interactiveCommandName(command: string): string | undefined {
     ) {
       return name;
     }
+    // sudo 在无 TTY 时会等密码直到超时。允许 -n（NOPASSWD）和 -S（自己喂 stdin），
+    // 其余情况引导用户改用 xzh sudo（密码从 0600 凭据文件经 stdin 传入）。
+    if (
+      name === "sudo" &&
+      !/(^|\s)(-n|--non-interactive|-S|--stdin)(\s|$)/.test(segment)
+    ) {
+      return "sudo";
+    }
   }
   return undefined;
+}
+
+/**
+ * 判断输出是否像「外网不可达」。
+ *
+ * 只做提示，不自动改命令：git/npm/curl 的报错格式随版本变化，
+ * 这里宁可漏报也不误判成本地命令失败。
+ */
+export function looksLikeNetworkFailure(output: string): boolean {
+  const text = output.toLowerCase();
+  return [
+    "could not resolve host",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "getaddrinfo",
+    "network is unreachable",
+    "connection timed out",
+    "connection reset",
+    "failed to connect",
+    "ssl connect error",
+    "proxy connect",
+    "econnreset",
+    "etimedout",
+    "无法解析主机",
+    "连接超时",
+  ].some((keyword) => text.includes(keyword));
 }
 
 /**
@@ -249,9 +283,31 @@ export const bashTool: ToolDefinition = {
       return { ok: false, content: "错误：command 不能为空" };
     }
 
+    // 密码录入必须由用户在真实终端完成；模型通过 bash 调用会挂在 stdin 上。
+    if (/\bxzh\s+secret\s+(set|add)\b/.test(command)) {
+      return {
+        ok: false,
+        content:
+          "错误：xzh secret set 需要用户在真实终端输入密码，不能通过 bash 工具代跑。\n" +
+          "请提示用户在自己的终端执行 `xzh secret set <名称>`（输入不回显）；" +
+          "保存后你可以直接使用 `xzh sudo <命令>`。",
+      };
+    }
+
     // 交互式命令没有 TTY，会一直等到超时（如 `su` 等密码）。提前失败并给出替代方案。
     const interactive = interactiveCommandName(command);
     if (interactive) {
+      if (interactive === "sudo") {
+        return {
+          ok: false,
+          content:
+            `错误：\`sudo\` 在非交互 shell 中会等待密码直到超时。\n` +
+            `若已用 \`xzh secret set sudo\` 保存过密码，请改用：\n` +
+            `  xzh sudo <命令>\n` +
+            `（密码由玄猪从 ~/.xzh/secrets/sudo 经 stdin 传入，不会进入对话或命令行）。\n` +
+            `若系统已配置 NOPASSWD，可直接用 \`sudo -n <命令>\`。`,
+        };
+      }
       return {
         ok: false,
         content:
@@ -322,6 +378,14 @@ export const bashTool: ToolDefinition = {
     }
     if (result.timedOut) {
       parts.push(`[警告] 命令在 ${timeout}ms 后超时并被终止。`);
+    }
+    if (result.code !== 0 && looksLikeNetworkFailure(full)) {
+      parts.push(
+        "[网络提示] 命令看起来因外网不可达而失败。若本机已有 v2ray / Clash / sing-box，" +
+          "请先 load_skill v2ray，按指南探测本地代理后重试；" +
+          "用代理时只对当前命令临时设置 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY，" +
+          "并设置 NO_PROXY=127.0.0.1,localhost。",
+      );
     }
     parts.push(`[退出码] ${result.code ?? "未知"}`);
 

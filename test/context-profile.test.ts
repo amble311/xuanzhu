@@ -69,7 +69,9 @@ describe("small 档自动识别", () => {
     expect(names).toContain("bash");
     expect(names).toContain("todo_write");
     expect(names).not.toContain("task");
-    expect(names).not.toContain("load_skill");
+    // v2ray / 全局记忆精简在 small 档也要可用，否则外网失败时无法加载技能
+    expect(names).toContain("load_skill");
+    expect(names).toContain("memory_compact");
     expect(names).not.toContain("goal_complete");
     expect(seen[0].maxTokens).toBe(2048);
 

@@ -185,6 +185,50 @@ describe("D18：bash 输出截断必须有提示", () => {
     expect(interactiveCommandName("grep passwd README.md")).toBeUndefined();
     expect(interactiveCommandName("echo hi && su root")).toBe("su");
     expect(interactiveCommandName("FOO=bar vim a.txt")).toBe("vim");
+    // sudo 无 TTY 会等密码；带 -n / -S 或走 xzh sudo 时不应拦截
+    expect(interactiveCommandName("sudo ls")).toBe("sudo");
+    expect(interactiveCommandName("sudo -n ls")).toBeUndefined();
+    expect(interactiveCommandName("sudo -S ls")).toBeUndefined();
+    expect(interactiveCommandName("xzh sudo ls")).toBeUndefined();
+  });
+
+  it("sudo 提示引导使用 xzh sudo，而不是干等超时", async () => {
+    const cwd = tmpDir("xzh-bash-");
+    const result = await bashTool.execute(
+      { command: "sudo ls", timeout: 30_000 },
+      toolCtx(cwd),
+    );
+    expect(result.ok).toBe(false);
+    expect(result.content).toContain("xzh sudo");
+    expect(result.content).toContain("xzh secret set sudo");
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("密码录入命令不能在 bash 工具里代跑", async () => {
+    const cwd = tmpDir("xzh-bash-");
+    const result = await bashTool.execute(
+      { command: "xzh secret set sudo", timeout: 30_000 },
+      toolCtx(cwd),
+    );
+    expect(result.ok).toBe(false);
+    expect(result.content).toContain("不能通过 bash 工具代跑");
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("外网失败时追加 v2ray 技能提示", async () => {
+    const cwd = tmpDir("xzh-bash-");
+    const result = await bashTool.execute(
+      {
+        command:
+          `node -e "console.error('curl: (6) Could not resolve host: github.com'); process.exit(6)"`,
+        timeout: 30_000,
+      },
+      toolCtx(cwd),
+    );
+    expect(result.ok).toBe(false);
+    expect(result.content).toContain("[网络提示]");
+    expect(result.content).toContain("load_skill v2ray");
+    fs.rmSync(cwd, { recursive: true, force: true });
   });
 });
 

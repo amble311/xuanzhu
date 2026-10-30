@@ -46,8 +46,10 @@ import {
 import { expandHome, getConfigDir } from "../utils/paths";
 import { VERSION } from "../utils/version";
 import {
+  clearGlobalMemory,
   clearProjectMemory,
   ensureProjectDir,
+  inspectGlobalMemory,
   inspectProjectMemory,
 } from "../workspace";
 import {
@@ -2859,13 +2861,18 @@ export class TuiApp {
    * 不刷新的话后续请求仍会带着刚删掉的旧记忆。
    */
   private async handleMemoryCommand(arg: string): Promise<void> {
-    const sub = arg.trim().toLowerCase();
-    const status = inspectProjectMemory(this.cwd);
+    const parts = arg.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const targetGlobal = parts.includes("global");
+    const sub = parts.find((part) => part !== "global") ?? "";
+    const label = targetGlobal ? "全局记忆" : "项目记忆";
+    const status = targetGlobal
+      ? inspectGlobalMemory()
+      : inspectProjectMemory(this.cwd);
 
     if (!sub || sub === "status") {
       if (!status.hasLongTerm && status.dailyFiles.length === 0) {
         this.lines.push(
-          `${ansi.bold}项目记忆${ansi.reset} ${ansi.gray}（为空）${ansi.reset}`,
+          `${ansi.bold}${label}${ansi.reset} ${ansi.gray}（为空）${ansi.reset}`,
         );
         this.lines.push(`${ansi.gray}  目录：${status.dir}${ansi.reset}`);
       } else {
@@ -2874,7 +2881,7 @@ export class TuiApp {
             ? `${status.dailyFiles.length} 份（${status.dailyFiles[0].name.replace(/\.md$/, "")} ~ ` +
               `${status.dailyFiles[status.dailyFiles.length - 1].name.replace(/\.md$/, "")}）`
             : "无";
-        this.lines.push(`${ansi.bold}项目记忆${ansi.reset} ${ansi.gray}${status.dir}${ansi.reset}`);
+        this.lines.push(`${ansi.bold}${label}${ansi.reset} ${ansi.gray}${status.dir}${ansi.reset}`);
         this.lines.push(
           `${ansi.gray}  长期记忆 MEMORY.md：${ansi.reset}` +
             (status.hasLongTerm
@@ -2885,14 +2892,16 @@ export class TuiApp {
         this.lines.push(`${ansi.gray}  合计：${ansi.reset}${formatBytes(status.totalBytes)}`);
       }
       this.lines.push(
-        `${ansi.gray}  · /memory clear 清空记忆（需再次确认；不会删除 ~/.xzh/sessions 的会话存档）${ansi.reset}`,
+        `${ansi.gray}  · /memory clear 清空项目记忆 · /memory global 查看全局记忆` +
+          `${ansi.reset}${ansi.gray}（/memory clear global 清空全局；均需确认；` +
+          `不会删除 ~/.xzh/sessions 的会话存档）${ansi.reset}`,
       );
       return;
     }
 
     if (["clear", "reset", "rm", "delete"].includes(sub)) {
       if (!status.hasLongTerm && status.dailyFiles.length === 0) {
-        this.lines.push(`${ansi.gray}项目记忆已经是空的（${status.dir}）。${ansi.reset}`);
+        this.lines.push(`${ansi.gray}${label}已经是空的（${status.dir}）。${ansi.reset}`);
         return;
       }
 
@@ -2909,27 +2918,32 @@ export class TuiApp {
         .join("\n");
       const more =
         files.length > MAX_SHOWN ? `\n  …还有 ${files.length - MAX_SHOWN} 个文件` : "";
+      const clearHint = targetGlobal
+        ? "⚠ 全局记忆会注入所有项目，清空后不可恢复；不会删除 ~/.xzh/sessions 里的会话存档。"
+        : "⚠ 此操作不可恢复；不会删除 ~/.xzh/sessions 里的会话存档。";
       const approved = await this.requestConfirm(
         {
           tool: "memory_clear",
-          title: "清空项目记忆？",
+          title: targetGlobal ? "清空全局记忆？" : "清空项目记忆？",
           detail:
             `目录：${status.dir}\n` +
             `将删除 ${files.length} 个文件（共 ${formatBytes(status.totalBytes)}）：\n` +
             `${shown}${more}\n\n` +
-            `⚠ 此操作不可恢复；不会删除 ~/.xzh/sessions 里的会话存档。\n` +
+            `${clearHint}\n` +
             `按 y（或 ← → 切到「允许」再回车）才会执行。`,
           danger: true,
         },
-        // 默认停在「拒绝」：一个回车不能把项目记忆删掉
+        // 默认停在「拒绝」：一个回车不能把记忆删掉
         false,
       );
       if (!approved) {
-        this.lines.push(`${ansi.gray}已取消，项目记忆未改动。${ansi.reset}`);
+        this.lines.push(`${ansi.gray}已取消，${label}未改动。${ansi.reset}`);
         return;
       }
 
-      const cleared = clearProjectMemory(this.cwd);
+      const cleared = targetGlobal
+        ? clearGlobalMemory()
+        : clearProjectMemory(this.cwd);
       this.agent.reloadSystemPrompt();
       if (cleared.files.length === 0) {
         this.lines.push(
@@ -2938,7 +2952,7 @@ export class TuiApp {
         return;
       }
       this.lines.push(
-        `${ansi.green}✓ 已清空项目记忆：删除 ${cleared.files.length} 个文件` +
+        `${ansi.green}✓ 已清空${label}：删除 ${cleared.files.length} 个文件` +
           `（${formatBytes(cleared.totalBytes)}）。${ansi.reset}`,
       );
       this.lines.push(
@@ -2951,7 +2965,8 @@ export class TuiApp {
       `${ansi.yellow}未知用法：/memory ${arg}${ansi.reset}`,
     );
     this.lines.push(
-      `${ansi.gray}  · /memory 查看现状 · /memory clear 清空（需确认）${ansi.reset}`,
+      `${ansi.gray}  · /memory 查看项目记忆 · /memory global 查看全局记忆 · ` +
+        `/memory clear [global] 清空（需确认）${ansi.reset}`,
     );
   }
 
@@ -3715,7 +3730,7 @@ export class TuiApp {
       `  /model [编号|id|模型名]  查看 / 切换当前模型（不带参数：↑ ↓ 选择，Enter 确认）`,
       `  /goal <目标>   目标模式：持续自动执行直到完成（Ctrl+C 中断；/goal off 清除）`,
       `  /goal [status|continue|off]  查看当前目标 / 继续已暂停的目标 / 清除目标`,
-      `  /memory        查看项目记忆（长期记忆 / 每日日志）；/memory clear 清空（需确认）`,
+      `  /memory        查看项目记忆；/memory global 查看全局记忆；/memory clear [global] 清空（需确认）`,
       `  /init [--dry-run|--force]  扫描项目并生成 / 补全 AGENTS.md 与 docs/（写入前确认）`,
       `  /auto [on|off] 切换自动批准（on：所有工具直接执行，写入配置）`,
       `  /intent [on|off] 切换意图分析（on：每条消息先做意图分析再处理，写入配置）`,
