@@ -4,6 +4,35 @@
 
 ## [未发布]
 
+## [0.8.5] — 2026-10-31
+
+### 变更
+
+- **TUI 顶部布局**：移除顶部信息区的「模型」行（底部状态栏已展示当前模型）；
+  任务列表改为显示在快捷键提示**下方**，不再插在标题与快捷键说明之间。
+- **全局 HTTP/SOCKS 代理**：新增单一交互入口 `xzh vpn`（设置 / 探测 / 测试 / 启停 / 清除），
+  代理写入配置 `network.proxy`，同时用于模型请求（OpenAI / Anthropic / Gemini）与
+  bash 子进程；本机地址默认 NO_PROXY。代理测试通过时系统提示词会跳过 v2ray 技能。
+- **Prompt Injection 防线**：系统提示词把文件/命令/网页内容标记为数据而非指令；
+  模型主动写全局记忆需确认（自动捕获不弹确认）。
+- **用量与修改可见性**：新增 `/usage` 显示服务端真实 token 用量；
+  `write_file` / `edit_file` 返回短 diff；`/undo [N]` 支持多步撤销；
+  `/memory show [global]` 查看记忆全文，便于审计自动记录。
+- **跨平台**：Windows 可通过 `XZH_SHELL` 指向 Git Bash / WSL 的 POSIX shell，绕过 cmd.exe
+  与技能命令不兼容的问题。
+- **Prompt caching**：Anthropic 把静态 system 前缀与动态追加分成两个 block，只在静态前缀 /
+  最后一个 tool 上打 `cache_control: ephemeral`（`promptCache=false` 可关闭）；
+  OpenAI / Gemini 使用服务商自动缓存。`usage` 新增缓存命中/写入字段，`/usage` 显示缓存命中。
+- **代理认证加密**：`xzh vpn` 保存带用户名/密码的代理时，凭据拆到 vault，
+  config 只保留 `network.proxyAuthId`；SOCKS 会提示 npm/pip 建议使用 HTTP 入站。
+- **项目记忆来源确认**：`memory_write` / `memory_compact` 支持 `source=user|tool|model`；
+  从工具/文件/网页总结并写项目记忆时需要确认。
+- **全局记忆检索与 TTL**：长记忆静态只注入主题目录，按最近 3 条用户消息选择相关小节；
+  自动记录超过 `globalMemoryTtlDays`（默认 90 天）自动清理，手工小节不动。
+- **repo_map 增强**：按 mtime/ctime/size + 内容 SHA-1 增量复用符号，查询加分区分路径/文件名/符号名，
+  新增 Lua / Shell 与常见 Java/Kotlin/Scala 方法解析。
+- **测试**：新增顶部布局纯函数、diff、`xzh vpn` 地址校验与提示词跳过 v2ray 测试。
+
 ## [0.8.4] — 2026-10-31
 
 ### 变更

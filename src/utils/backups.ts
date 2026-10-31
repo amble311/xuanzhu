@@ -121,11 +121,8 @@ export function snapshotForUndo(target: string, cwd: string): void {
   }
 }
 
-/**
- * 撤销最近一次被玄猪修改的文件。
- * 返回给用户看的说明文字（含成功/失败与具体动作）。
- */
-export function undoLastChange(cwd: string): string {
+/** 撤销最近一次修改；内部单步实现 */
+function undoOne(cwd: string): string {
   const entries = readManifest(cwd);
   const last = entries[entries.length - 1];
   if (!last) return "没有可撤销的修改。";
@@ -151,4 +148,21 @@ export function undoLastChange(cwd: string): string {
   return last.backup
     ? `✓ 已撤销对 ${last.file} 的修改（恢复为修改前的内容）。`
     : `✓ 已撤销：删除了玄猪新建的文件 ${last.file}。`;
+}
+
+/**
+ * 撤销最近 N 次被玄猪修改的文件（默认 1 次）。
+ * 返回给用户看的说明文字（含成功/失败与具体动作）。
+ */
+export function undoLastChange(cwd: string, count = 1): string {
+  const times = Math.max(1, Math.min(20, Math.floor(count) || 1));
+  const results: string[] = [];
+  for (let i = 0; i < times; i++) {
+    const message = undoOne(cwd);
+    results.push(message);
+    if (message.startsWith("撤销失败") || message === "没有可撤销的修改。") {
+      break;
+    }
+  }
+  return results.join("\n");
 }

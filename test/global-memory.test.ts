@@ -17,6 +17,8 @@ import {
   readGlobalMemory,
   readProjectMemory,
   resolveGlobalMemoryPaths,
+  pruneGlobalMemory,
+  selectRelevantGlobalMemory,
   writeGlobalMemory,
 } from "../src/workspace";
 import {
@@ -137,6 +139,57 @@ describe("自动全局记忆捕获", () => {
     expect(result.added).toBe(false);
   });
 
+  it("Agent 对长全局记忆按用户消息注入相关小节", async () => {
+    const long = [
+      "# 全局长期记忆",
+      "",
+      "## 网络代理",
+      "- 本机 SOCKS 10808 可用。",
+      "",
+      "## 其他细节",
+      Array.from({ length: 120 }, (_, i) => `- 无关细节 ${i} ` + "x".repeat(40)).join("\n"),
+    ].join("\n");
+    writeGlobalMemory(long);
+
+    const cwd = tmpProject();
+    const seen: ChatOptions[] = [];
+    const events: AgentEvents = {
+      onText: () => undefined,
+      onToolStart: () => undefined,
+      onToolEnd: () => undefined,
+      onStatus: () => undefined,
+      confirm: async () => true,
+    };
+    const config: XuanZhuConfig = {
+      ...DEFAULT_CONFIG,
+      provider: "fake",
+      model: "fake",
+      models: [
+        {
+          id: "fake/fake",
+          provider: "fake",
+          model: "fake",
+          contextWindow: 100_000,
+        },
+      ],
+    };
+    const provider: LLMProvider = {
+      id: "fake",
+      model: "fake",
+      async *chat(options: ChatOptions): AsyncGenerator<StreamChunk> {
+        seen.push(options);
+        yield { type: "text", text: "好的" };
+        yield { type: "done", finishReason: "stop" };
+      },
+    };
+    const agent = new Agent(provider, config, cwd, events);
+    await agent.run("本机代理端口怎么用");
+
+    const system = seen[0]?.messages.find((message) => message.role === "system");
+    expect(system?.content).toContain("本轮相关全局记忆");
+    expect(system?.content).toContain("## 网络代理");
+  });
+
   it("Agent.run 会自动触发全局捕获并提示用户", async () => {
     const cwd = tmpProject();
     const notices: string[] = [];
@@ -209,6 +262,41 @@ describe("加密凭据库", () => {
     expect(protectedText.credentialIds).toHaveLength(2);
   });
 
+  it("模型主动写全局记忆需要确认；拒绝时不落盘", async () => {
+    const denied = await memoryWriteTool.execute(
+      { content: "- 全局事实：用 pnpm", target: "global", scope: "long" },
+      { ...ctx(), confirm: async () => false },
+    );
+    expect(denied.ok).toBe(false);
+    expect(readGlobalMemory().longTerm).toBe("");
+  });
+
+  it("从工具输出来源写项目记忆需要确认", async () => {
+    const cwd = tmpProject();
+    const denied = await memoryWriteTool.execute(
+      {
+        content: "工具输出总结：项目使用 pnpm",
+        target: "project",
+        scope: "long",
+        source: "tool",
+      },
+      { cwd, autoApprove: true, confirm: async () => false },
+    );
+    expect(denied.ok).toBe(false);
+    expect(readProjectMemory(cwd).longTerm).toBe("");
+
+    const approved = await memoryWriteTool.execute(
+      {
+        content: "用户要求记录：项目使用 pnpm",
+        target: "project",
+        scope: "long",
+        source: "user",
+      },
+      { cwd, autoApprove: true, confirm: async () => false },
+    );
+    expect(approved.ok).toBe(true);
+  });
+
   it("memory_write 自动加密后落盘，不拒绝写入", async () => {
     const result = await memoryWriteTool.execute(
       { content: "sudo 密码是 p@ssw0rd", target: "global", scope: "long" },
@@ -220,5 +308,80 @@ describe("加密凭据库", () => {
     const memory = readGlobalMemory().longTerm;
     expect(memory).toContain("[加密凭据 ");
     expect(memory).not.toContain("p@ssw0rd");
+  });
+});
+
+describe("全局记忆检索与 TTL", () => {
+  it("按当前用户消息挑选相关主题，而不是整段注入", () => {
+    writeGlobalMemory(
+      [
+        "# 全局长期记忆",
+        "",
+        "## 网络代理",
+        "- 本机 SOCKS 10808 可用。",
+        "",
+        "## 用户偏好",
+        "- 回答用中文。",
+      ].join("\n"),
+    );
+
+    const selected = selectRelevantGlobalMemory(
+      readGlobalMemory().longTerm,
+      "本机代理端口 10808 怎么用",
+      1_800,
+    );
+    expect(selected).toContain("## 网络代理");
+    expect(selected).toContain("10808");
+    expect(selected).not.toContain("## 用户偏好");
+  });
+
+  it("清理超过 TTL 的自动记录，保留手工小节和近期记录", () => {
+    writeGlobalMemory(
+      [
+        "# 全局长期记忆",
+        "",
+        "## 手工约定",
+        "- 这是用户自己整理的内容，不应被 TTL 删除。",
+        "",
+        "## 自动记录 · 全局信息",
+        "- 2025-01-01：过期代理端口。",
+        "  这是过期条目的续行，应一起删除。",
+        "- 2026-10-31：近期代理端口。",
+      ].join("\n"),
+    );
+
+    const removed = pruneGlobalMemory(90, new Date("2026-10-31T12:00:00Z"));
+    expect(removed).toBe(1);
+
+    const text = readGlobalMemory().longTerm;
+    expect(text).not.toContain("过期代理端口");
+    expect(text).not.toContain("这是过期条目的续行");
+    expect(text).toContain("近期代理端口");
+    expect(text).toContain("这是用户自己整理的内容");
+  });
+
+  it("长全局记忆在静态提示词里只放主题目录", () => {
+    const long = [
+      "# 全局长期记忆",
+      "",
+      "## 网络代理",
+      "- 本机代理信息。",
+      "",
+      "## 长主题",
+      Array.from({ length: 200 }, (_, i) => `- 第 ${i} 条细节 ` + "x".repeat(40)).join("\n"),
+    ].join("\n");
+    const prompt = buildSystemPrompt(
+      tmpProject(),
+      undefined,
+      null,
+      null,
+      undefined,
+      false,
+      false,
+      { longTerm: long, recentDaily: "" },
+      4_000,
+    );
+    expect(prompt).toContain("现有全局记忆（主题目录）");
+    expect(prompt).not.toContain("第 199 条细节");
   });
 });

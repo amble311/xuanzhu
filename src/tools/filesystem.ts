@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { snapshotForUndo } from "../utils/backups";
+import { diffNote } from "../utils/diff";
 import { expandHome } from "../utils/paths";
 import type { ToolDefinition, ToolResult } from "./types";
 
@@ -254,6 +255,14 @@ export const writeFileTool: ToolDefinition = {
     if (bad) return { ok: false, content: bad.problem };
 
     try {
+      let before = "";
+      try {
+        if (fs.existsSync(target) && fs.statSync(target).isFile()) {
+          before = fs.readFileSync(target, "utf8");
+        }
+      } catch {
+        // 读不到旧内容就不展示 diff，但不影响写入
+      }
       // 写之前先快照（供 /undo 撤销）。覆盖已有文件才需要备份，
       // 新建文件的撤销语义是「删除」，由 snapshotForUndo 内部区分
       snapshotForUndo(target, ctx.cwd);
@@ -261,7 +270,9 @@ export const writeFileTool: ToolDefinition = {
       fs.writeFileSync(target, content, "utf8");
       return {
         ok: true,
-        content: `已写入 ${target}（${content.length} 字符）`,
+        content:
+          `已写入 ${target}（${content.length} 字符）` +
+          diffNote(before, content),
         summary: "写入成功",
       };
     } catch (err) {
@@ -378,7 +389,9 @@ export const editFileTool: ToolDefinition = {
     fs.writeFileSync(target, updated, "utf8");
     return {
       ok: true,
-      content: `已更新 ${target}（替换 ${replaceAll ? occurrences : 1} 处）`,
+      content:
+        `已更新 ${target}（替换 ${replaceAll ? occurrences : 1} 处）` +
+        diffNote(original, updated),
       summary: `替换 ${replaceAll ? occurrences : 1} 处`,
     };
   },

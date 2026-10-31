@@ -8,6 +8,7 @@ import {
   validateProviderConfig,
 } from "../llm";
 import { friendlyError } from "../llm/http";
+import { applyProxyConfig } from "../network/proxy";
 import { deviceCommand } from "./commands/device";
 import { restoreTerminalSafely, TuiApp } from "../tui/app";
 import { ansi } from "../utils/ansi";
@@ -29,6 +30,7 @@ import { errorsCommand } from "./commands/errors";
 import { initCommand } from "./commands/init";
 import { modelCommand } from "./commands/model";
 import { setupCommand } from "./commands/setup";
+import { vpnCommand } from "./commands/vpn";
 import { skillCommand } from "./commands/skill";
 import { recordErrorReport } from "../utils/error-reports";
 
@@ -141,6 +143,9 @@ async function main(): Promise<void> {
     case "errors":
       await errorsCommand(args.slice(1));
       return;
+    case "vpn":
+      await vpnCommand(args.slice(1));
+      return;
     case "device":
       await deviceCommand(args.slice(1));
       return;
@@ -226,6 +231,14 @@ async function startChat(
   }
 
   const config = loadConfig();
+
+  // 全局代理：先于 Provider 创建生效，让模型请求与 bash 子进程都走同一代理
+  const proxy = applyProxyConfig(config);
+  if (proxy.error) {
+    process.stdout.write(
+      `${ansi.yellow}⚠ 代理配置无效，已忽略：${proxy.error}${ansi.reset}\n`,
+    );
+  }
 
   // 默认使用**上次用过的**那个模型（记在 config.provider / config.model）；
   // 它已不在列表里时退回列表第一项 —— 顺序即回退优先级。
@@ -353,6 +366,7 @@ ${ansi.bold}用法${ansi.reset}
   ${ansi.green}xzh config edit${ansi.reset}         使用 nano 编辑配置文件
   ${ansi.green}xzh config path${ansi.reset}         打印配置文件路径
   ${ansi.green}xzh config init${ansi.reset}         生成默认配置文件
+  ${ansi.green}xzh vpn${ansi.reset}                 交互式设置 / 探测 / 测试全局 HTTP(S)/SOCKS5 代理
   ${ansi.green}xzh setup${ansi.reset}               检查并安装依赖（剪贴板工具 + 技能 CLI）
   ${ansi.green}xzh init${ansi.reset}                扫描项目并生成 / 补全 AGENTS.md 与 docs/（只追加缺失小节）
   ${ansi.green}xzh init --dry-run${ansi.reset}      只预览将生成的内容，不写文件

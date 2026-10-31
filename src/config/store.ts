@@ -89,6 +89,27 @@ export function buildIntentPrompt(template: string, message: string): string {
 }
 
 /** 玄猪主配置 */
+/**
+ * 全局网络代理（`xzh vpn` 配置）。
+ *
+ * 支持 HTTP(S) 与 SOCKS5/SOCKS5h 代理（v2ray 常见 SOCKS 10808、Clash 常见 HTTP 7890）。
+ * 不修改系统代理，只在本进程的模型请求与 bash 子进程中生效。
+ */
+export interface NetworkSettings {
+  /** 代理地址，例如 http://127.0.0.1:10809 或 socks5h://127.0.0.1:10808 */
+  proxy?: string;
+  /** 代理用户名/密码的加密凭据 id（值只存 vault，不写 config） */
+  proxyAuthId?: string;
+  /** 不走代理的地址，默认本机 */
+  noProxy?: string;
+  /** false 表示临时停用但保留地址 */
+  enabled?: boolean;
+  /** 最近一次 xzh vpn 菜单中测试的时间 */
+  lastCheckAt?: string;
+  /** 最近一次测试是否通过 */
+  lastCheckOk?: boolean;
+}
+
 export interface XuanZhuConfig {
   version: number;
   /** **上次使用的** provider 标识（见 src/llm/index.ts PROVIDERS）；空表示还没选过 */
@@ -164,6 +185,8 @@ export interface XuanZhuConfig {
    * 设为 0 表示不限制（仍会去重）。
    */
   globalMemoryMaxChars?: number;
+  /** 全局自动记录保留天数（0 = 不清理；只清理 `## 自动记录` 小节） */
+  globalMemoryTtlDays?: number;
   /**
    * 并行执行的子代理数量上限。默认 4。
    *
@@ -174,8 +197,12 @@ export interface XuanZhuConfig {
   maxParallelAgents?: number;
   /** 采样温度 */
   temperature: number;
+  /** 是否启用服务商 prompt caching（Anthropic 断点；OpenAI/Gemini 为自动缓存） */
+  promptCache?: boolean;
   /** 追加到系统提示词的额外内容 */
   systemPromptExtra?: string;
+  /** 全局 HTTP(S)/SOCKS5 代理（xzh vpn） */
+  network?: NetworkSettings;
 }
 
 export const CONFIG_VERSION = 1;
@@ -204,10 +231,17 @@ export const DEFAULT_CONFIG: XuanZhuConfig = {
   memoryMaxChars: DEFAULT_MEMORY_MAX_CHARS,
   // 全局记忆注入每个项目，默认 4000 字符，避免跨项目把提示词顶爆
   globalMemoryMaxChars: DEFAULT_GLOBAL_MEMORY_MAX_CHARS,
+  // 自动记录超过 90 天自动清理；手工整理的小节不动
+  globalMemoryTtlDays: 90,
   // 同一轮里并列的多个子代理最多同时跑 4 个：再多容易撞上服务商的速率限制，
   // 而收益有限（瓶颈通常就是那几个并发请求）。
   maxParallelAgents: 4,
   temperature: 0.2,
+  promptCache: true,
+  network: {
+    enabled: false,
+    noProxy: "127.0.0.1,localhost,::1",
+  },
 };
 
 /** 读取配置；不存在时返回默认配置（不写盘） */
@@ -285,9 +319,26 @@ function mergeConfig(partial: Partial<XuanZhuConfig>): XuanZhuConfig {
     memoryMaxChars: partial.memoryMaxChars ?? DEFAULT_CONFIG.memoryMaxChars,
     globalMemoryMaxChars:
       partial.globalMemoryMaxChars ?? DEFAULT_CONFIG.globalMemoryMaxChars,
+    globalMemoryTtlDays:
+      partial.globalMemoryTtlDays ?? DEFAULT_CONFIG.globalMemoryTtlDays,
     maxParallelAgents:
       partial.maxParallelAgents ?? DEFAULT_CONFIG.maxParallelAgents,
     temperature: partial.temperature ?? DEFAULT_CONFIG.temperature,
+    promptCache: partial.promptCache !== false,
+    network: {
+      ...DEFAULT_CONFIG.network,
+      ...(partial.network ?? {}),
+      ...(typeof partial.network?.proxy === "string" && partial.network.proxy.trim()
+        ? { proxy: partial.network.proxy.trim() }
+        : { proxy: undefined }),
+      noProxy:
+        (typeof partial.network?.noProxy === "string" &&
+          partial.network.noProxy.trim()) ||
+        DEFAULT_CONFIG.network?.noProxy,
+      enabled:
+        Boolean(partial.network?.proxy?.trim()) &&
+        partial.network?.enabled !== false,
+    },
   };
 }
 
@@ -328,6 +379,21 @@ export function maskKey(key?: string): string {
   return `${key.slice(0, 4)}...${key.slice(-4)}`;
 }
 
+/** 代理地址里的 user:password 脱敏（展示用，不可用于实际请求） */
+export function maskProxyUrl(proxy?: string): string {
+  if (!proxy) return "";
+  try {
+    const url = new URL(proxy);
+    if (url.username || url.password) {
+      url.username = url.username ? "***" : "";
+      url.password = url.password ? "***" : "";
+    }
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return "****";
+  }
+}
+
 /** 生成用于 xzh config 展示的脱敏副本 */
 export function redactConfig(config: XuanZhuConfig): unknown {
   const providers: Record<string, unknown> = {};
@@ -354,14 +420,25 @@ export function redactConfig(config: XuanZhuConfig): unknown {
       ...(config.intent?.prompt ? { prompt: config.intent.prompt } : {}),
     },
     temperature: config.temperature,
+    promptCache: config.promptCache !== false,
     maxToolRounds: config.maxToolRounds,
     autoApprove: config.autoApprove,
     memoryMaxChars: config.memoryMaxChars ?? DEFAULT_CONFIG.memoryMaxChars,
     globalMemoryMaxChars:
       config.globalMemoryMaxChars ?? DEFAULT_CONFIG.globalMemoryMaxChars,
+    globalMemoryTtlDays:
+      config.globalMemoryTtlDays ?? DEFAULT_CONFIG.globalMemoryTtlDays,
     maxParallelAgents:
       config.maxParallelAgents ?? DEFAULT_CONFIG.maxParallelAgents,
     systemPromptExtra: config.systemPromptExtra ?? "",
+    network: config.network
+      ? {
+          ...config.network,
+          ...(config.network.proxy
+            ? { proxy: maskProxyUrl(config.network.proxy) }
+            : {}),
+        }
+      : undefined,
     providers,
   };
 }

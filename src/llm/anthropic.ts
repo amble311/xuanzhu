@@ -2,9 +2,11 @@ import Anthropic from "@anthropic-ai/sdk";
 import type {
   ContentBlockParam,
   MessageParam,
+  TextBlockParam,
   Tool,
 } from "@anthropic-ai/sdk/resources/messages";
 import { llmIdleTimeoutMs, withIdleTimeout } from "./http";
+import { currentProxyUrl, proxyFetch } from "../network/proxy";
 import { StreamEmitter, withRetry } from "./stream-retry";
 import type {
   ChatMessage,
@@ -22,6 +24,8 @@ export interface AnthropicConfig {
   baseUrl?: string;
   model: string;
   maxTokens?: number;
+  /** 是否在 system / tools 上打 prompt cache 断点（默认 true） */
+  promptCache?: boolean;
 }
 
 /** Anthropic Claude Provider（流式 + tool_use，重试与断连续传见 stream-retry.ts） */
@@ -30,14 +34,18 @@ export class AnthropicProvider implements LLMProvider {
   public readonly model: string;
   private readonly client: Anthropic;
   private readonly maxTokens: number;
+  private readonly promptCache: boolean;
 
   constructor(config: AnthropicConfig) {
     this.id = config.id;
     this.model = config.model;
     this.maxTokens = config.maxTokens ?? 8192;
+    this.promptCache = config.promptCache !== false;
+    const proxy = currentProxyUrl();
     this.client = new Anthropic({
       apiKey: config.apiKey,
       baseURL: config.baseUrl,
+      ...(proxy ? { fetch: proxyFetch as never } : {}),
       maxRetries: 0, // 由本 Provider 统一控制重试，避免重复
     });
   }
@@ -65,13 +73,20 @@ export class AnthropicProvider implements LLMProvider {
           )
         : undefined;
 
+    const cached = withAnthropicPromptCache(
+      system,
+      tools,
+      this.promptCache,
+      options.systemCachePrefix,
+    );
+
     const stream = await this.client.messages.create(
       {
         model: this.model,
         max_tokens: options.maxTokens ?? this.maxTokens,
-        system: system || undefined,
+        system: cached.system,
         messages,
-        tools,
+        tools: cached.tools,
         temperature: options.temperature,
         stream: true,
       },
@@ -86,8 +101,16 @@ export class AnthropicProvider implements LLMProvider {
     for await (const event of stream) {
       switch (event.type) {
         case "message_start": {
-          const input = event.message?.usage?.input_tokens;
-          if (typeof input === "number") usage = { inputTokens: input };
+          const info = event.message?.usage;
+          const input = info?.input_tokens;
+          if (typeof input === "number") {
+            usage = {
+              inputTokens: input,
+              cachedInputTokens: info?.cache_read_input_tokens ?? undefined,
+              cacheWriteInputTokens:
+                info?.cache_creation_input_tokens ?? undefined,
+            };
+          }
           break;
         }
         case "content_block_start": {
@@ -151,6 +174,51 @@ export class AnthropicProvider implements LLMProvider {
       usage,
     };
   }
+}
+
+/**
+ * Anthropic prompt cache 断点：
+ * - 最后一个 tool 打一个断点（tools 是稳定前缀，system 的动态变化不会冲掉它）；
+ * - system 再打一个断点，覆盖静态系统提示词。
+ * Anthropic 最多 4 个断点，这里只用 2 个。
+ */
+export function withAnthropicPromptCache(
+  system: string,
+  tools: Tool[] | undefined,
+  enabled: boolean,
+  cachePrefix?: string,
+): {
+  system: string | TextBlockParam[] | undefined;
+  tools: Tool[] | undefined;
+} {
+  if (!enabled) {
+    return { system: system || undefined, tools };
+  }
+  const cachedTools =
+    tools && tools.length > 0
+      ? tools.map((tool, index) =>
+          index === tools.length - 1
+            ? { ...tool, cache_control: { type: "ephemeral" as const } }
+            : tool,
+        )
+      : tools;
+  let systemBlocks: TextBlockParam[] | undefined;
+  if (system) {
+    // 只有静态前缀走缓存；动态追加（相关记忆、goal、提醒）放在后一个 block，
+    // 这样它变化时不会让整个 system 缓存失效。
+    const prefix =
+      cachePrefix && system.startsWith(cachePrefix) ? cachePrefix : system;
+    const rest = system.slice(prefix.length);
+    systemBlocks = [
+      {
+        type: "text",
+        text: prefix,
+        cache_control: { type: "ephemeral" },
+      },
+    ];
+    if (rest.trim()) systemBlocks.push({ type: "text", text: rest });
+  }
+  return { system: systemBlocks, tools: cachedTools };
 }
 
 function toAnthropicMessages(messages: ChatMessage[]): {

@@ -147,6 +147,12 @@ export const memoryWriteTool: ToolDefinition = {
         enum: ["project", "global"],
         description: "project=当前项目（默认）；global=跨项目全局记忆",
       },
+      source: {
+        type: "string",
+        enum: ["user", "tool", "model"],
+        description:
+          "信息来源：user=用户明确要求；tool=从命令/文件/网页输出总结；model=模型自行推断。project + tool 会要求确认",
+      },
     },
     required: ["content"],
   },
@@ -158,6 +164,8 @@ export const memoryWriteTool: ToolDefinition = {
     }
     const scope = args.scope === "long" ? "long" : "daily";
     const target = args.target === "global" ? "global" : "project";
+    const source =
+      args.source === "user" || args.source === "tool" ? args.source : "model";
 
     const protectedContent = protectForMemory(rawContent);
     if (protectedContent.error) {
@@ -169,6 +177,37 @@ export const memoryWriteTool: ToolDefinition = {
         ? `\n\n（已加密 ${protectedContent.credentialIds.length} 项凭据，` +
           "记忆只保留 `[加密凭据 ...]` 引用）"
         : "";
+
+    // 项目记忆也可能被工具输出/网页内容里的指令污染。模型从外部内容总结记忆时
+    // 必须标 source=tool，这里要求用户确认；用户明确要求（source=user）不打断。
+    if (target === "project" && source === "tool" && ctx.confirm) {
+      const approved = await ctx.confirm({
+        tool: "memory_write",
+        title: "写入项目记忆？",
+        detail:
+          "这段内容来自工具输出 / 文件 / 网页，可能包含 Prompt Injection。\n" +
+          "确认要把以下内容写进项目记忆吗？\n\n" +
+          content.slice(0, 1200),
+        danger: false,
+      });
+      if (!approved) {
+        return { ok: false, content: "已取消写入项目记忆。" };
+      }
+    }
+
+    if (target === "global" && ctx.confirm) {
+      const approved = await ctx.confirm({
+        tool: "memory_write",
+        title: "写入跨项目全局记忆？",
+        detail:
+          "以下内容将注入所有项目。请确认没有 Prompt Injection 或敏感信息：\n\n" +
+          content.slice(0, 1200),
+        danger: false,
+      });
+      if (!approved) {
+        return { ok: false, content: "已取消写入全局记忆。" };
+      }
+    }
 
     const paths = pathsFor(target, ctx.cwd);
     const limit =
@@ -257,6 +296,12 @@ export const memoryCompactTool: ToolDefinition = {
         enum: ["project", "global"],
         description: "project=当前项目长期记忆（默认）；global=全局长期记忆",
       },
+      source: {
+        type: "string",
+        enum: ["user", "tool", "model"],
+        description:
+          "信息来源：user=用户明确要求；tool=从命令/文件/网页输出总结；model=模型自行推断。project + tool 会要求确认",
+      },
     },
     required: ["content"],
   },
@@ -270,6 +315,8 @@ export const memoryCompactTool: ToolDefinition = {
       };
     }
     const target = args.target === "global" ? "global" : "project";
+    const source =
+      args.source === "user" || args.source === "tool" ? args.source : "model";
     const protectedContent = protectForMemory(rawContent);
     if (protectedContent.error) {
       return { ok: false, content: protectedContent.error };
@@ -279,6 +326,37 @@ export const memoryCompactTool: ToolDefinition = {
       protectedContent.credentialIds.length > 0
         ? `\n（已加密 ${protectedContent.credentialIds.length} 项凭据）`
         : "";
+
+    // 项目记忆也可能被工具输出/网页内容里的指令污染。模型从外部内容总结记忆时
+    // 必须标 source=tool，这里要求用户确认；用户明确要求（source=user）不打断。
+    if (target === "project" && source === "tool" && ctx.confirm) {
+      const approved = await ctx.confirm({
+        tool: "memory_write",
+        title: "写入项目记忆？",
+        detail:
+          "这段内容来自工具输出 / 文件 / 网页，可能包含 Prompt Injection。\n" +
+          "确认要把以下内容写进项目记忆吗？\n\n" +
+          content.slice(0, 1200),
+        danger: false,
+      });
+      if (!approved) {
+        return { ok: false, content: "已取消写入项目记忆。" };
+      }
+    }
+
+    if (target === "global" && ctx.confirm) {
+      const approved = await ctx.confirm({
+        tool: "memory_compact",
+        title: "重写跨项目全局记忆？",
+        detail:
+          "以下内容将覆盖全局记忆并注入所有项目，请检查：\n\n" +
+          content.slice(0, 1200),
+        danger: false,
+      });
+      if (!approved) {
+        return { ok: false, content: "已取消重写全局记忆。" };
+      }
+    }
 
     const paths = pathsFor(target, ctx.cwd);
     const label = target === "global" ? "全局" : "项目";

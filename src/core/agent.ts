@@ -35,6 +35,7 @@ import type {
   ImageAttachment,
   LLMProvider,
   ToolCall,
+  Usage,
 } from "../llm/types";
 import { appendSessionMessages } from "./sessions";
 import {
@@ -75,9 +76,11 @@ import {
   DEFAULT_GLOBAL_MEMORY_MAX_CHARS,
   DEFAULT_MEMORY_MAX_CHARS,
   loadProjectRules,
+  pruneGlobalMemory,
   readGlobalMemory,
   readProjectMemory,
   resolveProjectPaths,
+  selectRelevantGlobalMemory,
 } from "../workspace";
 import {
   addTaskDecision,
@@ -91,7 +94,7 @@ import {
   type TaskLedger,
 } from "./task-ledger";
 import { goalSystemSection } from "./goal";
-import { buildSystemPrompt } from "./prompt";
+import { buildSystemPrompt, GLOBAL_MEMORY_EXCERPT_CHARS } from "./prompt";
 import {
   buildSelfState,
   finishGatePrompt,
@@ -141,6 +144,8 @@ export interface AgentEvents {
   }) => void;
   /** 任务列表更新（来自 todo_write） */
   onTodos?: (items: TodoItem[]) => void;
+  /** 服务端返回的真实 token usage（每次模型请求一次） */
+  onUsage?: (usage: Usage) => void;
   /** 请求用户确认危险操作 */
   confirm: (request: ConfirmRequest) => Promise<boolean>;
 }
@@ -575,6 +580,10 @@ export class Agent {
   private runVerifyOk = false;
   /** 本轮模型是否已经主动写过记忆（写过就不再自动补一条） */
   private runWroteMemory = false;
+  /** 系统提示词构建时的全局记忆快照（用于本轮相关性注入） */
+  private globalMemory?: { longTerm: string; recentDaily: string } | null;
+  /** 本轮用户消息（尚未提交进 history，供提示词相关性/全局提醒使用） */
+  private turnUserText = "";
   /** 是否启用自动记忆（子代理关闭） */
   private autoMemory: boolean;
   /** 是否维护任务账本（子代理关闭，避免覆盖主任务） */
@@ -648,8 +657,10 @@ export class Agent {
     // 子代理使用调用方给定的角色提示词（不注入项目规则与记忆 —— 它只做一件子任务），
     // 因此也不参与记忆精简：记忆归属主代理。
     if (this.systemPromptOverride) return this.systemPromptOverride;
-    // 读记忆之前先做一次自动精简，保证注入提示词的是精简后的版本
+    // 读记忆之前先做一次自动精简 / TTL，保证注入提示词的是精简后的版本
     this.autoCompactMemory();
+    const globalMemory = readGlobalMemory();
+    this.globalMemory = globalMemory;
     return buildSystemPrompt(
       this.cwd,
       this.config.systemPromptExtra,
@@ -658,8 +669,13 @@ export class Agent {
       this.config.memoryMaxChars,
       Boolean(this.deviceBridge),
       this.contextProfile() === "small",
-      readGlobalMemory(),
+      globalMemory,
       this.config.globalMemoryMaxChars,
+      Boolean(
+        this.config.network?.proxy &&
+          this.config.network.enabled !== false &&
+          this.config.network.lastCheckOk !== false,
+      ),
     );
   }
 
@@ -670,13 +686,34 @@ export class Agent {
    * `this.systemPrompt`：目标结束时只需清掉 `this.goal`，提示词自动恢复；
    * 而 `this.systemPrompt` 是 `/switch`、记忆精简等逻辑的基线，不该混入临时状态。
    */
-  private effectiveSystemPrompt(): string {
-    let prompt = this.systemPrompt;
+  private effectiveSystemParts(): { static: string; dynamic: string } {
+    const parts: string[] = [];
     if (this.goal && !this.goal.completed) {
-      prompt += `\n\n${goalSystemSection(this.goal.text)}`;
+      parts.push(goalSystemSection(this.goal.text));
+    }
+    // 全局记忆较长时，静态提示词里只有主题目录；这里按最近几轮用户消息挑相关小节。
+    // 只看最后一条会让「继续」「然后呢」这类消息选不到上一轮主题。
+    const recent = this.recentUserText();
+    if (
+      recent &&
+      this.globalMemory?.longTerm &&
+      this.globalMemory.longTerm.length > GLOBAL_MEMORY_EXCERPT_CHARS
+    ) {
+      const relevant = selectRelevantGlobalMemory(
+        this.globalMemory.longTerm,
+        recent,
+        1_800,
+      );
+      if (relevant) parts.push(`## 本轮相关全局记忆\n${relevant}`);
     }
     const hint = this.globalMemoryHint();
-    return hint ? `${prompt}\n\n${hint}` : prompt;
+    if (hint) parts.push(hint);
+    return { static: this.systemPrompt, dynamic: parts.join("\n\n") };
+  }
+
+  private effectiveSystemPrompt(): string {
+    const parts = this.effectiveSystemParts();
+    return parts.dynamic ? `${parts.static}\n\n${parts.dynamic}` : parts.static;
   }
 
   /**
@@ -686,15 +723,36 @@ export class Agent {
    * 全局记忆会影响所有项目，误提取（尤其把密码原文写进去）代价很大，
    * 因此只提醒模型在本轮结束前判断并调用 memory_write target=global。
    */
-  private globalMemoryHint(): string | undefined {
+  /** 最近 3 条用户消息（含本轮尚未提交的），用于主题检索 */
+  private recentUserText(): string | undefined {
+    const historyUsers = this.history
+      .filter(
+        (message) =>
+          message.role === "user" && typeof message.content === "string",
+      )
+      .slice(-3)
+      .map((message) => message.content);
+    if (this.turnUserText.trim()) historyUsers.push(this.turnUserText);
+    const text = historyUsers.filter(Boolean).join("\n").trim();
+    return text || undefined;
+  }
+
+  private lastUserText(): string | undefined {
+    if (this.turnUserText.trim()) return this.turnUserText;
     const lastUser = [...this.history]
       .reverse()
       .find(
         (message) =>
           message.role === "user" && typeof message.content === "string",
       );
-    if (!lastUser || typeof lastUser.content !== "string") return undefined;
-    const text = lastUser.content;
+    return lastUser && typeof lastUser.content === "string"
+      ? lastUser.content
+      : undefined;
+  }
+
+  private globalMemoryHint(): string | undefined {
+    const text = this.lastUserText();
+    if (!text) return undefined;
     if (
       !/(全局|所有项目|每个项目|跨项目|以后都|以后每次|统一用|统一使用|sudo|v2ray|本机代理|密码|凭据|all projects|across projects)/i.test(
         text,
@@ -754,6 +812,13 @@ export class Agent {
         this.config.memoryMaxChars ?? DEFAULT_MEMORY_MAX_CHARS,
       ),
     );
+    const ttlDays = this.config.globalMemoryTtlDays ?? 90;
+    const pruned = pruneGlobalMemory(ttlDays);
+    if (pruned > 0) {
+      this.pendingMemoryNotices.push(
+        `全局长期记忆已清理 ${pruned} 条超过 ${ttlDays} 天的自动记录（手工整理的小节不受影响）。`,
+      );
+    }
     report(
       "全局",
       compactGlobalMemoryIfNeeded(
@@ -781,6 +846,7 @@ export class Agent {
     this.sessionChangedFiles.clear();
     this.contextUsage = undefined;
     this.runStatus = undefined;
+    this.turnUserText = "";
     // 新对话 = 新任务：旧账本不再适用于这段历史
     clearTaskLedger(this.cwd);
     this.task = undefined;
@@ -1436,6 +1502,8 @@ export class Agent {
     this.runWroteMemory = false;
     // 用户最新一条消息定义当前任务；旧任务暂停时不会自动继续
     this.beginTask(userInput);
+    // 原始输入用于全局记忆相关性/提醒；意图分析后的 content 可能丢失关键词
+    this.turnUserText = userInput;
 
     // 自动捕获全局信息（跨项目偏好、本机代理、sudo 等）。
     // 凭据值在写入前加密，记忆里只留引用；目标模式/子代理不参与，避免重复。
@@ -1528,6 +1596,7 @@ export class Agent {
     const commitTurn = (): void => {
       this.appendHistory(turn);
       this.trimHistory();
+      this.turnUserText = "";
     };
 
     /**
@@ -2130,7 +2199,9 @@ export class Agent {
     // 直接并入系统提示词而不是另起一条 system 消息：各家最终都会把它并进系统提示词，
     // 单独一条还会改变「对话首条 system 是裁剪提醒」的既有结构（历史裁剪提醒依赖该位置）。
     const stateBlock = this.buildSelfStateBlock();
-    const systemParts = [this.effectiveSystemPrompt()];
+    const system = this.effectiveSystemParts();
+    const systemParts = [system.static];
+    if (system.dynamic) systemParts.push(system.dynamic);
     if (hoisted.notes.length > 0) systemParts.push(...hoisted.notes);
     if (stateBlock) systemParts.push(stateBlock);
     const messages: ChatMessage[] = [
@@ -2164,6 +2235,7 @@ export class Agent {
         tools: getToolSpecs(this.requestTools()),
         temperature: this.config.temperature,
         maxTokens: this.requestMaxTokens(),
+        systemCachePrefix: system.static,
         signal,
         onRetry: (retryAttempt, maxAttempts, error, info) => {
           // 区分「还没输出就失败」与「输出到一半断连后续传」——
@@ -2200,6 +2272,7 @@ export class Agent {
             toolCalls.push(chunk.toolCall);
             break;
           case "done":
+            if (chunk.usage) this.events.onUsage?.(chunk.usage);
             // 真实 usage 回填：把「本次估算 vs 服务端实际计入」的偏差记进校正器，
             // 下一次组装请求时据此收紧预算（只收紧、不放宽）。
             if (chunk.usage?.inputTokens) {

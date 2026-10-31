@@ -83,6 +83,38 @@ describe("仓库地图索引", () => {
     );
   });
 
+  it("索引新增语言（Lua / Shell）", () => {
+    const cwd = seedProject();
+    fs.writeFileSync(
+      path.join(cwd, "src", "tools", "job.lua"),
+      "function run_lua()\n  return 1\nend\n",
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(cwd, "src", "tools", "build.sh"),
+      "build_all() {\n  echo hi\n}\n",
+      "utf8",
+    );
+    clearRepoIndexCache();
+    const index = buildRepoIndex(cwd, true);
+    expect(index.files).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "src/tools/job.lua",
+          symbols: expect.arrayContaining([
+            expect.objectContaining({ name: "run_lua", kind: "function" }),
+          ]),
+        }),
+        expect.objectContaining({
+          path: "src/tools/build.sh",
+          symbols: expect.arrayContaining([
+            expect.objectContaining({ name: "build_all", kind: "function" }),
+          ]),
+        }),
+      ]),
+    );
+  });
+
   it("repo_map 按查询返回相关文件与符号", async () => {
     const cwd = seedProject();
     clearRepoIndexCache();

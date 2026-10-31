@@ -2,6 +2,7 @@ import { spawn } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import { expandHome } from "../utils/paths";
+import { isProxyActive } from "../network/proxy";
 import type { ToolDefinition, ToolResult } from "./types";
 
 const MAX_OUTPUT = 30000;
@@ -64,8 +65,16 @@ function runCommand(
     }
 
     const isWindows = process.platform === "win32";
-    const shell = isWindows ? "cmd.exe" : process.env.SHELL || "bash";
-    const args = isWindows ? ["/d", "/s", "/c", command] : ["-lc", command];
+    // XZH_SHELL 可指定 POSIX shell（Windows 上常用 Git Bash / WSL 的 bash），
+    // 用于绕过 cmd.exe 与技能命令不兼容的问题；默认仍按平台选择。
+    const customShell = process.env.XZH_SHELL?.trim();
+    const shell =
+      customShell || (isWindows ? "cmd.exe" : process.env.SHELL || "bash");
+    const args = customShell
+      ? ["-lc", command]
+      : isWindows
+        ? ["/d", "/s", "/c", command]
+        : ["-lc", command];
 
     const child = spawn(shell, args, {
       cwd,
@@ -368,10 +377,13 @@ export const bashTool: ToolDefinition = {
     }
     if (result.code !== 0 && looksLikeNetworkFailure(full)) {
       parts.push(
-        "[网络提示] 命令看起来因外网不可达而失败。若本机已有 v2ray / Clash / sing-box，" +
-          "请先 load_skill v2ray，按指南探测本地代理后重试；" +
-          "用代理时只对当前命令临时设置 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY，" +
-          "并设置 NO_PROXY=127.0.0.1,localhost。",
+        isProxyActive()
+          ? "[网络提示] 已启用 xzh vpn 全局代理，但命令仍然外网失败。先运行 " +
+              "`xzh vpn` 菜单中测试代理；代理正常时不要重复 load_skill v2ray。"
+          : "[网络提示] 命令看起来因外网不可达而失败。若本机已有 v2ray / Clash / sing-box，" +
+              "请先 load_skill v2ray，按指南探测本地代理后重试；" +
+              "用代理时只对当前命令临时设置 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY，" +
+              "并设置 NO_PROXY=127.0.0.1,localhost。",
       );
     }
     parts.push(`[退出码] ${result.code ?? "未知"}`);

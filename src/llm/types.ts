@@ -62,6 +62,10 @@ export interface ToolSpec {
 export interface Usage {
   inputTokens?: number;
   outputTokens?: number;
+  /** 命中服务端 prompt cache 的输入 token（OpenAI cached_tokens / Anthropic cache_read） */
+  cachedInputTokens?: number;
+  /** 本次写入缓存的输入 token（Anthropic cache_creation；OpenAI 不返回） */
+  cacheWriteInputTokens?: number;
 }
 
 export type StreamChunk =
@@ -83,6 +87,12 @@ export interface ChatOptions {
   messages: ChatMessage[];
   tools: ToolSpec[];
   temperature?: number;
+  /**
+   * 系统提示词中可缓存的静态前缀。
+   * Anthropic 用它把 static / dynamic system 分成两个 block，
+   * 避免「本轮相关记忆 / goal / 提醒」变化冲掉整个 system cache。
+   */
+  systemCachePrefix?: string;
   /** 单次回复的最大输出 token 数（不设则由 Provider 默认值决定） */
   maxTokens?: number;
   signal?: AbortSignal;

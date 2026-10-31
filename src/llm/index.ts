@@ -255,7 +255,13 @@ export function createProvider(
 
   switch (meta.kind) {
     case "anthropic":
-      return new AnthropicProvider({ id: meta.id, apiKey, baseUrl, model });
+      return new AnthropicProvider({
+        id: meta.id,
+        apiKey,
+        baseUrl,
+        model,
+        promptCache: config.promptCache !== false,
+      });
     case "gemini":
       return new GeminiProvider({ id: meta.id, apiKey, baseUrl, model });
     case "openai":

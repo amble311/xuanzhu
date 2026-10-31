@@ -106,6 +106,7 @@ export class GeminiProvider implements LLMProvider {
         usage = {
           inputTokens: meta.promptTokenCount,
           outputTokens: meta.candidatesTokenCount,
+          cachedInputTokens: meta.cachedContentTokenCount,
         };
       }
     }

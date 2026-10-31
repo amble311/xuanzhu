@@ -170,6 +170,7 @@ xzh
 | `xzh config edit` | 使用 `nano` 编辑配置文件 |
 | `xzh config path` | 打印配置文件路径 |
 | `xzh config init` | 生成默认配置文件 |
+| `xzh vpn` | 交互式设置 / 探测 / 测试 / 启停全局 HTTP(S)/SOCKS5 代理 |
 | `xzh setup` | 检查并自动安装依赖（玄猪自身 + 技能：playwright / officecli / 剪贴板工具等） |
 | `xzh init` | 扫描项目并生成 / 补全 `AGENTS.md` 与 `docs/`（已有内容只补缺失小节） |
 | `xzh init --dry-run` | 只预览将生成的内容，不写文件 |
@@ -211,6 +212,9 @@ XZH_HOME=/path/to/dir xzh          # 改用 /path/to/dir/config.json
 适用于多环境并行（本机 / 远程 / 容器各持一份配置互不干扰）。设置后**不会**执行
 `~/.xuanzhu` 的旧目录迁移 —— 那是为你显式指定的新位置，不该把家目录里的旧数据搬进去。
 
+Windows 上如果希望 bash 工具使用 Git Bash / WSL 的 shell，可设置 `XZH_SHELL`（指向一个
+支持 `-lc` 的 POSIX shell）；默认 Windows 仍用 `cmd.exe`。
+
 ```json
 {
   "version": 1,
@@ -227,6 +231,13 @@ XZH_HOME=/path/to/dir xzh          # 改用 /path/to/dir/config.json
   "confirmSensitiveRead": false,
   "memoryMaxChars": 12000,
   "globalMemoryMaxChars": 4000,
+  "globalMemoryTtlDays": 90,
+  "promptCache": true,
+  "network": {
+    "enabled": true,
+    "proxy": "http://127.0.0.1:10809",
+    "noProxy": "127.0.0.1,localhost,::1"
+  },
   "maxParallelAgents": 4,
   "intent": { "enabled": false },
   "providers": {
@@ -249,6 +260,12 @@ XZH_HOME=/path/to/dir xzh          # 改用 /path/to/dir/config.json
 | `confirmSensitiveRead` | `false` | 读取凭据类文件（`.env`、`~/.ssh`、`config.json` 等）时是否确认 |
 | `memoryMaxChars` | `12000` | **项目**长期记忆字符上限，超出即自动精简（`0` = 不限制长度，仍去重） |
 | `globalMemoryMaxChars` | `4000` | **全局**长期记忆字符上限；全局记忆注入每个项目，默认更紧 |
+| `globalMemoryTtlDays` | `90` | 全局自动记录保留天数；只清理 `## 自动记录` / `## 网络代理` 小节，手工小节不动（`0` = 不清理） |
+| `promptCache` | `true` | 服务商 prompt caching；Anthropic 显式断点，OpenAI/Gemini 为自动缓存 |
+| `network.proxy` | — | 全局 HTTP(S)/SOCKS5 代理；模型请求与 bash 子进程共用，`xzh vpn` 管理 |
+| `network.proxyAuthId` | — | 代理用户名/密码的加密凭据引用；`xzh vpn` 自动生成，config 不保存密码 |
+| `network.noProxy` | `127.0.0.1,localhost,::1` | 不走代理的地址；本机模型端点默认绕过 |
+| `network.enabled` | `false` | 代理开关；在 `xzh vpn` 菜单中可停用并保留地址 |
 | `maxParallelAgents` | `4` | 并行子代理数量上限（`1` = 串行，硬上限 16） |
 | `intent.enabled` | `false` | 意图分析（每条消息先分析再处理） |
 | `intent.prompt` | 内置模板 | 意图分析模板，占位符 `{{'用户发送过来的消息'}}` |
@@ -288,7 +305,7 @@ xzh model modelid custom/qwen3.6-35b qwen3.6-35b-new
 xzh model remove openai/gpt-4o         # 删除（id / 模型名 / 序号 / 别名均可）
 ```
 
-想让某个模型**不参与回退**，直接 `xzh model remove` 删掉即可。当前使用的模型显示在界面顶部与状态栏，
+想让某个模型**不参与回退**，直接 `xzh model remove` 删掉即可。当前使用的模型显示在底部状态栏，
 发生回退时输出区会给出提示；想临时换一个用，直接在对话里 `/model` 选（`xzh model` 仍是增删改的入口）。
 
 **自定义模型的别名与模型 ID**：交互式 `xzh model add custom` 会先问「模型别名」（仅用于展示，
@@ -395,8 +412,8 @@ API Key 也可以来自环境变量，优先级低于配置文件：
 | `list_skills` | 列出玄猪可用的全部技能 | 否 |
 | `load_skill` | 加载指定技能的完整指南 | 否 |
 | `memory_read` | 读取项目 / 全局记忆（`target=project\|global\|all`；长期记忆 + 最近日志） | 否 |
-| `memory_write` | 写入项目 / 全局记忆（`target` + `scope`），凭据值自动 AES-GCM 加密，长期记忆超限时自动精简 | 否 |
-| `memory_compact` | 用精简后的完整内容重写项目 / 全局长期记忆（凭据值自动加密；把新结论并入主题小节 / 语义压缩） | 否 |
+| `memory_write` | 写入项目 / 全局记忆（`target` + `scope`），支持 `source=user/tool/model`；来源为工具输出且写项目记忆时需确认；凭据值自动 AES-GCM 加密 | 否 |
+| `memory_compact` | 用精简后的完整内容重写项目 / 全局长期记忆（凭据值自动加密；支持来源确认；把新结论并入主题小节 / 语义压缩） | 否 |
 | `todo_write` | 创建 / 更新任务列表（每次提交完整列表） | 否 |
 | `goal_complete` | 目标模式（`/goal`）下声明目标已全部完成（仅主代理可用） | 否 |
 | `report_status` | 结构化上报受阻 / 需要用户决定 / 置信度低（仅主代理可用） | 否 |
@@ -422,7 +439,7 @@ API Key 也可以来自环境变量，优先级低于配置文件：
 ## 任务拆分与子代理
 
 **任务拆分**：任务需要 3 步以上、或用户一次提出多项要求时，玄猪会先用 `todo_write`
-把计划写成结构化列表，每完成一步就更新状态。列表显示在顶部信息区（`任务 2/5` +
+把计划写成结构化列表，每完成一步就更新状态。列表显示在顶部信息区的快捷键提示下方（`任务 2/5` +
 进行中项），比"它说自己做到哪了"更可靠。
 
 **子代理**：`task` 工具会**新建一个独立的 Agent 实例**去完成一件子任务，只有最终结论
@@ -617,6 +634,7 @@ npm run bench -- \
 输出：按 window/profile 的成功率汇总、按任务类型的汇总、逐项明细；同时写
 `/tmp/xzh-bench-results.json`。`--modules`、`--tasks`、`--timeout` 可调。
 端点未返回 `usage` 时，token 数使用本地估算（用于比较趋势，不当作精确计费）。
+TUI `/usage` 显示服务端真实 input/output 与缓存命中；缓存统计取决于服务商是否返回。
 
 ## 小上下文模型（small 档）
 
@@ -796,7 +814,8 @@ AutoX.js 那侧也可用环境变量 `XZH_DEVICE_PORT` 指定端口。
 - 因此每个项目目录各自拥有独立的记忆与规则；`~/.xzh` 保存**全局配置、全局记忆、会话、日志与技能**，
   不保存项目记忆
 - **查看 / 清空**：`/memory` 显示项目记忆目录、长期记忆字符数与每日日志份数；
-  `/memory global` 查看全局记忆；`/memory clear [global]` 清空对应记忆。
+  `/memory global` 查看全局记忆状态、`/memory show [global]` 查看全文；
+  `/memory clear [global]` 清空对应记忆。
   清空**必须二次确认**：确认框默认停在「拒绝」，要按 `y`（或 ← → 切到「允许」再回车）才会执行，
   一个回车不会误删。它只删对应 `memory/` 下的记忆文件，**不会**删除 `~/.xzh/sessions/` 的会话存档，
   清空后系统提示词立即刷新（后续请求不再注入旧记忆）
@@ -812,6 +831,8 @@ AutoX.js 那侧也可用环境变量 `XZH_DEVICE_PORT` 指定端口。
 
 - 启动时先注入全局记忆，再注入项目记忆；全局记忆默认上限 `globalMemoryMaxChars=4000`，
   超限自动去重/裁剪，仍超限时用 `memory_compact target=global` 语义精简。
+- 记忆超过约 2500 字符时，静态提示词只放**主题目录**；每轮按最近 3 条用户消息挑相关小节注入。
+- `globalMemoryTtlDays` 默认 90 天：只清理 `## 自动记录` 下过期的日期行，手工整理的小节不会被动。
 - 当用户说「全局 / 所有项目 / 跨项目 / 以后都 / 统一用」时，玄猪会**自动捕获**消息里的
   关键信息写入全局记忆；只属于当前项目的内容仍写项目记忆。模型也可以用
   `memory_write target=global` 主动补充。
@@ -823,7 +844,29 @@ AutoX.js 那侧也可用环境变量 `XZH_DEVICE_PORT` 指定端口。
 - `memory_read` / `memory_write` / `memory_compact` 都支持 `target=project|global`
   （`memory_read` 还支持 `all`）。
 
-### 外网与本地代理
+### 外网与代理（`xzh vpn` / `v2ray`）
+
+运行 `xzh vpn` 进入交互菜单（和 `xzh model` 一致，方向键 / 数字选择）：
+
+```text
+玄猪代理
+  地址：socks5h://127.0.0.1:10808
+  状态：已启用
+请选择操作：
+  1. 设置 / 修改代理
+  2. 探测本机代理
+  3. 测试当前代理
+  4. 启用 / 停用代理
+  5. 清除代理配置
+  6. 退出
+```
+
+代理支持 HTTP(S) 与 SOCKS5；带用户名/密码的地址会把认证拆到加密 vault，config 只保留地址。
+SOCKS 对 `npm` / `pip` 支持有限，这些工具建议同时开启 HTTP 入站。
+配置成功且 `lastCheckOk` 不为 false 时，
+**模型请求与 bash 子进程都会走这个代理**；
+系统提示词会标记「全局代理（已配置）」，此时不会触发 `v2ray` 技能，避免重复探测。
+只有没配置代理、或在 `xzh vpn` 菜单中测试失败时，才用下面的 `v2ray` 技能临时兜底。
 
 内置 `v2ray` 技能用于「需要外网但直连失败」的场景：探测本机已有的
 v2ray / Clash / mihomo / sing-box **本地 SOCKS/HTTP 入站端口**，验证后**只对当前命令**
@@ -991,7 +1034,7 @@ description: 一句话说明该技能的用途与适用场景
 kitty / Ghostty 会把该 xterm 兼容序列映射成「所有按键都用转义码上报」而破坏普通输入，
 故玄猪对这两类终端不发送请求，请改用 `Alt+Enter` 或在终端侧自行配置。
 
-界面内命令：`/help`、`/clear`、`/tools`、`/context`、`/compact`、`/focus [文件]`、`/device`、`/image`（`/paste`）、`/copy [N|A-B|last|all]`、`/mouse`、`/reset`、`/undo`、`/resume [编号]`、`/cwd`、`/switch <目录>`、`/term`、`/model [编号|id|模型名]`、`/goal <目标>`（`/goal [status|continue|off]`）、`/memory [global|clear [global]]`、`/init [--dry-run|--force]`、`/auto [on|off]`、`/intent [on|off]`、`/exit`。
+界面内命令：`/help`、`/clear`、`/tools`、`/context`、`/compact`、`/focus [文件]`、`/device`、`/image`（`/paste`）、`/copy [N|A-B|last|all]`、`/mouse`、`/reset`、`/resume [编号]`、`/cwd`、`/switch <目录>`、`/term`、`/model [编号|id|模型名]`、`/goal <目标>`（`/goal [status|continue|off]`）、`/memory [global|show [global]|clear [global]]`、`/usage`、`/undo [N]`、`/init [--dry-run|--force]`、`/auto [on|off]`、`/intent [on|off]`、`/exit`。
 
 ### 选中与复制
 

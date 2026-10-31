@@ -5,6 +5,7 @@ import type {
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
 import { createNonPoolingAgent, llmIdleTimeoutMs, withIdleTimeout } from "./http";
+import { currentProxyUrl, proxyFetch } from "../network/proxy";
 import { StreamEmitter, withRetry } from "./stream-retry";
 import type {
   ChatOptions,
@@ -43,10 +44,15 @@ export class OpenAICompatProvider implements LLMProvider {
     this.id = config.id;
     this.model = config.model;
     const targetUrl = config.baseUrl || "https://api.openai.com/v1";
+    const proxy = currentProxyUrl();
     this.client = new OpenAI({
       apiKey: config.apiKey || "not-needed",
       baseURL: config.baseUrl,
-      httpAgent: createNonPoolingAgent(targetUrl),
+      // 配置了 xzh vpn 时改用 undici fetch（走全局 ProxyAgent）；
+      // 未配置时保留原来的 httpAgent：禁用 keep-alive + 空闲超时。
+      ...(proxy
+        ? { fetch: proxyFetch as never }
+        : { httpAgent: createNonPoolingAgent(targetUrl) }),
       // 重试统一交给 withRetry（见 stream-retry.ts）。
       // SDK 默认 maxRetries = 2 且**不会**回调 onRetry，会让实际请求次数
       // 最多膨胀到 1+2 再乘以 MAX_ATTEMPTS，界面上却仍显示 "1/3"。
@@ -98,6 +104,8 @@ export class OpenAICompatProvider implements LLMProvider {
         usage = {
           inputTokens: chunk.usage.prompt_tokens,
           outputTokens: chunk.usage.completion_tokens,
+          cachedInputTokens:
+            chunk.usage.prompt_tokens_details?.cached_tokens ?? undefined,
         };
       }
 

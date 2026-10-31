@@ -1,3 +1,4 @@
+import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import type { ToolContext, ToolDefinition, ToolResult } from "./types";
@@ -40,6 +41,12 @@ export interface RepoFile {
   path: string;
   lines: number;
   symbols: RepoSymbol[];
+  /** 增量索引用：mtime / ctime / 文件大小；旧缓存可能没有 */
+  mtimeMs?: number;
+  ctimeMs?: number;
+  sizeBytes?: number;
+  /** 文件内容 SHA-1；用于 mtime/ctime/size 都没变但内容被改写的极端情况 */
+  contentHash?: string;
 }
 
 export interface RepoIndex {
@@ -91,6 +98,14 @@ const SOURCE_EXTS = new Set([
   ".rb",
   ".php",
   ".swift",
+  ".scala",
+  ".lua",
+  ".dart",
+  ".zig",
+  ".sol",
+  ".vue",
+  ".svelte",
+  ".sh",
   ".md",
 ]);
 
@@ -207,12 +222,26 @@ function kindOfLine(
     return null;
   }
 
-  // Java / Kotlin / C# / C++ 等：至少索引类型
-  let m = /^(?:public\s+|private\s+|protected\s+|static\s+|final\s+|abstract\s+)*(?:class|interface|enum|record)\s+([A-Za-z_]\w*)/.exec(
+  // Lua / Shell
+  if (ext === ".lua") {
+    const m = /^(?:local\s+)?function\s+([A-Za-z_]\w*)/.exec(trimmed);
+    if (m?.[1]) return { name: m[1], kind: "function" };
+    return null;
+  }
+  if (ext === ".sh") {
+    const m = /^(?:function\s+)?([A-Za-z_]\w*)\s*\(\)\s*\{/.exec(trimmed);
+    if (m?.[1]) return { name: m[1], kind: "function" };
+    return null;
+  }
+
+  // Java / Kotlin / C# / C++ / Scala / Swift 等：类型 + 常见方法
+  let m = /^(?:public\s+|private\s+|protected\s+|static\s+|final\s+|abstract\s+|open\s+|internal\s+|suspend\s+|sealed\s+|data\s+|inline\s+)*(?:class|interface|enum|record|object|trait)\s+([A-Za-z_]\w*)/.exec(
     trimmed,
   );
   if (m?.[1]) return { name: m[1], kind: "class" };
-  m = /^(?:pub\s+)?(?:fn|func|def)\s+([A-Za-z_]\w*)/.exec(trimmed);
+  m = /^(?:public\s+|private\s+|protected\s+|static\s+|final\s+|abstract\s+|synchronized\s+|async\s+|override\s+|suspend\s+|internal\s+|open\s+|inline\s+)*(?:fun|fn|func|def)\s+([A-Za-z_]\w*)/.exec(
+    trimmed,
+  );
   if (m?.[1]) return { name: m[1], kind: "function" };
   return null;
 }
@@ -255,6 +284,7 @@ export function buildRepoIndex(root: string, refresh = false): RepoIndex {
   const absRoot = path.resolve(root);
   const files: RepoFile[] = [];
   const symbols: RepoSymbol[] = [];
+  const previous = new Map(cached?.files.map((file) => [file.path, file]) ?? []);
 
   for (const full of walkFiles(absRoot)) {
     if (symbols.length >= MAX_SYMBOLS) break;
@@ -265,15 +295,45 @@ export function buildRepoIndex(root: string, refresh = false): RepoIndex {
     } catch {
       continue;
     }
-    let content: string;
-    try {
-      content = fs.readFileSync(full, "utf8");
-    } catch {
-      continue;
+    const rel = path.relative(absRoot, full).split(path.sep).join("/");
+    const old = previous.get(rel);
+    let content: string | undefined;
+    let contentHash: string | undefined;
+    const sameStat =
+      old &&
+      old.mtimeMs === stat.mtimeMs &&
+      old.ctimeMs === stat.ctimeMs &&
+      old.sizeBytes === stat.size;
+
+    // 统计信息相同还不足以证明内容没变：同一毫秒内改写且大小不变时，
+    // 再比对内容 hash。refresh 时直接重读，跳过复用。
+    if (!refresh && old && sameStat) {
+      try {
+        content = fs.readFileSync(full, "utf8");
+        contentHash = crypto
+          .createHash("sha1")
+          .update(content, "utf8")
+          .digest("hex");
+      } catch {
+        continue;
+      }
+      if (old.contentHash && old.contentHash === contentHash) {
+        files.push(old);
+        symbols.push(...old.symbols);
+        continue;
+      }
+    }
+
+    if (content === undefined) {
+      try {
+        content = fs.readFileSync(full, "utf8");
+      } catch {
+        continue;
+      }
     }
     if (content.includes("\0")) continue;
+    contentHash ??= crypto.createHash("sha1").update(content, "utf8").digest("hex");
     const ext = path.extname(full).toLowerCase();
-    const rel = path.relative(absRoot, full).split(path.sep).join("/");
     const lines = content.split("\n");
     const fileSymbols: RepoSymbol[] = [];
     const scanTo = Math.min(lines.length, MAX_SCAN_LINES);
@@ -290,7 +350,15 @@ export function buildRepoIndex(root: string, refresh = false): RepoIndex {
       fileSymbols.push(symbol);
       symbols.push(symbol);
     }
-    files.push({ path: rel, lines: lines.length, symbols: fileSymbols });
+    files.push({
+      path: rel,
+      lines: lines.length,
+      symbols: fileSymbols,
+      mtimeMs: stat.mtimeMs,
+      ctimeMs: stat.ctimeMs,
+      sizeBytes: stat.size,
+      contentHash,
+    });
   }
 
   const index: RepoIndex = {
@@ -315,6 +383,27 @@ function scoreText(text: string, tokens: string[]): number {
   const lower = text.toLowerCase();
   let score = 0;
   for (const token of tokens) if (lower.includes(token)) score += 1;
+  return score;
+}
+
+/** 符号名精确匹配权重最高，前缀次之，签名命中最低 */
+function scoreSymbol(symbol: RepoSymbol, tokens: string[]): number {
+  const name = symbol.name.toLowerCase();
+  let score = 0;
+  for (const token of tokens) {
+    if (name === token) score += 8;
+    else if (name.startsWith(token)) score += 5;
+    else if (name.includes(token)) score += 2;
+    score += scoreText(symbol.signature, [token]);
+  }
+  return score;
+}
+
+function scoreFile(file: RepoFile, tokens: string[]): number {
+  const lowerPath = file.path.toLowerCase();
+  const base = path.basename(lowerPath);
+  let score = scoreText(lowerPath, tokens) * 3 + scoreText(base, tokens) * 4;
+  for (const symbol of file.symbols) score += scoreSymbol(symbol, tokens);
   return score;
 }
 
@@ -356,16 +445,7 @@ function renderRepoMap(index: RepoIndex, query: string, limit: number): string {
     }
   } else {
     const scored = index.files
-      .map((file) => {
-        let score = scoreText(file.path, tokens) * 3;
-        for (const symbol of file.symbols) {
-          if (tokens.some((token) => symbol.name.toLowerCase().includes(token))) {
-            score += 2;
-          }
-          score += scoreText(symbol.signature, tokens);
-        }
-        return { file, score };
-      })
+      .map((file) => ({ file, score: scoreFile(file, tokens) }))
       .filter((item) => item.score > 0)
       .sort((a, b) => b.score - a.score || a.file.path.localeCompare(b.file.path))
       .slice(0, limit);
@@ -375,14 +455,11 @@ function renderRepoMap(index: RepoIndex, query: string, limit: number): string {
     } else {
       for (const { file } of scored) {
         const matched = file.symbols
-          .filter((symbol) =>
-            tokens.some(
-              (token) =>
-                symbol.name.toLowerCase().includes(token) ||
-                symbol.signature.toLowerCase().includes(token),
-            ),
-          )
-          .slice(0, 6);
+          .map((symbol) => ({ symbol, score: scoreSymbol(symbol, tokens) }))
+          .filter((item) => item.score > 0)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 6)
+          .map((item) => item.symbol);
         lines.push("", `${file.path}（${file.lines} 行 · ${file.symbols.length} 符号）`);
         for (const symbol of matched) {
           lines.push(`  - ${symbol.kind} ${symbol.name}（第 ${symbol.line} 行）`);

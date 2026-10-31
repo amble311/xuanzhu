@@ -45,12 +45,15 @@ import {
 } from "../utils/clipboard";
 import { expandHome, getConfigDir } from "../utils/paths";
 import { VERSION } from "../utils/version";
+import { composeHeaderBlocks } from "./header-layout";
 import {
   clearGlobalMemory,
   clearProjectMemory,
   ensureProjectDir,
   inspectGlobalMemory,
   inspectProjectMemory,
+  readGlobalMemory,
+  readProjectMemory,
 } from "../workspace";
 import {
   ansi,
@@ -207,6 +210,14 @@ export class TuiApp {
   private statusDetail = "";
   /** 当前任务列表（todo_write），显示在顶部信息区 */
   private todoItems: TodoItem[] = [];
+  /** 真实 usage：本轮 / 会话累计（模型未返回 usage 时保持 0） */
+  private turnInputTokens = 0;
+  private turnOutputTokens = 0;
+  private turnCachedTokens = 0;
+  private sessionInputTokens = 0;
+  private sessionOutputTokens = 0;
+  private sessionCachedTokens = 0;
+  private sessionCacheWriteTokens = 0;
   /**
    * 手机设备桥（`/device serve` 启动）。
    *
@@ -399,6 +410,15 @@ export class TuiApp {
       onTodos: (items) => {
         this.todoItems = items;
         this.scheduleRender();
+      },
+      onUsage: (usage) => {
+        this.turnInputTokens += usage.inputTokens ?? 0;
+        this.turnOutputTokens += usage.outputTokens ?? 0;
+        this.turnCachedTokens += usage.cachedInputTokens ?? 0;
+        this.sessionInputTokens += usage.inputTokens ?? 0;
+        this.sessionOutputTokens += usage.outputTokens ?? 0;
+        this.sessionCachedTokens += usage.cachedInputTokens ?? 0;
+        this.sessionCacheWriteTokens += usage.cacheWriteInputTokens ?? 0;
       },
       onIntent: (analysis, original) => this.handleIntent(analysis, original),
       onModelChange: (info) => this.handleModelChange(info),
@@ -2216,6 +2236,9 @@ export class TuiApp {
     this.lines.push("");
 
     this.busy = true;
+    this.turnInputTokens = 0;
+    this.turnOutputTokens = 0;
+    this.turnCachedTokens = 0;
     this.statusText = "思考中";
     this.statusDetail = "";
     this.startBusyProgress();
@@ -2275,6 +2298,9 @@ export class TuiApp {
       case "context":
         this.handleContextCommand();
         break;
+      case "usage":
+        this.handleUsageCommand();
+        break;
       case "compact":
         void this.handleCompactCommand();
         break;
@@ -2307,9 +2333,13 @@ export class TuiApp {
         this.agent.restoreSession([], this.currentSessionFile);
         this.lines.push(`${ansi.gray}会话已重置。${ansi.reset}`);
         break;
-      case "undo":
-        this.lines.push(undoLastChange(this.cwd));
+      case "undo": {
+        const count = Number.parseInt(arg, 10);
+        this.lines.push(
+          undoLastChange(this.cwd, Number.isFinite(count) ? count : 1),
+        );
         break;
+      }
       case "resume":
         this.handleResumeCommand(arg);
         break;
@@ -2895,6 +2925,30 @@ export class TuiApp {
         `${ansi.gray}  · /memory clear 清空项目记忆 · /memory global 查看全局记忆` +
           `${ansi.reset}${ansi.gray}（/memory clear global 清空全局；均需确认；` +
           `不会删除 ~/.xzh/sessions 的会话存档）${ansi.reset}`,
+      );
+      return;
+    }
+
+    if (sub === "show" || sub === "read") {
+      const memory = targetGlobal
+        ? readGlobalMemory()
+        : readProjectMemory(this.cwd);
+      const text = memory.longTerm.trim();
+      if (!text) {
+        this.lines.push(`${ansi.gray}${label}长期记忆为空。${ansi.reset}`);
+        return;
+      }
+      this.lines.push(`${ansi.bold}${label} MEMORY.md${ansi.reset}`);
+      const lines = text.split(/\r?\n/);
+      const MAX = 80;
+      for (const line of lines.slice(0, MAX)) this.lines.push(line);
+      if (lines.length > MAX) {
+        this.lines.push(
+          `${ansi.gray}…还有 ${lines.length - MAX} 行；可打开 ${status.dir}/MEMORY.md 查看全文${ansi.reset}`,
+        );
+      }
+      this.lines.push(
+        `${ansi.gray}  · /memory clear ${targetGlobal ? "global" : ""} 清空（需确认）${ansi.reset}`,
       );
       return;
     }
@@ -3594,6 +3648,43 @@ export class TuiApp {
     );
   }
 
+  /** `/usage` —— 服务端返回的真实 token 用量（没有 usage 的本地端点会显示未知）。 */
+  private handleUsageCommand(): void {
+    const report = this.agent.getContextReport();
+    const fmt = (value: number): string =>
+      value > 0 ? `${formatContextWindow(value)} tokens` : "未返回";
+    this.lines.push(`${ansi.bold}Token 用量${ansi.reset} ${ansi.gray}（来自服务端 usage）${ansi.reset}`);
+    const cacheNote = (cached: number, write = 0): string => {
+      if (cached <= 0 && write <= 0) return "";
+      return (
+        ` · ${ansi.green}缓存命中 ${cached > 0 ? fmt(cached) : "0"}${ansi.reset}` +
+        (write > 0 ? ` · 写入缓存 ${fmt(write)}` : "")
+      );
+    };
+    this.lines.push(
+      `  本轮：输入 ${fmt(this.turnInputTokens)} · 输出 ${fmt(this.turnOutputTokens)}` +
+        cacheNote(this.turnCachedTokens),
+    );
+    this.lines.push(
+      `  累计：输入 ${fmt(this.sessionInputTokens)} · 输出 ${fmt(this.sessionOutputTokens)}` +
+        cacheNote(this.sessionCachedTokens, this.sessionCacheWriteTokens),
+    );
+    this.lines.push(
+      `${ansi.gray}  最近一次上下文占用：${Math.round(report.ratio * 100)}%` +
+        ` / 窗口 ${formatContextWindow(report.window)} tokens${ansi.reset}`,
+    );
+    if (
+      this.turnInputTokens === 0 &&
+      this.sessionInputTokens === 0 &&
+      this.sessionOutputTokens === 0
+    ) {
+      this.lines.push(
+        `${ansi.gray}  提示：部分本地端点不返回 usage，可改用 /context 查看估算。${ansi.reset}`,
+      );
+    }
+    this.scheduleRender();
+  }
+
   /** `/compact` —— 用一次模型调用把旧历史压成摘要，保留最近几轮。 */
   private async handleCompactCommand(): Promise<void> {
     if (this.busy) return;
@@ -3712,6 +3803,7 @@ export class TuiApp {
       `  /clear         清空屏幕`,
       `  /tools         列出本轮发给模型的工具（排查「某个工具似乎没被调用过」）`,
       `  /context       查看上下文预算（系统 / 工具 / 历史 / 状态各占多少）`,
+      `  /usage         查看本轮 / 累计真实 token 用量（模型返回 usage 时）`,
       `  /compact       将旧历史压缩成摘要（用一次模型调用，保留最近几轮）`,
       `  /focus [文件]  查看 / 维护工作集（/focus <文件>、rm、clear）`,
       `  /device        手机设备桥（先 /device serve 或 /device connect <手机IP>）`,
@@ -3722,7 +3814,7 @@ export class TuiApp {
       `  /image         把系统剪贴板里的图片加为本轮附件（同 Ctrl+V；别名 /paste）`,
       `  /mouse         切换鼠标捕获：开启后可在输出区拖拽选择（按整行）`,
       `  /reset         重置对话上下文`,
-      `  /undo          撤销玄猪对文件的最近一次修改（改前自动备份）`,
+      `  /undo [N]      撤销玄猪最近 N 次文件修改（默认 1，最多 20；改前自动备份）`,
       `  /resume [编号]  列出 / 恢复历史会话（对话历史会自动保存）`,
       `  /cwd           显示当前工作目录`,
       `  /switch <目录> 切换项目（载入该项目上次会话接着聊）`,
@@ -3730,7 +3822,7 @@ export class TuiApp {
       `  /model [编号|id|模型名]  查看 / 切换当前模型（不带参数：↑ ↓ 选择，Enter 确认）`,
       `  /goal <目标>   目标模式：持续自动执行直到完成（Ctrl+C 中断；/goal off 清除）`,
       `  /goal [status|continue|off]  查看当前目标 / 继续已暂停的目标 / 清除目标`,
-      `  /memory        查看项目记忆；/memory global 查看全局记忆；/memory clear [global] 清空（需确认）`,
+      `  /memory        查看项目记忆；/memory show [global] 查看全文；/memory global 状态；/memory clear [global] 清空（需确认）`,
       `  /init [--dry-run|--force]  扫描项目并生成 / 补全 AGENTS.md 与 docs/（写入前确认）`,
       `  /auto [on|off] 切换自动批准（on：所有工具直接执行，写入配置）`,
       `  /intent [on|off] 切换意图分析（on：每条消息先做意图分析再处理，写入配置）`,
@@ -3770,10 +3862,6 @@ export class TuiApp {
    * 高度受限时必须保留（见 render 的头部裁剪），故不能被一起裁掉。
    */
   private buildHeaderLines(width: number): { info: string[]; divider: string } {
-    const modelText = truncate(
-      `${this.modelProviderLabel} / ${this.modelLabel}`,
-      Math.max(10, width - 8),
-    );
     const dirText = truncate(this.cwd, Math.max(10, width - 8));
     const divider = `${ansi.gray}${"─".repeat(Math.max(0, width))}${ansi.reset}`;
     // 目标模式：始终占一行显示目标，便于随时看清「它现在为什么还在跑」
@@ -3791,24 +3879,26 @@ export class TuiApp {
           Math.max(10, width - 18),
         )}${ansi.reset}${ansi.gray}（${goalState}）${ansi.reset}`
       : null;
-    const info = [
-      `${ansi.brightMagenta}${ansi.bold}  玄猪 XuanZhu${ansi.reset} ${ansi.gray}v${VERSION} · 终端 AI 编码 Agent${ansi.reset}`,
-      `${ansi.gray}  模型：${ansi.reset}${modelText}${ansi.reset}`,
-      `${ansi.gray}  目录：${ansi.reset}${dirText}${ansi.reset}`,
-      ...(goalLine ? [goalLine] : []),
-      ...this.todoHeaderLines(width),
-      `${ansi.gray}  输入 ${ansi.reset}${ansi.brightGreen}/help${ansi.reset}${ansi.gray} 查看命令与快捷键${ansi.reset}`,
-      `${ansi.gray}  ${ansi.reset}Ctrl+D${ansi.gray} 结束本轮对话（不退出）· ${ansi.reset}Ctrl+C${ansi.gray} 中断/清空/退出${ansi.reset}`,
-      `${ansi.gray}  ${ansi.reset}Shift+Tab${ansi.gray} 切终端 · ${ansi.reset}PgUp${ansi.gray}/滚轮回看历史${ansi.reset}`,
-    ];
+    const info = composeHeaderBlocks({
+      brand: `${ansi.brightMagenta}${ansi.bold}  玄猪 XuanZhu${ansi.reset} ${ansi.gray}v${VERSION} · 终端 AI 编码 Agent${ansi.reset}`,
+      directory: `${ansi.gray}  目录：${ansi.reset}${dirText}${ansi.reset}`,
+      goal: goalLine,
+      shortcuts: [
+        `${ansi.gray}  输入 ${ansi.reset}${ansi.brightGreen}/help${ansi.reset}${ansi.gray} 查看命令与快捷键${ansi.reset}`,
+        `${ansi.gray}  ${ansi.reset}Ctrl+D${ansi.gray} 结束本轮对话（不退出）· ${ansi.reset}Ctrl+C${ansi.gray} 中断/清空/退出${ansi.reset}`,
+        `${ansi.gray}  ${ansi.reset}Shift+Tab${ansi.gray} 切终端 · ${ansi.reset}PgUp${ansi.gray}/滚轮回看历史${ansi.reset}`,
+      ],
+      // 任务列表放在快捷键提示**下方**：固定说明在前，动态任务在后。
+      todos: this.todoHeaderLines(width),
+    });
     return { info, divider };
   }
 
   /**
-   * 任务列表在顶部信息区的展示行（无任务时返回空数组）。
+   * 任务列表的展示行（无任务时返回空数组），固定排在快捷键提示下方。
    *
    * 只展开「进行中 + 待办」的前几项，已完成 / 已取消压缩成计数 ——
-   * 信息区高度上限是终端高度的 1/3，全部展开会挤掉模型与目录信息。
+   * 信息区高度上限是终端高度的 1/3，全部展开会挤掉标题、目录与快捷键。
    * 完整清单可由模型通过 todo_write 的返回值（回灌进对话）呈现。
    */
   private todoHeaderLines(width: number): string[] {

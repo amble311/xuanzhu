@@ -1,6 +1,6 @@
 {
   "name": "xuanzhu",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "description": "玄猪（XuanZhu）— 专为终端打造的 AI 编码 Agent",
   "keywords": [
     "ai",
@@ -48,6 +48,8 @@
     "@anthropic-ai/sdk": "^0.52.0",
     "@google/generative-ai": "^0.21.0",
     "openai": "^4.28.0",
+    "socks": "^2.8.10",
+    "undici": "^6.29.1",
     "ws": "^8.22.0"
   },
   "devDependencies": {

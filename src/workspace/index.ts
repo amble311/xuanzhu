@@ -1,6 +1,13 @@
 import * as fs from "fs";
 import * as path from "path";
 import { getConfigDir } from "../utils/paths";
+import { pruneAutoMemory } from "./memory-retrieval";
+
+export {
+  globalMemoryIndex,
+  selectRelevantGlobalMemory,
+  splitMemorySections,
+} from "./memory-retrieval";
 
 /**
  * 项目级目录（对应 CodeBuddy 的 `.codebuddy`）。
@@ -658,6 +665,27 @@ export function writeLongTermMemoryAt(
 
 export function writeLongTermMemory(cwd: string, content: string): string {
   return writeLongTermMemoryAt(projectMemoryPaths(cwd), content);
+}
+
+/**
+ * 清理全局记忆中过期的自动记录（TTL）。
+ * 只影响 `## 自动记录 · ...` 下的 `- YYYY-MM-DD：` 行，手工整理的小节不动。
+ * 返回清理的行数；`days <= 0` 表示不启用。
+ */
+export function pruneGlobalMemory(days: number, now = new Date()): number {
+  if (!Number.isFinite(days) || days <= 0) return 0;
+  const paths = resolveGlobalMemoryPaths();
+  let raw: string;
+  try {
+    raw = fs.readFileSync(paths.longTermFile, "utf8");
+  } catch {
+    return 0;
+  }
+  const cleaned = pruneAutoMemory(raw, days, now);
+  if (cleaned.removed > 0) {
+    writeLongTermMemoryAt(paths, cleaned.text);
+  }
+  return cleaned.removed;
 }
 
 // ------------------------------------------------------------ 项目记忆清空
