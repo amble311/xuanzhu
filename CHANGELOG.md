@@ -4,6 +4,21 @@
 
 ## [未发布]
 
+## [0.8.4] — 2026-10-31
+
+### 变更
+
+- **自动捕获全局信息**：项目对话中出现「全局 / 所有项目 / 跨项目 / 以后都 / 统一用」，
+  或 `sudo 密码是 ...` / 本机代理端点等跨项目事实时，自动写入 `~/.xzh/memory/`；
+  同时保留模型主动 `memory_write target=global` 的入口。
+- **凭据自动加密**：移除 `xzh secret` / `xzh sudo` 子命令与 `~/.xzh/secrets/` 明文存储。
+  `memory_write` / `memory_compact` 与自动捕获会在写入前把 `密码: xxx` / `token=xxx`
+  这类值用 AES-256-GCM 加密到 `~/.xzh/vault/`（目录 0700，`key` / `entries.json` 0600），
+  记忆里只留 `[加密凭据 sec_xxx]` 引用；密钥与密文同机，保证记忆/日志/上下文无明文，
+  但不防本地 root。
+- **bash**：`sudo` 仍会因无 TTY 提前失败，提示改用 `sudo -n`（NOPASSWD），不再引导
+  `xzh sudo`。
+
 ## [0.8.3] — 2026-10-30
 
 ### 变更

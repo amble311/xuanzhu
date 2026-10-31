@@ -9,6 +9,7 @@ import {
   writeLongTermMemoryAt,
   type MemoryPaths,
 } from "../workspace";
+import { protectSecretsInText } from "../secrets/vault";
 import type { ToolDefinition, ToolResult } from "./types";
 
 const MAX_DISPLAY = 12_000;
@@ -29,34 +30,30 @@ function pathsFor(target: MemoryTarget, cwd: string): MemoryPaths {
 /**
  * 记忆是**每次请求都会进提示词**的内容，绝不能放密码原文。
  *
- * 这里做一道确定性防线：`密码: xxx` / `token=xxx` 这类赋值如果写进记忆，
- * 直接拒绝并引导用户用 `xzh secret`（密码只进 0600 凭据文件，不进上下文）。
- * 允许 `密码位置：~/.xzh/secrets/sudo` 这种指针写法。
+ * 写入前把 `密码: xxx` / `token=xxx` 这类赋值里的值替换成
+ * `[加密凭据 sec_xxx]`：值用 AES-256-GCM 存进 ~/.xzh/vault，记忆只留引用。
+ * 返回加密后的文本；加密失败必须拒绝写入，避免明文落盘。
  */
-function secretRejection(content: string): string | null {
-  const assignment =
-    /(?:密码|口令|pass(?:word|wd|phrase)?|token|api[_-]?key|secret|uuid)\s*(?:[:=：]|是|为)\s*([^\s，。；;]+)/gi;
-  for (const match of content.matchAll(assignment)) {
-    const value = match[1] ?? "";
-    if (
-      value.includes("~/.xzh/secrets") ||
-      value.includes("xzh secret") ||
-      value.includes("xzh sudo") ||
-      value.startsWith("（") ||
-      value.startsWith("(") ||
-      // token 上限：4096 这类数值不是密码
-      /^\d+$/.test(value)
-    ) {
-      continue;
-    }
-    return (
-      `拒绝写入记忆：内容里出现疑似密码/Token 原文（${match[0]}）。\n` +
-      `记忆会注入每次请求的提示词，不能保存秘密。\n` +
-      `请改用 \`xzh secret set <名称>\` 存入 0600 凭据文件，` +
-      `记忆里只写「密码存放在 ~/.xzh/secrets/<名称>，使用 xzh sudo」。`
-    );
+function protectForMemory(content: string): {
+  content: string;
+  credentialIds: string[];
+  error?: string;
+} {
+  try {
+    const protectedText = protectSecretsInText(content);
+    return {
+      content: protectedText.text,
+      credentialIds: protectedText.credentialIds,
+    };
+  } catch (err) {
+    return {
+      content,
+      credentialIds: [],
+      error: `凭据加密失败，已拒绝写入记忆：${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
   }
-  return null;
 }
 
 /** memory_read —— 读取项目 / 全局记忆 */
@@ -130,8 +127,8 @@ export const memoryWriteTool: ToolDefinition = {
     "scope=daily 追加当日日志（默认，适合当天进展）；" +
     "scope=long 在长期记忆 MEMORY.md 末尾追加一块 —— **只适合全新主题**：" +
     "若新结论属于已有主题小节，应先 memory_read 再用 memory_compact 并进那个小节。" +
-    "全局记忆会注入每次请求，**禁止写入密码/Token 原文**；密码请用 `xzh secret set`，" +
-    "记忆里只写凭据文件指针。",
+    "全局记忆会注入每次请求；密码/Token 原文会在写入前自动加密为 " +
+    "`[加密凭据 ...]` 引用，不要读取或猜测其值。",
   parameters: {
     type: "object",
     properties: {
@@ -154,15 +151,24 @@ export const memoryWriteTool: ToolDefinition = {
     required: ["content"],
   },
   async execute(args, ctx): Promise<ToolResult> {
-    const content = typeof args.content === "string" ? args.content.trim() : "";
-    if (!content) {
+    const rawContent =
+      typeof args.content === "string" ? args.content.trim() : "";
+    if (!rawContent) {
       return { ok: false, content: "错误：content 不能为空。" };
     }
     const scope = args.scope === "long" ? "long" : "daily";
     const target = args.target === "global" ? "global" : "project";
 
-    const rejected = secretRejection(content);
-    if (rejected) return { ok: false, content: rejected };
+    const protectedContent = protectForMemory(rawContent);
+    if (protectedContent.error) {
+      return { ok: false, content: protectedContent.error };
+    }
+    const content = protectedContent.content;
+    const encryptedNote =
+      protectedContent.credentialIds.length > 0
+        ? `\n\n（已加密 ${protectedContent.credentialIds.length} 项凭据，` +
+          "记忆只保留 `[加密凭据 ...]` 引用）"
+        : "";
 
     const paths = pathsFor(target, ctx.cwd);
     const limit =
@@ -206,7 +212,9 @@ export const memoryWriteTool: ToolDefinition = {
 
       return {
         ok: true,
-        content: `已写入${label}${kind}：${file}${compactNote}\n\n（记忆目录：${paths.memoryDir}）`,
+        content:
+          `已写入${label}${kind}：${file}${compactNote}${encryptedNote}\n\n` +
+          `（记忆目录：${paths.memoryDir}）`,
         summary: `已写入${label}${kind}`,
       };
     } catch (err) {
@@ -235,7 +243,7 @@ export const memoryCompactTool: ToolDefinition = {
     "（长期记忆的常规更新方式，因为 memory_write 只会在文末追加）；② 过长/重复/有过时条目时整体整理。" +
     "做法：先 memory_read 读取全文，再按主题合并条目、删除已过时或被后续结论推翻的内容、" +
     "把冗长的过程浓缩为结论，最后提交完整的新版本（不是增量）。" +
-    "全局记忆禁止写入密码/Token 原文。",
+    "密码/Token 原文会自动加密为 `[加密凭据 ...]` 引用，不会明文落盘。",
   parameters: {
     type: "object",
     properties: {
@@ -253,16 +261,24 @@ export const memoryCompactTool: ToolDefinition = {
     required: ["content"],
   },
   async execute(args, ctx): Promise<ToolResult> {
-    const content = typeof args.content === "string" ? args.content.trim() : "";
-    if (!content) {
+    const rawContent =
+      typeof args.content === "string" ? args.content.trim() : "";
+    if (!rawContent) {
       return {
         ok: false,
         content: "错误：content 不能为空。若要清空长期记忆，请提交非空说明内容。",
       };
     }
     const target = args.target === "global" ? "global" : "project";
-    const rejected = secretRejection(content);
-    if (rejected) return { ok: false, content: rejected };
+    const protectedContent = protectForMemory(rawContent);
+    if (protectedContent.error) {
+      return { ok: false, content: protectedContent.error };
+    }
+    const content = protectedContent.content;
+    const encryptedNote =
+      protectedContent.credentialIds.length > 0
+        ? `\n（已加密 ${protectedContent.credentialIds.length} 项凭据）`
+        : "";
 
     const paths = pathsFor(target, ctx.cwd);
     const label = target === "global" ? "全局" : "项目";
@@ -273,7 +289,8 @@ export const memoryCompactTool: ToolDefinition = {
       return {
         ok: true,
         content:
-          `已重写${label}长期记忆：${file}\n（${before} → ${content.length} 字符）`,
+          `已重写${label}长期记忆：${file}\n（${before} → ${content.length} 字符）` +
+          encryptedNote,
         summary: `${label}长期记忆已精简（${before} → ${content.length} 字符）`,
       };
     } catch (err) {

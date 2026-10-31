@@ -66,6 +66,7 @@ import {
 import { mapWithConcurrency } from "../utils/concurrency";
 import { recordErrorReport } from "../utils/error-reports";
 import { expandHome, getConfigPath } from "../utils/paths";
+import { captureGlobalMemoryFromUser } from "../workspace/global-capture";
 import {
   appendLongTermTopicEntry,
   appendMemory,
@@ -703,12 +704,12 @@ export class Agent {
     }
     return (
       "## 本轮全局记忆提醒\n" +
-      "用户这条消息提到了「全局 / 跨项目」。如果其中包含跨项目稳定事实" +
-      "（用户偏好、sudo 使用方式、代理地址、统一安装/构建方式），" +
-      "请在本轮结束前用 `memory_write target=global` 记录；" +
+      "系统已尝试自动捕获这条消息里明确的全局信息（凭据已加密）。" +
+      "如果还有遗漏的跨项目稳定事实（用户偏好、代理地址、统一安装/构建方式），" +
+      "请在本轮结束前用 `memory_write target=global` 补充；" +
       "只属于当前项目的内容仍写项目记忆。\n" +
-      "**密码 / Token / UUID / API Key 原文绝对不能写入任何记忆**：" +
-      "用 `xzh secret set <名称>` 存入 0600 凭据文件，记忆里只写指针。"
+      "**密码 / Token / UUID / API Key 原文绝对不能写进回复**；" +
+      "写入记忆时工具会自动加密为 `[加密凭据 ...]`，不要复述或猜测其值。"
     );
   }
 
@@ -1435,6 +1436,25 @@ export class Agent {
     this.runWroteMemory = false;
     // 用户最新一条消息定义当前任务；旧任务暂停时不会自动继续
     this.beginTask(userInput);
+
+    // 自动捕获全局信息（跨项目偏好、本机代理、sudo 等）。
+    // 凭据值在写入前加密，记忆里只留引用；目标模式/子代理不参与，避免重复。
+    if (this.autoMemory && !this.systemPromptOverride && !this.goal) {
+      try {
+        const captured = captureGlobalMemoryFromUser(userInput);
+        if (captured.added) {
+          this.events.onNotice?.(
+            `已自动记录全局记忆` +
+              (captured.credentialIds.length > 0
+                ? `（${captured.credentialIds.length} 项凭据已加密）`
+                : ""),
+          );
+        }
+      } catch {
+        // 自动记忆是尽力而为：失败不能影响本轮
+      }
+    }
+
     let content = userInput;
 
     // 补发构造 / 切换目录期间攒下的提示（构造时终端尚未接管，不能当场写输出区）

@@ -185,7 +185,7 @@ export function interactiveCommandName(command: string): string | undefined {
       return name;
     }
     // sudo 在无 TTY 时会等密码直到超时。允许 -n（NOPASSWD）和 -S（自己喂 stdin），
-    // 其余情况引导用户改用 xzh sudo（密码从 0600 凭据文件经 stdin 传入）。
+    // 其余情况直接拒绝，避免白等到超时。
     if (
       name === "sudo" &&
       !/(^|\s)(-n|--non-interactive|-S|--stdin)(\s|$)/.test(segment)
@@ -283,17 +283,6 @@ export const bashTool: ToolDefinition = {
       return { ok: false, content: "错误：command 不能为空" };
     }
 
-    // 密码录入必须由用户在真实终端完成；模型通过 bash 调用会挂在 stdin 上。
-    if (/\bxzh\s+secret\s+(set|add)\b/.test(command)) {
-      return {
-        ok: false,
-        content:
-          "错误：xzh secret set 需要用户在真实终端输入密码，不能通过 bash 工具代跑。\n" +
-          "请提示用户在自己的终端执行 `xzh secret set <名称>`（输入不回显）；" +
-          "保存后你可以直接使用 `xzh sudo <命令>`。",
-      };
-    }
-
     // 交互式命令没有 TTY，会一直等到超时（如 `su` 等密码）。提前失败并给出替代方案。
     const interactive = interactiveCommandName(command);
     if (interactive) {
@@ -302,10 +291,8 @@ export const bashTool: ToolDefinition = {
           ok: false,
           content:
             `错误：\`sudo\` 在非交互 shell 中会等待密码直到超时。\n` +
-            `若已用 \`xzh secret set sudo\` 保存过密码，请改用：\n` +
-            `  xzh sudo <命令>\n` +
-            `（密码由玄猪从 ~/.xzh/secrets/sudo 经 stdin 传入，不会进入对话或命令行）。\n` +
-            `若系统已配置 NOPASSWD，可直接用 \`sudo -n <命令>\`。`,
+            `若系统已配置 NOPASSWD，请直接用 \`sudo -n <命令>\`；` +
+            `否则请在真实终端中执行，或让用户配置 NOPASSWD。`,
         };
       }
       return {

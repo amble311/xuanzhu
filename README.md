@@ -170,10 +170,6 @@ xzh
 | `xzh config edit` | 使用 `nano` 编辑配置文件 |
 | `xzh config path` | 打印配置文件路径 |
 | `xzh config init` | 生成默认配置文件 |
-| `xzh secret set <名称>` | 保存密码到 `~/.xzh/secrets/`（输入不回显，权限 0600，不进入对话） |
-| `xzh secret list` | 列出凭据名称（不显示内容） |
-| `xzh secret remove <名称>` | 删除凭据 |
-| `xzh sudo <命令>` | 用已保存的 sudo 密码执行命令（密码经 stdin 传给 `sudo -S`） |
 | `xzh setup` | 检查并自动安装依赖（玄猪自身 + 技能：playwright / officecli / 剪贴板工具等） |
 | `xzh init` | 扫描项目并生成 / 补全 `AGENTS.md` 与 `docs/`（已有内容只补缺失小节） |
 | `xzh init --dry-run` | 只预览将生成的内容，不写文件 |
@@ -399,8 +395,8 @@ API Key 也可以来自环境变量，优先级低于配置文件：
 | `list_skills` | 列出玄猪可用的全部技能 | 否 |
 | `load_skill` | 加载指定技能的完整指南 | 否 |
 | `memory_read` | 读取项目 / 全局记忆（`target=project\|global\|all`；长期记忆 + 最近日志） | 否 |
-| `memory_write` | 写入项目 / 全局记忆（`target` + `scope`），长期记忆超限时自动精简 | 否 |
-| `memory_compact` | 用精简后的完整内容重写项目 / 全局长期记忆（把新结论并入主题小节 / 语义压缩） | 否 |
+| `memory_write` | 写入项目 / 全局记忆（`target` + `scope`），凭据值自动 AES-GCM 加密，长期记忆超限时自动精简 | 否 |
+| `memory_compact` | 用精简后的完整内容重写项目 / 全局长期记忆（凭据值自动加密；把新结论并入主题小节 / 语义压缩） | 否 |
 | `todo_write` | 创建 / 更新任务列表（每次提交完整列表） | 否 |
 | `goal_complete` | 目标模式（`/goal`）下声明目标已全部完成（仅主代理可用） | 否 |
 | `report_status` | 结构化上报受阻 / 需要用户决定 / 置信度低（仅主代理可用） | 否 |
@@ -816,18 +812,14 @@ AutoX.js 那侧也可用环境变量 `XZH_DEVICE_PORT` 指定端口。
 
 - 启动时先注入全局记忆，再注入项目记忆；全局记忆默认上限 `globalMemoryMaxChars=4000`，
   超限自动去重/裁剪，仍超限时用 `memory_compact target=global` 语义精简。
-- 当用户说「全局 / 所有项目 / 跨项目 / 以后都 / 统一用」时，系统提示词会额外提醒模型用
-  `memory_write target=global` 记录；只属于当前项目的内容仍写项目记忆。
-- **密码、Token、UUID、API Key 原文绝不能写入记忆**（记忆会进入每次请求的上下文）。
-  用 `xzh secret set <名称>` 存到 `~/.xzh/secrets/`（目录 0700 / 文件 0600），
-  记忆里只写「凭据存放在哪里、怎么用」。例如 sudo：
-
-  ```bash
-  xzh secret set sudo        # 输入不回显
-  xzh sudo apt update        # 密码经 stdin 传给 sudo -S，不出现在命令行/对话
-  ```
-
-  全局记忆会自动记录一条「sudo 密码存放在 `~/.xzh/secrets/sudo`，使用 `xzh sudo`」的指针。
+- 当用户说「全局 / 所有项目 / 跨项目 / 以后都 / 统一用」时，玄猪会**自动捕获**消息里的
+  关键信息写入全局记忆；只属于当前项目的内容仍写项目记忆。模型也可以用
+  `memory_write target=global` 主动补充。
+- **凭据自动加密**：对话中出现 `sudo 密码是 ...` / `token=...` 这类内容时，玄猪在写入记忆前
+  会用 **AES-256-GCM** 加密到 `~/.xzh/vault/`（目录 0700，`key` 与 `entries.json` 均 0600），
+  记忆里只保留 `[加密凭据 sec_xxx]` 引用，不出现明文。密钥与密文同机，这能保证
+  记忆/日志/模型上下文不含明文，但不防本地 root。
+- 密码原文不要出现在回复里；模型只能看到加密引用。
 - `memory_read` / `memory_write` / `memory_compact` 都支持 `target=project|global`
   （`memory_read` 还支持 `all`）。
 

@@ -172,7 +172,7 @@ const GLOBAL_MEMORY_EXCERPT_CHARS = 2500;
  *
  * 与项目记忆的区别：全局记忆跨项目复用，必须**短**，并且**绝不能放秘密**。
  * 它每次请求都会进入提示词，密码/Token 原文写进去等于发给模型服务商；
- * 因此这里明确要求使用 `xzh secret` + 全局记忆只存指针。
+ * 因此记忆工具会在写入前自动把凭据值替换成加密引用。
  */
 function buildGlobalMemorySection(
   memory?: { longTerm: string; recentDaily: string } | null,
@@ -183,18 +183,16 @@ function buildGlobalMemorySection(
     ? "\n\n## 全局记忆（跨项目）\n" +
       "- 路径 `~/.xzh/memory`；用户说「全局/所有项目/以后都」时用 " +
       "`memory_write target=global`；项目内容仍写项目记忆。\n" +
-      "- 密码/Token/UUID/API Key 原文**禁止写入记忆**；用 `xzh secret set` 存 0600 凭据，" +
-      "记忆只写指针。"
+      "- 密码/Token/UUID/API Key 原文**禁止出现在回复里**；记忆工具会自动加密为" +
+      "`[加密凭据 ...]` 引用，不要读取或猜测其值。"
     : "\n\n## 全局记忆（跨项目）\n" +
       "全局记忆存放在 `~/.xzh/memory/`，内容对**所有项目**生效。\n" +
       "- 当用户明确说「全局 / 所有项目 / 以后都 / 统一 / 跨项目」，或提供跨项目环境事实" +
       "（代理地址、常用安装方式、sudo 使用方式、个人偏好）时，用 " +
       "`memory_write target=global` 记录。\n" +
-      "- **禁止把密码、Token、UUID、API Key 原文写入任何记忆**。需要保存时用 " +
-      "`xzh secret set <名称>` 存入 0600 凭据文件，全局记忆里只写指针" +
-      "（例如「sudo 密码存放在 ~/.xzh/secrets/sudo，使用 xzh sudo」）。" +
-      "`xzh secret set` 必须由用户在自己的终端执行（需要不回显输入），" +
-      "**不要通过 bash 工具代跑**。\n" +
+      "- **禁止把密码、Token、UUID、API Key 原文写进回复或记忆**。写入记忆时，" +
+      "工具会自动把凭据值加密为 `[加密凭据 ...]` 引用并存入 ~/.xzh/vault；" +
+      "不要读取、猜测或复述凭据值。\n" +
       "- 项目专属的事实、路径、约定写项目记忆，不要污染全局记忆。\n" +
       "- 全局长期记忆过长时用 `memory_read target=global` + `memory_compact target=global` 精简。";
 

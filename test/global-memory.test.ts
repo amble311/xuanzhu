@@ -2,8 +2,12 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { Agent, type AgentEvents } from "../src/core/agent";
 import { buildSystemPrompt } from "../src/core/prompt";
+import { DEFAULT_CONFIG, type XuanZhuConfig } from "../src/config/store";
+import type { ChatOptions, LLMProvider, StreamChunk } from "../src/llm/types";
 import { memoryWriteTool } from "../src/tools/memory";
+import { captureGlobalMemoryFromUser } from "../src/workspace/global-capture";
 import {
   appendGlobalMemory,
   appendGlobalTopicEntry,
@@ -17,18 +21,18 @@ import {
 } from "../src/workspace";
 import {
   deleteSecret,
-  listSecretNames,
-  readSecret,
-  saveSecret,
-  secretsDir,
-} from "../src/secrets/store";
-import { runWithSudo } from "../src/secrets/sudo";
+  listSecrets,
+  loadSecret,
+  protectSecretsInText,
+  storeSecret,
+  vaultDir,
+} from "../src/secrets/vault";
 
 /**
- * 全局记忆与本地凭据的回归测试。
+ * 全局记忆与加密凭据的回归测试。
  *
  * 全局记忆必须严格隔离在临时 XZH_HOME 下，绝不碰真实 ~/.xzh；
- * 密码只允许进 0600 凭据文件，不能出现在全局记忆里。
+ * 密码只允许进 AES-GCM 加密库，记忆/日志里不能出现明文。
  */
 
 const originalHome = process.env.XZH_HOME;
@@ -40,7 +44,7 @@ const tmpProject = (): string =>
 
 beforeEach(() => {
   fs.rmSync(path.join(home, "memory"), { recursive: true, force: true });
-  fs.rmSync(path.join(home, "secrets"), { recursive: true, force: true });
+  fs.rmSync(path.join(home, "vault"), { recursive: true, force: true });
   fs.mkdirSync(home, { recursive: true });
 });
 
@@ -106,81 +110,115 @@ describe("全局记忆", () => {
       prompt.indexOf("## 项目记忆"),
     );
   });
+});
 
-  it("拒绝把密码/T 令牌原文写入全局记忆，但允许凭据指针", async () => {
-    const rejected = await memoryWriteTool.execute(
-      { content: "sudo 密码: p@ssw0rd", target: "global", scope: "long" },
-      ctx(),
+describe("自动全局记忆捕获", () => {
+  it("捕获明确说「以后都 / 所有项目」的偏好", () => {
+    const result = captureGlobalMemoryFromUser(
+      "以后都用 pnpm，所有项目统一用这个包管理器。",
     );
-    expect(rejected.ok).toBe(false);
-    expect(rejected.content).toContain("拒绝写入记忆");
-    expect(readGlobalMemory().longTerm).toBe("");
+    expect(result.added).toBe(true);
+    expect(readGlobalMemory().longTerm).toContain("pnpm");
+  });
 
-    const projectRejected = await memoryWriteTool.execute(
-      { content: "token=abcdef123456", target: "project", scope: "long" },
-      ctx(),
-    );
-    expect(projectRejected.ok).toBe(false);
+  it("sudo 密码自动加密，记忆里只有引用", () => {
+    const result = captureGlobalMemoryFromUser("我的 sudo 密码是 s3cret-pw");
+    expect(result.added).toBe(true);
+    expect(result.credentialIds.length).toBe(1);
 
-    const pointer = await memoryWriteTool.execute(
-      {
-        content: "sudo 密码位置：~/.xzh/secrets/sudo，使用 xzh sudo 执行。",
-        target: "global",
-        scope: "long",
+    const memory = readGlobalMemory().longTerm;
+    expect(memory).toContain("[加密凭据 ");
+    expect(memory).not.toContain("s3cret-pw");
+    expect(loadSecret(result.credentialIds[0])).toBe("s3cret-pw");
+  });
+
+  it("问题句不写入，避免把「密码怎么设置」当成事实", () => {
+    const result = captureGlobalMemoryFromUser("sudo 密码怎么设置？");
+    expect(result.added).toBe(false);
+  });
+
+  it("Agent.run 会自动触发全局捕获并提示用户", async () => {
+    const cwd = tmpProject();
+    const notices: string[] = [];
+    const events: AgentEvents = {
+      onText: () => undefined,
+      onToolStart: () => undefined,
+      onToolEnd: () => undefined,
+      onStatus: () => undefined,
+      onNotice: (message) => notices.push(message),
+      confirm: async () => true,
+    };
+    const config: XuanZhuConfig = {
+      ...DEFAULT_CONFIG,
+      provider: "fake",
+      model: "fake",
+      models: [
+        {
+          id: "fake/fake",
+          provider: "fake",
+          model: "fake",
+          contextWindow: 100_000,
+        },
+      ],
+    };
+    const provider: LLMProvider = {
+      id: "fake",
+      model: "fake",
+      async *chat(_options: ChatOptions): AsyncGenerator<StreamChunk> {
+        yield { type: "text", text: "好的" };
+        yield { type: "done", finishReason: "stop" };
       },
-      ctx(),
-    );
-    expect(pointer.ok).toBe(true);
-    expect(readGlobalMemory().longTerm).toContain("xzh sudo");
+    };
+    const agent = new Agent(provider, config, cwd, events);
+    await agent.run("以后都用 pnpm");
+
+    expect(readGlobalMemory().longTerm).toContain("pnpm");
+    expect(notices.some((item) => item.includes("自动记录全局记忆"))).toBe(true);
   });
 });
 
-describe("本地凭据", () => {
-  it("以 0600 保存、只列出名称、可删除", () => {
-    const file = saveSecret("sudo", "p@ssw0rd");
-    const mode = fs.statSync(file).mode & 0o777;
-    expect(mode).toBe(0o600);
-    expect(fs.statSync(secretsDir()).mode & 0o777).toBe(0o700);
-    expect(readSecret("sudo")).toBe("p@ssw0rd");
-    expect(listSecretNames()).toEqual(["sudo"]);
+describe("加密凭据库", () => {
+  it("AES-GCM 保存：记忆与磁盘都看不到明文，文件权限 0600", () => {
+    const id = storeSecret("p@ssw0rd", "sudo 密码");
+    expect(loadSecret(id)).toBe("p@ssw0rd");
+    expect(listSecrets()).toEqual([
+      expect.objectContaining({ id, label: "sudo 密码" }),
+    ]);
 
-    expect(deleteSecret("sudo")).toBe(true);
-    expect(readSecret("sudo")).toBeNull();
+    const entries = fs.readFileSync(
+      path.join(vaultDir(), "entries.json"),
+      "utf8",
+    );
+    expect(entries).not.toContain("p@ssw0rd");
+    expect(fs.statSync(path.join(vaultDir(), "entries.json")).mode & 0o777).toBe(
+      0o600,
+    );
+    expect(fs.statSync(path.join(vaultDir(), "key")).mode & 0o777).toBe(0o600);
+
+    expect(deleteSecret(id)).toBe(true);
+    expect(loadSecret(id)).toBeNull();
   });
 
-  it("拒绝路径穿越式名称", () => {
-    expect(() => saveSecret("../config", "x")).toThrow(/非法凭据名称/);
+  it("文本保护只替换凭据值，返回引用 id", () => {
+    const protectedText = protectSecretsInText(
+      "sudo 密码是 abc123\n数据库密码是 dbpass。",
+    );
+    expect(protectedText.text).toContain("[加密凭据 ");
+    expect(protectedText.text).not.toContain("abc123");
+    expect(protectedText.text).not.toContain("dbpass");
+    expect(protectedText.credentialIds).toHaveLength(2);
   });
 
-  it.skipIf(process.platform === "win32")(
-    "xzh sudo 只通过 stdin 把密码交给 sudo",
-    async () => {
-      const bin = fs.mkdtempSync(path.join(os.tmpdir(), "xzh-fake-sudo-"));
-      const fake = path.join(bin, "sudo");
-      fs.writeFileSync(
-        fake,
-        '#!/bin/sh\nread -r pw\n[ "$pw" = "test-pw" ] || exit 9\nshift 4\nexec "$@"\n',
-        { mode: 0o755 },
-      );
-      const oldPath = process.env.PATH;
-      process.env.PATH = `${bin}:${oldPath ?? ""}`;
-      try {
-        const ok = await runWithSudo("test-pw", [
-          process.execPath,
-          "-e",
-          "process.exit(0)",
-        ]);
-        expect(ok.code).toBe(0);
-        const bad = await runWithSudo("wrong", [
-          process.execPath,
-          "-e",
-          "process.exit(0)",
-        ]);
-        expect(bad.code).toBe(9);
-      } finally {
-        process.env.PATH = oldPath;
-        fs.rmSync(bin, { recursive: true, force: true });
-      }
-    },
-  );
+  it("memory_write 自动加密后落盘，不拒绝写入", async () => {
+    const result = await memoryWriteTool.execute(
+      { content: "sudo 密码是 p@ssw0rd", target: "global", scope: "long" },
+      ctx(),
+    );
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain("已加密");
+
+    const memory = readGlobalMemory().longTerm;
+    expect(memory).toContain("[加密凭据 ");
+    expect(memory).not.toContain("p@ssw0rd");
+  });
 });

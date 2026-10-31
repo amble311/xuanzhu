@@ -185,33 +185,21 @@ describe("D18：bash 输出截断必须有提示", () => {
     expect(interactiveCommandName("grep passwd README.md")).toBeUndefined();
     expect(interactiveCommandName("echo hi && su root")).toBe("su");
     expect(interactiveCommandName("FOO=bar vim a.txt")).toBe("vim");
-    // sudo 无 TTY 会等密码；带 -n / -S 或走 xzh sudo 时不应拦截
+    // sudo 无 TTY 会等密码；带 -n / -S 时不应拦截
     expect(interactiveCommandName("sudo ls")).toBe("sudo");
     expect(interactiveCommandName("sudo -n ls")).toBeUndefined();
     expect(interactiveCommandName("sudo -S ls")).toBeUndefined();
-    expect(interactiveCommandName("xzh sudo ls")).toBeUndefined();
   });
 
-  it("sudo 提示引导使用 xzh sudo，而不是干等超时", async () => {
+  it("sudo 无 TTY 时提前失败并提示 NOPASSWD", async () => {
     const cwd = tmpDir("xzh-bash-");
     const result = await bashTool.execute(
       { command: "sudo ls", timeout: 30_000 },
       toolCtx(cwd),
     );
     expect(result.ok).toBe(false);
-    expect(result.content).toContain("xzh sudo");
-    expect(result.content).toContain("xzh secret set sudo");
-    fs.rmSync(cwd, { recursive: true, force: true });
-  });
-
-  it("密码录入命令不能在 bash 工具里代跑", async () => {
-    const cwd = tmpDir("xzh-bash-");
-    const result = await bashTool.execute(
-      { command: "xzh secret set sudo", timeout: 30_000 },
-      toolCtx(cwd),
-    );
-    expect(result.ok).toBe(false);
-    expect(result.content).toContain("不能通过 bash 工具代跑");
+    expect(result.content).toContain("sudo -n");
+    expect(result.content).toContain("NOPASSWD");
     fs.rmSync(cwd, { recursive: true, force: true });
   });
 
