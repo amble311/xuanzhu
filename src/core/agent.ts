@@ -1533,7 +1533,7 @@ export class Agent {
       this.pendingMemoryNotices = [];
     }
 
-    // system prompt 自身就可能撑满窗口：项目规则（rules.md）与附加指令
+    // system prompt 自身就可能撑满窗口：项目规则（AGENTS.md）与附加指令
     // （systemPromptExtra）都是全文注入、无长度上限。这种情况下再怎么裁历史也发不出去，
     // 必须让用户知道真正的原因，而不是只看到一句语焉不详的 400。
     if (
@@ -1547,7 +1547,7 @@ export class Agent {
       this.warnedTightContext = true;
       this.events.onNotice?.(
         "当前模型可用上下文过小：系统提示词已占去绝大部分窗口，历史与工具输出将无法发送。" +
-          "可精简项目规则（.xuanzhu/rules.md）或 systemPromptExtra，" +
+          "可精简项目规则（AGENTS.md）或 systemPromptExtra，" +
           "或改用窗口更大的模型（xzh model context <id> <大小>）。",
       );
     }

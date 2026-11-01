@@ -113,6 +113,7 @@ describe("计划与写入", () => {
     expect(plan.files.map((file) => file.relPath)).toContain("AGENTS.md");
     expect(plan.files.map((file) => file.relPath)).toContain("docs/ARCHITECTURE.md");
     expect(plan.files.map((file) => file.relPath)).toContain("docs/COMMANDS.md");
+    expect(plan.files.map((file) => file.relPath)).toContain("docs/README.md");
     // 计划阶段不写盘
     expect(fs.existsSync(path.join(root, "AGENTS.md"))).toBe(false);
 
@@ -121,7 +122,16 @@ describe("计划与写入", () => {
     expect(agents.content).toContain("# demo-app 开发规范");
     expect(agents.content).toContain("`npm run test`");
     expect(agents.content).toContain("## 目录结构");
+    expect(agents.content).toContain("本文件只保留入口级大纲");
+    expect(agents.content).toContain("## 文档同步");
+    expect(agents.content).toContain("额外告知用户设计变化");
     expect(agents.content).toContain("docs/ARCHITECTURE.md");
+    expect(agents.content).not.toContain("| 用途 | 命令 | 来源 |");
+
+    const docsIndex = plan.files.find((file) => file.relPath === "docs/README.md")!;
+    expect(docsIndex.content).toContain("对应关系");
+    expect(docsIndex.content).toContain("AGENTS.md");
+    expect(docsIndex.content).toContain("docs/ARCHITECTURE.md");
   });
 
   it("写入后再计划 → 全部跳过（幂等，无变化不写盘）", () => {
@@ -131,6 +141,7 @@ describe("计划与写入", () => {
     applyInit(planInit(root));
     expect(fs.existsSync(path.join(root, "AGENTS.md"))).toBe(true);
     expect(fs.existsSync(path.join(root, "docs/ARCHITECTURE.md"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "docs/README.md"))).toBe(true);
 
     const second = planInit(root);
     expect(second.files.every((file) => file.action === "skip")).toBe(true);

@@ -366,7 +366,7 @@ function resolveTotalBudget(
 /**
  * system prompt 是否已占去窗口的一半以上。
  *
- * 项目规则（rules.md）与附加指令（systemPromptExtra）都是全文注入、无长度上限，
+ * 项目规则（AGENTS.md）与附加指令（systemPromptExtra）都是全文注入、无长度上限，
  * 它们可能把窗口吃光，此时裁历史毫无意义 —— 需要提示用户精简或换大窗口模型。
  */
 export function isSystemPromptTight(

@@ -175,6 +175,7 @@ xzh
 | `xzh init` | 扫描项目并生成 / 补全 `AGENTS.md` 与 `docs/`（已有内容只补缺失小节） |
 | `xzh init --dry-run` | 只预览将生成的内容，不写文件 |
 | `xzh init --force` | 整体覆盖已有规范文件（覆盖前自动备份） |
+| `xzh agents.md` | 让当前模型根据项目实际内容重写 / 整合 `AGENTS.md`（支持 `--dry-run`、`--yes`） |
 | `xzh skill` | 交互式管理技能：启用 / 禁用 / 删除（禁用的技能对模型不可见） |
 | `xzh skill list` | 列出全部技能（来源与状态，含已禁用项） |
 | `xzh skill enable/disable <名称>` | 启用 / 禁用技能 |
@@ -341,7 +342,7 @@ xzh model remove openai/gpt-4o         # 删除（id / 模型名 / 序号 / 别�
   实测中用户只发了句「在吗」，它却接着去起服务、查凭据。
 
 > 裁剪依据是**估算**的 token 数（中文约 1 字符/token，英文与代码约 3.5 字符/token），
-> 不依赖 tokenizer，属保守近似。项目规则（`.xuanzhu/rules.md`）与 `systemPromptExtra`
+> 不依赖 tokenizer，属保守近似。项目规则（`AGENTS.md`）与 `systemPromptExtra`
 > 会全文进入系统提示词，写得过长会挤占历史额度 —— 占去窗口一半以上时界面会给出提示。
 >
 > 估算偏差还会被**真实用量回填**逐步校正：每次请求结束后，玄猪拿服务端返回的
@@ -779,14 +780,14 @@ AutoX.js 那侧也可用环境变量 `XZH_DEVICE_PORT` 指定端口。
 
 ## 项目目录（.xuanzhu/）
 
-首次在某个项目中运行 `xzh` 时，会在项目根自动创建 `.xuanzhu/`，用于保存**项目级记忆与规则**
-（对应 CodeBuddy 的 `.codebuddy/memory/`）：
+首次在某个项目中运行 `xzh` 时，会在项目根自动创建 `.xuanzhu/` 保存**项目级记忆**；
+项目规范使用根目录 `AGENTS.md`，只在用户执行 `xzh init` 且文件不存在时创建：
 
 | 路径 | 用途 |
 | --- | --- |
 | `.xuanzhu/memory/MEMORY.md` | 长期记忆：**按主题整理的结论库**（稳定事实、口径与踩坑），启动时会注入系统提示词（节选） |
 | `.xuanzhu/memory/YYYY-MM-DD.md` | 每日日志：按天追加的进展与过程记录 |
-| `.xuanzhu/rules.md` | 项目规则，内容作为「项目级指令」注入系统提示词。**首次初始化时若项目根已有 `AGENTS.md`**，则写入一条「必须严格按照 `AGENTS.md` 执行」的指令（而非复制其内容）—— 这样 `AGENTS.md` 始终是唯一真实来源，你改完它模型下次读取即是新版 |
+| `AGENTS.md` | 项目根的项目规范；**内容会直接注入系统提示词**（不再只让模型“记得去读”），大小写兼容 |
 
 记忆由玄猪自行维护：
 
@@ -888,7 +889,8 @@ v2ray / Clash / mihomo / sing-box **本地 SOCKS/HTTP 入站端口**，验证后
 
 | 文件 | 内容 |
 | --- | --- |
-| `AGENTS.md` | 入口级：项目概览、常用命令、两层目录树、开发约定、文档索引（保持精简） |
+| `AGENTS.md` | **只放入口级大纲**：项目概览、关键命令、顶层目录、必守约定、文档索引；完整内容放 `docs/` |
+| `docs/README.md` | 文档索引：AGENTS.md 与 `docs/` 各文件的对应关系 |
 | `docs/ARCHITECTURE.md` | 目录结构、模块概览、入口与运行方式；无法确定的部分标注「待补充」 |
 | `docs/COMMANDS.md` | 命令表 + `package.json` scripts 原始内容（有命令时才生成） |
 | `docs/CONVENTIONS.md` | 从配置文件探测到的风格与工程约定（有配置时才生成） |
@@ -900,11 +902,24 @@ v2ray / Clash / mihomo / sing-box **本地 SOCKS/HTTP 入站端口**，验证后
 | `xzh init --force` | 整体覆盖已有规范文件（覆盖前写 `.bak-<时间戳>` 备份） |
 | `xzh init --yes` | 跳过确认（脚本 / CI） |
 | `/init` | 对话内执行（写入前弹确认框；支持 `/init --dry-run`、`/init --force`） |
+| `/agents.md` | 对话内让模型重写 / 整合 `AGENTS.md`（支持 `/agents.md --dry-run`） |
 
 - **幂等**：再次运行内容无变化时不写盘，只报「已是最新」；
 - **不自动「修正」**：已有同名小节一律保留（不改写团队手写约定），只补缺失部分；
-- **不在进入项目时自动执行**：启动保持只读；需要时手动运行，避免每次启动都扫描、写文件。
-- 已有的 `.xuanzhu/rules.md` 会在项目根存在 `AGENTS.md` 时要求模型严格遵循它，因此生成的规范会直接影响后续对话 —— 请像维护代码一样维护它。
+- **不在进入项目时自动扫描/生成**：`xzh init` 需要手动运行；启动不会创建 `AGENTS.md`，也不会扫描仓库。
+- 项目根 `AGENTS.md` 会**直接注入系统提示词**；启动不会创建它，只有 `xzh init` 在文件不存在时生成入口模板。请像维护代码一样维护它。
+
+## 用模型整理 AGENTS.md（`xzh agents.md` / `/agents.md`）
+
+`xzh init` 是确定性的扫描与增量补充；`xzh agents.md` 会调用当前模型，根据项目扫描结果
+和现有 `AGENTS.md` 做一次重写：
+
+- 不存在 `AGENTS.md`：直接根据项目事实编写，不做整合；
+- 已存在：保留仍然有效的用户约定，合并重复内容，删除空模板/过时内容；
+- 写入前展示预览并确认，覆盖旧文件时自动备份为 `AGENTS.md.bak-<时间戳>`；
+- 模型只使用扫描事实、现有 AGENTS、README/docs 摘要，不读取依赖或构建产物；
+- 仍不编造命令和路径；失败时不会写入半成品；
+- 强制保留「文档同步」小节：代码改动同步到 AGENTS/docs，md 设计变化需额外告知用户。
 
 ## 内置技能
 
@@ -1034,7 +1049,7 @@ description: 一句话说明该技能的用途与适用场景
 kitty / Ghostty 会把该 xterm 兼容序列映射成「所有按键都用转义码上报」而破坏普通输入，
 故玄猪对这两类终端不发送请求，请改用 `Alt+Enter` 或在终端侧自行配置。
 
-界面内命令：`/help`、`/clear`、`/tools`、`/context`、`/compact`、`/focus [文件]`、`/device`、`/image`（`/paste`）、`/copy [N|A-B|last|all]`、`/mouse`、`/reset`、`/resume [编号]`、`/cwd`、`/switch <目录>`、`/term`、`/model [编号|id|模型名]`、`/goal <目标>`（`/goal [status|continue|off]`）、`/memory [global|show [global]|clear [global]]`、`/usage`、`/undo [N]`、`/init [--dry-run|--force]`、`/auto [on|off]`、`/intent [on|off]`、`/exit`。
+界面内命令：`/help`、`/clear`、`/tools`、`/context`、`/compact`、`/focus [文件]`、`/device`、`/image`（`/paste`）、`/copy [N|A-B|last|all]`、`/mouse`、`/reset`、`/resume [编号]`、`/cwd`、`/switch <目录>`、`/term`、`/model [编号|id|模型名]`、`/goal <目标>`（`/goal [status|continue|off]`）、`/memory [global|show [global]|clear [global]]`、`/usage`、`/undo [N]`、`/init [--dry-run|--force]`、`/agents.md [--dry-run]`、`/auto [on|off]`、`/intent [on|off]`、`/exit`。
 
 ### 选中与复制
 

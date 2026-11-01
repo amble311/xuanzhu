@@ -16,6 +16,7 @@ export const AGENTS_FILE = "AGENTS.md";
 export const ARCHITECTURE_FILE = "docs/ARCHITECTURE.md";
 export const COMMANDS_FILE = "docs/COMMANDS.md";
 export const CONVENTIONS_FILE = "docs/CONVENTIONS.md";
+export const DOCS_INDEX_FILE = "docs/README.md";
 
 const GENERATED_MARK = (version: string, date: string): string =>
   `> 本文件由 \`xzh init\` 扫描生成（xzh v${version}，${date}）。可直接编辑；` +
@@ -105,7 +106,14 @@ function docIndex(facts: ProjectFacts, generated: string[]): string {
   return `## 文档索引\n\n${files.map(docLine).join("\n")}`;
 }
 
-/** 生成 AGENTS.md（精简的入口级规范） */
+/**
+ * 生成 AGENTS.md（入口级大纲，不写细节）。
+ *
+ * 固定设计：
+ * - 只描述项目是什么、怎么验证、去哪里看细节；
+ * - 完整命令、目录树、模块职责、编码约定都放 docs/；
+ * - 本文件任何新增内容都应先问「这是入口级导航，还是 docs 的细节？」
+ */
 export function buildAgentsDoc(
   facts: ProjectFacts,
   options: { version: string; date: string; generatedDocs: string[] },
@@ -120,34 +128,89 @@ export function buildAgentsDoc(
     `- 规模：约 ${facts.fileCount} 个文件、${facts.directories.length} 个顶层目录（不含依赖与构建产物）`,
   );
 
-  const conventions: string[] = [];
-  const test = facts.commands.find((command) => command.name === "测试");
-  const build = facts.commands.find((command) => command.name === "构建");
-  const typecheck = facts.commands.find((command) => command.name === "类型检查");
-  if (test) conventions.push(`- 修改代码后运行 \`${test.command}\` 验证。`);
-  if (build) conventions.push(`- 提交前确保构建通过：\`${build.command}\`。`);
-  if (typecheck && typecheck.command !== test?.command) {
-    conventions.push(`- 类型检查：\`${typecheck.command}\`。`);
+  const commandNames = ["安装依赖", "测试", "构建", "类型检查", "lint", "格式化"];
+  const commandLines = commandNames
+    .map((name) => facts.commands.find((command) => command.name === name))
+    .filter((command): command is NonNullable<typeof command> => Boolean(command))
+    .map((command) => `- ${command.name}：\`${command.command}\``);
+  if (commandLines.length === 0) {
+    commandLines.push("- （未检测到构建 / 测试命令，见 `docs/COMMANDS.md`）");
   }
-  if (test || build || typecheck) {
-    conventions.push("- 若确实无法运行验证，在结论里说明原因与未验证的风险。");
-  }
-  conventions.push("- 具体模块职责、入口与数据流见 `docs/ARCHITECTURE.md`；命令细节见 `docs/COMMANDS.md`。");
-  conventions.push("- 本文件与 `docs/` 由项目维护者负责；`xzh init` 只做增量补充。");
+
+  const topDirs = facts.directories
+    .slice(0, 10)
+    .map((dir) => `\`${dir.name}/\``)
+    .join("、");
+  const dirLine = topDirs
+    ? `- 顶层目录：${topDirs}`
+    : "- （未检测到顶层目录）";
+
+  const hasDoc = (file: string): boolean => options.generatedDocs.includes(file);
+  const commandHint = hasDoc(COMMANDS_FILE)
+    ? "> 完整命令、来源与说明见 `docs/COMMANDS.md`。"
+    : "> 目前未检测到完整命令表；需要时再补 `docs/COMMANDS.md`。";
+  const conventionHint = hasDoc(CONVENTIONS_FILE)
+    ? "- 详细编码规范与环境约定见 `docs/CONVENTIONS.md`；需要补充时先写 docs，不要在 AGENTS 展开。"
+    : "- 编码规范与环境约定如有需要，请新建 `docs/CONVENTIONS.md`，不要在 AGENTS 展开。";
 
   const sections = [
     `# ${facts.name} 开发规范`,
     GENERATED_MARK(options.version, options.date),
+    "> **本文件只保留入口级大纲，详细内容写在 `docs/` 下；不要把长说明、完整命令表、目录树或代码细节堆在这里。**",
     `## 项目概览\n\n${overview.join("\n")}`,
-    `## 常用命令\n\n${commandRows(facts)}\n\n> 命令来自 package.json scripts / Makefile / 构建文件；如与实际不符，请直接修改本文件。`,
-    `## 目录结构\n\n\`\`\`\n${renderTree(facts.root)}\n\`\`\`\n\n> 只列主要目录；详细说明见 \`docs/ARCHITECTURE.md\`。`,
-    `## 开发约定\n\n${conventions.join("\n")}`,
+    `## 常用命令\n\n${commandLines.join("\n")}\n\n${commandHint}`,
+    `## 目录结构\n\n${dirLine}\n\n> 模块职责、入口与数据流见 \`docs/ARCHITECTURE.md\`。`,
+    "## 开发约定\n\n" +
+      "- 先读本文件与相关 `docs/` 小节，再开始修改。\n" +
+      "- 修改代码后运行上面的测试 / 构建命令；无法验证时说明原因与风险。\n" +
+      conventionHint,
+    "## 文档同步\n\n" +
+      "- **修改项目代码后，必须同步修改 `AGENTS.md` 或 `docs/` 下对应的说明文件**，" +
+      "让入口大纲与详细文档互相呼应；不要在代码改了之后留下过期说明。\n" +
+      "- 修改 `AGENTS.md` / `docs/*.md` 时，如果设计、目录、命令或约定发生变化，" +
+      "**必须在最终回复中额外告知用户设计变化**，不要只提交文件改动。",
   ];
+
 
   const docs = docIndex(facts, options.generatedDocs);
   if (docs) sections.push(docs);
 
   return `${sections.join("\n\n")}\n`;
+}
+
+/** 生成 docs/README.md：文档入口与 AGENTS 的映射 */
+export function buildDocsIndexDoc(
+  facts: ProjectFacts,
+  options: { version: string; date: string; generatedDocs: string[] },
+): string {
+  const links = [
+    ...new Set(["AGENTS.md", ...options.generatedDocs, DOCS_INDEX_FILE]),
+  ];
+  const has = (file: string): boolean =>
+    file === DOCS_INDEX_FILE || options.generatedDocs.includes(file);
+  const rows = [
+    "| 项目入口大纲、必守约定 | `AGENTS.md` |",
+    "| 目录结构、模块职责、数据流 | `docs/ARCHITECTURE.md` |",
+    has(COMMANDS_FILE) ? "| 安装 / 构建 / 测试 / 校验命令 | `docs/COMMANDS.md` |" : "",
+    has(CONVENTIONS_FILE) ? "| 编码风格、配置与环境约定 | `docs/CONVENTIONS.md` |" : "",
+  ].filter(Boolean);
+  return `# ${facts.name} 文档索引
+
+${GENERATED_MARK(options.version, options.date)}
+
+> \`AGENTS.md\` 只放大纲；本目录存放详细说明。Agent 先读 AGENTS.md，再按需打开对应文档。
+> 修改代码后同步维护对应 md；md 改动涉及设计变化时，必须在回复中额外说明。
+
+## 对应关系
+
+| 内容 | 位置 |
+| --- | --- |
+${rows.join("\n")}
+
+## 已有文档
+
+${links.map((item) => `- \`${item}\``).join("\n")}
+`;
 }
 
 /** 生成 docs/ARCHITECTURE.md */
@@ -326,6 +389,13 @@ export function generateProjectDocs(
   if (facts.configs.length > 0) {
     docs.push({ relPath: CONVENTIONS_FILE, content: buildConventionsDoc(facts, options) });
   }
+  docs.push({
+    relPath: DOCS_INDEX_FILE,
+    content: buildDocsIndexDoc(facts, {
+      ...options,
+      generatedDocs: docs.map((doc) => doc.relPath),
+    }),
+  });
   docs.push({
     relPath: AGENTS_FILE,
     content: buildAgentsDoc(facts, {

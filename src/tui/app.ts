@@ -4,6 +4,10 @@ import { Agent, type AgentEvents } from "../core/agent";
 import { goalContinuePrompt, goalStartPrompt } from "../core/goal";
 import { applyInit, planInit, summarizePlan } from "../init";
 import {
+  generateAgentsRewrite,
+  writeAgentsFile,
+} from "../init/agents-rewrite";
+import {
   appendSessionMessages,
   listSessions,
   loadSessionMessages,
@@ -483,9 +487,6 @@ export class TuiApp {
       );
       this.lines.push(
         `${ansi.gray}  · memory/   项目记忆（玄猪写入，跨会话复用）${ansi.reset}`,
-      );
-      this.lines.push(
-        `${ansi.gray}  · rules.md  项目规则（内容注入系统提示词）${ansi.reset}`,
       );
       this.lines.push("");
     }
@@ -2432,6 +2433,10 @@ export class TuiApp {
         // 项目规范：扫描并生成 / 补全 AGENTS.md 与 docs/（写入前确认）
         void this.handleInitCommand(arg);
         break;
+      case "agents.md":
+        // 与模型一起重写 / 整合 AGENTS.md
+        void this.handleAgentsMdCommand(arg);
+        break;
       default:
         this.lines.push(`${ansi.yellow}未知命令：/${command}，输入 /help 查看帮助。${ansi.reset}`);
     }
@@ -2530,6 +2535,96 @@ export class TuiApp {
       this.lines.push(
         `${ansi.red}✗ 写入失败：${err instanceof Error ? err.message : String(err)}${ansi.reset}`,
       );
+    }
+  }
+
+  /**
+   * /agents.md —— 用当前模型重写 / 整合项目根 AGENTS.md。
+   * 已存在时保留用户有效约定并合并；不存在时直接根据扫描事实编写。
+   */
+  private async handleAgentsMdCommand(arg: string): Promise<void> {
+    const flags = new Set(arg.split(/\s+/).filter(Boolean));
+    const allowed = new Set(["--dry-run", "-n"]);
+    const unknown = [...flags].filter((flag) => !allowed.has(flag));
+    if (unknown.length > 0) {
+      this.lines.push(`${ansi.yellow}未知参数：${unknown.join(" ")}${ansi.reset}`);
+      this.lines.push(`${ansi.gray}  · 用法：/agents.md [--dry-run]${ansi.reset}`);
+      return;
+    }
+    if (this.busy) {
+      this.lines.push(`${ansi.gray}当前正忙，完成后再试 /agents.md。${ansi.reset}`);
+      return;
+    }
+    const dryRun = flags.has("--dry-run") || flags.has("-n");
+    this.busy = true;
+    this.statusText = "整理 AGENTS.md";
+    this.statusDetail = "";
+    this.startBusyProgress();
+    this.abortController = new AbortController();
+    this.scheduleRender();
+
+    try {
+      const draft = await generateAgentsRewrite(
+        this.cwd,
+        this.options.config,
+        this.agent.getActiveModel(),
+        this.abortController.signal,
+      );
+      this.lines.push(
+        `${ansi.bold}${draft.existing ? "重写" : "新建"} AGENTS.md${ansi.reset} ` +
+          `${ansi.gray}（${draft.facts.fileCount} 个文件 · ${draft.facts.directories.length} 个顶层目录）${ansi.reset}`,
+      );
+      const preview = draft.content.split("\n").slice(0, 40);
+      for (const line of preview) this.lines.push(`${ansi.gray}${line}${ansi.reset}`);
+      if (draft.content.split("\n").length > preview.length) {
+        this.lines.push(`${ansi.gray}…（预览已截断）${ansi.reset}`);
+      }
+
+      if (dryRun) {
+        this.lines.push(
+          `${ansi.gray}未写入文件；去掉 --dry-run 才会写入。${ansi.reset}`,
+        );
+        return;
+      }
+
+      const approved = await this.requestConfirm(
+        {
+          tool: "agents.md",
+          title: draft.existing ? "覆盖 AGENTS.md？" : "创建 AGENTS.md？",
+          detail:
+            `${draft.existing ? "将覆盖" : "将创建"}：${draft.targetPath}\n\n` +
+            draft.content.slice(0, 1_500) +
+            (draft.content.length > 1_500 ? "\n…" : ""),
+          danger: Boolean(draft.existing),
+        },
+        !draft.existing,
+      );
+      if (!approved) {
+        this.lines.push(`${ansi.gray}已取消，未修改 AGENTS.md。${ansi.reset}`);
+        return;
+      }
+
+      const result = writeAgentsFile(this.cwd, draft.content);
+      this.agent.reloadSystemPrompt();
+      this.lines.push(`${ansi.green}✓ 已写入 ${result.target}${ansi.reset}`);
+      if (result.backup) {
+        this.lines.push(`${ansi.gray}  备份：${result.backup}${ansi.reset}`);
+      }
+      this.lines.push(
+        `${ansi.gray}  系统提示词已刷新，下一轮将使用新的 AGENTS.md。${ansi.reset}`,
+      );
+    } catch (err) {
+      this.lines.push(
+        `${ansi.red}✗ 生成 AGENTS.md 失败：${
+          err instanceof Error ? err.message : String(err)
+        }${ansi.reset}`,
+      );
+    } finally {
+      this.stopBusyProgress();
+      this.busy = false;
+      this.abortController = undefined;
+      this.statusText = "就绪";
+      this.scheduleRender();
     }
   }
 
@@ -3128,7 +3223,7 @@ export class TuiApp {
     this.lines.push(`${ansi.green}✓ 已切换项目目录：${resolved}${ansi.reset}`);
     if (project.created) {
       this.lines.push(
-        `${ansi.gray}  已初始化项目目录 ${project.paths.dir}（memory/ 记忆 · rules.md 规则）${ansi.reset}`,
+        `${ansi.gray}  已初始化项目目录 ${project.paths.dir}（memory/ 项目记忆）${ansi.reset}`,
       );
     }
 
@@ -3791,7 +3886,7 @@ export class TuiApp {
       );
     }
     this.lines.push(
-      `${ansi.gray}  是否被调用由模型决定；想强调某个工具，可写进项目规则（.xuanzhu/rules.md）。${ansi.reset}`,
+      `${ansi.gray}  是否被调用由模型决定；想强调某个工具，可写进项目根 AGENTS.md。${ansi.reset}`,
     );
     this.scheduleRender();
   }
@@ -3824,6 +3919,7 @@ export class TuiApp {
       `  /goal [status|continue|off]  查看当前目标 / 继续已暂停的目标 / 清除目标`,
       `  /memory        查看项目记忆；/memory show [global] 查看全文；/memory global 状态；/memory clear [global] 清空（需确认）`,
       `  /init [--dry-run|--force]  扫描项目并生成 / 补全 AGENTS.md 与 docs/（写入前确认）`,
+      `  /agents.md [--dry-run]     让模型根据项目实际内容重写 / 整合 AGENTS.md`,
       `  /auto [on|off] 切换自动批准（on：所有工具直接执行，写入配置）`,
       `  /intent [on|off] 切换意图分析（on：每条消息先做意图分析再处理，写入配置）`,
       `  /exit          退出玄猪`,

@@ -171,9 +171,9 @@ ${deviceSection}
   }
 
   if (projectRules && projectRules.trim()) {
-    // 小窗口模型下规则也必须有上限：rules.md 是用户手写的，可能很长
+    // 小窗口模型下规则也必须有上限：AGENTS.md 是用户手写的，可能很长
     const rules = compact ? projectRules.trim().slice(0, 2500) : projectRules.trim();
-    result += `\n\n## 项目规则（来自项目根 .xuanzhu/rules.md，请优先遵守）\n${rules}`;
+    result += `\n\n## 项目规则（AGENTS.md，请优先遵守）\n${rules}`;
   }
 
   result += buildGlobalMemorySection(globalMemory, globalMemoryMaxChars, compact);
