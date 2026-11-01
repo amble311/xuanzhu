@@ -25,7 +25,7 @@ function printHelp(): void {
 ${ansi.bold}xzh init${ansi.reset} ${ansi.gray}—— 扫描项目并生成 / 补全开发规范${ansi.reset}
 
 ${ansi.bold}用法${ansi.reset}
-  ${ansi.green}xzh init${ansi.reset}                 生成 AGENTS.md 与 docs/（已有内容只补充缺失小节）
+  ${ansi.green}xzh init${ansi.reset}                 搭建 AGENTS.md 与 docs/ 初始框架（已有内容只补充缺失小节）
   ${ansi.green}xzh init --dry-run${ansi.reset}       只预览将生成的内容，不写任何文件
   ${ansi.green}xzh init --force${ansi.reset}         整体覆盖已有规范文件（覆盖前自动备份）
   ${ansi.green}xzh init --yes${ansi.reset}           跳过确认（脚本 / CI）

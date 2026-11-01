@@ -6,6 +6,7 @@ import { applyInit, planInit, summarizePlan } from "../init";
 import {
   generateAgentsRewrite,
   writeAgentsFile,
+  writeDocsFiles,
 } from "../init/agents-rewrite";
 import {
   appendSessionMessages,
@@ -2433,10 +2434,6 @@ export class TuiApp {
         // 项目规范：扫描并生成 / 补全 AGENTS.md 与 docs/（写入前确认）
         void this.handleInitCommand(arg);
         break;
-      case "agents.md":
-        // 与模型一起重写 / 整合 AGENTS.md
-        void this.handleAgentsMdCommand(arg);
-        break;
       default:
         this.lines.push(`${ansi.yellow}未知命令：/${command}，输入 /help 查看帮助。${ansi.reset}`);
     }
@@ -2479,7 +2476,16 @@ export class TuiApp {
     }
 
     if (plan.files.every((file) => file.action === "skip")) {
-      this.lines.push(`${ansi.gray}项目规范已是最新，未修改任何文件。${ansi.reset}`);
+      if (dryRun) {
+        this.lines.push(
+          `${ansi.gray}项目规范框架已是最新，未修改任何文件。${ansi.reset}`,
+        );
+        return;
+      }
+      this.lines.push(
+        `${ansi.gray}框架已存在，继续用模型完善 AGENTS.md 与 docs/…${ansi.reset}`,
+      );
+      await this.refineProjectFramework();
       return;
     }
 
@@ -2529,8 +2535,9 @@ export class TuiApp {
         this.lines.push(`${ansi.gray}  备份：${backup}${ansi.reset}`);
       }
       this.lines.push(
-        `${ansi.gray}  后续可直接编辑 AGENTS.md 与 docs/；再次 /init 只补充缺失小节。${ansi.reset}`,
+        `${ansi.gray}  框架已写入，继续用模型完善 AGENTS.md 与 docs/…${ansi.reset}`,
       );
+      await this.refineProjectFramework();
     } catch (err) {
       this.lines.push(
         `${ansi.red}✗ 写入失败：${err instanceof Error ? err.message : String(err)}${ansi.reset}`,
@@ -2539,25 +2546,16 @@ export class TuiApp {
   }
 
   /**
-   * /agents.md —— 用当前模型重写 / 整合项目根 AGENTS.md。
-   * 已存在时保留用户有效约定并合并；不存在时直接根据扫描事实编写。
+   * /init 的模型完善阶段：在确定性框架写好后，用当前模型整理
+   * AGENTS.md 与 docs/。会先展示预览并二次确认。
    */
-  private async handleAgentsMdCommand(arg: string): Promise<void> {
-    const flags = new Set(arg.split(/\s+/).filter(Boolean));
-    const allowed = new Set(["--dry-run", "-n"]);
-    const unknown = [...flags].filter((flag) => !allowed.has(flag));
-    if (unknown.length > 0) {
-      this.lines.push(`${ansi.yellow}未知参数：${unknown.join(" ")}${ansi.reset}`);
-      this.lines.push(`${ansi.gray}  · 用法：/agents.md [--dry-run]${ansi.reset}`);
-      return;
-    }
+  private async refineProjectFramework(): Promise<void> {
     if (this.busy) {
-      this.lines.push(`${ansi.gray}当前正忙，完成后再试 /agents.md。${ansi.reset}`);
+      this.lines.push(`${ansi.gray}当前正忙，完成后再试 /init。${ansi.reset}`);
       return;
     }
-    const dryRun = flags.has("--dry-run") || flags.has("-n");
     this.busy = true;
-    this.statusText = "整理 AGENTS.md";
+    this.statusText = "完善项目框架";
     this.statusDetail = "";
     this.startBusyProgress();
     this.abortController = new AbortController();
@@ -2571,41 +2569,58 @@ export class TuiApp {
         this.abortController.signal,
       );
       this.lines.push(
-        `${ansi.bold}${draft.existing ? "重写" : "新建"} AGENTS.md${ansi.reset} ` +
+        `${ansi.bold}模型完善 AGENTS.md / docs${ansi.reset} ` +
           `${ansi.gray}（${draft.facts.fileCount} 个文件 · ${draft.facts.directories.length} 个顶层目录）${ansi.reset}`,
       );
+      if (draft.scaffold.length > 0) {
+        this.lines.push(
+          `${ansi.gray}补齐 docs 初始文件：${draft.scaffold.map((doc) => doc.path).join("、")}${ansi.reset}`,
+        );
+      }
+      if (draft.docs.length > 0) {
+        this.lines.push(
+          `${ansi.gray}同步 docs：${draft.docs.map((doc) => doc.path).join("、")}${ansi.reset}`,
+        );
+      }
       const preview = draft.content.split("\n").slice(0, 40);
       for (const line of preview) this.lines.push(`${ansi.gray}${line}${ansi.reset}`);
       if (draft.content.split("\n").length > preview.length) {
         this.lines.push(`${ansi.gray}…（预览已截断）${ansi.reset}`);
       }
 
-      if (dryRun) {
-        this.lines.push(
-          `${ansi.gray}未写入文件；去掉 --dry-run 才会写入。${ansi.reset}`,
-        );
-        return;
-      }
-
       const approved = await this.requestConfirm(
         {
-          tool: "agents.md",
-          title: draft.existing ? "覆盖 AGENTS.md？" : "创建 AGENTS.md？",
+          tool: "init",
+          title: "用模型完善项目框架？",
           detail:
-            `${draft.existing ? "将覆盖" : "将创建"}：${draft.targetPath}\n\n` +
-            draft.content.slice(0, 1_500) +
+            `将更新：${draft.targetPath}\n` +
+            (draft.scaffold.length > 0
+              ? `补齐 docs：${draft.scaffold.map((doc) => doc.path).join("、")}\n`
+              : "") +
+            (draft.docs.length > 0
+              ? `模型更新 docs：${draft.docs.map((doc) => doc.path).join("、")}\n`
+              : "") +
+            `\n${draft.content.slice(0, 1_500)}` +
             (draft.content.length > 1_500 ? "\n…" : ""),
-          danger: Boolean(draft.existing),
+          danger: draft.scaffold.length > 0 || draft.docs.length > 0,
         },
-        !draft.existing,
+        true,
       );
       if (!approved) {
-        this.lines.push(`${ansi.gray}已取消，未修改 AGENTS.md。${ansi.reset}`);
+        this.lines.push(`${ansi.gray}已取消模型完善，保留初始框架。${ansi.reset}`);
         return;
       }
 
+      const scaffoldResult = writeDocsFiles(this.cwd, draft.scaffold);
+      const docsResult = writeDocsFiles(this.cwd, draft.docs);
       const result = writeAgentsFile(this.cwd, draft.content);
       this.agent.reloadSystemPrompt();
+      for (const item of [...scaffoldResult, ...docsResult]) {
+        this.lines.push(`${ansi.green}✓ 已写入 ${item.target}${ansi.reset}`);
+        if (item.backup) {
+          this.lines.push(`${ansi.gray}  备份：${item.backup}${ansi.reset}`);
+        }
+      }
       this.lines.push(`${ansi.green}✓ 已写入 ${result.target}${ansi.reset}`);
       if (result.backup) {
         this.lines.push(`${ansi.gray}  备份：${result.backup}${ansi.reset}`);
@@ -2615,10 +2630,11 @@ export class TuiApp {
       );
     } catch (err) {
       this.lines.push(
-        `${ansi.red}✗ 生成 AGENTS.md 失败：${
+        `${ansi.red}✗ 模型完善项目框架失败：${
           err instanceof Error ? err.message : String(err)
         }${ansi.reset}`,
       );
+      this.lines.push(`${ansi.gray}  初始框架已保留，可稍后再次执行 /init。${ansi.reset}`);
     } finally {
       this.stopBusyProgress();
       this.busy = false;
@@ -3918,8 +3934,7 @@ export class TuiApp {
       `  /goal <目标>   目标模式：持续自动执行直到完成（Ctrl+C 中断；/goal off 清除）`,
       `  /goal [status|continue|off]  查看当前目标 / 继续已暂停的目标 / 清除目标`,
       `  /memory        查看项目记忆；/memory show [global] 查看全文；/memory global 状态；/memory clear [global] 清空（需确认）`,
-      `  /init [--dry-run|--force]  扫描项目并生成 / 补全 AGENTS.md 与 docs/（写入前确认）`,
-      `  /agents.md [--dry-run]     让模型根据项目实际内容重写 / 整合 AGENTS.md`,
+      `  /init [--dry-run|--force]  扫描并搭建 AGENTS.md/docs 框架，再用模型完善（写入前确认）`,
       `  /auto [on|off] 切换自动批准（on：所有工具直接执行，写入配置）`,
       `  /intent [on|off] 切换意图分析（on：每条消息先做意图分析再处理，写入配置）`,
       `  /exit          退出玄猪`,

@@ -4,13 +4,16 @@ import * as path from "path";
 import { describe, expect, it } from "vitest";
 import {
   buildAgentsDraft,
+  buildDocsScaffold,
   extractAgentsMarkdown,
+  parseAgentsRewriteResponse,
   writeAgentsFile,
+  writeDocsFiles,
 } from "../src/init/agents-rewrite";
 
 const tmp = (): string => fs.mkdtempSync(path.join(os.tmpdir(), "xzh-agents-"));
 
-describe("agents.md 重写辅助", () => {
+describe("对话内 init 的模型完善辅助", () => {
   it("确定性草稿来自项目扫描事实", () => {
     const cwd = tmp();
     fs.writeFileSync(
@@ -35,6 +38,35 @@ describe("agents.md 重写辅助", () => {
     expect(
       extractAgentsMarkdown("以下是结果：\n\n# Demo\n\n- 约定\n"),
     ).toBe("# Demo\n\n- 约定\n");
+  });
+
+  it("解析 AGENTS 与 docs 更新，拒绝白名单外路径", () => {
+    const parsed = parseAgentsRewriteResponse(`
+<AGENTS>
+# Demo
+</AGENTS>
+<DOC path="docs/README.md">
+# 文档
+</DOC>
+<DOC path="../secret.md">
+# 不应写入
+</DOC>
+`);
+    expect(parsed.content).toBe("# Demo\n");
+    expect(parsed.docs).toHaveLength(1);
+    expect(parsed.docs[0].path).toBe("docs/README.md");
+  });
+
+  it("初始化 docs 脚手架并可写入", () => {
+    const cwd = tmp();
+    fs.writeFileSync(
+      path.join(cwd, "package.json"),
+      JSON.stringify({ name: "demo", scripts: { test: "npm test" } }),
+    );
+    const scaffold = buildDocsScaffold(cwd);
+    expect(scaffold.map((doc) => doc.path)).toContain("docs/README.md");
+    writeDocsFiles(cwd, scaffold);
+    expect(fs.existsSync(path.join(cwd, "docs", "README.md"))).toBe(true);
   });
 
   it("覆盖已有 AGENTS.md 前生成备份", () => {
