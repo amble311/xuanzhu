@@ -2,7 +2,7 @@
  * 顶部信息区的纯排列逻辑（无 ANSI、无 I/O，便于单测）。
  *
  * 顺序约定：
- *   品牌 → 目录 → 目标（可选）→ 快捷键提示 → 任务列表
+ *   品牌 → 目录 → 目标（可选）→ 快捷键提示 → 任务列表 → 子代理
  * 模型只显示在底部状态栏，顶部不重复。
  */
 export interface HeaderBlocks {
@@ -11,6 +11,7 @@ export interface HeaderBlocks {
   goal?: string | null;
   shortcuts: string[];
   todos: string[];
+  subagents?: string[];
 }
 
 export function composeHeaderBlocks(blocks: HeaderBlocks): string[] {
@@ -20,5 +21,6 @@ export function composeHeaderBlocks(blocks: HeaderBlocks): string[] {
     ...(blocks.goal ? [blocks.goal] : []),
     ...blocks.shortcuts,
     ...blocks.todos,
+    ...(blocks.subagents ?? []),
   ];
 }

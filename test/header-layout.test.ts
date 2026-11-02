@@ -23,6 +23,24 @@ describe("TUI 顶部布局", () => {
     expect(lines.some((line) => line.includes("模型"))).toBe(false);
   });
 
+  it("子代理排在任务列表之后", () => {
+    const lines = composeHeaderBlocks({
+      brand: "brand",
+      directory: "dir",
+      shortcuts: ["hint"],
+      todos: ["任务 1/1"],
+      subagents: ["子代理 1", "▸ code-explorer · 检查认证"],
+    });
+    expect(lines).toEqual([
+      "brand",
+      "dir",
+      "hint",
+      "任务 1/1",
+      "子代理 1",
+      "▸ code-explorer · 检查认证",
+    ]);
+  });
+
   it("目标行在快捷键之前", () => {
     const lines = composeHeaderBlocks({
       brand: "brand",

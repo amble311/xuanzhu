@@ -40,6 +40,7 @@ import type { LLMProvider, ToolCall } from "../llm/types";
 import { clipboardRequirements, currentPlatform } from "../skills/dependencies";
 import { isRequirementMet, runShellInteractive } from "../skills/installer";
 import { getToolSpecs, type ExecuteToolResult } from "../tools";
+import { DEFAULT_SUBAGENT_NAME } from "../subagents";
 import type { ConfirmRequest, RunStatus, TodoItem } from "../tools/types";
 import {
   MAX_CLIPBOARD_IMAGE_BYTES,
@@ -215,6 +216,11 @@ export class TuiApp {
   private statusDetail = "";
   /** 当前任务列表（todo_write），显示在顶部信息区 */
   private todoItems: TodoItem[] = [];
+  /** 正在运行的子代理（task 工具生命周期） */
+  private activeSubagents = new Map<
+    string,
+    { name: string; description: string; startedAt: number }
+  >();
   /** 真实 usage：本轮 / 会话累计（模型未返回 usage 时保持 0） */
   private turnInputTokens = 0;
   private turnOutputTokens = 0;
@@ -781,14 +787,41 @@ export class TuiApp {
   private handleToolStart(call: ToolCall): void {
     // 先落定未完成的正文，否则它会被渲染到工具行下方，顺序错乱
     this.flushStreamingPreview();
+    if (call.name === "task") {
+      let args: Record<string, unknown> = {};
+      try {
+        const parsed = JSON.parse(call.arguments);
+        if (parsed && typeof parsed === "object") {
+          args = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // 参数不合法时仍展示一个占位，最终由工具返回错误
+      }
+      const name =
+        typeof args.subagent_name === "string" && args.subagent_name.trim()
+          ? args.subagent_name.trim()
+          : DEFAULT_SUBAGENT_NAME;
+      const description =
+        typeof args.description === "string" && args.description.trim()
+          ? args.description.trim()
+          : "执行子任务";
+      this.activeSubagents.set(call.id, {
+        name,
+        description,
+        startedAt: Date.now(),
+      });
+    }
     const summary = summarizeToolCall(call);
     this.lines.push(`${ansi.magenta}⏺${ansi.reset} ${ansi.bold}${call.name}${ansi.reset} ${ansi.gray}${summary}${ansi.reset}`);
     this.statusText = `执行 ${call.name}`;
     this.scheduleRender();
   }
 
-  private handleToolEnd(_call: ToolCall, result: ExecuteToolResult): void {
+  private handleToolEnd(call: ToolCall, result: ExecuteToolResult): void {
     this.flushStreamingPreview();
+    if (call.name === "task") {
+      this.activeSubagents.delete(call.id);
+    }
     // summary 由工具生成，可能包含被读文件的片段或命令输出，同样需要净化
     const preview = sanitizeControl(
       result.summary ?? (result.ok ? "完成" : "失败"),
@@ -2276,6 +2309,8 @@ export class TuiApp {
       if (runStatus) this.printRunStatus(runStatus);
       this.lines.push("");
       this.stopBusyProgress();
+      // 异常中断时 onToolEnd 可能没有机会触发，避免子代理状态永久挂在顶部
+      this.activeSubagents.clear();
       this.busy = false;
       this.abortController = undefined;
       this.statusText = "就绪";
@@ -4001,6 +4036,8 @@ export class TuiApp {
       ],
       // 任务列表放在快捷键提示**下方**：固定说明在前，动态任务在后。
       todos: this.todoHeaderLines(width),
+      // 子代理与任务列表同级，继续排在动态区域末尾。
+      subagents: this.subagentHeaderLines(width),
     });
     return { info, divider };
   }
@@ -4038,6 +4075,36 @@ export class TuiApp {
     }
     if (active.length > MAX_ITEMS) {
       lines.push(`${ansi.gray}  …还有 ${active.length - MAX_ITEMS} 项${ansi.reset}`);
+    }
+    return lines;
+  }
+
+  /**
+   * 正在运行的子代理列表（无子代理时返回空数组）。
+   *
+   * 只展示 active 状态：任务结束即从顶部消失，完整报告仍在输出区。
+   * 与任务列表共用同一个左上角动态区域，避免子代理状态挤进状态栏。
+   */
+  private subagentHeaderLines(width: number): string[] {
+    if (this.activeSubagents.size === 0) return [];
+    const active = [...this.activeSubagents.values()];
+    const lines = [
+      `${ansi.gray}  ${ansi.reset}${ansi.bold}子代理 ${active.length}${ansi.reset}`,
+    ];
+    const MAX_ITEMS = 3;
+    for (const item of active.slice(0, MAX_ITEMS)) {
+      const text = truncate(
+        `${item.name} · ${item.description}`,
+        Math.max(8, width - 8),
+      );
+      lines.push(
+        `  ${ansi.brightCyan}▸${ansi.reset} ${ansi.bold}${text}${ansi.reset}`,
+      );
+    }
+    if (active.length > MAX_ITEMS) {
+      lines.push(
+        `${ansi.gray}  …还有 ${active.length - MAX_ITEMS} 个子代理${ansi.reset}`,
+      );
     }
     return lines;
   }
