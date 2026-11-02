@@ -283,6 +283,12 @@ export const bashTool: ToolDefinition = {
         type: "string",
         description: "命令执行目录（可选，默认当前工作目录）",
       },
+      run_in_background: {
+        type: "boolean",
+        description:
+          "立即返回、不阻塞本轮（适合 dev server、监听、长时间测试）。结束后会自动通知你，**不要轮询**；" +
+          "需要中途看输出或终止时用 bash_output / bash_kill。",
+      },
     },
     required: ["command"],
   },
@@ -318,6 +324,40 @@ export const bashTool: ToolDefinition = {
     if (typeof args.cwd === "string" && args.cwd) {
       const expanded = expandHome(args.cwd);
       cwd = path.isAbsolute(expanded) ? expanded : path.resolve(ctx.cwd, expanded);
+    }
+
+    // —— 后台任务：立刻返回，结束后由 Agent 主动通知 ——
+    if (args.run_in_background === true) {
+      if (!ctx.jobs) {
+        return {
+          ok: false,
+          content:
+            "错误：当前环境不支持后台任务" +
+            (ctx.spawnAgent ? "（子代理没有后台任务注册表：子代理结束后进程没有归属）。" : "。") +
+            "请改用前台执行并设置合适的 timeout。",
+        };
+      }
+      const started = ctx.jobs.start(command, cwd);
+      if (!started.job) {
+        return { ok: false, content: `错误：无法启动后台任务：${started.error}` };
+      }
+      const job = started.job;
+      if (job.error) {
+        return {
+          ok: false,
+          content: `错误：后台任务 ${job.id} 启动失败：${job.error}`,
+        };
+      }
+      return {
+        ok: true,
+        content:
+          `已转入后台：${job.id}（pid ${job.pid ?? "未知"}）\n` +
+          `日志：${job.logFile}\n` +
+          `它结束后会**自动把结果推送给你**，不要轮询 ` +
+          `（除非需要中途排查，才用 bash_output job_id=${job.id}）。\n` +
+          `若不再需要它，用 bash_kill job_id=${job.id} 终止。`,
+        summary: `后台 ${job.id}`,
+      };
     }
 
     const rawTimeout =

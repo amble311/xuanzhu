@@ -2,6 +2,16 @@ import * as fs from "fs";
 import * as path from "path";
 import { Agent, type AgentEvents } from "../core/agent";
 import { goalContinuePrompt, goalStartPrompt } from "../core/goal";
+import { readObservedActions } from "../core/autonomy";
+import {
+  defaultPartText,
+  OVERRIDABLE_PARTS,
+  promptDefaultsHash,
+  resolvePromptOverrides,
+  type PromptPartKey,
+} from "../core/prompt";
+import type { AskUserAnswer, AskUserRequest } from "../tools/types";
+import { describeJob, readFileTail, type BackgroundJob } from "../tools/jobs";
 import { applyInit, planInit, summarizePlan } from "../init";
 import {
   generateAgentsRewrite,
@@ -158,6 +168,24 @@ interface PendingSelectOption {
   value: string;
 }
 
+/**
+ * 输入区里的 `ask_user` 提问浮层。
+ *
+ * 与 `PendingSelect` 的区别：选项是可选的。给了候选时走单选（数字直选）；
+ * 没给时是可编辑的文本行 —— 因为「选 A 还是 B」和「套餐 ID 是多少」是两类问题，
+ * 强行都用单选会让用户没法回答后者。
+ */
+interface PendingAsk {
+  request: AskUserRequest;
+  /** 自由文本答案（无 options 时使用） */
+  value: string;
+  /** 文本光标位置（按 `input` 的字符下标，与主输入框一致） */
+  cursor: number;
+  /** 有 options 时的高亮序号 */
+  index: number;
+  resolve: (answer: AskUserAnswer) => void;
+}
+
 interface InputLayout {
   lines: string[];
   cursorRow: number;
@@ -296,6 +324,8 @@ export class TuiApp {
    * 而对话进行中 `submit()` 直接返回，压根进不到命令处理）。
    */
   private pendingSelect?: PendingSelect;
+  /** `ask_user` 的提问浮层（一次只有一个：并行子代理也不能提问，见 tools/index.ts） */
+  private pendingAsk?: PendingAsk;
   /** 确认请求的串行链：并行子代理同时请求确认时排队，避免覆盖导致挂死 */
   private confirmChain: Promise<void> = Promise.resolve();
   private abortController?: AbortController;
@@ -433,6 +463,9 @@ export class TuiApp {
       },
       onIntent: (analysis, original) => this.handleIntent(analysis, original),
       onModelChange: (info) => this.handleModelChange(info),
+      // 后台任务结束：本轮还在跑时结果会由 Agent 注入对话，这里只负责让人看到
+      onJobComplete: (job) => this.handleJobComplete(job),
+      askUser: (request) => this.requestAsk(request),
       confirm: (request) => this.requestConfirm(request),
       // 轮次配额用尽时问一次，而不是硬性中断 —— 真实的重构任务常常超过默认轮数，
       // 直接停掉会让工作断在半路。复用同一套确认弹窗（y 继续 / n 结束）。
@@ -708,6 +741,10 @@ export class TuiApp {
     // 右侧终端里的命令以 detached 独立进程组运行，不主动终止会成为孤儿进程
     this.stopAutoScroll();
     this.stopBusyProgress();
+    // 关闭时还停在提问浮层上：先给工具一个「跳过」的结果，避免 promise 悬空
+    if (this.pendingAsk) this.resolveAsk({ cancelled: true });
+    // 后台任务同理：它们也是独立进程组，不终止就会留下 dev server / 测试进程
+    this.agent.killBackgroundJobs("xzh 退出");
     this.term.dispose();
     this.exitTerminal();
     this.resolveExit?.();
@@ -1193,9 +1230,15 @@ export class TuiApp {
     // 括号粘贴：整段一次性插入输入框（保留其中的换行），不逐字走按键逻辑 ——
     // 逐字处理会让内容里的回车触发「提交」，也会把粘贴的转义码当控制键执行。
     if (rawKey.startsWith(PASTE_START) && rawKey.endsWith(PASTE_END)) {
-      this.insertPastedText(
-        rawKey.slice(PASTE_START.length, rawKey.length - PASTE_END.length),
-      );
+      const pasted = rawKey.slice(PASTE_START.length, rawKey.length - PASTE_END.length);
+      // 提问浮层里的粘贴要落在浮层上，否则会插进背后的主输入框
+      if (this.pendingAsk) {
+        this.pendingAsk.value += pasted;
+        this.pendingAsk.cursor = this.pendingAsk.value.length;
+        this.scheduleRender();
+        return;
+      }
+      this.insertPastedText(pasted);
       return;
     }
 
@@ -1212,6 +1255,11 @@ export class TuiApp {
     const key = normalizeKey(rawKey);
     if (this.pendingConfirm) {
       this.handleConfirmKey(key);
+      return;
+    }
+    // 提问浮层（ask_user）优先级最高：模型正阻塞等这个答案
+    if (this.pendingAsk) {
+      this.handleAskKey(key);
       return;
     }
     // 单选浮层（/model）优先吃掉按键：此时输入区已被列表取代，
@@ -1863,6 +1911,174 @@ export class TuiApp {
     }
   }
 
+  /**
+   * 打开 `ask_user` 的提问浮层（模型侧阻塞等待）。
+   *
+   * 答案会同时写进输出区：浮层消失后若不留痕，用户回看时只看到模型「自作主张」，
+   * 却不知道那是自己刚回答过的。
+   */
+  private requestAsk(request: AskUserRequest): Promise<AskUserAnswer> {
+    return new Promise<AskUserAnswer>((resolve) => {
+      this.pendingAsk = {
+        request,
+        value: "",
+        cursor: 0,
+        index: 0,
+        resolve,
+      };
+      this.scheduleRender();
+    });
+  }
+
+  private resolveAsk(answer: AskUserAnswer): void {
+    const pending = this.pendingAsk;
+    if (!pending) return;
+    this.pendingAsk = undefined;
+    const shown =
+      answer.cancelled || !answer.answer?.trim()
+        ? `${ansi.yellow}（已跳过）${ansi.reset}`
+        : `${ansi.green}${sanitizeControl(answer.answer.trim())}${ansi.reset}`;
+    this.lines.push(
+      `${ansi.brightCyan}❓ ${sanitizeControl(pending.request.question)}${ansi.reset}`,
+    );
+    this.lines.push(`  ${ansi.gray}→${ansi.reset} ${shown}`);
+    pending.resolve(answer);
+    this.scheduleRender();
+  }
+
+  private handleAskKey(key: string): void {
+    const pending = this.pendingAsk!;
+    const options = pending.request.options;
+
+    // —— 有候选：单选 ——
+    if (options && options.length > 0) {
+      const count = options.length;
+      switch (key) {
+        case "\x1b[A":
+        case "k":
+          pending.index = (pending.index - 1 + count) % count;
+          this.scheduleRender();
+          return;
+        case "\x1b[B":
+        case "j":
+          pending.index = (pending.index + 1) % count;
+          this.scheduleRender();
+          return;
+        case "\r":
+          this.resolveAsk({ answer: options[pending.index] });
+          return;
+        case "\x1b":
+          this.resolveAsk({ cancelled: true });
+          return;
+        case "\x03":
+          // Ctrl+C 的语义是「中断任务」，不只是跳过这一问
+          this.resolveAsk({ cancelled: true });
+          if (this.busy) this.abortController?.abort();
+          return;
+        default:
+          if (/^[1-9]$/.test(key)) {
+            const index = Number(key) - 1;
+            if (index < count) this.resolveAsk({ answer: options[index] });
+          }
+          return;
+      }
+    }
+
+    // —— 无候选：自由文本 ——
+    switch (key) {
+      case "\r":
+        this.resolveAsk({ answer: pending.value });
+        return;
+      case "\x1b":
+        this.resolveAsk({ cancelled: true });
+        return;
+      case "\x03":
+        this.resolveAsk({ cancelled: true });
+        if (this.busy) this.abortController?.abort();
+        return;
+      case "\x7f":
+      case "\b": {
+        if (pending.cursor > 0) {
+          const chars = Array.from(pending.value);
+          let cp = 0;
+          let count = 0;
+          for (let i = 0; i < chars.length; i++) {
+            if (count >= pending.cursor) {
+              cp = i;
+              break;
+            }
+            count += chars[i].length;
+            cp = i + 1;
+          }
+          const removed = chars[Math.max(0, cp - 1)] ?? "";
+          chars.splice(Math.max(0, cp - 1), 1);
+          pending.value = chars.join("");
+          // 光标按**删掉的那个字符**的实际长度回退，不能简单取 min（会把光标留在原文末尾）
+          pending.cursor = Math.max(0, pending.cursor - removed.length);
+          this.scheduleRender();
+        }
+        return;
+      }
+      case "\x15": // Ctrl+U 清空
+        pending.value = "";
+        pending.cursor = 0;
+        this.scheduleRender();
+        return;
+      case "\x1b[D":
+        pending.cursor = Math.max(0, pending.cursor - 1);
+        this.scheduleRender();
+        return;
+      case "\x1b[C":
+        pending.cursor = Math.min(pending.value.length, pending.cursor + 1);
+        this.scheduleRender();
+        return;
+      default:
+        // 只接受可见字符：控制序列（方向键、功能键）已经在上面的分支处理
+        if (key.length > 0 && !key.startsWith("\x1b") && key >= " ") {
+          const chars = Array.from(pending.value);
+          let cp = chars.length;
+          let count = 0;
+          for (let i = 0; i < chars.length; i++) {
+            if (count >= pending.cursor) {
+              cp = i;
+              break;
+            }
+            count += chars[i].length;
+          }
+          chars.splice(cp, 0, key);
+          pending.value = chars.join("");
+          pending.cursor += key.length;
+          this.scheduleRender();
+        }
+    }
+  }
+
+  /** 后台任务结束时在输出区留一行（此时模型可能已经结束本轮） */
+  private handleJobComplete(job: BackgroundJob): void {
+    this.flushStreamingPreview();
+    const seconds = Math.max(
+      0,
+      Math.round(
+        (Date.parse(job.endedAt ?? new Date().toISOString()) -
+          Date.parse(job.startedAt)) /
+          1000,
+      ),
+    );
+    const ok = job.code === 0 && !job.killed;
+    const label = job.killed
+      ? `${ansi.yellow}⏱ ${job.id} 已终止${ansi.reset}`
+      : ok
+        ? `${ansi.green}⏱ ${job.id} 已完成（${seconds}s）${ansi.reset}`
+        : `${ansi.yellow}⏱ ${job.id} 已结束（退出码 ${
+            job.code ?? job.signal ?? "未知"
+          }）${ansi.reset}`;
+    this.lines.push(`${label} ${ansi.gray}${truncate(job.command, 60)}${ansi.reset}`);
+    this.lines.push(
+      `${ansi.gray}  · 输出：/jobs ${job.id} · 终止：/jobs kill ${job.id}${ansi.reset}`,
+    );
+    this.scheduleRender();
+  }
+
   private insertText(text: string): void {
     this.input =
       this.input.slice(0, this.inputCursor) +
@@ -2344,6 +2560,15 @@ export class TuiApp {
       case "focus":
         this.handleFocusCommand(arg);
         break;
+      case "jobs":
+        this.handleJobsCommand(arg);
+        break;
+      case "autonomy":
+        this.handleAutonomyCommand(arg);
+        break;
+      case "prompt":
+        this.handlePromptCommand(arg);
+        break;
       case "device":
         // 手机设备桥（AutoX.js）：启动 / 查看 / 推脚本 / 看日志。异步，故不阻塞按键处理。
         void this.handleDeviceCommand(arg);
@@ -2416,9 +2641,10 @@ export class TuiApp {
         const next =
           arg === "on" ? true : arg === "off" ? false : !this.autoApprove;
         this.autoApprove = next;
-        this.options.config.autoApprove = next;
+        // 走自治等级而不是只改 autoApprove：两者各写一套会让
+        // 「明明开了 /auto，为什么还在确认」（或反过来）变得无法解释
         try {
-          saveConfig(this.options.config);
+          this.agent.setAutonomyMode(next ? "auto" : "ask");
         } catch (err) {
           this.lines.push(
             `${ansi.yellow}⚠ 配置保存失败：${err instanceof Error ? err.message : String(err)}${ansi.reset}`,
@@ -2809,10 +3035,16 @@ export class TuiApp {
         ? "受阻"
         : status.kind === "needs_input"
           ? "需要你的决定"
-          : "置信度低";
+          : status.kind === "dropped"
+            ? "无需处理"
+            : status.kind === "waiting"
+              ? "等待下一步"
+              : "置信度低";
     const color =
       status.kind === "low_confidence" ? ansi.yellow : ansi.brightYellow;
-    this.lines.push(`${color}⚠ ${label}：${status.summary}${ansi.reset}`);
+    // 「无需处理」不是警告：它是查清之后的正常结论
+    const mark = status.kind === "dropped" ? "⊘" : "⚠";
+    this.lines.push(`${color}${mark} ${label}：${status.summary}${ansi.reset}`);
     if (status.detail) {
       for (const line of status.detail.split("\n").slice(0, 6)) {
         this.lines.push(`${ansi.gray}  ${line}${ansi.reset}`);
@@ -2825,6 +3057,10 @@ export class TuiApp {
     } else if (status.kind === "blocked") {
       this.lines.push(
         `${ansi.gray}  · ${this.agent.getGoal() ? "补齐条件后 /goal continue 继续目标" : "补齐条件后直接回复即可"}${ansi.reset}`,
+      );
+    } else if (status.kind === "waiting") {
+      this.lines.push(
+        `${ansi.gray}  · 本轮到此为止，等你的下一步${this.agent.getGoal() ? "；要接着自动推进用 /goal continue" : ""}${ansi.reset}`,
       );
     }
   }
@@ -2857,6 +3093,14 @@ export class TuiApp {
 
     this.goalLoopActive = true;
     this.goalCancelled = false;
+    // observe 档下目标只能调研（写操作会被代码拦下）：先讲清楚，
+    // 免得用户以为「自动执行」卡住了
+    if (this.agent.getAutonomyMode() === "observe") {
+      this.lines.push(
+        `${ansi.yellow}⚠ 当前是 observe 模式：目标只能做只读调研，写文件 / 执行命令会被拦截` +
+          `${ansi.reset}${ansi.gray}（/autonomy auto 放行）${ansi.reset}`,
+      );
+    }
     // 每次（重新）进入循环都重置「零推进」计数：/goal continue 本身就是再给一次机会
     this.goalIdleRounds = 0;
     this.busy = true;
@@ -2977,7 +3221,13 @@ export class TuiApp {
       if (done && final) {
         this.statusText = "就绪";
         this.statusDetail = "";
-        this.lines.push(`${ansi.brightGreen}${ansi.bold}✓ 目标已完成${ansi.reset}`);
+        // 「无需处理」不是「已完成」：两者都让循环停下，但结论不同，
+        // 混在一起会让人以为这次真的改过代码
+        this.lines.push(
+          final.outcome === "dropped"
+            ? `${ansi.brightYellow}${ansi.bold}⊘ 目标结束：无需处理${ansi.reset}`
+            : `${ansi.brightGreen}${ansi.bold}✓ 目标已完成${ansi.reset}`,
+        );
         this.lines.push(
           `${ansi.gray}  共执行 ${this.goalIterations} 轮 · 用时 ${this.goalElapsedText()}。${ansi.reset}`,
         );
@@ -3001,7 +3251,9 @@ export class TuiApp {
             ? "目标等待决定"
             : pausedStatus?.kind === "blocked"
               ? "目标受阻"
-              : "目标已暂停";
+              : pausedStatus?.kind === "waiting"
+                ? "目标等待下一步"
+                : "目标已暂停";
         this.statusDetail = `第 ${this.goalIterations} 轮 · ${this.goalElapsedText()}`;
         if (hitLimit) {
           this.lines.push(
@@ -3876,6 +4128,242 @@ export class TuiApp {
   }
 
   /** `/focus` —— 维护工作集（只存路径，内容按需读取）。 */
+  /**
+   * `/prompt` —— 查看系统提示词的段落与覆盖状态。
+   *
+   * 只做「看」和「取消覆盖」：改文本用编辑器写文件再 `xzh prompt set` 更顺手，
+   * 也避免在 TUI 里塞一个多行编辑器。
+   */
+  private handlePromptCommand(arg: string): void {
+    const [sub, key] = arg.trim().split(/\s+/);
+    const config = this.options.config;
+    const { overrides } = resolvePromptOverrides(config.promptOverrides);
+    const overridden = Object.keys(overrides).length;
+
+    if (!sub || sub === "list") {
+      this.lines.push(
+        `${ansi.bold}系统提示词段落${ansi.reset}${ansi.gray}（${overridden} 段被覆盖）${ansi.reset}`,
+      );
+      for (const part of OVERRIDABLE_PARTS) {
+        const has = Object.prototype.hasOwnProperty.call(overrides, part.key);
+        const text = has ? (overrides[part.key] ?? "") : defaultPartText(part.key);
+        const mark = has
+          ? text.trim()
+            ? `${ansi.green}已覆盖${ansi.reset}`
+            : `${ansi.yellow}已删除${ansi.reset}`
+          : `${ansi.gray}内置${ansi.reset}`;
+        this.lines.push(
+          `  ${ansi.bold}${part.key}${ansi.reset} ${ansi.gray}${part.title} · ${text.length} 字符${ansi.reset} ${mark}`,
+        );
+      }
+      const base = config.promptOverridesBase;
+      const now = promptDefaultsHash();
+      if (overridden > 0 && base && base !== now) {
+        this.lines.push(
+          `${ansi.yellow}  ⚠ 内置提示词已升级，你覆盖的段落可能已与新版默认不一致（xzh prompt show <段落> 对比）${ansi.reset}`,
+        );
+      }
+      this.lines.push(
+        `${ansi.gray}  · /prompt show <段落> 查看内容 · /prompt reset <段落|--all> 取消覆盖${ansi.reset}`,
+      );
+      this.lines.push(
+        `${ansi.gray}  · 用文件覆盖：xzh prompt set <段落> <文件>（支持 - 表示 stdin）${ansi.reset}`,
+      );
+      return;
+    }
+
+    if (sub === "show") {
+      if (!key) {
+        this.lines.push(
+          `${ansi.yellow}用法：/prompt show <段落>${ansi.reset}` +
+            `${ansi.gray}（完整提示词用 xzh prompt show）${ansi.reset}`,
+        );
+        return;
+      }
+      const has = Object.prototype.hasOwnProperty.call(overrides, key);
+      const valid = OVERRIDABLE_PARTS.some((part) => part.key === key);
+      if (!valid) {
+        this.lines.push(
+          `${ansi.yellow}没有这个段落：${key}${ansi.reset}${ansi.gray}（可用：${OVERRIDABLE_PARTS.map(
+            (part) => part.key,
+          ).join(" / ")}）${ansi.reset}`,
+        );
+        return;
+      }
+      const text = has
+        ? (overrides[key as PromptPartKey] ?? "")
+        : defaultPartText(key as PromptPartKey);
+      this.lines.push(
+        `${ansi.bold}${key}${ansi.reset} ${ansi.gray}${has ? "（已覆盖）" : "（内置）"}${ansi.reset}`,
+      );
+      for (const line of text.split("\n")) {
+        this.lines.push(`${ansi.gray}  ${line}${ansi.reset}`);
+      }
+      return;
+    }
+
+    if (sub === "reset") {
+      const target = key;
+      if (!target) {
+        this.lines.push(`${ansi.yellow}用法：/prompt reset <段落|--all>${ansi.reset}`);
+        return;
+      }
+      if (target === "--all") {
+        delete config.promptOverrides;
+        delete config.promptOverridesBase;
+      } else {
+        if (!config.promptOverrides || !(target in config.promptOverrides)) {
+          this.lines.push(`${ansi.gray}${target} 没有覆盖，无需重置。${ansi.reset}`);
+          return;
+        }
+        delete config.promptOverrides[target];
+        if (Object.keys(config.promptOverrides).length === 0) {
+          delete config.promptOverrides;
+          delete config.promptOverridesBase;
+        }
+      }
+      saveConfig(config);
+      this.agent.reloadSystemPrompt();
+      this.lines.push(
+        `${ansi.green}✓ 已重置${target === "--all" ? "全部覆盖" : ` ${target} 的覆盖`}${ansi.reset}` +
+          `${ansi.gray}（下一次请求即生效）${ansi.reset}`,
+      );
+      return;
+    }
+
+    this.lines.push(
+      `${ansi.yellow}用法：/prompt [list] · /prompt show <段落> · /prompt reset <段落|--all>${ansi.reset}`,
+    );
+  }
+
+  /**
+   * `/autonomy` —— 查看 / 切换自治等级。
+   *
+   * `observe` 的价值全在「看完记录再决定」，所以查看时必须把最近拦下了什么摆出来；
+   * 只显示一个模式名，用户没法判断要不要切 auto。
+   */
+  private handleAutonomyCommand(arg: string): void {
+    const mode = arg.trim();
+    const current = this.agent.getAutonomyMode();
+
+    if (mode === "ask" || mode === "observe" || mode === "auto") {
+      this.agent.setAutonomyMode(mode);
+      this.autoApprove = mode === "auto";
+      const label =
+        mode === "auto"
+          ? "全自动（写文件 / 执行命令直接执行）"
+          : mode === "ask"
+            ? "逐项确认（危险操作先问）"
+            : "观察（危险操作一律拦截并记录，只做只读调研）";
+      this.lines.push(`${ansi.green}✓ 自治等级已切换为 ${mode}${ansi.reset} — ${label}`);
+      if (mode === "observe") {
+        this.lines.push(
+          `${ansi.gray}  · 拦截记录：.xuanzhu/state/observe.log（/autonomy 查看最近几条）${ansi.reset}`,
+        );
+      }
+      return;
+    }
+
+    if (mode && mode !== "status") {
+      this.lines.push(
+        `${ansi.yellow}用法：/autonomy [ask|observe|auto]${ansi.reset}${ansi.gray}（不带参数查看当前）${ansi.reset}`,
+      );
+      return;
+    }
+
+    const currentLabel =
+      current === "auto"
+        ? "全自动（写文件 / 执行命令直接执行）"
+        : current === "ask"
+          ? "逐项确认（危险操作先问）"
+          : "观察（危险操作一律拦截并记录）";
+    this.lines.push(`${ansi.bold}自治等级${ansi.reset}：${current} — ${currentLabel}`);
+    this.lines.push(
+      `${ansi.gray}  · /autonomy ask     危险操作逐项确认${ansi.reset}`,
+    );
+    this.lines.push(
+      `${ansi.gray}  · /autonomy observe 只读调研：改环境的操作一律拦截并记录${ansi.reset}`,
+    );
+    this.lines.push(
+      `${ansi.gray}  · /autonomy auto    全部直接执行${ansi.reset}`,
+    );
+
+    if (current === "observe") {
+      const recent = readObservedActions(this.cwd, 8);
+      this.lines.push("");
+      if (recent.length === 0) {
+        this.lines.push(`${ansi.gray}还没有拦下任何操作。${ansi.reset}`);
+      } else {
+        this.lines.push(`${ansi.bold}最近被拦截的操作${ansi.reset}`);
+        for (const line of recent) {
+          this.lines.push(`${ansi.gray}  · ${line}${ansi.reset}`);
+        }
+      }
+    }
+  }
+
+  /**
+   * `/jobs` —— 后台任务列表、查看输出、终止。
+   *
+   * 为什么要有界面入口：后台任务的核心是「不阻塞」，但如果用户看不到它在跑，
+   * 就变成了「偷偷在后台执行东西」。这里把 id、状态与最后几行输出摆在明面上。
+   */
+  private handleJobsCommand(arg: string): void {
+    const [sub, ...rest] = arg.trim().split(/\s+/);
+    const id = rest.join(" ").trim();
+    const jobs = this.agent.getBackgroundJobs();
+
+    if (sub === "kill") {
+      if (!id) {
+        this.lines.push(`${ansi.yellow}用法：/jobs kill <job-id>${ansi.reset}`);
+        return;
+      }
+      const result = this.agent.killBackgroundJob(id);
+      this.lines.push(
+        result.ok
+          ? `${ansi.green}${result.message}${ansi.reset}`
+          : `${ansi.yellow}${result.message}${ansi.reset}`,
+      );
+      return;
+    }
+
+    if (!sub) {
+      if (jobs.length === 0) {
+        this.lines.push(
+          `${ansi.gray}没有后台任务。模型执行长命令时会自动转后台（bash 的 run_in_background）。${ansi.reset}`,
+        );
+        return;
+      }
+      this.lines.push(`${ansi.bold}后台任务${ansi.reset}`);
+      for (const job of jobs) {
+        const color = job.status === "running" ? ansi.brightYellow : job.code === 0 ? ansi.green : ansi.yellow;
+        this.lines.push(`${color}  ·${ansi.reset} ${describeJob(job)}`);
+      }
+      this.lines.push(
+        `${ansi.gray}  · /jobs <job-id> 查看输出 · /jobs kill <job-id> 终止${ansi.reset}`,
+      );
+      return;
+    }
+
+    const job = jobs.find((item) => item.id === sub);
+    if (!job) {
+      this.lines.push(
+        `${ansi.yellow}没有这个后台任务：${sub}${ansi.reset}` +
+          `${ansi.gray}（可用：${jobs.map((item) => item.id).join("、") || "无"}）${ansi.reset}`,
+      );
+      return;
+    }
+    this.lines.push(`${ansi.bold}${describeJob(job)}${ansi.reset}`);
+    this.lines.push(`${ansi.gray}日志：${job.logFile}${ansi.reset}`);
+    const tail = readFileTail(job.logFile, 3000);
+    for (const line of tail.text.trimEnd().split("\n")) {
+      this.lines.push(`${ansi.gray}  ${line}${ansi.reset}`);
+    }
+    if (tail.truncated) {
+      this.lines.push(`${ansi.gray}  …（只看末尾 3000 字符，完整内容见上面的日志路径）${ansi.reset}`);
+    }
+  }
+
   private handleFocusCommand(arg: string): void {
     const sub = arg.trim();
     if (!sub || sub === "list") {
@@ -3971,6 +4459,9 @@ export class TuiApp {
       `  /memory        查看项目记忆；/memory show [global] 查看全文；/memory global 状态；/memory clear [global] 清空（需确认）`,
       `  /init [--dry-run|--force]  扫描并搭建 AGENTS.md/docs 框架，再用模型完善（写入前确认）`,
       `  /auto [on|off] 切换自动批准（on：所有工具直接执行，写入配置）`,
+      `  /autonomy [ask|observe|auto]  自治等级：逐项确认 / 只观察（拦截并记录写操作）/ 全自动`,
+      `  /jobs [id|kill <id>]  查看后台任务与输出（长命令会自动转后台，结束时通知）`,
+      `  /prompt [list|show <段落>|reset <段落|--all>]  查看 / 重置系统提示词的分段覆盖`,
       `  /intent [on|off] 切换意图分析（on：每条消息先做意图分析再处理，写入配置）`,
       `  /exit          退出玄猪`,
       `${ansi.bold}快捷键${ansi.reset}`,
@@ -4137,9 +4628,11 @@ export class TuiApp {
 
     const inputBlock = this.pendingConfirm
       ? this.layoutConfirm(leftWidth)
-      : this.pendingSelect
-        ? this.layoutSelect(leftWidth)
-        : this.layoutInput(leftWidth);
+      : this.pendingAsk
+        ? this.layoutAsk(leftWidth)
+        : this.pendingSelect
+          ? this.layoutSelect(leftWidth)
+          : this.layoutInput(leftWidth);
     const inputRows = inputBlock.lines.length;
     const statusRows = 1;
 
@@ -4257,8 +4750,11 @@ export class TuiApp {
 
     out += cursor.to(rows, 1) + "\x1b[2K" + this.renderStatus(columns);
 
-    if (this.pendingConfirm || this.pendingSelect) {
-      // 浮层（确认框 / 单选列表）期间没有文本光标可定位
+    const askShowsCursor =
+      this.pendingAsk !== undefined &&
+      (this.pendingAsk.request.options?.length ?? 0) === 0;
+    if (this.pendingConfirm || this.pendingSelect || (this.pendingAsk && !askShowsCursor)) {
+      // 浮层（确认框 / 单选列表 / 带选项的提问）期间没有文本光标可定位
       out += cursor.hide;
     } else if (this.termFocus && termWidth > 0 && panel.cursorRow > 0) {
       // 焦点在右侧终端：光标定位到终端输入行（面板从 leftWidth+2 列开始）
@@ -4435,7 +4931,13 @@ export class TuiApp {
 
   private renderStatus(width: number): string {
     const left = ` 玄猪 `;
-    const autoMark = this.autoApprove ? "⚡auto · " : "";
+    // 自治等级徽标：三档都要露出来。observe 完全不显示的话，用户会把它当成
+    // 「什么都没开」，而实际上写文件 / 执行命令全被拦下了（这一点必须一眼可见）
+    const autonomyMode = this.agent.getAutonomyMode();
+    const autoMark =
+      autonomyMode === "auto"
+        ? "⚡auto · "
+        : `${ansi.yellow}${autonomyMode}${ansi.reset} · `;
     const intentMark = this.intentEnabled ? "⌁intent · " : "";
     // 目标模式标记：一眼看出当前处于「会自动继续」的状态
     const goalMark = this.agent.getGoal() ? "◎goal · " : "";
@@ -4543,6 +5045,75 @@ export class TuiApp {
       };
     }
     return { lines: physLines, cursorRow, cursorCol };
+  }
+
+  /**
+   * `ask_user` 浮层：问题一行、说明若干行，然后是「选项列表」或「可编辑的答案行」。
+   *
+   * 光标只出现在文本模式（见渲染里 askShowsCursor 的判断）——
+   * 带选项时是列表选择，定位光标反而让人以为要打字。
+   */
+  private layoutAsk(width: number): InputLayout {
+    const pending = this.pendingAsk!;
+    const { request } = pending;
+    const lines: string[] = [];
+    lines.push(
+      `${ansi.brightCyan}${ansi.bold}❓ ${sanitizeControl(request.question)}${ansi.reset}`,
+    );
+    if (request.detail) {
+      for (const wrapped of wrapText(
+        `${ansi.gray}${sanitizeControl(request.detail)}${ansi.reset}`,
+        width - 4,
+      )) {
+        lines.push(`  ${wrapped}`);
+      }
+    }
+
+    const options = request.options ?? [];
+    if (options.length > 0) {
+      options.forEach((option, index) => {
+        const text = ` ${index + 1}. ${option}`;
+        lines.push(
+          index === pending.index
+            ? `${ansi.inverse}${text}${ansi.reset}`
+            : `${ansi.gray}${text}${ansi.reset}`,
+        );
+      });
+      lines.push(
+        `  ${ansi.gray}↑ ↓ 选择 · 数字直选 · Enter 确认 · Esc 跳过${ansi.reset}`,
+      );
+      return { lines, cursorRow: 0, cursorCol: 0 };
+    }
+
+    const prefix = "  > ";
+    // 单行展示：答案通常很短；超宽时保留光标附近的一段，避免看不见正在输入的内容
+    const chars = Array.from(pending.value);
+    let cursorCp = chars.length;
+    {
+      let count = 0;
+      for (let i = 0; i < chars.length; i++) {
+        if (count >= pending.cursor) {
+          cursorCp = i;
+          break;
+        }
+        count += chars[i].length;
+      }
+    }
+    const before = chars.slice(0, cursorCp).join("");
+    const valueRow = lines.length;
+    lines.push(
+      `${prefix}${sanitizeControl(pending.value)}${
+        pending.value ? "" : `${ansi.gray}（输入答案）${ansi.reset}`
+      }`,
+    );
+    lines.push(
+      `  ${ansi.gray}Enter 提交 · Esc 跳过 · Ctrl+U 清空${ansi.reset}`,
+    );
+    const col = Math.min(
+      Math.max(0, width - 2),
+      textWidth(prefix) + textWidth(sanitizeControl(before)),
+    );
+    return { lines, cursorRow: valueRow, cursorCol: col };
   }
 
   private layoutConfirm(width: number): InputLayout {

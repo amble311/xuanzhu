@@ -101,12 +101,14 @@ describe("目标模式", () => {
 
     await agent.run("开始");
 
-    // 第一次请求：目标尚未完成 → 带目标段落与「不要中途停下」的规则
+    // 第一次请求：目标尚未完成 → 带目标段落与「不要用等回复的方式收尾」的规则
     const firstSystem = seen[0].messages[0];
     expect(firstSystem.role).toBe("system");
     expect(firstSystem.content).toContain("## 目标模式（/goal）");
     expect(firstSystem.content).toContain("实现 X 功能");
-    expect(firstSystem.content).toContain("不要在中途停下来");
+    expect(firstSystem.content).toContain("不要用「等你回复」「需要你确认」这种方式收尾");
+    // 需要用户拍板时走结构化提问，而不是在正文里问
+    expect(firstSystem.content).toContain("ask_user");
 
     // 第二次请求发生在 goal_complete 之后 → 目标已结束，不再注入
     const secondSystem = seen[1].messages[0];

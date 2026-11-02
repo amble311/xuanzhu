@@ -46,7 +46,15 @@ import {
   toolsForSubAgent,
   type ExecuteToolResult,
 } from "../tools";
+import { jobCompletionMessage } from "../tools/job-tools";
+import {
+  JobRegistry,
+  PENDING_DIR_NAME,
+  type BackgroundJob,
+} from "../tools/jobs";
 import type {
+  AskUserAnswer,
+  AskUserRequest,
   ConfirmRequest,
   GoalStore,
   RunStatus,
@@ -93,6 +101,12 @@ import {
   touchTaskLedger,
   type TaskLedger,
 } from "./task-ledger";
+import {
+  autonomyModeOf,
+  OBSERVE_BLOCKED_TOOLS,
+  recordObservedAction,
+  type AutonomyMode,
+} from "./autonomy";
 import { goalSystemSection } from "./goal";
 import { buildSystemPrompt, GLOBAL_MEMORY_EXCERPT_CHARS } from "./prompt";
 import {
@@ -146,8 +160,22 @@ export interface AgentEvents {
   onTodos?: (items: TodoItem[]) => void;
   /** 服务端返回的真实 token usage（每次模型请求一次） */
   onUsage?: (usage: Usage) => void;
+  /**
+   * 一个后台任务结束（无论本轮是否还在跑）。
+   *
+   * 界面用它提示用户；**本轮仍在进行时**结果还会被注入对话（见 run 里的说明），
+   * 这条回调只负责让人知道，不负责唤醒模型。
+   */
+  onJobComplete?: (job: BackgroundJob) => void;
   /** 请求用户确认危险操作 */
   confirm: (request: ConfirmRequest) => Promise<boolean>;
+  /**
+   * 向用户提一个结构化问题（`ask_user`）。未提供时该工具不可用。
+   *
+   * 单独一个回调而不是复用 `confirm`：确认框只有「允许 / 拒绝」两个答案，
+   * 而这里需要单选（2–4 个候选）或自由文本。
+   */
+  askUser?: (request: AskUserRequest) => Promise<AskUserAnswer>;
 }
 
 /**
@@ -200,8 +228,15 @@ export interface GoalState {
   text: string;
   /** 设定时间（ISO 字符串，界面展示用） */
   startedAt: string;
-  /** 模型是否已通过 `goal_complete` 声明完成 */
+  /** 模型是否已声明结束（`goal_complete` 或 `report_status(dropped)`） */
   completed: boolean;
+  /**
+   * 结束的结论类型：`completed`=真的做完了；`dropped`=无需处理。
+   *
+   * 分开的理由：界面要能显示「✓ 已完成」与「⊘ 无需处理」两种结论 ——
+   * 把「查完发现不是缺陷」显示成成功交付，会让人误以为改过代码。
+   */
+  outcome?: "completed" | "dropped";
   /** 完成总结（来自 `goal_complete` 的 summary） */
   summary?: string;
 }
@@ -243,6 +278,12 @@ export interface AgentOptions {
    * 会被子任务的 prompt/结论替换。
    */
   taskLedger?: boolean;
+  /**
+   * 是否允许后台 shell 任务（默认 true，仅主代理）。
+   *
+   * 子代理传 false：它结束后后台进程没有归属，还会与主对话抢进程组。
+   */
+  backgroundJobs?: boolean;
 }
 
 /**
@@ -364,12 +405,15 @@ const SMALL_TOOL_NAMES = new Set([
   "write_file",
   "edit_file",
   "bash",
+  "bash_output",
+  "bash_kill",
   "todo_write",
   "memory_read",
   "memory_write",
   "memory_compact",
   "load_skill",
   "report_status",
+  "ask_user",
 ]);
 
 /**
@@ -595,6 +639,52 @@ export class Agent {
    * 因此用户在另一个终端跑 `xzh device serve` 时同样可用（见 `tools/device.ts`）。
    */
   private deviceBridge?: DeviceBridge;
+  /** 是否允许后台 shell 任务（子代理关闭） */
+  private readonly backgroundJobsEnabled: boolean;
+  /** 后台任务注册表（主代理首次用到时创建） */
+  private jobsRef?: JobRegistry;
+  /**
+   * 收「可以投递」的后台任务结果：内存里的（本轮结束 / 空闲期结束）
+   * 加上**落盘的**（上一个 xzh 进程遗留）。按 job id 去重并「取走即删」，
+   * 因此同一条结果不会投递两次 —— 这就是幂等键。
+   */
+  private takeCarriedJobResults(): BackgroundJob[] {
+    if (!this.backgroundJobsEnabled) return [];
+    if (!this.jobsRef) {
+      // 没有注册表时，只有落盘目录里确实有未投递结果才创建它 ——
+      // 否则每次启动都会在项目里多建一个空目录
+      const pending = path.join(
+        resolveProjectPaths(this.cwd).dir,
+        "jobs",
+        PENDING_DIR_NAME,
+      );
+      let has = false;
+      try {
+        has = fs
+          .readdirSync(pending)
+          .some((name) => name.endsWith(".json"));
+      } catch {
+        has = false;
+      }
+      if (!has) return [];
+    }
+    const jobs = this.jobRegistry();
+    if (!jobs) return [];
+    const seen = new Set<string>();
+    return [...jobs.takeCompleted(), ...jobs.takePending()].filter((job) => {
+      if (seen.has(job.id)) return false;
+      seen.add(job.id);
+      return true;
+    });
+  }
+
+  /**
+   * 本轮是否已就「还有后台任务在跑」提醒过一次。
+   *
+   * 与收尾检查（`finishGateUsed`）同一个道理：只提醒一次。第二次仍要收尾就尊重它，
+   * 否则模型会被反复拉回来等一个它并不需要的命令。
+   */
+  private backgroundWaitNotified = false;
 
   /**
    * 构造 / 切换目录时自动精简记忆产生的提示。
@@ -623,6 +713,7 @@ export class Agent {
     this.sessionFile = options?.sessionFile;
     this.autoMemory = options?.autoMemory ?? true;
     this.taskLedgerEnabled = options?.taskLedger ?? true;
+    this.backgroundJobsEnabled = options?.backgroundJobs ?? true;
     this.systemPrompt = this.composeSystemPrompt();
   }
 
@@ -676,6 +767,10 @@ export class Agent {
           this.config.network.enabled !== false &&
           this.config.network.lastCheckOk !== false,
       ),
+      {
+        overrides: this.config.promptOverrides,
+        autonomy: autonomyModeOf(this.config),
+      },
     );
   }
 
@@ -925,25 +1020,92 @@ export class Agent {
 
   /** 模型经 `goal_complete` 声明目标完成；返回是否真的在目标模式中 */
   private markGoalComplete(summary: string): boolean {
+    return this.finishGoal(summary, "completed");
+  }
+
+  /**
+   * 结束目标：`completed` 指真的做完并验证过，`dropped` 指「无需处理」。
+   *
+   * 两者都让 `completed=true`（否则界面循环会继续推进），区别只在 `outcome`
+   * 与任务账本的结论文案 —— 账本里把 dropped 记成 completed 会让后续会话
+   * 误以为这次改动是「已验证的成果」。
+   */
+  private finishGoal(
+    summary: string,
+    outcome: "completed" | "dropped",
+  ): boolean {
     if (!this.goal || this.goal.completed) return false;
     this.goal.completed = true;
+    this.goal.outcome = outcome;
     this.goal.summary = summary.trim();
     if (this.task) {
-      addTaskDone(this.task, summary.trim());
+      addTaskDone(
+        this.task,
+        outcome === "dropped" ? `无需处理：${summary.trim()}` : summary.trim(),
+      );
       this.task.status = "completed";
       touchTaskLedger(this.cwd, this.task);
     }
     return true;
   }
 
-  /** 目标模式的状态出口：交给 `goal_complete` 工具的引用 */
+  /** 目标模式的状态出口：交给 `goal_complete` / `report_status(dropped)` 的引用 */
   private goalStore(): GoalStore {
     return {
       active: () => Boolean(this.goal && !this.goal.completed),
       complete: (summary) => {
         this.markGoalComplete(summary);
       },
+      drop: (reason) => {
+        this.finishGoal(reason, "dropped");
+      },
     };
+  }
+
+  /**
+   * 后台任务注册表（首次用到时创建）。
+   *
+   * 日志落在 `<项目>/.xuanzhu/jobs/` 而不是全局目录：任务与项目一一对应，
+   * 用户在项目里能直接找到「那个测试到底输出了什么」。
+   */
+  private jobRegistry(): JobRegistry | undefined {
+    if (!this.backgroundJobsEnabled) return undefined;
+    if (!this.jobsRef) {
+      this.jobsRef = new JobRegistry({
+        logDir: () => path.join(resolveProjectPaths(this.cwd).dir, "jobs"),
+        onComplete: (job) => {
+          // 界面提示与对话注入是两条路：本轮已结束时只有界面提示有意义
+          try {
+            this.events.onJobComplete?.(job);
+          } catch {
+            // 界面回调异常不能影响注册表
+          }
+        },
+      });
+    }
+    return this.jobsRef;
+  }
+
+  /** 当前仍在运行的后台任务（供界面展示） */
+  getBackgroundJobs(): BackgroundJob[] {
+    return this.jobsRef?.list() ?? [];
+  }
+
+  /** 主动终止全部后台任务（xzh 退出时由界面调用，避免留下孤儿进程） */
+  killBackgroundJobs(reason = "xzh 退出"): void {
+    this.jobsRef?.killAll(reason);
+  }
+
+  /** 终止单个后台任务（界面 `/jobs kill`） */
+  killBackgroundJob(id: string): { ok: boolean; message: string } {
+    if (!this.jobsRef) return { ok: false, message: "当前没有后台任务。" };
+    return this.jobsRef.kill(id);
+  }
+
+  /** `ask_user` 的出口：没有界面问不了，直接告知不可用 */
+  private askUserHandler(): ((request: AskUserRequest) => Promise<AskUserAnswer>) | undefined {
+    if (!this.events.askUser) return undefined;
+    return (request) => this.events.askUser!(request);
   }
 
   /** 本轮运行非正常收尾的原因（供界面判断是否该继续自动推进） */
@@ -1387,6 +1549,24 @@ export class Agent {
     if (changed) this.reloadSystemPrompt();
   }
 
+  /** 当前自治等级（界面 `/autonomy` 展示用） */
+  getAutonomyMode(): AutonomyMode {
+    return autonomyModeOf(this.config);
+  }
+
+  /**
+   * 切换自治等级：写回配置并重建系统提示词。
+   *
+   * `autoApprove` 跟着同步：它仍被少数代码路径单独读取（如技能的安装确认），
+   * 两个字段各说一套会让「为什么没有确认」变得难解释。
+   */
+  setAutonomyMode(mode: AutonomyMode): void {
+    this.config.autonomy = mode;
+    this.config.autoApprove = mode === "auto";
+    this.persistConfig();
+    this.reloadSystemPrompt();
+  }
+
   /**
    * 本次请求实际下发的工具集。
    *
@@ -1500,6 +1680,7 @@ export class Agent {
     this.runVerifyCommand = undefined;
     this.runVerifyOk = false;
     this.runWroteMemory = false;
+    this.backgroundWaitNotified = false;
     // 用户最新一条消息定义当前任务；旧任务暂停时不会自动继续
     this.beginTask(userInput);
     // 原始输入用于全局记忆相关性/提醒；意图分析后的 content 可能丢失关键词
@@ -1575,6 +1756,22 @@ export class Agent {
     // 这样提交点集中，且完全不受历史裁剪影响 —— 早先两版分别用「起点下标校正」和
     // 「按条数从尾部截断」，前者下标会漂移成负数并抛 Invalid array length 覆盖真实错误，
     // 后者在单轮消息数超过保留窗口时会把整段历史删光。
+    // 上一轮结束后才结束的后台任务：结果当时没能进对话，这里补在**同一条** user 消息里。
+    //
+    // 为什么必须补：模型起了 dev server / 长测试后收尾走人，任务在空闲期结束或失败 ——
+    // 界面上只是一行灰字，模型永远不会知道。不补的话它会以为「它还在跑」或「它成功了」。
+    // 为什么不追加一条新的 user 消息：部分协议要求 user / assistant 严格交替，
+    // 连续两条 user 消息会被服务端拒绝，所以并进当前这条。
+    // 结果先落盘再投递（见 tools/jobs.ts 的 pending 目录）：上一次 xzh 退出时被终止的
+    // 后台任务也会在这里补上，模型据此知道「那条命令其实没跑完」。
+    const carriedJobs = this.takeCarriedJobResults();
+    if (carriedJobs.length > 0) {
+      content +=
+        "\n\n[后台任务结果 · 上一轮已结束] 下面这些任务是在你上一条答复之后（或上一次 xzh 运行期间）结束的，" +
+        "结果当时没能进入对话：\n\n" +
+        carriedJobs.map((job) => jobCompletionMessage(job)).join("\n\n");
+    }
+
     // 只带图片没有正文时补一句兜底文本：部分端点要求 content 至少含一个非空文本块
     const hasImages = Boolean(images && images.length > 0);
     const turn: ChatMessage[] = [
@@ -1786,6 +1983,39 @@ export class Agent {
         });
 
         if (toolCalls.length === 0) {
+          // 后台任务的结果必须**先于收尾**处理：模型在等它时不该直接结束这一轮。
+          const finishedJobs = this.jobsRef?.takeCompleted() ?? [];
+          if (finishedJobs.length > 0) {
+            for (const job of finishedJobs) {
+              turn.push({ role: "user", content: jobCompletionMessage(job) });
+            }
+            this.events.onStatus(
+              "后台任务完成",
+              `${finishedJobs.map((job) => job.id).join("、")}`,
+            );
+            continue;
+          }
+
+          // 仍在跑的任务：只提醒一次。第二次仍要收尾就尊重它 ——
+          // dev server 这类「本来就该长期运行」的任务不该被反复拉回。
+          const runningJobs = this.jobsRef?.running() ?? [];
+          if (runningJobs.length > 0 && !this.backgroundWaitNotified) {
+            this.backgroundWaitNotified = true;
+            turn.push({
+              role: "user",
+              content:
+                `[后台任务仍在运行] ${runningJobs
+                  .map((job) => `${job.id}（\`${job.command}\`）`)
+                  .join("、")}\n\n` +
+                "· 如果你在等它的结果：本轮先不要收尾 —— 继续做别的事，或用 " +
+                "bash_output 查看当前输出；\n" +
+                "· 如果它本来就该长期运行（dev server / 监听）：忽略本条直接给出结论，" +
+                "它会在后台继续，结束时系统会提示。",
+            });
+            this.events.onStatus("后台任务未结束", `${runningJobs.length} 个`);
+            continue;
+          }
+
           // 收尾检查 = 验证门 + 未完成门，合计**只提醒一次**（第二次仍直接答复就尊重它）。
           // 模型已通过 report_status 声明受阻 / 待输入时不再拦截：它已经给过结构化原因了。
           const goalActive = Boolean(this.goal && !this.goal.completed);
@@ -1842,6 +2072,17 @@ export class Agent {
           // 自动记忆：当日摘要必写；代码有实际改动时再按主题并入长期记忆。
           this.autoRecordRunMemory(text);
           commitTurn();
+          // 收尾时仍有后台任务：告诉用户它还在跑、怎么找它 —— 否则「界面上什么都没发生」
+          const stillRunning = this.jobsRef?.running() ?? [];
+          if (stillRunning.length > 0) {
+            this.events.onNotice?.(
+              `后台任务仍在运行：${stillRunning
+                .map((job) => `${job.id}（${job.command}）`)
+                .join("、")}\n` +
+                `· 结束后会在这里提示；随时用 /jobs 查看输出，/jobs kill <id> 终止\n` +
+                `· 退出 xzh 时会一并终止它们`,
+            );
+          }
           this.events.onStatus("就绪");
           return;
         }
@@ -2055,6 +2296,12 @@ export class Agent {
 
         // 本轮所有 tool 消息已写完，此时再插入带图消息（见 imageNotes 的说明）
         if (imageNotes.length > 0) turn.push(...imageNotes);
+
+        // 工具执行期间结束的后台任务：顺手告诉模型，免得它下一轮还去轮询
+        const completedWhileWorking = this.jobsRef?.takeCompleted() ?? [];
+        for (const job of completedWhileWorking) {
+          turn.push({ role: "user", content: jobCompletionMessage(job) });
+        }
       }
 
       // 达到工具轮次上限（用户选择不再继续）：工具已经真实执行过（有副作用），
@@ -2478,6 +2725,35 @@ export class Agent {
       return { ok: false, content: `错误：未知工具 "${call.name}"` };
     }
 
+    // 自治等级闸门（确定性）：observe 模式下「会改动环境」的操作一律不执行。
+    // 放在确认框之前 —— 观察模式的语义是「根本不放行」，而不是「先问再说」。
+    const autonomy = autonomyModeOf(this.config);
+    if (autonomy === "observe" && OBSERVE_BLOCKED_TOOLS.has(tool.name)) {
+      let parsed: Record<string, unknown> = {};
+      try {
+        const value = JSON.parse(call.arguments);
+        if (value && typeof value === "object" && !Array.isArray(value)) {
+          parsed = value as Record<string, unknown>;
+        }
+      } catch {
+        // 参数不合法也照样拦截并记一条，交给人看出模型想干什么
+      }
+      const logFile = recordObservedAction(this.cwd, tool.name, parsed);
+      this.events.onNotice?.(
+        `[observe] 已拦截 ${tool.name}（未执行）· 记录：${logFile}`,
+      );
+      return {
+        ok: false,
+        summary: "已被 observe 模式拦截",
+        content:
+          `[observe 模式] \`${tool.name}\` 会改动环境，已被拦截，**没有执行**。\n` +
+          `· 记录已写入 ${logFile}\n` +
+          `· 观察模式只做只读调研：请给出「要改哪些文件 / 要跑哪些命令」的方案，` +
+          `由用户执行，或在界面里用 \`/autonomy auto\` 放行。\n` +
+          `· 不要重复尝试同一个操作。`,
+      };
+    }
+
     // 确认策略：
     //  1. autoApprove（**默认开启**）下所有工具直接执行 —— 包括执行命令、写文件、
     //     读取工作区外的文件。用户选择「全自动」意味着接受相应风险，
@@ -2487,10 +2763,12 @@ export class Agent {
     //     「凭据被读进上下文、转手发给模型服务商」，与「是否信任模型执行命令」
     //     是两个问题，但默认关闭以免破坏「自动放行」的预期。
     //  3. 未开启自动批准时，声明了 requiresConfirmation 的工具逐项确认。
+    // `ask` 档等价于原来的「未开启自动批准」；`observe` 已在上面拦截过危险工具，
+    // 剩下的只读操作不需要确认；`auto` 全放行。
     const needsConfirm =
       (this.config.confirmSensitiveRead === true &&
         this.touchesSensitivePath(tool.name, call.arguments)) ||
-      (Boolean(tool.requiresConfirmation) && !this.config.autoApprove);
+      (Boolean(tool.requiresConfirmation) && autonomy === "ask");
 
     if (needsConfirm) {
       let argsPreview = call.arguments;
@@ -2518,7 +2796,7 @@ export class Agent {
 
     const ctx: ToolContext = {
       cwd: this.cwd,
-      autoApprove: this.config.autoApprove,
+      autoApprove: autonomy === "auto",
       emit: (message) => this.events.onNotice?.(message),
       confirm: (request) => this.events.confirm(request),
       signal,
@@ -2534,6 +2812,8 @@ export class Agent {
       },
       spawnAgent: (input) => this.spawnSubAgent(input, signal),
       deviceBridge: this.deviceBridge,
+      jobs: this.jobRegistry(),
+      askUser: this.askUserHandler(),
     };
 
     const outcome = await executeTool(call.name, call.arguments, ctx, this.tools);
@@ -2744,6 +3024,8 @@ export class Agent {
       // 子代理的工作由主代理汇总；自己写记忆 / 账本会污染项目，并在并行子代理之间重复
       autoMemory: false,
       taskLedger: false,
+      // 子代理结束后后台进程没有归属，还会与主对话抢进程组
+      backgroundJobs: false,
     });
 
     try {

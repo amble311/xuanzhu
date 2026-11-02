@@ -4,6 +4,49 @@
 
 ## [未发布]
 
+## [0.8.9] — 2026-11-02
+
+### 新增
+
+- **后台任务（不阻塞对话）**：`bash` 新增 `run_in_background`，立刻返回 `job-N` 并把输出写到
+  `<项目>/.xuanzhu/jobs/`；任务结束时**自动把结果推进对话**（退出码 + 末尾输出），模型不必轮询。
+  配套 `bash_output` / `bash_kill` 两个工具与 `/jobs` 命令；退出 `xzh` 时整组终止，不留孤儿进程。
+  子代理不能使用（它结束后进程没有归属）。
+- **`ask_user`：结构化提问**：需要用户拍板时弹出一个问题的浮层（2–4 个选项可数字直选，
+  没有选项则是一行可编辑文本），回答会留在输出区。目标模式的提示词同步改写：
+  「需要用户决定就用 `ask_user`」而不是在正文里问或自己拍板。
+- **自治等级（`ask` / `observe` / `auto`）**：新增配置 `autonomy` 与 `/autonomy` 命令。
+  `observe` 档由**代码**拦下写文件 / 执行命令 / 动手机，只把「本来会做什么」记进
+  `.xuanzhu/state/observe.log`（参数已脱敏）；读操作不受限。`/auto on|off` 现在等价于
+  `/autonomy auto|ask`，两个开关不会再各说一套。
+- **系统提示词分段覆盖**：提示词按具名段落组装（`core` / `tools` / `device` / `skills` /
+  `trust` / `output` / `memory-global` / `memory-project`），可用 `xzh prompt set <段落> <文件|->`
+  只覆盖其中一段，其余继续跟随升级；`xzh prompt` / `/prompt` 查看，`reset` 取消。
+  保存时记录内置指纹，内置文本升级后会提示「你覆盖的那段原文已变」。
+- **`report_status` 补两种结论**：`dropped`（无需处理，目标结束但显示为「⊘ 无需处理」而不是
+  「✓ 已完成」）与 `waiting`（本轮结束、等下一次触发）。
+- **文档一致性测试**（`test/docs.test.ts`）：模块表的目录与文件数、§10 测试清单与实际用例、
+  目录树、本地链接、冲突标记都会在 `npm run test` 里校验 —— 文档过期不再靠自觉。
+
+### 修复
+
+- `vitest.config.ts` 显式 `include: ["test/**/*.test.ts"]`：此前会扫到仓库内参考项目
+  `superagent/` 的用例，因缺 `jsdom` 导致 `npm run test` 报一堆与本项目无关的错误。
+
+### 增强
+
+- **`xzh autonomy`**：自治等级的命令行入口 —— 查看 / 切换 `ask|observe|auto`、
+  `xzh autonomy log [N]` 直接读观察日志。`/autonomy` 只在 TUI 可用，而 `observe` 恰恰在
+  脚本 / CI 里最该用。切换时同步写 `autoApprove`；状态栏常驻显示当前档位（原先 `observe`
+  什么都不显示，容易被误认为「什么都没开」）。
+
+- **后台任务结果先落盘再投递**：结论写入 `.xuanzhu/jobs/pending/<job-id>.json`，投递成功
+  （注入对话，或被 `bash_output` 直接读到）才删除。因此「跑完就退出 xzh」「退出时任务被
+  终止」都不会丢结论 —— 下次启动的第一轮补上；幂等键就是 job id，同一条结果只投一次。
+  `job-N` 序号接着历史日志往下排，不会与遗留任务撞号。
+- **`grep` 翻页**：新增 `offset`，命中上限时结果末尾给出 `next_offset`，并说明返回的是
+  第几条到第几条；越过末尾时明确回「没有更多匹配」。
+
 ## [0.8.8] — 2026-11-02
 
 ### 变更

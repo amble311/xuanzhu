@@ -29,6 +29,8 @@ import { configCommand } from "./commands/config";
 import { errorsCommand } from "./commands/errors";
 import { initCommand } from "./commands/init";
 import { modelCommand } from "./commands/model";
+import { promptCommand } from "./commands/prompt";
+import { autonomyCommand } from "./commands/autonomy";
 import { setupCommand } from "./commands/setup";
 import { vpnCommand } from "./commands/vpn";
 import { skillCommand } from "./commands/skill";
@@ -139,6 +141,12 @@ async function main(): Promise<void> {
       return;
     case "skill":
       await skillCommand(args.slice(1));
+      return;
+    case "prompt":
+      await promptCommand(args.slice(1));
+      return;
+    case "autonomy":
+      autonomyCommand(args.slice(1));
       return;
     case "errors":
       await errorsCommand(args.slice(1));
@@ -377,6 +385,13 @@ ${ansi.bold}用法${ansi.reset}
                             启用 / 禁用技能
   ${ansi.green}xzh skill delete <名称> [--yes]${ansi.reset}
                             删除技能（仅限用户技能；内置技能请用 disable）
+  ${ansi.green}xzh prompt${ansi.reset}              查看系统提示词的段落（可分段覆盖，不必整份重写）
+  ${ansi.green}xzh prompt show [段落]${ansi.reset}   打印当前提示词 / 某段的内置原文与生效内容
+  ${ansi.green}xzh prompt set <段落> <文件|->${ansi.reset}  用文件（或 stdin）覆盖某一段
+  ${ansi.green}xzh prompt reset <段落|--all>${ansi.reset}   取消覆盖
+  ${ansi.green}xzh autonomy${ansi.reset}           查看自治等级（ask / observe / auto）与最近拦截记录
+  ${ansi.green}xzh autonomy <档位>${ansi.reset}    切换自治等级；observe = 只观察、改动一律拦截并记账
+  ${ansi.green}xzh autonomy log [N]${ansi.reset}   打印观察日志（.xuanzhu/state/observe.log）
   ${ansi.green}xzh errors${ansi.reset}              查看玄猪记录的错误报告（~/.xzh/errors/，等价 errors list）
   ${ansi.green}xzh errors list${ansi.reset}         列出全部报告（最近的在前）
   ${ansi.green}xzh errors show <序号|签名>${ansi.reset}  查看一份报告的完整内容

@@ -1,5 +1,6 @@
 import type { DeviceBridge } from "../device/server";
 import type { ImageAttachment, JsonSchema } from "../llm/types";
+import type { JobRegistry } from "./jobs";
 
 /** 任务项状态 */
 export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
@@ -33,14 +34,35 @@ export interface GoalStore {
   active(): boolean;
   /** 标记目标完成并记下总结 */
   complete(summary: string): void;
+  /**
+   * 标记目标「无需继续」（`report_status(dropped)`）。
+   *
+   * 与 `complete` 分开：目标循环要在这里停下来，但结论不是「做完了」——
+   * 界面要能区分「✓ 已完成」与「⊘ 无需处理」，否则会把「查了半天发现不是缺陷」
+   * 显示成一次成功交付。
+   */
+  drop(reason: string): void;
 }
 
-/** 状态上报的三种类型（`report_status` 工具） */
-export type RunStatusKind = "blocked" | "needs_input" | "low_confidence";
+/**
+ * 状态上报的类型（`report_status` 工具）。
+ *
+ * 前三种是「还能不能继续」的判定，后两种补上了原先缺失的两个语义：
+ * - `dropped`：查清楚了，**这件事无需处理**（不是缺陷 / 已被别人修掉 / 需求已取消）。
+ *   以前这种结论只能谎报「完成」，与「真做完了」混在一起；
+ * - `waiting`：本轮结束但没有未决问题，等下一次触发（有意暂停）。
+ *   以前只能不调用工具直接答复，循环会把它当成「没做完」继续催。
+ */
+export type RunStatusKind =
+  | "blocked"
+  | "needs_input"
+  | "low_confidence"
+  | "dropped"
+  | "waiting";
 
 /** 模型主动上报的状态 */
 export interface RunStatusInput {
-  /** blocked=外部条件不满足；needs_input=必须用户决定；low_confidence=能继续但结论不可靠 */
+  /** blocked=外部条件不满足；needs_input=必须用户决定；low_confidence=能继续但结论不可靠；dropped=无需处理；waiting=等待下一次触发 */
   kind: RunStatusKind;
   /** 一句话说明 */
   summary: string;
@@ -119,6 +141,15 @@ export interface ToolContext {
   /** 派生子代理执行子任务（由 Agent 注入），未提供时 task 工具不可用 */
   spawnAgent?: (input: SubAgentInput) => Promise<ToolResult>;
   /**
+   * 后台任务注册表（由**主代理**注入）。
+   *
+   * 子代理拿不到它 —— 子代理结束后它的后台进程没有归属，还会与主对话抢进程组，
+   * 因此 `bash run_in_background` 在子代理里直接返回错误。
+   */
+  jobs?: JobRegistry;
+  /** 向用户提问（由 Agent 注入），未提供时 ask_user 工具不可用 */
+  askUser?: (request: AskUserRequest) => Promise<AskUserAnswer>;
+  /**
    * 手机设备桥（由 Agent 注入）。
    *
    * 只有 **xzh 进程内**启动的桥才会出现在这里（TUI 的 `/device serve`）；
@@ -126,6 +157,30 @@ export interface ToolContext {
    * 因此这个字段为空并不代表"用不了设备"，详见 `tools/device.ts`。
    */
   deviceBridge?: DeviceBridge;
+}
+
+/**
+ * `ask_user` 的一次提问（一次只问**一个**具体问题）。
+ *
+ * 为什么要有它：在此之前模型想问「选 A 还是 B」时只能写在最终答复里 ——
+ * 一个问题夹在一段总结中间，用户很容易漏掉；反过来模型也可能自己替用户
+ * 拍板，或者反复重试到安全阀上限。
+ */
+export interface AskUserRequest {
+  /** 一句话问题（必须能独立看懂，不要依赖上文） */
+  question: string;
+  /** 可选答案（2–4 个）：给出时界面用单选浮层，省掉用户打字 */
+  options?: string[];
+  /** 补充说明：已尝试什么、为什么必须由用户定（可选） */
+  detail?: string;
+}
+
+/** `ask_user` 的答复 */
+export interface AskUserAnswer {
+  /** 选中的选项或用户输入的文本；取消时为 undefined */
+  answer?: string;
+  /** 用户按 Esc / Ctrl+C 跳过 */
+  cancelled?: boolean;
 }
 
 /** 需要用户确认的请求 */

@@ -136,6 +136,18 @@ export interface XuanZhuConfig {
    */
   autoApprove: boolean;
   /**
+   * 自治等级：模型能对环境做多大的改动（**由代码强制**，不是提示词）。
+   *
+   * - `ask`：写文件 / 执行命令前逐项确认；
+   * - `observe`：这些操作一律**拦截**，只写一条记录到
+   *   `<项目>/.xuanzhu/state/observe.log`（先看它想做什么，再放行）；
+   * - `auto`：全部直接执行。
+   *
+   * 未设置时按 `autoApprove` 推导（true→auto，false→ask），旧配置行为不变。
+   * 界面内可用 `/autonomy` 切换。
+   */
+  autonomy?: "ask" | "observe" | "auto";
+  /**
    * 是否让玄猪接管鼠标（滚轮滚动输出区 + 拖拽选中复制）。
    *
    * true（默认）：
@@ -201,6 +213,17 @@ export interface XuanZhuConfig {
   promptCache?: boolean;
   /** 追加到系统提示词的额外内容 */
   systemPromptExtra?: string;
+  /**
+   * 系统提示词**段落覆盖**：key → 文本；空串表示删掉该段。
+   *
+   * 可用 key 见 `src/core/prompt.ts` 的 `OVERRIDABLE_PARTS`
+   * （core / tools / device / skills / trust / output / memory-global / memory-project）。
+   * 只覆盖这一段，其余段落继续跟随内置文本升级 —— 因此升级后不会把你改过的
+   * 那一段一起换掉（会通过下面的指纹提示「内置原文变了」）。
+   */
+  promptOverrides?: Record<string, string>;
+  /** 保存覆盖时内置提示词的指纹（`promptDefaultsHash()`）；用于提示内置文本已升级 */
+  promptOverridesBase?: string;
   /** 全局 HTTP(S)/SOCKS5 代理（xzh vpn） */
   network?: NetworkSettings;
 }

@@ -22,5 +22,14 @@ fs.mkdirSync(XZH_TEST_HOME, { recursive: true });
 export default defineConfig({
   test: {
     env: { XZH_HOME: XZH_TEST_HOME },
+    /**
+     * 只跑本仓库的用例。
+     *
+     * 不加 include 时 vitest 会扫到仓库里任何 `*.test.ts` / `*.spec.ts` ——
+     * 例如放在 `superagent/` 下的参考项目（它依赖 jsdom，本仓库没装），
+     * 于是 `npm run test` 会报一堆与本项目无关的 ERR_MODULE_NOT_FOUND。
+     */
+    include: ["test/**/*.test.ts"],
+    exclude: ["node_modules/**", "dist/**", "superagent/**"],
   },
 });

@@ -13,7 +13,7 @@ xzh                 # 启动
 ## 简介
 
 玄猪是一个运行在终端里的全屏 AI Agent：它能读懂你的代码库、直接读写文件、执行命令、运行测试，
-并用流式输出向你展示它的每一步思考与工具调用。内核采用了 codebuddy 的开源代码。
+并用流式输出向你展示它的每一步思考与工具调用。
 
 ```
 ╭──────────────────────────────────────────────╮
@@ -30,6 +30,13 @@ xzh                 # 启动
 - **默认全自动**：`autoApprove` 默认为 `true`，**所有工具都直接执行、不做任何确认** —— 包括写文件、执行命令、读取工作区之外的文件，以及读取凭据类文件（`~/.ssh`、`.env`、`~/.xzh/config.json` 等）。开箱即用，不打断。`/auto off` 可切换为写文件与执行命令逐项确认。
   - 如果希望读取凭据类文件时确认一次（防止密钥被读进上下文后转交给模型服务商），把 `confirmSensitiveRead` 设为 `true`，默认关闭。
 - **多轮自主执行**：自动串联工具调用完成任务，可随时 `Ctrl+C` 中断。
+- **后台任务**：跑测试 / 起 dev server 这类长命令可以 `run_in_background` 发出去 ——
+  立刻回到对话继续干活，**结束时结果自动推给模型**，不用轮询（见「后台任务」）。
+- **结构化提问（`ask_user`）**：需要你拍板时（选方案、填只有你知道的信息），模型会
+  弹出**一个问题**（带 2–4 个选项可直接按数字选），而不是把问题夹在一段总结里。
+- **自治等级（`ask` / `observe` / `auto`）**：`observe` 档下**写文件 / 执行命令一律被拦下**
+  并记进 `.xuanzhu/state/observe.log`，先看它想做什么再切 `auto` —— 比「全自动」与
+  「逐项确认」之间的二选一更好用（见「自治等级」）。
 - **请求开销与进度**：状态栏实时显示「本轮耗时 · 思考字数 · 输出字数」；未连接设备桥时
   不下发 `device_*` 工具与手机操作说明，提示词更短、首 token 更快。
 - **目标模式（`/goal`）**：设一个目标，玄猪会持续自动推进（每轮答复后立刻继续），
@@ -179,6 +186,13 @@ xzh
 | `xzh skill list` | 列出全部技能（来源与状态，含已禁用项） |
 | `xzh skill enable/disable <名称>` | 启用 / 禁用技能 |
 | `xzh skill delete <名称> [--yes]` | 删除技能（仅限用户技能；内置技能请用 disable） |
+| `xzh prompt` | 查看系统提示词的段落（哪些被覆盖、各段多少字符） |
+| `xzh prompt show [段落]` | 打印当前实际发给模型的提示词（或某段的内置原文 vs 生效内容） |
+| `xzh prompt set <段落> <文件\|->` | 用文件内容（或 stdin：`-`）覆盖某一段；空文件 = 删掉该段 |
+| `xzh prompt reset <段落\|--all>` | 取消某段 / 全部覆盖 |
+| `xzh autonomy` | 查看自治等级与最近被拦截的操作 |
+| `xzh autonomy ask\|observe\|auto` | 切换自治等级（`observe` = 改动一律拦截并记账） |
+| `xzh autonomy log [N]` | 打印观察日志（`.xuanzhu/state/observe.log`）最近 N 条 |
 | `xzh errors` | 列出玄猪自动记录的错误报告（`~/.xzh/errors/`，等价 `errors list`） |
 | `xzh errors list` | 列出全部报告（最近的在前） |
 | `xzh errors show <序号\|签名>` | 查看一份报告的完整内容（JSON） |
@@ -256,6 +270,7 @@ Windows 上如果希望 bash 工具使用 Git Bash / WSL 的 shell，可设置 `
 | `temperature` | `0.2` | 采样温度 |
 | `maxToolRounds` | `200` | 单轮任务内工具调用轮数上限（用尽时询问是否追加） |
 | `autoApprove` | `true` | 自动批准工具（`false` 时写文件/执行命令前询问） |
+| `autonomy` | 由 `autoApprove` 推导 | `ask` / `observe` / `auto`；`observe` 拦下写操作并记账（`/autonomy` 切换） |
 | `mouseCapture` | `true` | 接管鼠标：滚轮滚动 + 输出区拖拽选中复制（`/mouse` 切换） |
 | `confirmSensitiveRead` | `false` | 读取凭据类文件（`.env`、`~/.ssh`、`config.json` 等）时是否确认 |
 | `memoryMaxChars` | `12000` | **项目**长期记忆字符上限，超出即自动精简（`0` = 不限制长度，仍去重） |
@@ -270,6 +285,8 @@ Windows 上如果希望 bash 工具使用 Git Bash / WSL 的 shell，可设置 `
 | `intent.enabled` | `false` | 意图分析（每条消息先分析再处理） |
 | `intent.prompt` | 内置模板 | 意图分析模板，占位符 `{{'用户发送过来的消息'}}` |
 | `systemPromptExtra` | — | 追加到系统提示词的额外内容 |
+| `promptOverrides` | — | 系统提示词**分段覆盖**（`xzh prompt set` 写入；空串 = 删掉该段） |
+| `promptOverridesBase` | — | 保存覆盖时的内置指纹，升级后据此提示「原段落已变」 |
 
 > 旧版配置（只有 `provider` / `model`、没有 `models`）依然可用：会被视为唯一的一个模型。
 > 旧配置里的 `weight` / `decayed` 字段已废弃，读取时会被忽略、下次保存时自动清掉。
@@ -424,10 +441,13 @@ API Key 也可以来自环境变量，优先级低于配置文件：
 | `read_file` | 读取文件（带行号，支持偏移与行数限制） | 否 |
 | `list_dir` | 列出目录内容 | 否 |
 | `glob` | 按 `**` / `*` / `?` 模式查找文件 | 否 |
-| `grep` | 按正则搜索文件内容 | 否 |
+| `grep` | 按正则搜索文件内容；命中上限时用 `offset` 翻页（结果里会给下一个 offset） | 否 |
+| `ask_user` | 向用户提**一个**具体问题并等待回答（可给 2–4 个选项，按数字选；仅主代理可用） | 否 |
 | `write_file` | 覆盖写入文件 | 是 |
 | `edit_file` | 精确文本替换 | 是 |
-| `bash` | 执行 shell 命令 | 是 |
+| `bash` | 执行 shell 命令；`run_in_background: true` 则转后台、立刻返回 job id | 是 |
+| `bash_output` | 查看后台任务状态与最近输出（不带 `job_id` 时列出全部） | 否 |
+| `bash_kill` | 终止后台任务（连同它派生的子进程） | 是 |
 | `device_list` | 列出已连接的手机设备 | 否 |
 | `device_push` | 把脚本保存到手机（不运行） | 是 |
 | `device_run` | 把脚本推到手机并立即运行 | 是 |
@@ -435,6 +455,59 @@ API Key 也可以来自环境变量，优先级低于配置文件：
 | `device_logs` | 读取手机上的脚本日志 | 否 |
 | `device_read_screen` | 读取手机当前界面（包名 / 控件文本与位置），**以文字返回** | 否 |
 | `device_screenshot` | 截取手机屏幕，**图片随结果附给模型**（控件读不到时用它，再按坐标点击） | 否 |
+
+## 后台任务
+
+**为什么**：`npm test`、`npm run dev` 这类命令动辄几分钟、甚至根本不返回。以前只有两个选择 ——
+干等到超时（然后被截断的输出骗过去），或者中断整轮。
+
+**怎么用**：模型会对长命令自动加 `run_in_background`（你也可以直接说「把 dev server 起在后台」）。
+行为：
+
+- 立刻返回 `job-1` 与日志路径 `<项目>/.xuanzhu/jobs/job-1.log`；
+- **结束时自动把结果推给模型**（退出码 + 末尾输出），不需要轮询；
+- **结果不会丢**：先落盘再投递（`.xuanzhu/jobs/pending/`），投递成功才删 ——
+  「命令刚跑完就关掉 xzh」或「退出时被终止」都会在**下次启动**的第一轮补上，
+  且同一条结果只补一次；
+- 如果模型在等这个结果，它不会草草收尾（只提醒一次，避免把 dev server 当成阻塞）；
+- 界面：`/jobs` 列出全部任务、`/jobs job-1` 看输出、`/jobs kill job-1` 终止；
+- 退出 `xzh` 时会一并终止仍在跑的后台任务，不留孤儿进程。
+
+⚠️ 后台任务**不跨重启**：`xzh` 退出即终止。
+
+## 自治等级
+
+两个入口等价：界面 `/autonomy`，命令行 `xzh autonomy [ask|observe|auto]` / `xzh autonomy log` ——
+后者给脚本与 CI 用（那里没有人能按快捷键）。切换时会同步写 `autoApprove`，状态栏也会常驻显示当前档位
+（`⚡auto` / `ask` / `observe`）。
+
+| 档位 | 行为 |
+| --- | --- |
+| `auto`（默认） | 写文件 / 执行命令直接执行 |
+| `ask` | 每项确认后再执行 |
+| `observe` | **只观察**：这些操作一律被**代码**拦下，只往 `.xuanzhu/state/observe.log` 记一条 |
+
+`observe` 的典型用法：先让它调研并给出方案，你翻 `.xuanzhu/state/observe.log`（或 `/autonomy`
+里列出的「最近被拦截的操作」）确认它想做什么，再切 `auto` 放行。读文件、搜索、看后台输出不受限制。
+
+`/auto on|off` 仍然可用，等价于 `/autonomy auto|ask`。
+
+## 系统提示词分段覆盖
+
+不想整份重写提示词，只想改其中一段：
+
+```bash
+xzh prompt                    # 列出段落：core / tools / device / skills / trust / output / memory-global / memory-project
+xzh prompt show core          # 内置原文 vs 当前生效
+printf '## 核心原则\n先读后改，改完验证。\n' > core.md
+xzh prompt set core core.md   # 只覆盖这一段，其余继续跟随升级
+xzh prompt reset core         # 取消覆盖
+```
+
+- 覆盖写进 `~/.xzh/config.json` 的 `promptOverrides`；内容为空 = 删掉该段；
+- 内置提示词升级后会提示「你覆盖的那段原文已变」（记录在 `promptOverridesBase` 指纹里），
+  不会静默把你的文本换成新默认；
+- 界面里 `/prompt` 查看与重置，`/prompt show <段落>` 看某段内容。
 
 ## 任务拆分与子代理
 
@@ -1200,6 +1273,13 @@ registry 已可见（npm 有 staging 阶段，期间 `npm view` / `npm install` 
   [Oyinlola Olasunkanmi Raymond](https://github.com/olasunkanmi-SE)。
   玄猪由该项目改造而来，依 MIT 许可**保留其原始版权声明**。
   
+- **[dsh-superagent-prototype](https://github.com/deepseek-ai/dsh-superagent-prototype)** ——
+  由 DeepSeek 开源（作者见该仓库）。玄猪的**后台任务与完成唤醒**、**结构化提问（`ask_user`）**、
+  **自治等级（`ask` / `observe` / `auto`）**与**系统提示词分段覆盖**等机制的设计思路来自该项目：
+  它把「尽量少占人的注意力」当设计准则，给出了长任务不阻塞调用方、用代码而不是提示词兜底、
+  先观察再放行等一整套可借鉴的做法。玄猪按它的设计文档与源码重新实现（未复制代码），
+  并按终端的形态做了取舍。感谢作者把这些经验公开出来。
+
 - **[Playwright](https://github.com/microsoft/playwright)** —— 由 Microsoft 开源。
   内置的 `playwright` 技能基于它实现浏览器自动化与端到端测试。
 

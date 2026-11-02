@@ -35,6 +35,8 @@ const STATUS_LABEL: Record<RunStatus["kind"], string> = {
   blocked: "受阻",
   needs_input: "等待用户决定",
   low_confidence: "置信度低",
+  dropped: "无需处理",
+  waiting: "等待下一步",
 };
 
 /** 目标正文最多展示多少字符 */

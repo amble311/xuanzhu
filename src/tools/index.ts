@@ -1,6 +1,8 @@
 import type { ToolSpec } from "../llm/types";
 import { taskTool } from "./agent";
+import { askUserTool } from "./ask";
 import { bashTool } from "./bash";
+import { bashKillTool, bashOutputTool } from "./job-tools";
 import {
   editFileTool,
   globTool,
@@ -36,6 +38,7 @@ export const TOOLS: ToolDefinition[] = [
   todoWriteTool,
   goalCompleteTool,
   reportStatusTool,
+  askUserTool,
   taskTool,
   repoMapTool,
   findSymbolTool,
@@ -47,6 +50,8 @@ export const TOOLS: ToolDefinition[] = [
   writeFileTool,
   editFileTool,
   bashTool,
+  bashOutputTool,
+  bashKillTool,
   ...deviceTools,
 ];
 
@@ -64,12 +69,19 @@ export const TOOLS: ToolDefinition[] = [
  * - `device_*`：手机只有一台，多个子代理并行推脚本会互相打断（一个跑起来就把上一个顶掉），
  *   而且设备操作属于「对外部真实环境施加影响」，应由主代理统一发起。
  *   将来若要"在手机上验证"的子代理，需要先在这里开例外 —— 那是有意的决定。
+ * - `ask_user`：子代理没有自己的交互界面，提问只能回到主代理转述 ——
+ *   它应当把需要用户决定的事写进结论，由主代理统一去问（避免并行子代理同时抢界面）。
+ * - `bash_output` / `bash_kill`：后台任务注册表只挂主代理 ——
+ *   子代理结束后它的后台进程没有归属，还会跟主对话抢进程组。
  */
 export const SUBAGENT_FORBIDDEN_TOOLS = new Set([
   "task",
   "todo_write",
   "goal_complete",
   "report_status",
+  "ask_user",
+  "bash_output",
+  "bash_kill",
   "memory_write",
   "memory_compact",
   ...deviceTools.map((tool) => tool.name),

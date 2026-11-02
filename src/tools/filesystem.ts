@@ -495,6 +495,11 @@ export const grepTool: ToolDefinition = {
         type: "string",
         description: "文件名通配符过滤，如 '*.ts'（可选）",
       },
+      offset: {
+        type: "integer",
+        description:
+          "跳过前 N 条匹配再返回（默认 0）。命中上限时结果末尾会给 next_offset，照抄它即可翻页",
+      },
     },
     required: ["pattern"],
   },
@@ -524,9 +529,15 @@ export const grepTool: ToolDefinition = {
     const include = args.include ? globToRegExp(asString(args.include)) : null;
     const ignore = loadGitignore(root);
     const results: string[] = [];
+    // 翻页：只多收集「跳过的部分 + 一页」，避免为了 offset 把整棵树的命中都留在内存里
+    const offset =
+      typeof args.offset === "number" && Number.isFinite(args.offset)
+        ? Math.max(0, Math.floor(args.offset))
+        : 0;
+    const collectLimit = MAX_GREP_RESULTS + offset + 1;
 
     walk(root, (filePath) => {
-      if (results.length >= MAX_GREP_RESULTS) return;
+      if (results.length >= collectLimit) return;
       // 跳过 .gitignore 里显式忽略的文件（.env / 密钥 / 凭据等）
       if (ignore.length > 0 && matchesGitignore(path.relative(root, filePath), ignore)) {
         return;
@@ -553,7 +564,7 @@ export const grepTool: ToolDefinition = {
 
       const lines = buffer.toString("utf8").split("\n");
       for (let i = 0; i < lines.length; i++) {
-        if (results.length >= MAX_GREP_RESULTS) return;
+        if (results.length >= collectLimit) return;
         const line = lines[i];
         // 截断后再匹配：指数级回溯需要足够长的输入才会爆炸，
         // 限制长度即可把最坏情况压回可接受范围（正常代码行远达不到此长度）。
@@ -570,14 +581,26 @@ export const grepTool: ToolDefinition = {
     if (results.length === 0) {
       return { ok: true, content: "未找到匹配内容。" };
     }
-    const truncated =
-      results.length >= MAX_GREP_RESULTS
-        ? `\n…（已达 ${MAX_GREP_RESULTS} 条上限）`
+    const page = results.slice(offset, offset + MAX_GREP_RESULTS);
+    if (page.length === 0) {
+      return {
+        ok: true,
+        content: `没有更多匹配（offset=${offset} 之后为空，本次共找到 ${results.length} 条）。`,
+      };
+    }
+    // 命中上限时说清楚怎么继续，否则模型只能盲目缩小范围或换关键词
+    const more = results.length > offset + page.length;
+    const truncated = more
+      ? `\n…（本次返回第 ${offset + 1}–${offset + page.length} 条，还有更多；用 offset=${
+          offset + page.length
+        } 继续）`
+      : offset > 0
+        ? `\n（已跳过前 ${offset} 条）`
         : "";
     return {
       ok: true,
-      content: results.join("\n") + truncated,
-      summary: `${results.length} 条匹配`,
+      content: page.join("\n") + truncated,
+      summary: `${page.length} 条匹配${more ? "（还有更多）" : ""}`,
     };
   },
 };

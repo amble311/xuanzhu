@@ -146,6 +146,48 @@ describe("report_status 工具", () => {
     expect(result.ok).toBe(false);
     expect(result.content).toContain("kind 必须是");
   });
+
+  it("dropped：记录并把目标标记为「无需处理」", async () => {
+    const store = fakeStore({ goalActive: true, toolCalls: 1 });
+    const dropped: string[] = [];
+    const result = await reportStatusTool.execute(
+      { kind: "dropped", summary: "不是缺陷：测试环境复现不了" },
+      {
+        cwd: tmpCwd(),
+        autoApprove: true,
+        status: store,
+        goal: {
+          active: () => true,
+          complete: () => undefined,
+          drop: (reason) => {
+            dropped.push(reason);
+          },
+        },
+      },
+    );
+    expect(result.ok).toBe(true);
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toContain("不是缺陷");
+    expect(store.reported[0].kind).toBe("dropped");
+  });
+
+  it("dropped / waiting 不受「先尝试」限制", async () => {
+    const store = fakeStore({ goalActive: true, toolCalls: 0 });
+    const waiting = await reportStatusTool.execute(
+      { kind: "waiting", summary: "等 CI 结果" },
+      { cwd: tmpCwd(), autoApprove: true, status: store },
+    );
+    expect(waiting.ok).toBe(true);
+    expect(store.reported[0].kind).toBe("waiting");
+
+    // 非目标模式下的 dropped 不会调用 goal.drop（没有目标可结束）
+    const dropped = await reportStatusTool.execute(
+      { kind: "dropped", summary: "已被上游修掉" },
+      { cwd: tmpCwd(), autoApprove: true, status: store },
+    );
+    expect(dropped.ok).toBe(true);
+    expect(dropped.content).toContain("无需处理");
+  });
 });
 
 describe("状态进入 Agent 与状态块", () => {
@@ -190,6 +232,47 @@ describe("状态进入 Agent 与状态块", () => {
         status: { kind: "low_confidence", summary: "样本太少", at: "x" },
       }),
     ).toContain("状态：置信度低 —— 样本太少");
+  });
+});
+
+describe("目标模式：无需处理即结束", () => {
+  it("报告 dropped 后目标结束，结论显示为「无需处理」而不是「已完成」", async () => {
+    const file = path.join(tmpCwd(), "note.txt");
+    fs.writeFileSync(file, "hello", "utf8");
+
+    const { llm, calls } = scriptProvider([
+      toolCall("read_file", { path: file }),
+      toolCall("report_status", {
+        kind: "dropped",
+        summary: "已查清：这个问题在测试环境无法复现，不是代码缺陷",
+      }),
+      textReply("查过了，不是缺陷"),
+      textReply("不应该继续"),
+    ]);
+
+    const app = new TuiApp({
+      provider: llm,
+      config: configOf(),
+      cwd: tmpCwd(),
+      providerLabel: "fake",
+      model: "fake",
+      autoApprove: true,
+    });
+    const internals = app as unknown as {
+      runGoalLoop(): Promise<void>;
+      lines: string[];
+      agent: Agent;
+      exited: boolean;
+    };
+
+    internals.agent.setGoal("查一下这个缺陷");
+    await internals.runGoalLoop();
+    internals.exited = true;
+
+    expect(calls()).toBe(3);
+    const text = internals.lines.join("\n");
+    expect(text).toContain("⊘ 目标结束：无需处理");
+    expect(text).not.toContain("✓ 目标已完成");
   });
 });
 
