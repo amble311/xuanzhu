@@ -94,10 +94,10 @@ function formatSignal(data: unknown): string {
       ? `${payload.slice(0, 12_000)}\n…（已截断，完整快照可再看一次或查库）`
       : payload;
   return (
-    "三阶段买卖点（周线定势 → 日线定向 → 小时线定时）：\n\n" +
+    "三阶段买卖点（周线定势 → 日线定向 → 4 小时线定时）：\n\n" +
     `${clipped}\n\n` +
-    "注意：`stage3_hourly.degraded = true` 时表示小时线数据不足或未确认，" +
-    "结论里必须明说「小时线未确认」，不能当成三阶段已确认。"
+    "注意：`stage3_4h.degraded = true` 时表示4 小时线数据不足或未确认，" +
+    "结论里必须明说「4 小时线未确认」，不能当成三阶段已确认。"
   );
 }
 
@@ -192,7 +192,7 @@ const statusTool: ToolDefinition = {
   name: "btc_status",
   modes: BTC_MODES,
   description:
-    "查看 btc 模式的运行环境与本地行情库状态：计算环境是否装好、日线/小时线各多少根、" +
+    "查看 btc 模式的运行环境与本地行情库状态：计算环境是否装好、日线/4 小时线各多少根、" +
     "最新数据时间、交易标的与风控参数。**任何交易判断之前先调它**，以免拿着过期数据下结论。",
   parameters: { type: "object", properties: {}, required: [] },
   async execute(): Promise<ToolResult> {
@@ -270,7 +270,7 @@ const syncTool: ToolDefinition = {
       timeframe: {
         type: "string",
         enum: ["1d", "1h", "all"],
-        description: "要同步的周期，默认 all（日线 + 小时线）",
+        description: "要同步的周期，默认 all（日线 + 4 小时线）",
       },
       days: {
         type: "number",
@@ -315,7 +315,7 @@ const signalTool: ToolDefinition = {
   name: "btc_signal",
   modes: BTC_MODES,
   description:
-    "三阶段买卖点判断（周线定势 → 日线定向 → 小时线定时），返回每一阶段的判定、" +
+    "三阶段买卖点判断（周线定势 → 日线定向 → 4 小时线定时），返回每一阶段的判定、" +
     "置信度、建议动作（long/short/wait/stand_aside）、入场与止损目标。" +
     "数据来自本地库：先 btc_status 确认数据新鲜，必要时 btc_sync 补齐（尤其 1h）。" +
     "`action` 为 wait / stand_aside 时不得下单。",

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""三阶段买卖点判断：周线定势 → 日线定向 → 小时线定时。
+"""三阶段买卖点判断：周线定势 → 日线定向 → 4 小时线定时。
 
 设计原则：
 - 只做多周期一致性判断，冲突时明确 stand_aside，不硬凑信号。
 - 所有指标来自 `core.bt_engine.indicators`（与回测/实盘同一套口径，因果无未来函数）。
-- 周线由本地日线重采样；小时线只读本地 1h（行情同步由调用方负责），缺失则降级并标注。
+- 周线由日线重采样；4 小时线由 1h 重采样（行情同步只维护 1d + 1h），缺失则降级并标注。
 
 对外接口：
 - `analyze_timeframe(timeframe, limit)`：单周期指标摘要（1w / 1d / 4h / 1h）
@@ -50,7 +50,7 @@ def _hourly(limit: int = 400) -> tuple[pd.DataFrame | None, str]:
     """返回 (DataFrame, 来源)。来源：local / unavailable:<原因>。
 
     刻意**不联网**：行情同步由调用方（xzh 侧）负责并落库，这里只读本地 1h。
-    缺失时返回 degraded，让结论里明确写「小时线未确认」——
+    缺失时返回 degraded，让结论里明确写「4 小时线未确认」——
     否则三阶段会在一次工具调用里卡住等网络，而且模型分不清「没数据」和「网络差」。
     """
     from core.bt_engine import load_data
@@ -62,6 +62,29 @@ def _hourly(limit: int = 400) -> tuple[pd.DataFrame | None, str]:
         return None, f"unavailable: 本地 1h 只有 {bars} 根（<120），先同步 1h 数据"
     except Exception as e:
         return None, f"unavailable: {type(e).__name__}: {e}"
+
+
+def _h4(limit: int = 360) -> tuple[pd.DataFrame | None, str]:
+    """4 小时线：由本地 1h **重采样**得到。
+
+    为什么不单独同步 4h：多一个周期就多一份要维护、要对齐、要补的数据，
+    而 4h 完全由 1h 聚合而来（`o=first / h=max / l=min / c=last / v=sum`）。
+    同步链路因此不用改（仍是 1d + 1h）。
+    """
+    need = max(240, int(limit) * 4)
+    raw, src = _hourly(limit=need)
+    if raw is None:
+        return None, src.replace("1h", "4h")
+    h4 = (
+        raw.set_index("ts")
+        .resample("4h")
+        .agg({"o": "first", "h": "max", "l": "min", "c": "last", "v": "sum"})
+        .dropna()
+        .reset_index()
+    )
+    if len(h4) < 120:
+        return None, f"unavailable: 重采样后只有 {len(h4)} 根 4h（<120），先同步更多 1h 数据"
+    return h4.tail(limit).reset_index(drop=True), f"{src}→4h"
 
 
 def _ind(df: pd.DataFrame) -> pd.DataFrame:
@@ -248,13 +271,18 @@ def _stage2_daily(d: pd.DataFrame, trend: str) -> dict:
     }
 
 
-def _stage3_hourly(d: pd.DataFrame | None, source: str, bias: str) -> dict:
+def _stage3_4h(d: pd.DataFrame | None, source: str, bias: str) -> dict:
+    """第三阶段：4 小时线定时。
+
+    原来用 1h：周(7天) → 日(1天) → 小时线(24倍) 跨度过大，最噪音的周期反而有否决权。
+    换成 4h 后是 7 天 → 1 天 → 4 小时，相邻约 6–7 倍，且 4h 一根 K 线的噪音明显低于 1h。
+    """
     if bias == "wait":
         return {"entry": "wait", "source": source,
-                "reason": "日线无方向，小时线不单独入场"}
+                "reason": "日线无方向，4 小时线不单独入场"}
     if d is None:
         return {"entry": "wait", "source": source, "degraded": True,
-                "reason": f"小时线不可用（{source}）：只做日线级判断，等下根日线收盘或补 1h 数据后再定时"}
+                "reason": f"4 小时线不可用（{source}）：只做日线级判断，等下根 4h 收盘或补 1h 数据后再定时"}
 
     last = d.iloc[-1]
     prev = d.iloc[-2] if len(d) >= 2 else last
@@ -263,13 +291,14 @@ def _stage3_hourly(d: pd.DataFrame | None, source: str, bias: str) -> dict:
     rsi = _num(last.get("rsi"))
     hist = _num(last.get("macd_hist"))
     atr = _num(last.get("atr"))
-    lows = d["l"].tail(24)
-    highs = d["h"].tail(24)
+    # 近 24 小时 = 6 根 4h（4h 周期下不能再用 24 根，那是 4 天）
+    lows = d["l"].tail(6)
+    highs = d["h"].tail(6)
 
     if bias == "long":
         checks = {
-            "站上 MA20H": c > ma20 > 0,
-            "MA20H > MA50H": ma20 > ma50 > 0,
+            "站上 MA20（4h）": c > ma20 > 0,
+            "MA20 > MA50（4h）": ma20 > ma50 > 0,
             "RSI 45–72（不追超买）": 45 <= rsi <= 72,
             "MACD 柱 > 0": hist > 0,
         }
@@ -291,8 +320,8 @@ def _stage3_hourly(d: pd.DataFrame | None, source: str, bias: str) -> dict:
         }
 
     checks = {
-        "跌破 MA20H": c < ma20 > 0,
-        "MA20H < MA50H": ma20 < ma50 > 0,
+        "跌破 MA20（4h）": c < ma20 > 0,
+        "MA20 < MA50（4h）": ma20 < ma50 > 0,
         "RSI 28–55（不追超卖）": 28 <= rsi <= 55,
         "MACD 柱 < 0": hist < 0,
     }
@@ -318,14 +347,14 @@ def _decide(trend: str, bias: str, entry: str) -> tuple[str, str, str]:
     """返回 (action, 中文说明, 仓位建议)。"""
     if trend == "bull" and bias == "long":
         if entry == "now":
-            return "long", "周线多头 + 日线做多 + 小时线触发：顺势做多", "标准仓位（1.0x）"
-        return "wait", "周线多头、日线做多，但小时线未触发：等回踩 MA20H/前低再进", "0（等待）"
+            return "long", "周线多头 + 日线做多 + 4 小时线触发：顺势做多", "标准仓位（1.0x）"
+        return "wait", "周线多头、日线做多，但 4 小时线未触发：等回踩 MA20(4h)/前低再进", "0（等待）"
     if trend == "bear" and bias == "short":
         if entry == "now":
-            return "short", "周线空头 + 日线做空 + 小时线触发：顺势做空", "标准仓位（1.0x）"
-        return "wait", "周线空头、日线做空，但小时线未触发：等反弹到 MA20H 再进", "0（等待）"
+            return "short", "周线空头 + 日线做空 + 4 小时线触发：顺势做空", "标准仓位（1.0x）"
+        return "wait", "周线空头、日线做空，但 4 小时线未触发：等反弹到 MA20(4h) 再进", "0（等待）"
     if trend == "range" and bias in ("long", "short") and entry == "now":
-        return bias, "震荡市边缘反转 + 小时线确认：轻仓逆势", "半仓（0.5x），到区间中部止盈"
+        return bias, "震荡市边缘反转 + 4 小时线确认：轻仓逆势", "半仓（0.5x），到区间中部止盈"
     if trend == "range":
         return "stand_aside", "周线震荡且未到区间边缘：不做", "0"
     if bias == "wait":
@@ -334,7 +363,7 @@ def _decide(trend: str, bias: str, entry: str) -> tuple[str, str, str]:
 
 
 def three_stage_signal(symbol: str | None = None) -> dict:
-    """三阶段买卖点判断：周线定势 → 日线定向 → 小时线定时。"""
+    """三阶段买卖点判断：周线定势 → 日线定向 → 4 小时线定时。"""
     try:
         daily = _daily()
     except Exception as e:
@@ -348,8 +377,8 @@ def three_stage_signal(symbol: str | None = None) -> dict:
     s1 = _stage1_weekly(weekly_ind)
     s2 = _stage2_daily(daily_ind, s1["trend"])
 
-    hourly_df, hourly_src = _hourly(400)
-    s3 = _stage3_hourly(_ind(hourly_df) if hourly_df is not None else None, hourly_src, s2["bias"])
+    h4_df, h4_src = _h4(360)
+    s3 = _stage3_4h(_ind(h4_df) if h4_df is not None else None, h4_src, s2["bias"])
 
     action, reason, position = _decide(s1["trend"], s2["bias"], s3.get("entry", "wait"))
     confidence = round(min(s1["confidence"], s2["confidence"],
@@ -361,7 +390,7 @@ def three_stage_signal(symbol: str | None = None) -> dict:
         "as_of": snap_daily.get("as_of"),
         "stage1_weekly": s1,
         "stage2_daily": s2,
-        "stage3_hourly": s3,
+        "stage3_4h": s3,
         "action": action,
         "reason": reason,
         "position_hint": position,

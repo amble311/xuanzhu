@@ -7,7 +7,7 @@
  * - **代码**兜住「不管模型怎么排，这些时刻一定会看」：
  *   1. 日线收盘后（UTC 00:00，北京 08:00）—— 三阶段信号依赖日线，收盘才算新数据；
  *   2. 资金费结算后（UTC 00/08/16，北京 08/16/00）—— 持仓成本突变、常有插针；
- *   3. 小时线整点后（**仅在有持仓/挂单时**）—— 1h 确认是第三阶段，持仓时不能不看；
+ *   3. 4 小时线整点后（**仅在有持仓/挂单时**）—— 4h 是第三阶段，持仓时不能不看；
  *   4. 价格剧烈波动（相对上次巡检 ≥ 阈值）—— 这是唯一依赖实时数据的判定。
  *
  * 为什么不用「把这些时点写进队列」：每天 4 条固定 + 持仓时每小时 1 条，很快把
@@ -22,7 +22,7 @@ import { getBtcHome } from "../utils/paths";
 export type MarketEventKind =
   | "daily-close"
   | "funding"
-  | "hourly-close"
+  | "h4-close"
   | "volatility";
 
 export interface DueEvent {
@@ -50,9 +50,10 @@ export function lastDailyClose(now: number): number {
   return Math.floor(now / DAY) * DAY;
 }
 
-/** 最近的小时线收盘点 */
-export function lastHourClose(now: number): number {
-  return Math.floor(now / HOUR) * HOUR;
+/** 最近的 4 小时线收盘点（UTC 00/04/08/12/16/20） */
+export function lastH4Close(now: number): number {
+  const FOUR_HOURS = 4 * HOUR;
+  return Math.floor(now / FOUR_HOURS) * FOUR_HOURS;
 }
 
 /** 最近的资金费结算点（UTC 00/08/16） */
@@ -70,7 +71,7 @@ function beijing(ms: number): string {
 }
 
 export interface EventCheckOptions {
-  /** 有持仓或挂单时才关心小时线（空白账户看每小时只是烧钱） */
+  /** 有持仓或挂单时才关心 4 小时线（空白账户每 4 小时看一次只是烧钱） */
   hasPosition: boolean;
   /** 上次处理过的事件时点（kind → 时间戳） */
   lastHandled: Partial<Record<MarketEventKind, number>>;
@@ -79,7 +80,7 @@ export interface EventCheckOptions {
 /**
  * 是否有「刚到点且还没处理过」的市场事件。
  *
- * 顺序即优先级：日线收盘 > 资金费 > 小时线。同一分钟命中多个时只跑一轮，
+ * 顺序即优先级：日线收盘 > 资金费 > 4 小时线。同一分钟命中多个时只跑一轮，
  * 用最先命中的那个作为理由（一轮巡检本来就能覆盖多个检查项）。
  */
 export function dueMarketEvent(
@@ -101,9 +102,9 @@ export function dueMarketEvent(
 
   if (options.hasPosition) {
     candidates.push({
-      kind: "hourly-close",
-      at: lastHourClose(now),
-      reason: "小时线收盘后复核（有持仓）",
+      kind: "h4-close",
+      at: lastH4Close(now),
+      reason: "4 小时线收盘后复核（有持仓）",
     });
   }
 

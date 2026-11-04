@@ -3,7 +3,7 @@ import {
   dueMarketEvent,
   lastDailyClose,
   lastFundingSettle,
-  lastHourClose,
+  lastH4Close,
   volatilityDue,
   VOLATILITY_COOLDOWN_MS,
 } from "../src/btc/market-events";
@@ -17,11 +17,11 @@ import {
 describe("市场事件时点", () => {
   const at = (iso: string) => Date.parse(iso);
 
-  it("日线收盘 / 资金费 / 整点的取整正确", () => {
+  it("日线收盘 / 资金费 / 4 小时线的取整正确", () => {
     const now = at("2026-11-04T13:07:22Z");
     expect(lastDailyClose(now)).toBe(at("2026-11-04T00:00:00Z"));
     expect(lastFundingSettle(now)).toBe(at("2026-11-04T08:00:00Z"));
-    expect(lastHourClose(now)).toBe(at("2026-11-04T13:00:00Z"));
+    expect(lastH4Close(now)).toBe(at("2026-11-04T12:00:00Z"));
 
     // 16:00 之后进入当天的第三个资金费时段
     expect(lastFundingSettle(at("2026-11-04T16:00:01Z"))).toBe(
@@ -86,17 +86,17 @@ describe("市场事件时点", () => {
     expect(hit?.reason).toContain("资金费");
   });
 
-  it("小时线只在有持仓（或挂单）时才值得跑", () => {
-    const hour = at("2026-11-04T13:00:00Z");
-    // 无持仓：13:00 距日线收盘 13 小时、距资金费 5 小时，都不在宽限期 → 什么都不触发
+  it("4 小时线只在有持仓（或挂单）时才值得跑", () => {
+    // 12:00 UTC 是 4h 收盘点，同时距日线收盘 12 小时、距资金费 4 小时
+    const fourHour = at("2026-11-04T12:00:00Z");
     expect(
-      dueMarketEvent(hour + 30_000, { hasPosition: false, lastHandled: {} }),
+      dueMarketEvent(fourHour + 30_000, { hasPosition: false, lastHandled: {} }),
     ).toBeNull();
 
     expect(
-      dueMarketEvent(hour + 30_000, { hasPosition: true, lastHandled: {} })
+      dueMarketEvent(fourHour + 30_000, { hasPosition: true, lastHandled: {} })
         ?.kind,
-    ).toBe("hourly-close");
+    ).toBe("h4-close");
   });
 });
 
