@@ -118,6 +118,13 @@ export interface ToolLimits {
 export interface ToolContext {
   /** 当前工作目录 */
   cwd: string;
+  /**
+   * 专用模式名（如 `btc`）；普通模式为 undefined。
+   *
+   * 供 `list_skills` / `load_skill` 按模式裁剪技能范围 —— 这个过滤必须发生在工具层：
+   * 提示词里说「只有 btc 技能」并不能阻止模型直接 `load_skill github`。
+   */
+  mode?: string;
   /** 是否自动批准（非危险）工具 */
   autoApprove: boolean;
   /** 向界面输出区推送实时信息 */
@@ -216,6 +223,14 @@ export interface ToolDefinition {
   name: string;
   description: string;
   parameters: JsonSchema;
+  /**
+   * 归属的专用模式（如 `["btc"]`）；空 / 未声明 = 所有模式都可用。
+   *
+   * 语义与技能一致：声明了 modes 的工具**只在对应模式出现**，普通模式下既不下发给
+   * 模型也不允许执行 —— 否则每个通用会话都会背上交易工具的 schema 占用，
+   * 而模型在普通项目里也用不上它们。
+   */
+  modes?: string[];
   /** 执行前是否需要用户确认 */
   requiresConfirmation?: boolean;
   /**

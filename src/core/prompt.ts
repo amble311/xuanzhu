@@ -37,6 +37,13 @@ export interface PromptOptions {
   overrides?: Record<string, string>;
   /** 当前自治等级：生成一段「代码会拦什么」的说明，不可覆盖 */
   autonomy?: AutonomyMode;
+  /**
+   * 专用模式（如 `xzh btc`）的说明段。
+   *
+   * 由模式定义在代码里给出，**不进 `promptOverrides`**：段里写的是「代码已经强制了
+   * 哪些约束」（目录不可切、技能已收窄），被用户整段替换掉就会与真实行为不符。
+   */
+  modeSection?: string;
 }
 
 interface PromptContext {
@@ -481,11 +488,12 @@ function autonomySection(mode: AutonomyMode): string {
  * 段落顺序（省略空段）：
  * 1. 固定开场（身份 + 工作目录）
  * 2. `core` / `tools` / `device` / `skills` / `trust` / `output`（可覆盖）
- * 3. 全局代理（已配置时）
- * 4. 项目规则（AGENTS.md）
- * 5. `memory-global` / `memory-project`（可覆盖固定说明，动态节选由代码追加）
- * 6. 附加指令（`systemPromptExtra`）
- * 7. 自治等级（代码生成，放最后以保住前缀缓存）
+ * 3. 专用模式说明（如 `xzh btc`，由代码给出，不可覆盖）
+ * 4. 全局代理（已配置时）
+ * 5. 项目规则（AGENTS.md）
+ * 6. `memory-global` / `memory-project`（可覆盖固定说明，动态节选由代码追加）
+ * 7. 附加指令（`systemPromptExtra`）
+ * 8. 自治等级（代码生成，放最后以保住前缀缓存）
  */
 export function buildSystemPrompt(
   cwd: string,
@@ -530,6 +538,11 @@ export function buildSystemPrompt(
     const text = partText(part.key, ctx, overrides);
     if (text) sections.push(text);
   }
+
+  // 模式说明紧跟通用规则、先于项目规则：模型先知道「现在是什么场景」，
+  // 再用 AGENTS.md 的项目细节补充；反过来会让项目里的通用规则盖过模式约束。
+  const modeSection = options?.modeSection?.trim();
+  if (modeSection) sections.push(modeSection);
 
   if (proxyConfigured) sections.push(proxySection());
 

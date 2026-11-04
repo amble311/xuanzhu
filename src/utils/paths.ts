@@ -32,6 +32,19 @@ export function isConfigDirOverridden(): boolean {
   return Boolean(process.env.XZH_HOME?.trim());
 }
 
+/**
+ * btc 模式的数据目录，默认 `~/.btc`。
+ *
+ * 可用 `XZH_BTC_HOME` 重定向（测试隔离 / 多环境 / 数据放盘）。
+ * **刻意不跟随 `XZH_HOME`**：那是玄猪的全局配置（模型、技能开关），
+ * 而这里是交易数据（行情库、日志、计算脚本、venv），归属不同。
+ */
+export function getBtcHome(): string {
+  const override = process.env.XZH_BTC_HOME?.trim();
+  if (override) return path.resolve(expandHome(override));
+  return path.join(os.homedir(), ".btc");
+}
+
 /** 旧版全局目录：~/.xuanzhu（v0.1.0 及更早使用，仅供迁移检测） */
 export function getLegacyConfigDir(): string {
   return path.join(os.homedir(), ".xuanzhu");
@@ -50,6 +63,23 @@ export function getBuiltinSkillsDir(): string {
 /** 用户自定义技能目录：~/.xzh/skills */
 export function getUserSkillsDir(): string {
   return path.join(getConfigDir(), "skills");
+}
+
+/**
+ * 随包分发的**运行资产**目录（打包后为 `dist/assets`）。
+ *
+ * 与技能不同：技能是给模型看的说明文档，资产是**要被执行/复制出去的东西**
+ * （例如 btc 模式的 Python 计算层）。它们不能直接从 `dist` 里跑 —— 计算层要落到
+ * 用户的数据目录、连同它的 venv 与数据库一起工作，因此由 bootstrap 复制到
+ * `<模式 home>` 下。
+ *
+ * 开发态（`ts-node` / vitest / 未构建）没有 `dist/assets`，回退到仓库根的 `assets/`，
+ * 否则这些代码在测试里会找不到文件。
+ */
+export function getBuiltinAssetsDir(): string {
+  const packaged = path.join(__dirname, "assets");
+  if (fs.existsSync(packaged)) return packaged;
+  return path.join(__dirname, "..", "..", "assets");
 }
 
 /**

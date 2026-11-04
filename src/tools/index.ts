@@ -2,6 +2,7 @@ import type { ToolSpec } from "../llm/types";
 import { taskTool } from "./agent";
 import { askUserTool } from "./ask";
 import { bashTool } from "./bash";
+import { btcTools } from "./btc";
 import { bashKillTool, bashOutputTool } from "./job-tools";
 import {
   editFileTool,
@@ -53,7 +54,25 @@ export const TOOLS: ToolDefinition[] = [
   bashOutputTool,
   bashKillTool,
   ...deviceTools,
+  ...btcTools,
 ];
+
+/**
+ * 工具是否在指定模式下可见。
+ *
+ * 与技能同一套语义：未声明 `modes` = 通用工具，所有模式可用；声明了则只在列出的
+ * 模式出现，**普通模式不可见**。过滤点有两处（下发给模型的 schema、执行前的查找），
+ * 只做前者的话，模型凭上下文里残留的名字仍能调用到本该不存在的工具。
+ */
+export function toolVisibleInMode(
+  tool: ToolDefinition,
+  mode?: string,
+): boolean {
+  if (!tool.modes || tool.modes.length === 0) return true;
+  const normalized = mode?.trim().toLowerCase();
+  if (!normalized) return false;
+  return tool.modes.some((item) => item.toLowerCase() === normalized);
+}
 
 /**
  * 子代理**永不**可用的工具（无论白名单怎么写都会被过滤）。
@@ -85,6 +104,9 @@ export const SUBAGENT_FORBIDDEN_TOOLS = new Set([
   "memory_write",
   "memory_compact",
   ...deviceTools.map((tool) => tool.name),
+  // btc_*：行情/回测/交易都属于主代理的决策链，子代理只做调研，
+  // 让它自己同步数据或跑回测会与主对话抢同一个库，结论也无法复核。
+  ...btcTools.map((tool) => tool.name),
 ]);
 
 export function findTool(

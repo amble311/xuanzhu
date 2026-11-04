@@ -1,5 +1,4 @@
 import * as readline from "readline/promises";
-import { Writable } from "stream";
 import { ansi } from "../utils/ansi";
 
 export interface SelectOption<T> {
@@ -8,17 +7,102 @@ export interface SelectOption<T> {
   hint?: string;
 }
 
-/** 什么都不输出的写入流：配合 readline 实现掩码输入（不回显所输内容） */
-const mutedOutput = new Writable({
-  write(_chunk, _encoding, callback) {
-    callback();
-  },
-});
-
 /** 把凭据类字符串打码，仅保留头尾用于辨认（如 sk-1234…abcd） */
 function maskSecret(value: string): string {
   if (value.length <= 8) return "*".repeat(value.length);
   return `${value.slice(0, 4)}…${value.slice(-4)}`;
+}
+
+/**
+ * 掩码输入：每敲一个字符回显一个 `*`。
+ *
+ * 为什么不用「静音流 + readline」：那样屏幕上**什么都不显示**，用户无法判断
+ * 自己到底输入了没有、退格是否生效（API Key 又长又难核对，这个反馈是必需的）。
+ * 也不能把静音流改成 `*` 的流 —— readline 会整行重绘（光标移动、清行），
+ * 逐字节替换会得到一串错位的星号。所以这里自己读键：
+ * 字符进缓冲区、屏幕上补一个 `*`、退格删一个并回退一格。
+ */
+async function promptMasked(
+  label: string,
+  defaultValue?: string,
+): Promise<string> {
+  const hint = defaultValue
+    ? ` ${ansi.gray}(${maskSecret(defaultValue)} 已保存，回车沿用)${ansi.reset}`
+    : "";
+  process.stdout.write(`${label}${hint}: `);
+
+  // 非终端（管道 / CI）没有回显这回事，按行读即可
+  if (!process.stdin.isTTY) {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    try {
+      const answer = await Promise.race([
+        rl.question(""),
+        new Promise<string>((resolve) => rl.once("close", () => resolve(""))),
+      ]);
+      const trimmed = answer.trim();
+      return trimmed || defaultValue || "";
+    } finally {
+      rl.close();
+    }
+  }
+
+  const stdin = process.stdin;
+  const wasRaw = Boolean(stdin.isRaw);
+
+  return new Promise<string>((resolve) => {
+    let value = "";
+
+    const finish = (result: string): void => {
+      stdin.off("data", onData);
+      if (!wasRaw) stdin.setRawMode(false);
+      stdin.pause();
+      process.stdout.write("\n");
+      resolve(result);
+    };
+
+    /** 退格：删一个字符并把屏幕上那颗星擦掉 */
+    const eraseOne = (): void => {
+      if (value.length === 0) return;
+      value = value.slice(0, -1);
+      process.stdout.write("\b \b");
+    };
+
+    const onData = (chunk: string): void => {
+      // 按 code point 遍历：中文/emoji 是一个整体，逐字节切会写坏
+      for (const ch of chunk) {
+        if (ch === "\r" || ch === "\n") {
+          finish(value.trim() || defaultValue || "");
+          return;
+        }
+        if (ch === "\x03") {
+          // Ctrl+C：当成取消（返回空串，调用方按「未输入」处理）
+          finish("");
+          return;
+        }
+        if (ch === "\x7f" || ch === "\b") {
+          eraseOne();
+          continue;
+        }
+        if (ch === "\x15") {
+          // Ctrl+U 清空整行
+          while (value.length > 0) eraseOne();
+          continue;
+        }
+        // 其它控制字符（方向键转义序列等）忽略，别把它们塞进密钥
+        if (ch < " ") continue;
+        value += ch;
+        process.stdout.write("*");
+      }
+    };
+
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding("utf8");
+    stdin.on("data", onData);
+  });
 }
 
 /** 读取一行文本输入 */
@@ -27,22 +111,21 @@ export async function promptInput(
   defaultValue?: string,
   options: { mask?: boolean } = {},
 ): Promise<string> {
-  // mask 模式：输入的字符不回显到终端，默认值也以降级形式展示，
-  // 避免 API Key 出现在屏幕上（或被录屏 / script 录制捕获）。
+  if (options.mask) return promptMasked(label, defaultValue);
+
   const rl = readline.createInterface({
     input: process.stdin,
-    output: options.mask ? mutedOutput : process.stdout,
+    output: process.stdout,
   });
   try {
-    const shown =
-      defaultValue && options.mask ? maskSecret(defaultValue) : defaultValue;
-    const suffix = shown ? ` ${ansi.gray}(${shown})${ansi.reset}` : "";
+    const suffix = defaultValue
+      ? ` ${ansi.gray}(${defaultValue})${ansi.reset}`
+      : "";
     // 非交互环境（stdin 提前结束）时回落为默认值，避免静默挂起
     const answer = await Promise.race([
       rl.question(`${label}${suffix}: `),
       new Promise<string>((resolve) => rl.once("close", () => resolve(""))),
     ]);
-    if (options.mask) process.stdout.write("\n");
     const trimmed = answer.trim();
     return trimmed || defaultValue || "";
   } finally {

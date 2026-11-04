@@ -66,8 +66,9 @@ export async function skillCommand(args: string[]): Promise<void> {
 // ------------------------------------------------------------------ 列表
 
 function printSkillTable(includeDisabled: boolean): void {
-  const skills = discoverSkills({ includeDisabled: true });
-  const visible = discoverSkills();
+  const skills = discoverSkills({ includeDisabled: true, includeAllModes: true });
+  // 判断「是否禁用」必须同样忽略模式：否则所有带 modes 的技能都会被误标成已禁用
+  const visible = discoverSkills({ includeAllModes: true });
   const builtin = skills.filter((s) => s.source === "builtin").length;
   const user = skills.length - builtin;
 
@@ -91,6 +92,12 @@ function printSkillTable(includeDisabled: boolean): void {
     const disabled = !visible.some((v) => v.name === skill.name);
     const mark = disabled ? `${ansi.yellow}✗${ansi.reset}` : `${ansi.green}✓${ansi.reset}`;
     const source = skill.source === "user" ? `${ansi.cyan}用户${ansi.reset}` : "内置";
+    // 归属模式（modes: [btc]）：普通模式看不到这类技能，列表里必须标出来，
+    // 否则用户会以为「明明启用了，为什么 /skills 里没有」
+    const modes =
+      skill.modes.length > 0
+        ? ` ${ansi.magenta}[${skill.modes.join(",")}]${ansi.reset}`
+        : "";
     const state = disabled ? `${ansi.gray}（已禁用）${ansi.reset} ` : "";
     // padEnd 用 ansi 的宽度感知版本：技能名可能是中文（宽度按 2 计），普通 padEnd 会错位；
     // ANSI 码要包在 padEnd 结果外面，否则转义序列会被算进宽度
@@ -99,7 +106,7 @@ function printSkillTable(includeDisabled: boolean): void {
       ? `${ansi.gray}${padded}${ansi.reset}`
       : `${ansi.bold}${padded}${ansi.reset}`;
     process.stdout.write(
-      `  ${mark} ${name} ${source}  ${state}${ansi.gray}${truncate(skill.description, DESCRIPTION_LIMIT)}${ansi.reset}\n`,
+      `  ${mark} ${name} ${source}${modes}  ${state}${ansi.gray}${truncate(skill.description, DESCRIPTION_LIMIT)}${ansi.reset}\n`,
     );
   }
 }
@@ -111,7 +118,7 @@ async function toggleCommand(args: string[], enable: boolean): Promise<void> {
   const name = args.find((arg) => !arg.startsWith("-"));
 
   if (name) {
-    const skill = discoverSkills({ includeDisabled: true }).find(
+    const skill = discoverSkills({ includeDisabled: true, includeAllModes: true }).find(
       (s) => s.name.toLowerCase() === name.trim().toLowerCase(),
     );
     if (!skill) {
@@ -127,8 +134,10 @@ async function toggleCommand(args: string[], enable: boolean): Promise<void> {
   }
 
   // 未给名字：交互式挑一个（启用 → 只列已禁用的；禁用 → 只列启用中的）
-  const visible = new Set(discoverSkills().map((skill) => skill.name));
-  const candidates = discoverSkills({ includeDisabled: true }).filter(
+  const visible = new Set(
+    discoverSkills({ includeAllModes: true }).map((skill) => skill.name),
+  );
+  const candidates = discoverSkills({ includeDisabled: true, includeAllModes: true }).filter(
     (skill) => (enable ? !visible.has(skill.name) : visible.has(skill.name)),
   );
   if (candidates.length === 0) {
@@ -180,7 +189,7 @@ async function deleteCommand(args: string[]): Promise<void> {
 
   let skill: SkillInfo | undefined;
   if (name) {
-    skill = discoverSkills({ includeDisabled: true }).find(
+    skill = discoverSkills({ includeDisabled: true, includeAllModes: true }).find(
       (s) => s.name.toLowerCase() === name.trim().toLowerCase(),
     );
     if (!skill) {
@@ -192,7 +201,7 @@ async function deleteCommand(args: string[]): Promise<void> {
       return;
     }
   } else {
-    const userSkills = discoverSkills({ includeDisabled: true }).filter(
+    const userSkills = discoverSkills({ includeDisabled: true, includeAllModes: true }).filter(
       (s) => s.source === "user",
     );
     if (userSkills.length === 0) {

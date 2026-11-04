@@ -45,9 +45,10 @@ docs/
 # 更稳妥的做法是把它放到仓库之外（例如 ~/object/AutoJs6）。
 AutoJs6/
 
-# superagent/ 是另一份开源的 agent 实现，仅作设计参考放在这里（含它自己的
-# package.json / 依赖锁 / 测试）。它**不是**本项目的代码，还依赖 jsdom 等本仓库没有的包；
+# 外部 agent 实现（例如 dsh-superagent-prototype）临时放在这里做设计参考时，
+# 它们有自己的 package.json / 依赖锁 / 测试，**不是**本项目的代码；
 # release.sh 用的是 `git add -A`，不忽略就会把整个参考项目推上公开仓库。
+# 2026-11-03 那份参考项目已按要求删除，规则保留以备再次 clone 复查（见 ARCHITECTURE §13）。
 superagent/
 
 # ── 密钥与凭据（万一被误建在项目内）────────────────────

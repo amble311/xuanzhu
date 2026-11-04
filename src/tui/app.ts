@@ -11,6 +11,26 @@ import {
   type PromptPartKey,
 } from "../core/prompt";
 import type { AskUserAnswer, AskUserRequest } from "../tools/types";
+import type { AgentMode } from "../modes";
+import { activeExchange } from "../exchange";
+import { fetchAccountSnapshot, type AccountSnapshot } from "../btc/account";
+import { runRunner } from "../btc/python";
+import { readPause, setPaused } from "../btc/pause";
+import {
+  currentInspectOffset,
+  readInspectEvents,
+} from "../btc/inspect-stream";
+import {
+  readRiskSettings,
+  readRiskState,
+  type HardRiskSettings,
+  type HardRiskState,
+} from "../btc/risk";
+import {
+  currentScheduleRole,
+  readScheduleQueue,
+  type ScheduleEntry,
+} from "../btc/schedule";
 import { describeJob, readFileTail, type BackgroundJob } from "../tools/jobs";
 import { applyInit, planInit, summarizePlan } from "../init";
 import {
@@ -119,10 +139,44 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+/** 模拟盘面板数据（来自 Python 的 paper-status） */
+interface PaperPanelData {
+  price: number;
+  initial_capital: number;
+  cash: number;
+  equity: number;
+  return_pct: number;
+  position: {
+    side: string;
+    qty: number;
+    entry_price: number;
+    unrealized: number;
+    unrealized_pct: number;
+    stop_price: number | null;
+  } | null;
+  /** 未成交的限价挂单 */
+  open_orders?: Array<{
+    id: number;
+    side: string;
+    qty: number;
+    limit_price: number;
+  }>;
+  trades: number;
+  win_rate: number;
+  realized_pnl: number;
+}
+
 export interface TuiAppOptions {
   provider: LLMProvider;
   config: XuanZhuConfig;
   cwd: string;
+  /**
+   * 专用模式（`xzh btc`）。缺省 = 普通编码模式。
+   *
+   * 它只带来两类约束：固定工作目录（禁止 `/switch`）与收窄技能范围；
+   * 模型配置、会话、记忆等仍沿用同一套全局设置，退出模式即恢复。
+   */
+  mode?: AgentMode;
   providerLabel: string;
   model: string;
   /** 启动时选中的模型条目，交由 Agent 在调用失败时沿列表回退 */
@@ -229,6 +283,41 @@ export class TuiApp {
   private readonly agent: Agent;
   private readonly markdown = new MarkdownRenderer();
   private cwd: string;
+  /** 专用模式（`xzh btc`）；普通模式为 undefined */
+  private readonly mode?: AgentMode;
+  /**
+   * btc 模式右侧仪表盘的数据快照。
+   *
+   * 数据放在 TUI 侧而不是「每次渲染都拉网络」：账户接口有频率权重，
+   * 渲染每秒可能发生多次，必须由定时器统一刷新。
+   */
+  private btcPanel?: {
+    updatedAt: number;
+    /** 观察（真实账户）还是模拟盘 —— 决定右栏展示哪套数据 */
+    role: "live" | "paper";
+    ticker: { price: number; changePct: number } | null;
+    /** 后端是否被 `/stop` 暂停 */
+    paused: boolean;
+    account: AccountSnapshot | null;
+    paper: PaperPanelData | null;
+    paperError?: string;
+    queue: ScheduleEntry[];
+    riskState: HardRiskState;
+    riskSettings: HardRiskSettings;
+  };
+  private btcPanelTimer?: NodeJS.Timeout;
+  private btcRefreshing = false;
+  /**
+   * 后台巡检过程流的增量位置。
+   *
+   * 用文件偏移做增量：后端与界面是两个进程，只能靠文件传递；
+   * 首次接入定位到**末尾**，否则界面会被几百行历史事件刷屏。
+   */
+  private feedOffset = -1;
+  private feedTimer?: NodeJS.Timeout;
+  private feedEnabled = true;
+  /** 面板里显示的「最近一条后台活动」 */
+  private lastFeedLine?: string;
   /** 当前会话文件（JSONL）；/reset 与 /resume 会切换它 */
   private currentSessionFile: string;
 
@@ -412,6 +501,7 @@ export class TuiApp {
   constructor(options: TuiAppOptions) {
     this.options = options;
     this.cwd = options.cwd;
+    this.mode = options.mode;
     this.autoApprove = options.autoApprove;
     // 从配置读取初始鼠标行为，避免每次启动都要 /mouse 切换
     this.mouseCapture = options.config.mouseCapture === true;
@@ -499,7 +589,7 @@ export class TuiApp {
       options.cwd,
       events,
       options.activeModel,
-      { sessionFile },
+      { sessionFile, mode: options.mode },
     );
   }
 
@@ -745,6 +835,14 @@ export class TuiApp {
     if (this.pendingAsk) this.resolveAsk({ cancelled: true });
     // 后台任务同理：它们也是独立进程组，不终止就会留下 dev server / 测试进程
     this.agent.killBackgroundJobs("xzh 退出");
+    if (this.btcPanelTimer) {
+      clearInterval(this.btcPanelTimer);
+      this.btcPanelTimer = undefined;
+    }
+    if (this.feedTimer) {
+      clearInterval(this.feedTimer);
+      this.feedTimer = undefined;
+    }
     this.term.dispose();
     this.exitTerminal();
     this.resolveExit?.();
@@ -1617,8 +1715,55 @@ export class TuiApp {
     this.scheduleRender();
   }
 
+  /**
+   * `/reset moni [初始资金]`：清空模拟盘账本。
+   *
+   * 与 `/reset`（对话）分开：重置账本不该把对话历史一起丢掉，
+   * 反之重置对话也不该清掉绩效记录。
+   */
+  private async resetPaperAccount(arg: string): Promise<void> {
+    const parts = arg.split(/\s+/).filter(Boolean);
+    const capitalArg = parts[1];
+    const capital = capitalArg ? Number(capitalArg) : undefined;
+    if (
+      capitalArg &&
+      !(Number.isFinite(capital) && (capital as number) > 0)
+    ) {
+      this.lines.push(`${ansi.yellow}初始资金必须是大于 0 的数字。${ansi.reset}`);
+      this.scheduleRender();
+      return;
+    }
+
+    const result = await runRunner<{ reset: boolean; capital: number }>(
+      "paper-reset",
+      capital === undefined ? {} : { capital },
+    );
+
+    if (!result.ok) {
+      this.lines.push(
+        `${ansi.red}✗ 重置模拟盘失败：${result.error}${ansi.reset}` +
+          (result.detail ? `\n${ansi.gray}${result.detail}${ansi.reset}` : ""),
+      );
+    } else {
+      this.lines.push(
+        `${ansi.green}✓${ansi.reset} 模拟盘已重置，初始资金 ` +
+          `${ansi.bold}${result.data.capital}${ansi.reset} USDT（持仓、挂单、成交记录已清空）。`,
+      );
+      // 立刻刷新面板，不必等 8 秒的定时器
+      void this.refreshBtcPanel();
+    }
+    this.scheduleRender();
+  }
+
   /** Shift+Tab：在对话输入与右侧终端之间切换焦点 */
   private toggleFocus(): void {
+    if (this.mode?.name === "btc") {
+      this.lines.push(
+        `${ansi.gray}btc 面板是只读仪表盘（价格 / 账户 / 巡检 / 风控），不接受终端输入。${ansi.reset}`,
+      );
+      this.scheduleRender();
+      return;
+    }
     if (!this.termVisible) {
       this.lines.push(
         `${ansi.gray}终端面板已隐藏，输入 /term 可重新显示。${ansi.reset}`,
@@ -2586,7 +2731,59 @@ export class TuiApp {
       case "mouse":
         this.toggleMouseCapture();
         break;
+      case "feed": {
+        // 后台巡检的思考/工具调用实时显示在输出区，刷屏时可关掉
+        if (this.mode?.name !== "btc") {
+          this.lines.push(
+            `${ansi.gray}/feed 只在 btc 模式下有意义（后台巡检过程流）。${ansi.reset}`,
+          );
+          break;
+        }
+        this.feedEnabled = !this.feedEnabled;
+        this.lines.push(
+          this.feedEnabled
+            ? `${ansi.green}✓${ansi.reset} 后台过程流已开启：巡检的思考与工具调用会实时显示。`
+            : `${ansi.gray}后台过程流已关闭（${ansi.reset}/feed${ansi.gray} 重新开启；关闭期间不会补历史）。${ansi.reset}`,
+        );
+        break;
+      }
+      case "stop": {
+        // 只影响 btc 后端（进程仍在），与 `xzh btc stop`（杀进程）区分开
+        if (this.mode?.name !== "btc") {
+          this.lines.push(
+            `${ansi.gray}/stop 仅在 btc 模式下可用（暂停后端巡检与自动交易）。${ansi.reset}`,
+          );
+          break;
+        }
+        const wanted = arg.trim().toLowerCase();
+        if (wanted === "resume" || wanted === "on") {
+          setPaused(this.cwd, false);
+          this.lines.push(
+            `${ansi.green}✓${ansi.reset} 已恢复后端巡检与自动交易。`,
+          );
+        } else if (wanted === "status") {
+          const pause = readPause(this.cwd);
+          this.lines.push(
+            pause.paused
+              ? `${ansi.yellow}后端已暂停${ansi.reset}${ansi.gray}（${pause.at ?? "?"}，/stop resume 恢复）${ansi.reset}`
+              : `${ansi.green}后端运行中${ansi.reset}${ansi.gray}（/stop 可暂停巡检与自动交易）${ansi.reset}`,
+          );
+        } else {
+          const pause = setPaused(this.cwd, true, "/stop");
+          this.lines.push(
+            `${ansi.yellow}⏸${ansi.reset} 已暂停后端巡检与自动交易${ansi.gray}（${pause.at}）${ansi.reset}`,
+            `${ansi.gray}  恢复：/stop resume · 彻底停止进程：xzh btc stop${ansi.reset}`,
+          );
+        }
+        void this.refreshBtcPanel();
+        break;
+      }
       case "reset":
+        // `/reset moni [初始资金]` 重置模拟盘账本；不带参数仍是重置对话
+        if (arg.trim().toLowerCase().startsWith("moni")) {
+          void this.resetPaperAccount(arg.trim());
+          break;
+        }
         // Agent.reset() 会一并清除目标（目标属于这段对话）
         this.agent.reset();
         this.goalIterations = 0;
@@ -3494,6 +3691,19 @@ export class TuiApp {
    * 代价是当前对话就此中断：它已增量存档在原项目的会话文件里，切回去即可找回。
    */
   private switchDirectory(input: string): void {
+    // 专用模式（如 btc）把工作目录固定成模式数据目录。
+    // 不是「懒得做」而是语义不允许：该目录下的数据库、脚本、记忆、会话是一个整体，
+    // 切走之后 `xzh btc` 的会话归属就乱了，所以这里由代码直接拒绝，不靠提示词约束。
+    if (this.mode?.cwdLocked) {
+      this.lines.push(
+        `${ansi.red}✗ ${this.mode.label}模式已锁定工作目录，不能 /switch${ansi.reset}`,
+        `${ansi.gray}  当前目录：${this.cwd}${ansi.reset}`,
+        `${ansi.gray}  需要其它目录请退出后运行 ${ansi.reset}xzh <目录>${ansi.reset}`,
+      );
+      this.scheduleRender();
+      return;
+    }
+
     const expanded = expandHome(input.trim());
     const target = path.isAbsolute(expanded)
       ? expanded
@@ -3909,6 +4119,22 @@ export class TuiApp {
         break;
       }
 
+      case "feed": {
+        // 后台巡检的思考/工具调用实时显示在输出区，刷屏时可关掉
+        if (this.mode?.name !== "btc") {
+          this.lines.push(
+            `${ansi.gray}/feed 只在 btc 模式下有意义（后台巡检过程流）。${ansi.reset}`,
+          );
+          break;
+        }
+        this.feedEnabled = !this.feedEnabled;
+        this.lines.push(
+          this.feedEnabled
+            ? `${ansi.green}✓${ansi.reset} 后台过程流已开启：巡检的思考与工具调用会实时显示。`
+            : `${ansi.gray}后台过程流已关闭（${ansi.reset}/feed${ansi.gray} 重新开启；关闭期间不会补历史）。${ansi.reset}`,
+        );
+        break;
+      }
       case "stop": {
         if (!bridge?.isRunning()) {
           this.lines.push(`${ansi.gray}设备桥未在运行。${ansi.reset}`);
@@ -4447,7 +4673,10 @@ export class TuiApp {
       `  /copy term [N|A-B|all]  复制右侧终端输出（按栏取内容，不会串栏）`,
       `  /image         把系统剪贴板里的图片加为本轮附件（同 Ctrl+V；别名 /paste）`,
       `  /mouse         切换鼠标捕获：开启后可在输出区拖拽选择（按整行）`,
+      `  /feed          开关后台巡检过程流（思考 / 工具调用实时显示，btc 模式）`,
+      `  /stop          暂停后端巡检与自动交易（btc 模式；/stop resume 恢复）`,
       `  /reset         重置对话上下文`,
+      `  /reset moni [初始资金]  重置模拟盘账本（仅 xzh btc moni 下有意义）`,
       `  /undo [N]      撤销玄猪最近 N 次文件修改（默认 1，最多 20；改前自动备份）`,
       `  /resume [编号]  列出 / 恢复历史会话（对话历史会自动保存）`,
       `  /cwd           显示当前工作目录`,
@@ -4776,6 +5005,325 @@ export class TuiApp {
     return Math.min(64, Math.max(32, Math.floor(columns * 0.4)));
   }
 
+  /** 后台过程流：每 2.5 秒取一次增量（只读新增部分，开销极小） */
+  private ensureFeedTimer(): void {
+    if (this.feedTimer) return;
+    if (this.feedOffset < 0) {
+      this.feedOffset = currentInspectOffset(this.cwd);
+    }
+    this.feedTimer = setInterval(() => this.refreshFeed(), 2_500);
+    this.feedTimer.unref?.();
+  }
+
+  /**
+   * 把后台巡检的新事件追加到输出区。
+   *
+   * 关闭（`/feed`）时仍然推进偏移：重新开启只显示之后发生的事，
+   * 不会把关闭期间攒的几百行一次性倒出来。
+   */
+  private refreshFeed(): void {
+    if (this.feedOffset < 0) {
+      this.feedOffset = currentInspectOffset(this.cwd);
+      return;
+    }
+    const { events, offset } = readInspectEvents(this.feedOffset, this.cwd);
+    this.feedOffset = offset;
+    if (events.length === 0) return;
+    if (!this.feedEnabled) return;
+
+    const labels: Record<string, string> = {
+      "round-start": "巡检",
+      reasoning: "思考",
+      text: "输出",
+      tool: "工具",
+      "tool-end": "结果",
+      notice: "提示",
+      "round-end": "结论",
+      error: "错误",
+    };
+
+    for (const event of events) {
+      const clock = new Date(event.ts).toLocaleTimeString("zh-CN", {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
+      const label = labels[event.kind] ?? event.kind;
+      const body = event.text.replace(/\s+/g, " ").trim().slice(0, 240);
+      if (!body) continue;
+      const tinted =
+        event.kind === "error"
+          ? `${ansi.red}${body}${ansi.reset}`
+          : event.kind === "round-end"
+            ? `${ansi.cyan}${body}${ansi.reset}`
+            : body;
+      this.lines.push(
+        `${ansi.gray}[后台 ${clock}]${ansi.reset} ${label}：${tinted}`,
+      );
+      this.lastFeedLine = `${clock} ${label}：${body.slice(0, 50)}`;
+    }
+    this.scheduleRender();
+  }
+
+  /** btc 仪表盘的刷新定时器（首次渲染时启动，8 秒一次） */
+  private ensureBtcPanelTimer(): void {
+    if (this.btcPanelTimer) return;
+    this.btcPanelTimer = setInterval(() => {
+      void this.refreshBtcPanel();
+    }, 8_000);
+    // 不阻止进程退出：TUI 结束时由 dispose 清理
+    this.btcPanelTimer.unref?.();
+  }
+
+  /** 刷新面板数据（价格走公开接口，余额/持仓/挂单走签名接口，失败保留上次结果） */
+  private async refreshBtcPanel(): Promise<void> {
+    if (this.btcRefreshing) return;
+    this.btcRefreshing = true;
+    try {
+      const symbol = process.env.BTC_SYMBOL?.trim() || "BTC/USDT";
+      const role = currentScheduleRole();
+      const ticker = await activeExchange()
+        .exchange.fetchTicker(symbol)
+        .catch(() => null);
+
+      const base = {
+        updatedAt: Date.now(),
+        paused: readPause(this.cwd).paused,
+        role,
+        ticker: ticker
+          ? { price: ticker.price, changePct: ticker.changePct }
+          : null,
+        queue: readScheduleQueue(this.cwd, role),
+        riskState: readRiskState(this.cwd),
+        riskSettings: readRiskSettings(this.cwd),
+      };
+
+      if (role === "paper") {
+        // 模拟盘不能读真实账户：那是两套账，混在一起会让人误判
+        const paper = await runRunner<PaperPanelData>("paper-status");
+        this.btcPanel = {
+          ...base,
+          account: null,
+          paper: paper.ok ? paper.data : null,
+          paperError: paper.ok ? undefined : paper.error,
+        };
+      } else {
+        const account = await fetchAccountSnapshot();
+        this.btcPanel = {
+          ...base,
+          account,
+          paper: null,
+        };
+      }
+      this.scheduleRender();
+    } catch {
+      // 刷新失败继续显示上一份数据：面板不是错误输出区
+    } finally {
+      this.btcRefreshing = false;
+    }
+  }
+
+  /**
+   * btc 仪表盘：合约价格 / 账户余额 / 持仓 / 挂单 / 接下来两次巡检。
+   *
+   * 只读 —— 没有输入行，也不参与 `Shift+Tab` 焦点切换（见 `toggleFocus`）。
+   */
+  private buildBtcPanel(
+    width: number,
+    height: number,
+  ): { rows: string[]; cursorRow: number; cursorCol: number } {
+    if (width <= 0 || height <= 0) {
+      return { rows: [], cursorRow: 0, cursorCol: 0 };
+    }
+
+    this.ensureBtcPanelTimer();
+    this.ensureFeedTimer();
+    if (!this.btcPanel) void this.refreshBtcPanel();
+
+    const rows: string[] = [];
+    const push = (text: string): void => {
+      if (rows.length < height) rows.push(truncate(text, width));
+    };
+    const divider = (): void =>
+      push(`${ansi.gray}${"─".repeat(Math.max(4, width - 1))}${ansi.reset}`);
+    const amount = (value: number, digits = 2): string =>
+      value.toLocaleString("en-US", {
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits,
+      });
+    const signed = (value: number, digits = 2): string =>
+      `${value >= 0 ? "+" : ""}${amount(value, digits)}`;
+
+    push(
+      `${ansi.bgBlue}${ansi.brightWhite} ${this.mode?.label ?? "BTC"} ${ansi.reset}` +
+        `${ansi.gray} U 本位合约${ansi.reset}`,
+    );
+
+    const data = this.btcPanel;
+    if (!data) {
+      push(`${ansi.gray}  正在加载…${ansi.reset}`);
+      while (rows.length < height) rows.push("");
+      return { rows, cursorRow: 0, cursorCol: 0 };
+    }
+
+    if (data.ticker) {
+      const up = data.ticker.changePct >= 0;
+      push(
+        ` ${ansi.bold}${amount(data.ticker.price)}${ansi.reset} ` +
+          `${up ? ansi.green : ansi.red}${signed(data.ticker.changePct)}%${ansi.reset}`,
+      );
+    } else {
+      push(`${ansi.gray} 价格 —（行情接口不可用）${ansi.reset}`);
+    }
+    divider();
+
+    const account = data.account;
+    if (data.role === "paper") {
+      const paper = data.paper;
+      if (!paper) {
+        push(`${ansi.gray} 模拟盘 ${data.paperError ?? "未就绪"}${ansi.reset}`);
+      } else {
+        push(
+          ` ${ansi.gray}权益${ansi.reset} ${amount(paper.equity)}` +
+            `（${signed(paper.return_pct)}%）`,
+        );
+        push(` ${ansi.gray}现金${ansi.reset} ${amount(paper.cash)}`);
+        if (paper.position) {
+          const position = paper.position;
+          const tag =
+            position.side === "long"
+              ? `${ansi.green}多${ansi.reset}`
+              : `${ansi.red}空${ansi.reset}`;
+          push(
+            ` ${ansi.gray}持仓${ansi.reset} ${tag} ${position.qty} @ ${amount(
+              position.entry_price,
+            )}`,
+          );
+          push(
+            `${ansi.gray}    ${signed(position.unrealized)}（${signed(
+              position.unrealized_pct,
+            )}%）${ansi.reset}`,
+          );
+        } else {
+          push(` ${ansi.gray}持仓${ansi.reset} 无`);
+        }
+
+        const pending = paper.open_orders ?? [];
+        if (pending.length === 0) {
+          push(` ${ansi.gray}挂单${ansi.reset} 无`);
+        } else {
+          push(` ${ansi.gray}挂单${ansi.reset} ${pending.length} 条`);
+          for (const order of pending.slice(0, 2)) {
+            const side =
+              order.side === "long"
+                ? `${ansi.green}买${ansi.reset}`
+                : `${ansi.red}卖${ansi.reset}`;
+            push(
+              `   ${side} ${amount(order.limit_price)} × ${order.qty}`,
+            );
+          }
+        }
+        push(
+          `${ansi.gray}  已平仓 ${paper.trades} 笔 · 胜率 ${paper.win_rate}% · ` +
+            `盈亏 ${signed(paper.realized_pnl)}${ansi.reset}`,
+        );
+      }
+    } else if (!account || !account.ok) {
+      push(`${ansi.gray} 账户 ${account?.error ?? "未连接"}${ansi.reset}`);
+    } else if (account.wallet) {
+      push(` ${ansi.gray}权益${ansi.reset} ${amount(account.wallet.total)}`);
+      push(` ${ansi.gray}可用${ansi.reset} ${amount(account.wallet.available)}`);
+      push(` ${ansi.gray}浮盈${ansi.reset} ${signed(account.wallet.unrealized)}`);
+
+      if (account.positions.length === 0) {
+        push(` ${ansi.gray}持仓${ansi.reset} 无`);
+      } else {
+        for (const position of account.positions.slice(0, 2)) {
+          const tag =
+            position.side === "long"
+              ? `${ansi.green}多${ansi.reset}`
+              : `${ansi.red}空${ansi.reset}`;
+          push(
+            ` ${ansi.gray}持仓${ansi.reset} ${tag} ${position.qty} @ ${amount(position.entryPrice)} ` +
+              `${position.leverage}x`,
+          );
+          push(
+            `${ansi.gray}    ${signed(position.unrealized)}（${signed(position.roePct)}%）` +
+              ` 强平 ${amount(position.liquidationPrice)}${ansi.reset}`,
+          );
+        }
+      }
+
+      if (account.orders.length === 0) {
+        push(` ${ansi.gray}挂单${ansi.reset} 无`);
+      } else {
+        push(` ${ansi.gray}挂单${ansi.reset} ${account.orders.length} 条`);
+        for (const order of account.orders.slice(0, 2)) {
+          const side =
+            order.side === "buy"
+              ? `${ansi.green}买${ansi.reset}`
+              : `${ansi.red}卖${ansi.reset}`;
+          push(
+            `   ${side} ${amount(order.price)} × ${order.qty}` +
+              (order.reduceOnly ? `${ansi.gray} 只减仓${ansi.reset}` : ""),
+          );
+        }
+      }
+    }
+
+    divider();
+    push(` ${ansi.gray}巡检${ansi.reset}`);
+    const upcoming = data.queue.slice(0, 2);
+    if (upcoming.length === 0) {
+      push(`${ansi.gray}  无排期（到兜底间隔会自行巡检）${ansi.reset}`);
+    }
+    for (const entry of upcoming) {
+      const wait = Math.max(
+        0,
+        Math.round((Date.parse(entry.at) - Date.now()) / 60_000),
+      );
+      const clock = new Date(entry.at).toLocaleTimeString("zh-CN", {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
+      push(
+        ` ${clock} · ${wait} 分钟后${entry.slot === "extra" ? "（额外）" : ""}`,
+      );
+      push(`${ansi.gray}  ${entry.reason}${ansi.reset}`);
+    }
+
+    divider();
+    if (data.role === "paper") {
+      push(` ${ansi.gray}风控${ansi.reset} ${ansi.gray}模拟盘不触发硬性风控${ansi.reset}`);
+    } else {
+      push(
+        ` ${ansi.gray}风控${ansi.reset} ${
+          data.riskState.triggered
+            ? `${ansi.red}已触发${ansi.reset}`
+            : `${ansi.green}正常${ansi.reset}`
+        }`,
+      );
+      push(
+        `${ansi.gray}  持仓亏损 ${data.riskSettings.maxPositionLossPct}% · ` +
+          `当日 ${data.riskSettings.maxDailyLossPct}%${ansi.reset}`,
+      );
+    }
+
+    if (this.lastFeedLine) {
+      push(`${ansi.gray} 最近：${this.lastFeedLine}${ansi.reset}`);
+    }
+
+    if (data.paused) {
+      push(
+        ` ${ansi.yellow}⏸ 已暂停${ansi.reset}${ansi.gray}（/stop resume 恢复）${ansi.reset}`,
+      );
+    }
+
+    while (rows.length < height) rows.push("");
+    return { rows: rows.slice(0, height), cursorRow: 0, cursorCol: 0 };
+  }
+
   /**
    * 生成右侧终端面板：标题（工作目录 + 运行状态）、输出区（可滚动）、输入行。
    * cursorRow / cursorCol 为面板内 1-based 坐标，供聚焦时定位光标。
@@ -4784,6 +5332,9 @@ export class TuiApp {
     width: number,
     height: number,
   ): { rows: string[]; cursorRow: number; cursorCol: number } {
+    // btc 模式下右栏不是终端，而是只读仪表盘（价格 / 账户 / 巡检 / 风控）
+    if (this.mode?.name === "btc") return this.buildBtcPanel(width, height);
+
     if (width <= 0 || height <= 0) {
       return { rows: [], cursorRow: 0, cursorCol: 0 };
     }

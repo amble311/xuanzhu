@@ -20,7 +20,9 @@ const external = [
   "readline/promises",
 ];
 
-// 构建完成后把内置技能（skills/）复制到 dist/skills，供运行时发现
+// 构建完成后把内置资源复制进 dist：
+//   skills/  → dist/skills   （技能说明，运行时发现）
+//   assets/  → dist/assets   （要被执行/复制出去的东西，如 btc 的 Python 计算层）
 const copySkillsPlugin = {
   name: "copy-skills",
   setup(build) {
@@ -32,6 +34,14 @@ const copySkillsPlugin = {
       fs.rmSync(dest, { recursive: true, force: true });
       fs.cpSync(src, dest, { recursive: true });
       console.log(`📚 已复制 ${fs.readdirSync(dest).length} 个技能到 dist/skills`);
+
+      const assetsSrc = path.join(__dirname, "assets");
+      if (fs.existsSync(assetsSrc)) {
+        const assetsDest = path.join(__dirname, "dist", "assets");
+        fs.rmSync(assetsDest, { recursive: true, force: true });
+        fs.cpSync(assetsSrc, assetsDest, { recursive: true });
+        console.log("📦 已复制 assets/ 到 dist/assets");
+      }
 
       // 生产构建不产出 sourcemap，但上一次普通（开发）构建可能留下
       // dist/cli.js.map；package.json 的 files 含整个 dist/，不清掉就会被打进发布包。

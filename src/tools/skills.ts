@@ -15,8 +15,9 @@ export const listSkillsTool: ToolDefinition = {
     properties: {},
     required: [],
   },
-  async execute(_args, _ctx): Promise<ToolResult> {
-    const skills = discoverSkills();
+  async execute(_args, ctx): Promise<ToolResult> {
+    // 按当前模式裁剪：技能可见性由代码决定，不依赖提示词里「只有 btc 技能」这句话
+    const skills = discoverSkills({ mode: ctx.mode });
     if (skills.length === 0) {
       return { ok: true, content: "当前没有可用技能。" };
     }
@@ -55,9 +56,10 @@ export const loadSkillTool: ToolDefinition = {
       return { ok: false, content: "错误：缺少技能名称参数 name。" };
     }
 
-    const skill = findSkill(name);
+    // 同样按模式查找：即使模型凭记忆拼出技能名，不属于本模式的技能也加载不到
+    const skill = findSkill(name, { mode: ctx.mode });
     if (!skill) {
-      const available = discoverSkills()
+      const available = discoverSkills({ mode: ctx.mode })
         .map((item) => item.name)
         .join(", ");
       return {

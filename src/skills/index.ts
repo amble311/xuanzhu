@@ -25,6 +25,15 @@ export interface SkillInfo {
   /** SKILL.md 绝对路径 */
   file: string;
   source: SkillSource;
+  /**
+   * 归属的专用模式（`modes: [btc]`）；空数组 = 通用技能，所有模式可见。
+   *
+   * 语义（与 `discoverSkills` 一致）：
+   * - 未声明 → 普通模式与所有专用模式都可见（这才是「通用」）；
+   * - 声明了 → **只有**列出的模式可见，普通模式一律不可见。
+   * 这样 btc 技能不会污染普通 xzh 的技能列表，普通技能也能在 btc 模式里继续用。
+   */
+  modes: string[];
 }
 
 const SKILL_FILENAME = "SKILL.md";
@@ -33,6 +42,7 @@ const MAX_SKILL_CHARS = 80_000;
 interface Frontmatter {
   name?: string;
   description?: string;
+  modes?: string[];
 }
 
 function stripQuotes(value: string): string {
@@ -53,7 +63,45 @@ export function parseFrontmatter(content: string): {
   const nameLine = /^name:\s*(.+)$/m.exec(raw)?.[1];
   const name = nameLine ? stripQuotes(nameLine) : undefined;
 
-  return { meta: { name, description: extractDescription(raw) }, body };
+  return {
+    meta: { name, description: extractDescription(raw), modes: extractModes(raw) },
+    body,
+  };
+}
+
+/**
+ * 解析 `modes` 字段，支持三种常见写法：
+ *
+ * ```yaml
+ * modes: [btc]        # 行内数组
+ * modes: btc          # 单个值
+ * modes:              # YAML 列表
+ *   - btc
+ * ```
+ *
+ * 名字统一小写：`xzh btc` 的 `btc` 是命令名，写错大小写不该让技能凭空消失。
+ */
+function extractModes(raw: string): string[] {
+  const normalize = (value: string) =>
+    stripQuotes(value.trim()).toLowerCase();
+
+  // 只吃行内空白（`\s` 会连换行一起吃掉，把块形式误判成单值 `- btc`）
+  const inline = /^modes:[ \t]*(.+)$/m.exec(raw)?.[1]?.trim();
+  if (inline) {
+    return inline
+      .replace(/^\[|\]$/g, "")
+      .split(",")
+      .map(normalize)
+      .filter(Boolean);
+  }
+
+  // 块形式：`modes:` 独占一行，后面是若干 `- btc`
+  const block = /^modes:\s*\r?\n((?:[ \t]+-\s*\S.*\r?\n?)+)/m.exec(raw)?.[1];
+  if (!block) return [];
+  return block
+    .split(/\r?\n/)
+    .map((line) => normalize(line.replace(/^[ \t]*-\s*/, "")))
+    .filter(Boolean);
 }
 
 /** 支持单行与 YAML 块（> / |）两种 description 写法 */
@@ -116,6 +164,7 @@ function scanDir(
       dir,
       file,
       source,
+      modes: meta.modes ?? [],
     });
   }
 }
@@ -128,6 +177,20 @@ export interface DiscoverSkillsOptions {
    * 需要看全量（`xzh skill` 的列表、启用/删除操作）时显式传 `includeDisabled: true`。
    */
   includeDisabled?: boolean;
+  /**
+   * 当前专用模式名（如 `btc`）；缺省 = 普通模式。
+   *
+   * 过滤规则见 `SkillInfo.modes`：声明了 modes 的技能只在对应模式出现，
+   * 普通模式下完全不可见 —— 这样 `xzh skill list` 之外的日常列表不会被交易技能塞满。
+   */
+  mode?: string;
+  /**
+   * 忽略模式限制，返回所有模式的技能。
+   *
+   * 只给 `xzh skill` 的管理命令用（列出 / 启用 / 删除）：用户在配置层面必须能看见
+   * 全部技能，否则没法把某个 btc 技能禁用掉。模型侧永远不要传它。
+   */
+  includeAllModes?: boolean;
 }
 
 /** 发现全部可用技能（同名时用户技能覆盖内置技能；默认不含已禁用项） */
@@ -137,13 +200,31 @@ export function discoverSkills(
   const found = new Map<string, SkillInfo>();
   scanDir(getBuiltinSkillsDir(), "builtin", found);
   scanDir(getUserSkillsDir(), "user", found);
-  const all = [...found.values()].sort((a, b) => a.name.localeCompare(b.name));
+  let all = [...found.values()].sort((a, b) => a.name.localeCompare(b.name));
+
+  if (!options.includeAllModes) {
+    const mode = options.mode?.trim().toLowerCase();
+    all = all.filter((skill) => visibleInMode(skill, mode));
+  }
+
   if (options.includeDisabled) return all;
 
   const disabled = new Set(
     getDisabledSkillNames().map((name) => name.toLowerCase()),
   );
   return all.filter((skill) => !disabled.has(skill.name.toLowerCase()));
+}
+
+/**
+ * 技能是否在指定模式下可见。
+ *
+ * - 技能未声明 modes → 通用技能，任何模式（含普通模式）都可见；
+ * - 技能声明了 modes → 只有在列出的模式里可见，**普通模式不可见**。
+ */
+function visibleInMode(skill: SkillInfo, mode?: string): boolean {
+  if (skill.modes.length === 0) return true;
+  if (!mode) return false;
+  return skill.modes.includes(mode);
 }
 
 /** 按名称查找技能（大小写不敏感；默认不含已禁用项，见 discoverSkills） */

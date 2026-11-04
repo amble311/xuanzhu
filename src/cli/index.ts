@@ -35,6 +35,25 @@ import { setupCommand } from "./commands/setup";
 import { vpnCommand } from "./commands/vpn";
 import { skillCommand } from "./commands/skill";
 import { recordErrorReport } from "../utils/error-reports";
+import {
+  allModes,
+  BTC_MODE_NAME,
+  createBtcMode,
+  findMode,
+  modeForHome,
+  type AgentMode,
+} from "../modes";
+import {
+  btcApikeyCommand,
+  btcEnsureCredential,
+  btcFkCommand,
+  btcPlatformCommand,
+  btcSetupCommand,
+  btcStatusCommand,
+  btcStopCommand,
+} from "./commands/btc";
+import { runBtcBackend } from "../btc/daemon-main";
+import { ensureBtcNetwork } from "../btc/network";
 
 // 版本号来自构建期注入（见 utils/version.ts），全项目只此一处来源
 
@@ -123,6 +142,67 @@ async function main(): Promise<void> {
   );
   const command = args[0];
 
+  // 专用模式（`xzh btc`）：模式名优先于「同名目录」——
+  // 想打开当前目录下名为 btc 的文件夹请写 `xzh ./btc`。
+  const mode = findMode(command);
+  if (mode) {
+    const sub = args[1];
+    if (mode.name === BTC_MODE_NAME) {
+      if (sub === "setup") {
+        await btcSetupCommand(args.slice(2));
+        return;
+      }
+      if (sub === "stop") {
+        await btcStopCommand();
+        return;
+      }
+      if (sub === "status") {
+        await btcStatusCommand();
+        return;
+      }
+      if (sub === "apikey") {
+        await btcApikeyCommand(args.slice(2));
+        return;
+      }
+      if (sub === "fk") {
+        await btcFkCommand();
+        return;
+      }
+      if (sub === "platform") {
+        await btcPlatformCommand(args.slice(2));
+        return;
+      }
+      // 隐藏子命令：由 `xzh btc` / `xzh btc moni` 以 detached 方式拉起，手动运行用于前台调试
+      if (sub === "serve") {
+        await runBtcBackend({
+          role: args.includes("--paper") ? "paper" : "live",
+        });
+        return;
+      }
+      // 模拟盘：同一套模式，换成 paper 角色（独立后端 + 虚拟账本）
+      if (sub === "moni") {
+        process.env.XZH_BTC_ROLE = "paper";
+        await startChat(mode.home, intentOverride, createBtcMode({ paper: true }));
+        return;
+      }
+    }
+    if (sub) {
+      process.stdout.write(
+        `${ansi.red}未知子命令：${command} ${sub}${ansi.reset}\n` +
+          `${ansi.gray}${command} 模式目前支持：` +
+          `${command}${ansi.gray}（进入模式）、${command} moni（模拟盘）、${command} apikey（凭据管理）、` +
+          `${command} fk（硬性风控）、${command} platform（交易平台）、${command} setup、` +
+          `${command} stop、${command} status${ansi.reset}\n`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    // 实盘启动前确认凭据：没有就进交互式管理（用户选过「跳过」就不再问）
+    await btcEnsureCredential();
+    await startChat(mode.home, intentOverride, mode);
+    return;
+  }
+
   switch (command) {
     case undefined:
       await startChat(undefined, intentOverride);
@@ -174,9 +254,11 @@ async function main(): Promise<void> {
       }
 
       // 位置参数：作为项目目录启动，例如 `xzh /home`、`xzh .`
+      // 目录正好是某个模式的固定目录时（`xzh ~/.btc`），进入对应模式，
+      // 保证「同一个目录不管从哪条路径进来，约束都一样」。
       const dir = resolveDirectory(command);
       if (dir) {
-        await startChat(dir, intentOverride);
+        await startChat(dir, intentOverride, modeForHome(dir));
         return;
       }
       if (looksLikePath(command)) {
@@ -228,6 +310,7 @@ function resolveDirectory(input: string): string | null {
 async function startChat(
   cwd?: string,
   intentOverride?: boolean,
+  mode?: AgentMode,
 ): Promise<void> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     process.stdout.write(
@@ -236,6 +319,59 @@ async function startChat(
     );
     process.exitCode = 1;
     return;
+  }
+
+  // 模式的固定目录必须存在：首次 `xzh btc` 时 `~/.btc` 还没有。
+  // 这里只建空目录（记忆与会话会在启动流程里初始化），不联网、不落业务数据 ——
+  // 计算脚本与行情库由模式自己的 bootstrap 负责，不能拖慢每次启动。
+  /** 常驻服务的启动结果，稍后并进界面顶部提示 */
+  let serviceNotice: string | undefined;
+
+  if (mode) {
+    fs.mkdirSync(mode.home, { recursive: true });
+    try {
+      // 释放随包资产（毫秒级、无网络）；失败只影响该模式的功能，不该拦住启动
+      mode.bootstrap?.(mode.home);
+    } catch {
+      // 忽略：工具层会给出更具体的错误（缺脚本 / 缺 venv）
+    }
+
+    // 首次进入就把环境装好 —— 新手不该先读一段「请手动运行 setup」的提示。
+    // 必须在这里而不是更晚：TUI 一旦接管终端进入备用屏，pip 的进度就看不见了。
+    // 失败**不拦启动**：用户仍能进界面看行情，可稍后重试 `xzh btc setup`。
+    // XZH_SKIP_AUTO_SETUP=1 可跳过（CI / 离网 / 自己管环境的场景）。
+    if (mode.autoSetup && !process.env.XZH_SKIP_AUTO_SETUP?.trim()) {
+      const prepared = await mode.autoSetup();
+      if (!prepared.ok) {
+        process.stdout.write(
+          `${ansi.yellow}⚠ 环境准备未完成：${prepared.error ?? "未知原因"}${ansi.reset}\n` +
+            `${ansi.gray}  仍会进入界面；行情 / 回测暂不可用，可稍后重试 ${ansi.reset}xzh btc setup${ansi.gray}。${ansi.reset}\n\n`,
+        );
+      }
+    }
+
+    // 网络引导：先试直连，不通再自动找本机代理（策略见 src/btc/network.ts）。
+    // 必须在 ensureService 之前 —— 后端是独立进程，会自己做一次；这里做是为了
+    // 让**当前会话**的工具调用也能立刻取到行情，并把结论告诉用户。
+    if (mode.name === BTC_MODE_NAME) {
+      const network = await ensureBtcNetwork({ config: loadConfig() });
+      for (const note of network.notes) {
+        process.stdout.write(`${ansi.gray}${note}${ansi.reset}\n`);
+      }
+      if (network.notes.length > 0) process.stdout.write("\n");
+    }
+
+    // 常驻服务（btc 的行情巡检后端）：没有就拉起，已在跑就复用。
+    // 界面退出**不**停它 —— 下次进入时这里会拿到「复用」而不是再启动一个。
+    if (mode.ensureService) {
+      try {
+        serviceNotice = (await mode.ensureService()).message;
+      } catch (err) {
+        serviceNotice = `⚠ 常驻服务启动失败：${
+          err instanceof Error ? err.message : String(err)
+        }`;
+      }
+    }
   }
 
   const config = loadConfig();
@@ -294,10 +430,15 @@ async function startChat(
   const meta = findProvider(active.provider);
   const provider = createProvider(config, active);
 
+  const notices = [mode?.startupHint, serviceNotice, buildStartupNotice()].filter(
+    (item): item is string => Boolean(item),
+  );
+
   const app = new TuiApp({
     provider,
     config,
     cwd: cwd ?? process.cwd(),
+    mode,
     providerLabel: meta?.label ?? active.provider,
     model: active.model,
     activeModel: active,
@@ -306,7 +447,7 @@ async function startChat(
         ? intentOverride
         : config.intent?.enabled === true,
     autoApprove: config.autoApprove,
-    startupNotice: buildStartupNotice(),
+    startupNotice: notices.length > 0 ? notices.join("\n") : undefined,
   });
 
   activeApp = app;
@@ -358,6 +499,15 @@ ${ansi.brightMagenta}${ansi.bold}玄猪 XuanZhu${ansi.reset} ${ansi.gray}v${VERS
 ${ansi.bold}用法${ansi.reset}
   ${ansi.green}xzh${ansi.reset}                     在当前目录启动交互式终端界面
   ${ansi.green}xzh <目录>${ansi.reset}              在指定项目目录启动，例如 ${ansi.gray}xzh /home${ansi.reset}
+  ${ansi.green}xzh btc${ansi.reset}                进入 BTC 量化交易模式：工作目录固定为 ${ansi.gray}~/.btc${ansi.reset}
+                            （${ansi.gray}XZH_BTC_HOME${ansi.reset} 可重定向、不可 /switch、只加载交易相关技能）
+  ${ansi.green}xzh btc setup${ansi.reset}          重建 btc 计算环境（首次进入模式时自动执行；此处用于修复 / ${ansi.gray}--force${ansi.reset} 重装）
+  ${ansi.green}xzh btc moni${ansi.reset}           进入 BTC 模拟盘：虚拟账本开平仓，不涉及真钱（独立后端）
+  ${ansi.green}xzh btc apikey${ansi.reset}         管理交易所 API 凭据（录入 / 更新 / 删除 / 查看别名）
+  ${ansi.green}xzh btc fk${ansi.reset}             硬性风控阈值（持仓亏损 / 当日亏损 / 连亏）
+  ${ansi.green}xzh btc platform${ansi.reset}       选择交易平台（默认币安；已接入的只有币安）
+  ${ansi.green}xzh btc stop${ansi.reset}           停止 btc 常驻后端（退出界面不会停它；${ansi.gray}--paper${ansi.reset} 只停模拟盘）
+  ${ansi.green}xzh btc status${ansi.reset}         查看观察 / 模拟盘两个后端与排期队列
   ${ansi.green}xzh --intent${ansi.reset}            本次启动启用意图分析（默认关闭）
   ${ansi.green}xzh --no-intent${ansi.reset}         本次启动强制关闭意图分析
   ${ansi.green}xzh model${ansi.reset}               交互式管理多模型（新增 / 删除 / 查看全部）

@@ -44,6 +44,7 @@ import {
   getToolSpecs,
   TOOLS,
   toolsForSubAgent,
+  toolVisibleInMode,
   type ExecuteToolResult,
 } from "../tools";
 import { jobCompletionMessage } from "../tools/job-tools";
@@ -67,6 +68,7 @@ import type {
   ToolResult,
 } from "../tools/types";
 import type { DeviceBridge } from "../device";
+import type { AgentMode } from "../modes";
 import { findSubAgent, subAgentNames } from "../subagents";
 import {
   normalizeSubagentReport,
@@ -284,6 +286,12 @@ export interface AgentOptions {
    * 子代理传 false：它结束后后台进程没有归属，还会与主对话抢进程组。
    */
   backgroundJobs?: boolean;
+  /**
+   * 专用模式（`xzh btc`）：带来固定工作目录的守卫、模式提示词段与技能范围。
+   *
+   * 只有主代理会传；子代理继承不了它 —— 否则子代理会以为自己也能锁目录/换技能。
+   */
+  mode?: AgentMode;
 }
 
 /**
@@ -551,6 +559,8 @@ export class Agent {
   private provider: LLMProvider;
   private readonly config: XuanZhuConfig;
   private cwd: string;
+  /** 专用模式（`xzh btc`）；普通模式为 undefined */
+  private readonly mode?: AgentMode;
   private readonly events: AgentEvents;
   private systemPrompt: string;
   /** 是否已就「系统提示词撑满窗口」提示过（避免每条消息都刷一遍） */
@@ -705,6 +715,8 @@ export class Agent {
     this.provider = provider;
     this.config = config;
     this.cwd = cwd;
+    // 必须在 composeSystemPrompt() 之前赋值：提示词要据此插入模式说明段
+    this.mode = options?.mode;
     this.events = events;
     this.activeModel = activeModel ?? activeModelEntry(config);
     this.tools = options?.tools;
@@ -770,6 +782,7 @@ export class Agent {
       {
         overrides: this.config.promptOverrides,
         autonomy: autonomyModeOf(this.config),
+        modeSection: this.mode?.promptSection,
       },
     );
   }
@@ -1579,6 +1592,8 @@ export class Agent {
     const goalActive = Boolean(this.goal && !this.goal.completed);
     const small = this.contextProfile() === "small";
     return tools.filter((tool) => {
+      // 模式专属工具（btc_*）只在对应模式出现：普通会话不该背它们的 schema
+      if (!toolVisibleInMode(tool, this.mode?.name)) return false;
       // 未连接设备桥：不下发 device_*（schema 约 2.2KB，且模型调用必然失败）
       if (!this.deviceBridge && tool.name.startsWith("device_")) return false;
       // 非目标模式：不下发 goal_complete（模型没有目标可完成）
@@ -1586,6 +1601,8 @@ export class Agent {
       if (small) {
         // 小窗口下只保留核心工具；目标完成工具仅在目标模式保留
         if (tool.name === "goal_complete" && goalActive) return true;
+        // 模式专属工具是那个模式的全部能力，小窗口下也不能砍掉
+        if (tool.modes && tool.modes.length > 0) return true;
         if (!SMALL_TOOL_NAMES.has(tool.name)) return false;
       }
       return true;
@@ -1629,6 +1646,18 @@ export class Agent {
 
   /** 切换工作目录：更新工具上下文、项目规则与系统提示词（保留对话历史） */
   setCwd(cwd: string): void {
+    // 第二道闸门：界面层的 `/switch` 已经拦过，但只要还有别的调用路径就不算强制。
+    // 模式锁定目录时静默忽略切换（并告知用户），不抛异常 —— 没必要为一个被禁止的
+    // 操作把整个会话打断。
+    if (
+      this.mode?.cwdLocked &&
+      path.resolve(cwd) !== path.resolve(this.mode.home)
+    ) {
+      this.events.onNotice?.(
+        `${this.mode.label}模式已锁定工作目录（${this.mode.home}），忽略切换到 ${cwd}`,
+      );
+      return;
+    }
     this.cwd = cwd;
     this.systemPrompt = this.composeSystemPrompt();
     // 换项目：重新加载该项目的任务账本（旧的 active 会被降级为 paused）
@@ -2796,6 +2825,9 @@ export class Agent {
 
     const ctx: ToolContext = {
       cwd: this.cwd,
+      // 技能过滤必须在这里传下去：只在提示词里说「只有 btc 技能」是拦不住模型的，
+      // list_skills / load_skill 会按它真实裁剪（见 tools/skills.ts）。
+      mode: this.mode?.name,
       autoApprove: autonomy === "auto",
       emit: (message) => this.events.onNotice?.(message),
       confirm: (request) => this.events.confirm(request),
@@ -2816,7 +2848,14 @@ export class Agent {
       askUser: this.askUserHandler(),
     };
 
-    const outcome = await executeTool(call.name, call.arguments, ctx, this.tools);
+    // 执行集与下发集保持一致：模型凭旧上下文里残留的名字调用本模式不存在的工具时，
+    // 这里会直接报「未知工具」，而不是让它在普通会话里跑起 btc_* 或 device_*。
+    const outcome = await executeTool(
+      call.name,
+      call.arguments,
+      ctx,
+      this.tools ?? this.requestTools(),
+    );
     this.recordToolResult(call.name, call.arguments, outcome);
     return outcome;
   }
