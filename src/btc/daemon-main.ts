@@ -26,6 +26,7 @@ import {
 } from "./account";
 import { runInspectCycle, SUMMARY_LIMIT } from "./inspect";
 import { syncMarketData } from "./market-data";
+import { consecutiveLosses, dailyLossPct } from "./performance";
 import { readPause } from "./pause";
 import {
   checkHardRisk,
@@ -182,10 +183,20 @@ export async function runBtcBackend(
   const checkRisk = async (): Promise<AccountSnapshot | null> => {
     if (paper) return null;
     const snapshot = await fetchAccountSnapshot({ force: true });
-    if (!snapshot.ok) return snapshot;
 
+    // 连亏只依赖本地账本：账户读不到（网络抖动、密钥临时失效）时也要判，
+    // 否则「连续亏三次」这条最该生效的保护会被一次接口失败躲过去
     const settings = readRiskSettings(home);
-    const check = checkHardRisk(settings, worstPositionLoss(snapshot));
+    const equity = snapshot.ok
+      ? (snapshot.wallet?.total ?? 0) + (snapshot.wallet?.unrealized ?? 0)
+      : 0;
+    // 三个条件一起判：只判持仓亏损的话，「当日亏 15%、连亏 5 次」这种
+    // 慢性放血永远不会触发，而那才是最常见的爆仓方式
+    const check = checkHardRisk(settings, {
+      positionLoss: snapshot.ok ? worstPositionLoss(snapshot) : null,
+      consecutiveLosses: consecutiveLosses(home),
+      dailyLossPct: snapshot.ok ? dailyLossPct(equity, home) : undefined,
+    });
     if (check.triggered) {
       const state = triggerHardRisk(home, check.reason ?? "硬性风控触发", check.detail);
       log(`⚠ 硬性风控触发：${state.reason}${state.detail ? `（${state.detail}）` : ""}`);
@@ -368,14 +379,15 @@ export async function runBtcBackend(
       return;
     }
 
+    // 风控与巡检模式无关：`BTC_INSPECT_ENABLED=0` 只是省 token、不做决策，
+    // 不代表可以不管风险 —— 用户完全可能在前台手动交易，浮亏一样要监控。
+    const snapshot = await checkRisk();
+
     if (!inspectEnabled) {
       await runSyncIfDue(now);
       refreshQueueState();
       return;
     }
-
-    // 先看账户有没有触碰硬线：触发后本轮巡检要带着告警跑
-    const snapshot = await checkRisk();
 
     // 市场事件优先于队列：日线收盘/资金费/暴跌这类时刻比常规排期更该立刻看。
     // 而且这里**不能**先 takeDueSchedule —— 取出即出队，若事件又抢先跑，

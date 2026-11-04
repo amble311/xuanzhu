@@ -101,14 +101,49 @@ async function signedRequest<T>(
 
   if (!response.ok) {
     const body = await response.text().catch(() => "");
-    // 币安错误体形如 `{"code":-2015,"msg":"Invalid API-key..."}`：
-    // 把 code 原样带出来，比「请求失败」有用得多（-2015 权限、-1111 精度、-4131 名义不足）
+    // 币安错误体形如 `{"code":-2015,"msg":"Invalid API-key..."}`：把 code 带出来，
+    // 再翻成**可操作**的话 —— 模型看到「-2015」只会瞎猜，看到「权限不足」才知道下一步做什么
+    let code: number | undefined;
+    let msg: string | undefined;
+    try {
+      const parsed = JSON.parse(body) as { code?: number; msg?: string };
+      code = typeof parsed.code === "number" ? parsed.code : undefined;
+      msg = typeof parsed.msg === "string" ? parsed.msg : undefined;
+    } catch {
+      // 非 JSON（网关 502、HTML 错误页等）：保持原样截断
+    }
+
+    const hint = code === undefined ? undefined : ERROR_HINTS[code];
+    const detail = msg ?? (body ? body.slice(0, 300) : "");
     throw new Error(
-      `币安私有接口返回 HTTP ${response.status}${body ? `：${body.slice(0, 300)}` : ""}`,
+      `币安私有接口返回 HTTP ${response.status}` +
+        (code !== undefined ? `（${code}）` : "") +
+        (detail ? `：${detail}` : "") +
+        (hint ? `\n→ ${hint}` : ""),
     );
   }
   return (await response.json()) as T;
 }
+
+/**
+ * 常见错误码 → 可操作提示。
+ *
+ * 只收「看到之后知道该干什么」的码：不认识的码保持原样透传，
+ * 编一段似是而非的解释比不解释更糟。
+ */
+const ERROR_HINTS: Record<number, string> = {
+  [-2015]: "API Key 无效或权限不足：需要开启「合约交易」权限，并确认 IP 白名单包含本机",
+  [-1021]: "本机时间与币安服务器偏差过大：校准系统时间（NTP）后重试",
+  [-1022]: "签名不匹配：检查 API Secret 是否输错，或该 Key 已被重置",
+  [-1111]: "精度错误：数量或价格不符合该交易对的 stepSize / tickSize",
+  [-1013]: "下单数量不在允许区间（低于最小步长或超过单笔上限）",
+  [-4003]: "数量超过单笔最大限制：拆小或改用 notional",
+  [-4131]: "名义价值不足：加大数量（合约有最小下单金额）",
+  [-4164]: "名义价值不足最小下单金额（minNotional）",
+  [-2019]: "保证金不足：降低杠杆、减少数量或先平掉部分仓位",
+  [-2011]: "撤单失败：订单已成交或已撤销",
+  [-2022]: "reduceOnly 被拒：当前没有可减的持仓（不要用它开仓）",
+};
 
 /** 只读 GET（持牌白名单） */
 export async function privateGet<T>(

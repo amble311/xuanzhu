@@ -15,7 +15,9 @@ import type { AgentMode } from "../modes";
 import { activeExchange } from "../exchange";
 import { fetchAccountSnapshot, type AccountSnapshot } from "../btc/account";
 import { runRunner } from "../btc/python";
+import { readActions } from "../btc/actions";
 import { readPause, setPaused } from "../btc/pause";
+import { buildPreflight, liquidationGapPct } from "../btc/preflight";
 import {
   currentInspectOffset,
   readInspectEvents,
@@ -299,6 +301,10 @@ export class TuiApp {
     /** 后端是否被 `/stop` 暂停 */
     paused: boolean;
     account: AccountSnapshot | null;
+    /** 持仓没有任何止损/止盈单 */
+    unprotected?: boolean;
+    /** 持仓距强平的最小百分比（无持仓为 undefined） */
+    liqGapPct?: number;
     paper: PaperPanelData | null;
     paperError?: string;
     queue: ScheduleEntry[];
@@ -5109,9 +5115,19 @@ export class TuiApp {
         };
       } else {
         const account = await fetchAccountSnapshot();
+        // 与巡检用同一套核对逻辑：面板和后台看到的风险必须一致
+        const preflight = buildPreflight({
+          snapshot: account,
+          actions: readActions(this.cwd),
+        });
+        const gaps = account.positions
+          .map((position) => liquidationGapPct(position))
+          .filter((gap): gap is number => gap !== null);
         this.btcPanel = {
           ...base,
           account,
+          unprotected: preflight.unprotected,
+          liqGapPct: gaps.length > 0 ? Math.min(...gaps) : undefined,
           paper: null,
         };
       }
@@ -5308,6 +5324,14 @@ export class TuiApp {
         `${ansi.gray}  持仓亏损 ${data.riskSettings.maxPositionLossPct}% · ` +
           `当日 ${data.riskSettings.maxDailyLossPct}%${ansi.reset}`,
       );
+    }
+
+    // 风险提示放在最后：这两条比巡检排期更该被看见
+    if (data.unprotected) {
+      push(` ${ansi.red}⚠ 持仓无止损单${ansi.reset}${ansi.gray}（补挂或平仓）${ansi.reset}`);
+    }
+    if (data.liqGapPct !== undefined && data.liqGapPct < 5) {
+      push(` ${ansi.red}⚠ 距强平 ${data.liqGapPct.toFixed(1)}%${ansi.reset}`);
     }
 
     if (this.lastFeedLine) {

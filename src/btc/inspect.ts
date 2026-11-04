@@ -5,7 +5,10 @@ import { createProvider } from "../llm";
 import { ensureBtcNetwork } from "./network";
 import { createBtcMode } from "../modes";
 import { getBtcHome } from "../utils/paths";
+import { fetchAccountSnapshot } from "./account";
+import { readActions, updateAction } from "./actions";
 import { appendInspectEvent } from "./inspect-stream";
+import { buildPreflight } from "./preflight";
 import { readPolicy } from "./policy";
 
 /**
@@ -49,6 +52,8 @@ const INSPECT_PROMPT = `你现在处于**后台巡检**：没有用户在终端�
 - **日线收盘、资金费结算、价格剧烈波动由代码自动触发额外巡检**，
   你排期时不必刻意去覆盖这些时点；但仍要根据信号状态决定下次时间。
 - 拿不到数据就如实说，不要编造价格或指标。
+- 开头有一节「上次动作的落地情况」：**先处理那里的 critical 问题**（持仓无止损、
+  距强平过近、上次挂单已撤销却没跟进），再判断新机会。不要跳过它直接排期。
 - 开仓一律限价（\`btc_order\` 的 \`limit_price\`），挂单不追价；用 \`btc_orders\` 看是否成交。
 - 有未成交挂单时：到本轮巡检/信号变化仍未成交，判断「继续等」还是「撤单」；
   结论反向就 \`btc_cancel all=true\` 撤掉，别让旧方向的单子留在盘上。`;
@@ -191,6 +196,30 @@ export async function runInspectCycle(
     maxToolRounds: options.maxToolRounds ?? MAX_TOOL_ROUNDS,
   });
 
+  // ── 巡检前置核对：先确认上次动作落地了没有 ──
+  // 没有这一步时，一轮巡检只往前看：上一轮挂的单成交了吗？成交后止损挂上了吗？
+  // 平仓到底平掉没有？全是空白，而那正是最容易出事的环节。
+  let preflightSection = "";
+  if (!options.paper) {
+    const snapshot = await fetchAccountSnapshot({ force: true });
+    const report = buildPreflight({
+      snapshot,
+      actions: readActions(home),
+    });
+    // 把「已成交 / 已撤销」回写账本，避免下一轮重复核对同一笔
+    for (const item of report.settled) {
+      if (!item.status) continue;
+      updateAction(home, item.id, { status: item.status, note: item.note });
+    }
+    preflightSection = `\n\n${report.prompt}`;
+    if (report.hasCritical) {
+      log("⚠ 前置核对发现需要优先处理的问题");
+      for (const issue of report.issues) {
+        if (issue.level === "critical") log(`  ${issue.text.replace(/\*\*/g, "")}`);
+      }
+    }
+  }
+
   // 用户长期要求（btc_policy 落盘）注入本轮巡检：只在前台说一句「记住了」不会传到这里
   const policy = readPolicy(home);
   const policySection = policy
@@ -213,6 +242,7 @@ export async function runInspectCycle(
     await agent.run(
       INSPECT_PROMPT +
         (options.paper ? PAPER_PROMPT_SECTION : "") +
+        preflightSection +
         policySection +
         riskSection,
       controller.signal,

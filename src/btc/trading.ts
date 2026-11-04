@@ -9,10 +9,15 @@ import {
   type OrderSide,
   type PrivateCredential,
 } from "../exchange/binance-private";
+import { getBtcHome } from "../utils/paths";
 import { fetchAccountSnapshot } from "./account";
+import { appendAction } from "./actions";
 import { getCredential } from "./credentials";
 import { getSymbolFilters, quantizePrice, quantizeQty } from "./market-meta";
 import { readRiskSettings, readRiskState } from "./risk";
+
+/** taker 手续费率（0.05%）：只在估算已实现盈亏时用，不改交易所实际扣费 */
+const FEE_RATE = 0.0005;
 
 /**
  * 合约交易动作（下单 / 平仓 / 撤单 / 锁利划转）。
@@ -43,6 +48,8 @@ export interface OpenPositionInput {
   leverage?: number;
   stopLoss?: number;
   takeProfit?: number;
+  /** 开仓依据（写进动作账本，供下一轮巡检核对） */
+  reason?: string;
 }
 
 export interface OpenPositionResult {
@@ -58,6 +65,8 @@ export interface OpenPositionResult {
   protection: string[];
   /** 保护单失败等非致命问题 */
   warnings: string[];
+  /** 动作账本 id（下一轮巡检据此核对是否成交） */
+  actionId?: string;
 }
 
 function resolveSymbol(): string {
@@ -193,6 +202,19 @@ export async function openPosition(
     }
   }
 
+  // 记账：这单现在只是「挂出去了」，成交与否要等下一轮核对（见 preflight）
+  const action = appendAction(getBtcHome(), {
+    kind: "open",
+    symbol,
+    side: input.side,
+    qty: Number(quantity),
+    limitPrice: Number(limitPrice),
+    orderId: order.orderId,
+    status: "pending",
+    reason: input.reason ?? "",
+    note: warnings.length > 0 ? warnings.join("；").slice(0, 300) : undefined,
+  });
+
   return {
     symbol,
     side: input.side,
@@ -203,6 +225,7 @@ export async function openPosition(
     leverage: appliedLeverage,
     protection,
     warnings,
+    actionId: action.id,
   };
 }
 
@@ -240,13 +263,34 @@ export async function closePosition(): Promise<ClosePositionResult | null> {
     credential,
   );
 
+  const price = order.avgPrice ? Number(order.avgPrice) : position.markPrice;
+  // 已实现盈亏（含手续费估算）：连亏判定要用它，缺了就没法算「连续亏几次」
+  const direction = position.side === "long" ? 1 : -1;
+  const gross = (price - position.entryPrice) * position.qty * direction;
+  const fee = (position.entryPrice + price) * position.qty * FEE_RATE;
+  const pnl = Number((gross - fee).toFixed(2));
+
+  // 记 **pending** 而不是 filled：下单成功不代表仓位真的没了 ——
+  // reduceOnly 单可能被拒、也可能只成交一部分。由下一轮前置核对对着快照确认。
+  appendAction(getBtcHome(), {
+    kind: "close",
+    symbol,
+    side: position.side,
+    qty: position.qty,
+    orderId: order.orderId,
+    status: "pending",
+    reason: "平仓",
+    note: `成交价约 ${price}`,
+    pnl,
+  });
+
   return {
     symbol,
     side: position.side,
     quantity: String(position.qty),
     orderId: order.orderId,
     status: order.status,
-    price: order.avgPrice ? Number(order.avgPrice) : position.markPrice,
+    price,
   };
 }
 
@@ -265,9 +309,22 @@ export async function cancelOrders(input: {
 
   if (input.orderId) {
     await cancelOrder({ symbol, orderId: input.orderId }, credential);
+    appendAction(getBtcHome(), {
+      kind: "cancel",
+      symbol,
+      status: "cancelled",
+      reason: `撤销订单 ${input.orderId}`,
+      orderId: Number(input.orderId) || undefined,
+    });
     return { cancelled: "single", symbol, orderId: input.orderId };
   }
   await cancelAllOrders({ symbol }, credential);
+  appendAction(getBtcHome(), {
+    kind: "cancel",
+    symbol,
+    status: "cancelled",
+    reason: "撤销该交易对全部挂单",
+  });
   return { cancelled: "all", symbol };
 }
 
@@ -304,6 +361,14 @@ export async function transferProfitToSpot(
   }
 
   const result = await transferContractToSpot(amount, credential);
+  appendAction(getBtcHome(), {
+    kind: "transfer",
+    symbol: "USDT",
+    qty: result.amount,
+    status: "filled",
+    reason: "合约 → 现货（锁利）",
+    note: `划转前可用 ${available}`,
+  });
   return { amount: result.amount, availableBefore: available, tranId: result.tranId };
 }
 

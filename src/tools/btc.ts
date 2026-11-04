@@ -614,6 +614,7 @@ const orderTool: ToolDefinition = {
         stopLoss: typeof args.stop_loss === "number" ? args.stop_loss : undefined,
         takeProfit:
           typeof args.take_profit === "number" ? args.take_profit : undefined,
+        reason: String(args.reason ?? ""),
       });
       const lines = [
         `✓ 已挂${side === "long" ? "买入" : "卖出"}限价单 ${result.symbol} ${result.quantity} @ ${result.limitPrice}`,
@@ -676,10 +677,35 @@ const ordersTool: ToolDefinition = {
     } else {
       lines.push(`挂单 ${snapshot.orders.length} 条：`);
       for (const order of snapshot.orders) {
+        const tags = [
+          order.reduceOnly ? "只减仓" : "",
+          order.closePosition ? "触发全平" : "",
+          order.stopPrice > 0 ? `触发价 ${order.stopPrice}` : "",
+          `#${order.orderId}`,
+        ]
+          .filter(Boolean)
+          .join(" · ");
         lines.push(
           `  ${order.symbol} ${order.side === "buy" ? "买" : "卖"} ${order.type} ` +
-            `${order.qty} @ ${order.price}${order.reduceOnly ? "（只减仓）" : ""}`,
+            `${order.qty} @ ${order.price}（${tags}）`,
         );
+      }
+
+      const protective = snapshot.orders.filter(
+        (order) =>
+          order.closePosition ||
+          order.type.toUpperCase().startsWith("STOP") ||
+          order.type.toUpperCase().startsWith("TAKE_PROFIT"),
+      );
+      if (snapshot.positions.length > 0) {
+        lines.push(
+          protective.length > 0
+            ? `保护单：${protective.length} 张（止损/止盈已挂）`
+            : "⚠ **没有任何止损/止盈单**：这笔持仓在裸奔，先补挂或平仓",
+        );
+      }
+      if (snapshot.marginRatio > 0) {
+        lines.push(`保证金率：${snapshot.marginRatio.toFixed(1)}%（接近 100 会强平）`);
       }
     }
 

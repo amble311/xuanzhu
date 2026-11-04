@@ -46,13 +46,47 @@ describe("硬性风控", () => {
 
   it("阈值判定：亏 49% 不触发，亏 50% 触发", () => {
     const settings = { ...DEFAULT_HARD_RISK };
-    expect(checkHardRisk(settings, { symbol: "BTCUSDT", lossPct: 49 }).triggered).toBe(
-      false,
-    );
-    const hit = checkHardRisk(settings, { symbol: "BTCUSDT", lossPct: 52.3 });
+    const loss = (lossPct: number) => ({
+      positionLoss: { symbol: "BTCUSDT", lossPct },
+    });
+    expect(checkHardRisk(settings, loss(49)).triggered).toBe(false);
+    const hit = checkHardRisk(settings, loss(52.3));
     expect(hit.triggered).toBe(true);
     expect(hit.detail).toContain("BTCUSDT");
-    expect(checkHardRisk(settings, null).triggered).toBe(false);
+    expect(checkHardRisk(settings, { positionLoss: null }).triggered).toBe(false);
+  });
+
+  it("当日亏损与连亏同样会触发（原来只判持仓亏损，慢性放血永远触发不了）", () => {
+    const settings = readRiskSettings(home);
+
+    // 当日亏 12% ≥ 阈值 10%
+    const daily = checkHardRisk(settings, {
+      positionLoss: null,
+      dailyLossPct: 12,
+    });
+    expect(daily.triggered).toBe(true);
+    expect(daily.reason).toContain("当日亏损");
+
+    // 连亏 3 次 = 默认阈值
+    const streak = checkHardRisk(settings, {
+      positionLoss: null,
+      consecutiveLosses: 3,
+    });
+    expect(streak.triggered).toBe(true);
+    expect(streak.reason).toContain("连续亏损");
+
+    // 连亏 2 次不触发
+    expect(
+      checkHardRisk(settings, { positionLoss: null, consecutiveLosses: 2 }).triggered,
+    ).toBe(false);
+
+    // 多个条件同时命中时，取「当日亏损」这个影响面最大的作为理由
+    const both = checkHardRisk(settings, {
+      positionLoss: { symbol: "BTCUSDT", lossPct: 80 },
+      dailyLossPct: 15,
+      consecutiveLosses: 5,
+    });
+    expect(both.reason).toContain("当日亏损");
   });
 
   it("触发是幂等的，且 delivered 只在首次为 false", () => {

@@ -27,12 +27,18 @@ export interface AccountPosition {
 }
 
 export interface AccountOrder {
+  /** 币安订单号：用来核对「账本里那笔挂单现在怎么样了」 */
+  orderId: number;
   symbol: string;
   side: "buy" | "sell";
   type: string;
   price: number;
   qty: number;
   reduceOnly: boolean;
+  /** 条件单的触发价（保护单识别用；普通单为 0） */
+  stopPrice: number;
+  /** 触发后平掉全部仓位（我们挂的止损/止盈就是这种） */
+  closePosition: boolean;
 }
 
 export interface AccountSnapshot {
@@ -47,12 +53,21 @@ export interface AccountSnapshot {
   } | null;
   positions: AccountPosition[];
   orders: AccountOrder[];
+  /**
+   * 维持保证金 / 保证金余额（0–100）。接近 100 意味着即将强平。
+   *
+   * 币安不直接给这个比例，用 `totalMaintMargin / totalMarginBalance` 算；
+   * 拿不到就返回 0（视为未知，不报警）。
+   */
+  marginRatio: number;
 }
 
 interface RawAccount {
   totalWalletBalance?: string;
   availableBalance?: string;
   totalUnrealizedProfit?: string;
+  totalMaintMargin?: string;
+  totalMarginBalance?: string;
 }
 
 interface RawPosition {
@@ -66,12 +81,15 @@ interface RawPosition {
 }
 
 interface RawOrder {
+  orderId?: number;
   symbol?: string;
   side?: string;
   type?: string;
   price?: string;
   origQty?: string;
+  stopPrice?: string;
   reduceOnly?: boolean;
+  closePosition?: boolean;
 }
 
 const CACHE_TTL_MS = 5_000;
@@ -91,6 +109,7 @@ function emptySnapshot(error: string): AccountSnapshot {
     wallet: null,
     positions: [],
     orders: [],
+    marginRatio: 0,
   };
 }
 
@@ -145,13 +164,20 @@ export async function fetchAccountSnapshot(
           };
         }),
       orders: orders.map((item) => ({
+        orderId: Number(item.orderId) || 0,
         symbol: item.symbol ?? "",
         side: item.side === "SELL" ? "sell" : "buy",
         type: item.type ?? "",
         price: num(item.price),
         qty: num(item.origQty),
         reduceOnly: item.reduceOnly === true,
+        stopPrice: num(item.stopPrice),
+        closePosition: item.closePosition === true,
       })),
+      marginRatio:
+        num(account.totalMarginBalance) > 0
+          ? (num(account.totalMaintMargin) / num(account.totalMarginBalance)) * 100
+          : 0,
     };
 
     cache = { at: Date.now(), snapshot };

@@ -170,17 +170,56 @@ export function riskSummary(
  * 只做**持仓浮亏**这一项：当日亏损与连亏需要权益曲线/成交历史，属于下一步
  * （有下单工具、有成交记录之后才算得准），现在硬编一个假数字反而更危险。
  */
+export interface HardRiskInput {
+  /** 最严重的单持仓亏损（无持仓为 null） */
+  positionLoss: { symbol: string; lossPct: number } | null;
+  /** 当前连续亏损次数（从平仓账本统计） */
+  consecutiveLosses?: number;
+  /** 当日权益亏损百分比（正数 = 亏了多少） */
+  dailyLossPct?: number;
+}
+
+/**
+ * 检查是否触碰硬性风控。
+ *
+ * 三个条件**都**要判：只有持仓亏损判过的版本里，
+ * 「当日亏 15%、连亏 5 次」这种慢性放血完全不会触发 —— 而那才是最常见的爆仓方式。
+ * 判定顺序按「影响面」：当日 > 单持仓 > 连亏（同时命中时取最严重的那个作为理由）。
+ */
 export function checkHardRisk(
   settings: HardRiskSettings,
-  positionLoss: { symbol: string; lossPct: number } | null,
+  input: HardRiskInput,
 ): { triggered: boolean; reason?: string; detail?: string } {
-  if (!positionLoss) return { triggered: false };
-  if (positionLoss.lossPct < settings.maxPositionLossPct) {
-    return { triggered: false };
+  if (
+    input.dailyLossPct !== undefined &&
+    input.dailyLossPct >= settings.maxDailyLossPct
+  ) {
+    return {
+      triggered: true,
+      reason: `当日亏损超过 ${settings.maxDailyLossPct}%`,
+      detail: `当日权益回撤 ${input.dailyLossPct.toFixed(2)}%`,
+    };
   }
-  return {
-    triggered: true,
-    reason: `持仓亏损达到 ${settings.maxPositionLossPct}%`,
-    detail: `${positionLoss.symbol} 浮亏 ${positionLoss.lossPct.toFixed(2)}%`,
-  };
+
+  const positionLoss = input.positionLoss;
+  if (positionLoss && positionLoss.lossPct >= settings.maxPositionLossPct) {
+    return {
+      triggered: true,
+      reason: `持仓亏损超过 ${settings.maxPositionLossPct}%`,
+      detail: `${positionLoss.symbol} 亏损 ${positionLoss.lossPct.toFixed(1)}%`,
+    };
+  }
+
+  if (
+    input.consecutiveLosses !== undefined &&
+    input.consecutiveLosses >= settings.maxConsecutiveLosses
+  ) {
+    return {
+      triggered: true,
+      reason: `连续亏损 ${input.consecutiveLosses} 次（阈值 ${settings.maxConsecutiveLosses}）`,
+      detail: "先停手复盘，不要急着把亏损扳回来",
+    };
+  }
+
+  return { triggered: false };
 }
