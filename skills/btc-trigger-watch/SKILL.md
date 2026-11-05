@@ -30,6 +30,8 @@ modes: [btc]
 | `action` | `add` / `list` / `remove` / `clear` |
 | `kind` | `price`（价格）/ `indicator`（单个指标）/ `formula`（受限公式） |
 | `expression` | `kind=formula` 必填：如 `rsi_1h * 0.6 + adx_1h * 0.4` |
+| `steps` | `kind=chain` 必填：2–3 步，按顺序满足 |
+| `chain_expire_min` | 链式条件前一步满足后的有效期（默认 240 分钟） |
 | `op` | `>=` / `<=` / `>` / `<` |
 | `value` | 阈值。价格单位 USDT；RSI/ADX 是 0–100；`ma_gap_pct` 是相对 MA20 的百分比 |
 | `name` | `rsi` / `adx` / `ma_gap_pct` / `macd_hist`（kind=indicator 必填） |
@@ -72,11 +74,35 @@ abs(close_1h - price) / price >= 0.01     # 现价与 1h 收盘的偏离
 - 变量拼错/除零会写回 `lastError`（`list` 里显示 `⚠ 求值失败`）——
   看到它要改表达式，别当成「条件还没到」。
 
+### 链式条件（`kind=chain`，有先后顺序）
+
+用户说的是「**先**…**再**…」「等它站上 8 万**之后**跌破 7.95 万叫我」时用它 ——
+`and` 表示同一时刻同时成立，表达不了顺序。
+
+```
+btc_trigger add kind=chain
+  steps=[
+    {kind:"price", op:">=", value:80000},
+    {kind:"price", op:"<=", value:79500}
+  ]
+  chain_expire_min=240
+```
+
+规则：
+
+- 2–3 步；中间步满足**不叫醒**，只把进度推进一格（`btc_trigger list` 里显示「已到第 2 步」）；
+- 最后一步也满足才叫醒，命中后进度重置（一次性条件直接失效）；
+- 前一步满足后超过 `chain_expire_min`（默认 240 分钟）没等到下一步 → 退回第一步：
+  防止「三小时前到过 8 万」和「现在跌破 7.95 万」拼成一个假信号；
+- 缺数据（取不到价/指标）时停在原处，不推进也不重置；
+- 每步都可以是指标（如 `{kind:"indicator", op:"<=", value:30, name:"rsi", timeframe:"1h"}`）。
+
 ## 反例
 
 - 把「这次先别买」写成叫醒条件（那是当前决策，不是条件）；
 - 用叫醒条件代替排期（没有任何阈值时它永远不会命中）；
 - 设「RSI > 500」这类永远不成立的条件；
 - 用公式做本该由代码决定的事（改策略、改风控阈值、下单）—— 公式只能触发出「叫醒」；
+- 用 `and` 表达「先 A 后 B」（那是同一时刻成立，不是顺序）—— 该用 `chain`；
 - 写 `import os`、`obj.attr`、`x[0]` 这类表达式：会被直接拒绝，不要反复尝试绕过。
 - 命中后不看三周期打分直接下单 —— 叫醒只是提醒「值得看了」，不是交易信号。

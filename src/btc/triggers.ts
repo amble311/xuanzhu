@@ -23,10 +23,31 @@ export type TriggerOp = ">=" | "<=" | ">" | "<";
  * `price` = 实时标记价；`indicator` = 单个指标阈值；
  * `formula` = **受限公式**（多指标组合，如 `rsi_1h * 0.6 + adx_1h * 0.4`）。
  */
-export type TriggerKind = "price" | "indicator" | "formula";
+export type TriggerKind = "price" | "indicator" | "formula" | "chain";
 /** 可监控的指标：与 `runner.py probe` 的输出字段一一对应 */
 export type IndicatorName = "rsi" | "adx" | "ma_gap_pct" | "macd_hist";
 export type IndicatorTimeframe = "1h" | "4h" | "1d";
+
+/** 链式条件的一步：必须按顺序满足 */
+export interface ChainStep {
+  kind: "price" | "indicator";
+  op: TriggerOp;
+  value: number;
+  name?: IndicatorName;
+  timeframe?: IndicatorTimeframe;
+}
+
+/**
+ * 链式条件的进度。
+ *
+ * `step` = 下一个待满足的步骤下标；`armedAt` = 上一步满足的时间。
+ * 没有它，「先到 80000 再跌破 79500」这种有先后顺序的要求根本无法表达 ——
+ * `and` 只表示同一时刻同时成立。
+ */
+export interface ChainState {
+  step: number;
+  armedAt?: string;
+}
 
 export interface TriggerWindow {
   /** 起（含），北京时间整点 0–23 */
@@ -51,6 +72,12 @@ export interface Trigger {
   expression?: string;
   /** 最近一次求值失败的原因（`btc_trigger list` 会显示） */
   lastError?: string;
+  /** kind=chain 时必填：2–3 步，必须按顺序满足 */
+  steps?: ChainStep[];
+  /** 链式条件的进度（后端写入，用户不用管） */
+  chainState?: ChainState;
+  /** 链式条件「前一步满足后」的有效期（分钟，默认 240）；过期就退回第一步 */
+  chainExpireMin?: number;
   /** 命中时的方向倾向（只是给模型的上下文，不是指令） */
   sideHint?: "long" | "short";
   /** 用户为什么设这条（原话，注入巡检提示词） */
@@ -93,6 +120,12 @@ export const INDICATOR_NAMES: IndicatorName[] = [
   "macd_hist",
 ];
 export const INDICATOR_TIMEFRAMES: IndicatorTimeframe[] = ["1h", "4h", "1d"];
+
+/** 链式条件的步数上限：再多就该写成策略，而不是「叫醒条件」 */
+export const MIN_CHAIN_STEPS = 2;
+export const MAX_CHAIN_STEPS = 3;
+/** 前一步满足后的默认有效期：4 小时（跨过一个日线级别的小周期） */
+export const DEFAULT_CHAIN_EXPIRE_MIN = 4 * 60;
 
 /** 公式最大长度（与 `market.py::FORMULA_MAX_LEN` 对齐） */
 export const FORMULA_MAX_LEN = 200;
@@ -205,14 +238,71 @@ function formatHour(hour: number): string {
   return `${String(hour).padStart(2, "0")}:00`;
 }
 
+/** 校验一步链式条件（读文件与写入共用） */
+function normalizeStep(entry: unknown): ChainStep | null {
+  const raw = entry as Partial<ChainStep>;
+  if (raw?.kind !== "price" && raw?.kind !== "indicator") return null;
+  if (!isOp(raw?.op)) return null;
+  if (typeof raw?.value !== "number" || !Number.isFinite(raw.value)) return null;
+  if (raw.kind === "price") {
+    if (raw.value <= 0) return null;
+    return { kind: "price", op: raw.op, value: raw.value };
+  }
+  if (!isIndicatorName(raw.name)) return null;
+  const timeframe = raw.timeframe ?? "1h";
+  if (!isTimeframe(timeframe)) return null;
+  return {
+    kind: "indicator",
+    op: raw.op,
+    value: raw.value,
+    name: raw.name,
+    timeframe,
+  };
+}
+
+function normalizeSteps(steps: unknown): ChainStep[] | null {
+  if (!Array.isArray(steps)) return null;
+  const list: ChainStep[] = [];
+  for (const entry of steps) {
+    const step = normalizeStep(entry);
+    if (!step) return null;
+    list.push(step);
+  }
+  if (list.length < MIN_CHAIN_STEPS || list.length > MAX_CHAIN_STEPS) return null;
+  return list;
+}
+
+function normalizeChainState(raw: unknown): ChainState | undefined {
+  const input = raw as Partial<ChainState> | undefined;
+  if (
+    !input ||
+    typeof input.step !== "number" ||
+    !Number.isInteger(input.step) ||
+    input.step < 0
+  ) {
+    return undefined;
+  }
+  return {
+    step: input.step,
+    armedAt: typeof input.armedAt === "string" ? input.armedAt : undefined,
+  };
+}
+
 /** 兼容读取：坏条目直接丢弃，不让一个手改坏的文件把后端拖住 */
 function normalize(entry: unknown): Trigger | null {
   const raw = entry as Partial<Trigger>;
   if (typeof raw?.id !== "string" || !isOp(raw?.op)) return null;
   if (typeof raw?.value !== "number" || !Number.isFinite(raw.value)) return null;
-  if (raw.kind !== "price" && raw.kind !== "indicator" && raw.kind !== "formula") {
+  if (
+    raw.kind !== "price" &&
+    raw.kind !== "indicator" &&
+    raw.kind !== "formula" &&
+    raw.kind !== "chain"
+  ) {
     return null;
   }
+  const steps = raw.kind === "chain" ? normalizeSteps(raw.steps) : null;
+  if (raw.kind === "chain" && !steps) return null;
   if (raw.kind === "indicator" && !isIndicatorName(raw.name)) return null;
   if (
     raw.kind === "formula" &&
@@ -232,6 +322,17 @@ function normalize(entry: unknown): Trigger | null {
         ? raw.expression.trim()
         : undefined,
     lastError: typeof raw.lastError === "string" ? raw.lastError : undefined,
+    steps: steps ?? undefined,
+    chainState:
+      raw.kind === "chain" ? normalizeChainState(raw.chainState) : undefined,
+    chainExpireMin:
+      raw.kind === "chain" &&
+      typeof raw.chainExpireMin === "number" &&
+      Number.isFinite(raw.chainExpireMin)
+        ? Math.min(MAX_TRIGGER_EXPIRE_HOURS * 60, Math.max(1, Math.round(raw.chainExpireMin)))
+        : raw.kind === "chain"
+          ? DEFAULT_CHAIN_EXPIRE_MIN
+          : undefined,
     sideHint: raw.sideHint === "long" || raw.sideHint === "short" ? raw.sideHint : undefined,
     note: typeof raw.note === "string" ? raw.note : undefined,
     window: normalizeWindow(raw.window),
@@ -289,6 +390,10 @@ export interface AddTriggerInput {
   timeframe?: string;
   /** kind=formula 时必填：受限表达式 */
   expression?: string;
+  /** kind=chain 时必填：2–3 步（按顺序满足）；用 unknown 由这里校验 */
+  steps?: unknown;
+  /** 链式条件前一步满足后的有效期（分钟） */
+  chainExpireMin?: number;
   sideHint?: string;
   note?: string;
   once?: boolean;
@@ -306,8 +411,8 @@ export type AddTriggerResult =
 /** 数值范围校验：防止「RSI > 500」这种永远不会命中的条件静默躺着 */
 function validateValue(kind: TriggerKind, name: IndicatorName | undefined, value: number): string | null {
   if (!Number.isFinite(value)) return "阈值必须是有限数字。";
-  // 公式的值域由表达式决定（可能是任意数量级），不做范围校验
-  if (kind === "formula") return null;
+  // 公式的值域由表达式决定（可能是任意数量级），链式条件没有单值阈值
+  if (kind === "formula" || kind === "chain") return null;
   if (kind === "price") {
     if (value <= 0) return "价格阈值必须大于 0。";
     return null;
@@ -337,13 +442,34 @@ export function addTrigger(
   now = Date.now(),
 ): AddTriggerResult {
   const kind: TriggerKind = input.kind;
-  const op = input.op;
+  // 链式条件没有单值 op/value（每步各自带），这里给占位值以复用同一套结构
+  let op = input.op;
+  let value = input.value;
+  if (kind === "chain") {
+    op = ">=";
+    value = 0;
+  }
   const name = input.name?.trim().toLowerCase();
   const timeframe = (input.timeframe?.trim().toLowerCase() ?? "1h") as IndicatorTimeframe;
 
   if (!isOp(op)) return { ok: false, error: "op 只能是 >= / <= / > / <。" };
-  if (kind !== "price" && kind !== "indicator" && kind !== "formula") {
-    return { ok: false, error: "kind 只能是 price / indicator / formula。" };
+  if (
+    kind !== "price" &&
+    kind !== "indicator" &&
+    kind !== "formula" &&
+    kind !== "chain"
+  ) {
+    return { ok: false, error: "kind 只能是 price / indicator / formula / chain。" };
+  }
+
+  const chainSteps = kind === "chain" ? normalizeSteps(input.steps) : null;
+  if (kind === "chain" && !chainSteps) {
+    return {
+      ok: false,
+      error:
+        `链式条件需要 ${MIN_CHAIN_STEPS}–${MAX_CHAIN_STEPS} 步 steps，` +
+        "每步 { kind: price|indicator, op, value }（indicator 还要 name，可选 timeframe）。",
+    };
   }
   const expression = input.expression?.trim();
   if (kind === "formula") {
@@ -367,7 +493,7 @@ export function addTrigger(
       };
     }
   }
-  const invalid = validateValue(kind, name as IndicatorName | undefined, input.value);
+  const invalid = validateValue(kind, name as IndicatorName | undefined, value);
   if (invalid) return { ok: false, error: invalid };
 
   // 时段窗口：要么两个都给，要么都不给 —— 只给一半会被静默忽略，属于「看起来生效了」
@@ -404,7 +530,9 @@ export function addTrigger(
         ? item.name === name && item.timeframe === timeframe
         : kind === "formula"
           ? item.expression === expression
-          : true),
+          : kind === "chain"
+            ? JSON.stringify(item.steps) === JSON.stringify(chainSteps)
+            : true),
   );
   if (duplicate) {
     return { ok: true, trigger: duplicate, duplicate: true, size: existing.length };
@@ -430,10 +558,21 @@ export function addTrigger(
     id: `${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
     kind,
     op,
-    value: input.value,
+    value,
     name: kind === "indicator" ? (name as IndicatorName) : undefined,
     timeframe: kind === "indicator" ? timeframe : undefined,
     expression: kind === "formula" ? expression : undefined,
+    steps: chainSteps ?? undefined,
+    chainExpireMin:
+      kind === "chain"
+        ? Math.min(
+            MAX_TRIGGER_EXPIRE_HOURS * 60,
+            Math.max(
+              1,
+              Math.round(input.chainExpireMin ?? DEFAULT_CHAIN_EXPIRE_MIN),
+            ),
+          )
+        : undefined,
     sideHint:
       input.sideHint === "long" || input.sideHint === "short"
         ? input.sideHint
@@ -555,9 +694,87 @@ export function currentValue(
     const value = observation.formulas?.[trigger.id];
     return typeof value === "number" && Number.isFinite(value) ? value : null;
   }
+  // 链式条件没有「单一观测值」，进度由 `chainState` 表示
+  if (trigger.kind === "chain") return null;
   const key = indicatorKey(trigger.timeframe ?? "1h", trigger.name ?? "");
   const value = observation.indicators?.[key];
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** 取链式条件某一步的观测值 */
+function stepValue(
+  step: ChainStep,
+  observation: TriggerObservation,
+): number | null {
+  if (step.kind === "price") {
+    return typeof observation.price === "number" && observation.price > 0
+      ? observation.price
+      : null;
+  }
+  const key = indicatorKey(step.timeframe ?? "1h", step.name ?? "");
+  const value = observation.indicators?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+export interface ChainEvaluationResult {
+  /** 命中时的观测值（最后一步的值）；未命中为 null */
+  actual: number | null;
+  /** 推进后的进度 */
+  next: ChainState;
+  /** 本轮是否发生状态变化（需要落盘） */
+  changed: boolean;
+}
+
+/**
+ * 链式条件评估：「先满足 A，之后才看 B」。
+ *
+ * 关键点：
+ * - 中间步骤满足**不叫醒**，只推进进度（否则「先到 8 万」那一下就白叫一次）；
+ * - 前一步满足后受 `chainExpireMin` 约束，过期退回第一步 ——
+ *   否则「三小时前到过 8 万」会和「现在跌破 7.95 万」拼成一个虚假信号；
+ * - 缺数据（取不到价/指标）就停在原处，不推进也不重置。
+ */
+export function evaluateChain(
+  trigger: Trigger,
+  observation: TriggerObservation,
+): ChainEvaluationResult {
+  const steps = trigger.steps ?? [];
+  const current = trigger.chainState ?? { step: 0 };
+  if (steps.length === 0) {
+    return { actual: null, next: current, changed: false };
+  }
+
+  const expireMs =
+    (trigger.chainExpireMin ?? DEFAULT_CHAIN_EXPIRE_MIN) * 60_000;
+  let step = Math.min(Math.max(0, current.step), steps.length - 1);
+  let armedAt = current.armedAt;
+
+  if (step > 0 && armedAt) {
+    const age = observation.now - Date.parse(armedAt);
+    if (Number.isNaN(age) || age > expireMs) {
+      step = 0;
+      armedAt = undefined;
+    }
+  }
+
+  for (let i = step; i < steps.length; i += 1) {
+    const value = stepValue(steps[i], observation);
+    if (value === null) break; // 缺数据：停在当前步
+    if (!compare(value, steps[i].op, steps[i].value)) break; // 未满足：停在当前步
+    if (i === steps.length - 1) {
+      // 最后一步满足 → 叫醒，进度重置（一次性由 recordEvaluation 删除）
+      return { actual: value, next: { step: 0 }, changed: true };
+    }
+    step = i + 1;
+    armedAt = new Date(observation.now).toISOString();
+  }
+
+  const next: ChainState = { step, armedAt: step > 0 ? armedAt : undefined };
+  return {
+    actual: null,
+    next,
+    changed: next.step !== current.step || next.armedAt !== current.armedAt,
+  };
 }
 
 /** 持续型是否还在冷却期内 */
@@ -578,18 +795,52 @@ export function triggerHit(
   return compare(actual, trigger.op, trigger.value) ? actual : null;
 }
 
+export interface DetailedEvaluation {
+  hits: TriggerHit[];
+  /** 需要落盘的进度变化（链式条件推进/重置），键为条件 id */
+  states: Record<string, ChainState>;
+}
+
+/**
+ * 评估所有条件。
+ *
+ * 多条之间是**或**：任一条命中即返回（叫醒一轮）。链式条件内部是**且 + 顺序**，
+ * 由 `evaluateChain` 维护进度。
+ */
+export function evaluateTriggersDetailed(
+  triggers: Trigger[],
+  observation: TriggerObservation,
+): DetailedEvaluation {
+  const hits: TriggerHit[] = [];
+  const states: Record<string, ChainState> = {};
+
+  for (const trigger of triggers) {
+    if (!trigger.once && inCooldown(trigger, observation.now)) continue;
+
+    if (trigger.kind === "chain") {
+      if (trigger.expiresAt && Date.parse(trigger.expiresAt) <= observation.now) {
+        continue;
+      }
+      if (!inWindow(observation.now, trigger.window)) continue;
+      const result = evaluateChain(trigger, observation);
+      if (result.changed) states[trigger.id] = result.next;
+      if (result.actual !== null) hits.push({ trigger, actual: result.actual });
+      continue;
+    }
+
+    const actual = triggerHit(trigger, observation);
+    if (actual !== null) hits.push({ trigger, actual });
+  }
+
+  return { hits, states };
+}
+
 /** 命中的条件列表（按文件顺序，先设置先触发） */
 export function evaluateTriggers(
   triggers: Trigger[],
   observation: TriggerObservation,
 ): TriggerHit[] {
-  const hits: TriggerHit[] = [];
-  for (const trigger of triggers) {
-    if (!trigger.once && inCooldown(trigger, observation.now)) continue;
-    const actual = triggerHit(trigger, observation);
-    if (actual !== null) hits.push({ trigger, actual });
-  }
-  return hits;
+  return evaluateTriggersDetailed(triggers, observation).hits;
 }
 
 /**
@@ -604,6 +855,8 @@ export function recordEvaluation(
   observation: TriggerObservation,
   hits: TriggerHit[],
   role: ScheduleRole = "live",
+  /** 链式条件的进度变化（来自 `evaluateTriggersDetailed`） */
+  states?: Record<string, ChainState>,
 ): Trigger[] {
   const hitIds = new Set(hits.map((hit) => hit.trigger.id));
   const seen = new Map<string, number | null>();
@@ -622,6 +875,9 @@ export function recordEvaluation(
 
     const value = seen.get(trigger.id);
     const updated: Trigger = { ...trigger };
+    // 链式条件的进度：即使没命中也要落盘，否则「先到 8 万」永远记不住
+    const nextState = states?.[trigger.id];
+    if (nextState) updated.chainState = nextState;
     if (typeof value === "number") {
       updated.lastSeenValue = value;
       updated.lastSeenAt = new Date(observation.now).toISOString();
@@ -637,15 +893,29 @@ export function recordEvaluation(
 }
 
 /** 人类可读的一行（list / 日志 / 提示词共用） */
+function describeStep(step: ChainStep): string {
+  return step.kind === "price"
+    ? `价格 ${step.op} ${step.value}`
+    : `${step.timeframe ?? "1h"} ${step.name} ${step.op} ${step.value}`;
+}
+
 export function describeTrigger(trigger: Trigger): string {
   const target =
     trigger.kind === "price"
       ? `价格 ${trigger.op} ${trigger.value}`
       : trigger.kind === "formula"
         ? `公式 ${trigger.expression} ${trigger.op} ${trigger.value}`
-        : `${trigger.timeframe ?? "1h"} ${trigger.name} ${trigger.op} ${trigger.value}`;
+        : trigger.kind === "chain"
+          ? `链式 ${(trigger.steps ?? []).map(describeStep).join(" → ")}`
+          : `${trigger.timeframe ?? "1h"} ${trigger.name} ${trigger.op} ${trigger.value}`;
   const extra = [
     trigger.once ? "一次性" : `持续（冷却 ${trigger.cooldownMin} 分钟）`,
+    trigger.kind === "chain"
+      ? `前一步 ${trigger.chainExpireMin ?? DEFAULT_CHAIN_EXPIRE_MIN} 分钟内有效` +
+        (trigger.chainState && trigger.chainState.step > 0
+          ? `，已到第 ${trigger.chainState.step + 1} 步`
+          : "")
+      : "",
     trigger.lastError ? `⚠ 求值失败：${trigger.lastError}` : "",
     trigger.sideHint ? `偏向 ${trigger.sideHint}` : "",
     trigger.window
@@ -668,6 +938,9 @@ export function describeHit(hit: TriggerHit): string {
       ? `价格 ${actual} ${trigger.op} ${trigger.value}`
       : trigger.kind === "formula"
         ? `公式 ${trigger.expression} = ${actual} ${trigger.op} ${trigger.value}`
-        : `${trigger.timeframe ?? "1h"} ${trigger.name} = ${actual} ${trigger.op} ${trigger.value}`;
+        : trigger.kind === "chain"
+          ? `链式条件全部满足（${(trigger.steps ?? []).map(describeStep).join(" → ")}），` +
+            `最后一步观测 ${actual}`
+          : `${trigger.timeframe ?? "1h"} ${trigger.name} = ${actual} ${trigger.op} ${trigger.value}`;
   return `${target}${trigger.note ? `；用户原话：${trigger.note}` : ""}`;
 }

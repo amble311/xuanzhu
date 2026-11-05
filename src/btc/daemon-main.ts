@@ -36,7 +36,7 @@ import {
 } from "./order-ttl";
 import {
   describeHit,
-  evaluateTriggers,
+  evaluateTriggersDetailed,
   indicatorKey,
   markTriggerErrors,
   readTriggers,
@@ -403,7 +403,9 @@ export async function runBtcBackend(
       }
     }
     const observation = { price, indicators, formulas, now };
-    const hits: TriggerHit[] = evaluateTriggers(triggers, observation);
+    // 链式条件的进度要落盘，所以用带 states 的版本
+    const evaluation = evaluateTriggersDetailed(triggers, observation);
+    const hits: TriggerHit[] = evaluation.hits;
 
     // 求值失败要写回条件本身：否则它只是「永远不命中」，用户看不出来。
     // 必须在 recordEvaluation **之后** —— 它会按内存里的旧对象整份写回，
@@ -416,7 +418,7 @@ export async function runBtcBackend(
 
     if (hits.length === 0) {
       // 未命中：只回写观测值（用户能看到「离条件多远」），不动条件本身
-      recordEvaluation(home, triggers, observation, [], role);
+      recordEvaluation(home, triggers, observation, [], role, evaluation.states);
       flushFormulaErrors();
       refreshQueueState();
       return null;
@@ -431,7 +433,7 @@ export async function runBtcBackend(
       price,
       triggerNote: hits.map((hit) => describeHit(hit)).join("\n"),
       commit: () => {
-        recordEvaluation(home, triggers, observation, hits, role);
+        recordEvaluation(home, triggers, observation, hits, role, evaluation.states);
         flushFormulaErrors();
         refreshQueueState();
       },

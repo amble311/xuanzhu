@@ -1670,6 +1670,10 @@ const triggerTool: ToolDefinition = {
     "**它只叫醒、绝不下单** —— 下单仍要走三周期打分与风控。" +
     "默认一次性（命中即失效）；要持续监控设 once=false 并给 cooldown_min。" +
     "价格用实时标记价；指标来自本地行情库（1h/4h/1d，可能落后于刚收盘的那根）。" +
+    "**kind=chain 表示「先 A 再 B」**（有先后顺序）：给 steps 数组（2–3 步），" +
+    "前一步满足**不叫醒**、只记住进度，最后一步也满足才叫醒；" +
+    "前一步满足后超过 chain_expire_min（默认 240 分钟）还没等到下一步，就退回第一步。" +
+    "「到 80000 之后跌破 79500 叫我」这类要求只能用 chain，`and` 表达不了顺序。" +
     "**kind=formula 是受限公式**（不是任意代码）：只能用白名单变量 + 四则运算 + abs/min/max，" +
     "适合「RSI 与 ADX 加权」「价格偏离 MA20 的 ATR 倍数」这类组合条件；" +
     "求值在计算层按 AST 白名单执行，导入/属性/下标/函数定义一律拒绝。" +
@@ -1686,9 +1690,35 @@ const triggerTool: ToolDefinition = {
       },
       kind: {
         type: "string",
-        enum: ["price", "indicator", "formula"],
+        enum: ["price", "indicator", "formula", "chain"],
         description:
-          "price = 价格条件；indicator = 单个指标阈值；formula = 受限公式（多指标组合）",
+          "price = 价格条件；indicator = 单个指标阈值；formula = 受限公式（多指标组合）；" +
+          "chain = 链式条件（先 A 再 B，有先后顺序）",
+      },
+      steps: {
+        type: "array",
+        description:
+          "kind=chain 时必填：2–3 步，按顺序满足。前一步满足不叫醒，最后一步也满足才叫醒",
+        items: {
+          type: "object",
+          properties: {
+            kind: { type: "string", enum: ["price", "indicator"] },
+            op: { type: "string", enum: [">=", "<=", ">", "<"] },
+            value: { type: "number", description: "该步阈值" },
+            name: {
+              type: "string",
+              enum: ["rsi", "adx", "ma_gap_pct", "macd_hist"],
+              description: "kind=indicator 时必填",
+            },
+            timeframe: { type: "string", enum: ["1h", "4h", "1d"] },
+          },
+          required: ["kind", "op", "value"],
+        },
+      },
+      chain_expire_min: {
+        type: "number",
+        description:
+          "链式条件前一步满足后的有效期（分钟，默认 240）：过期就退回第一步，避免拿几小时前的信号拼成假信号",
       },
       expression: {
         type: "string",
@@ -1821,10 +1851,23 @@ const triggerTool: ToolDefinition = {
 
     if (action === "add") {
       const kind = String(args.kind ?? "").trim().toLowerCase();
-      if (kind !== "price" && kind !== "indicator" && kind !== "formula") {
+      if (
+        kind !== "price" &&
+        kind !== "indicator" &&
+        kind !== "formula" &&
+        kind !== "chain"
+      ) {
         return {
           ok: false,
-          content: "错误：add 需要 kind=price / indicator / formula。",
+          content: "错误：add 需要 kind=price / indicator / formula / chain。",
+        };
+      }
+      const isChain = kind === "chain";
+      if (isChain && !Array.isArray(args.steps)) {
+        return {
+          ok: false,
+          content:
+            "错误：kind=chain 需要 steps（2–3 步，每步 {kind, op, value}，indicator 还要 name）。",
         };
       }
       if (kind === "formula" && typeof args.expression !== "string") {
@@ -1834,15 +1877,16 @@ const triggerTool: ToolDefinition = {
             "错误：kind=formula 时需要 expression，例如 `rsi_1h * 0.6 + adx_1h * 0.4`。",
         };
       }
-      const op = String(args.op ?? "").trim();
-      if (![">=", "<=", ">", "<"].includes(op)) {
+      // 链式条件不用单值 op/value：阈值写在每一步里
+      const op = isChain ? ">=" : String(args.op ?? "").trim();
+      if (!isChain && ![">=", "<=", ">", "<"].includes(op)) {
         return {
           ok: false,
           content: "错误：add 需要 op，取值 >= / <= / > / <。",
         };
       }
-      const value = toNumber(args.value);
-      if (value === null) {
+      const value = isChain ? 0 : toNumber(args.value);
+      if (!isChain && value === null) {
         return { ok: false, content: "错误：add 需要数字 value（阈值）。" };
       }
 
@@ -1851,11 +1895,13 @@ const triggerTool: ToolDefinition = {
         {
           kind: kind as TriggerKind,
           op: op as TriggerOp,
-          value,
+          value: value ?? 0,
           name: typeof args.name === "string" ? args.name : undefined,
           timeframe: typeof args.timeframe === "string" ? args.timeframe : undefined,
           expression:
             typeof args.expression === "string" ? args.expression : undefined,
+          steps: Array.isArray(args.steps) ? args.steps : undefined,
+          chainExpireMin: toNumber(args.chain_expire_min) ?? undefined,
           sideHint: typeof args.side_hint === "string" ? args.side_hint : undefined,
           note: typeof args.note === "string" ? args.note : undefined,
           once: args.once !== false,

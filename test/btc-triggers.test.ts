@@ -7,6 +7,7 @@ import {
   DEFAULT_TRIGGER_COOLDOWN_MIN,
   describeTrigger,
   evaluateTriggers,
+  evaluateTriggersDetailed,
   inCooldown,
   indicatorKey,
   MAX_TRIGGER_EXPIRE_HOURS,
@@ -143,6 +144,164 @@ describe("叫醒条件", () => {
       ).toHaveLength(0);
       // 计算层没给值（求值失败）→ 不命中，而不是当成 0
       expect(evaluateTriggers([trigger], { formulas: {}, now })).toHaveLength(0);
+    });
+
+    it("链式条件：两步按顺序满足才叫醒，中间步只推进不叫醒", () => {
+      const added = addTrigger(
+        home,
+        {
+          kind: "chain",
+          op: ">=",
+          value: 0,
+          steps: [
+            { kind: "price", op: ">=", value: 80000 },
+            { kind: "price", op: "<=", value: 79500 },
+          ],
+        },
+        "live",
+        now,
+      );
+      expect(added.ok).toBe(true);
+      if (!added.ok) return;
+      const trigger = added.trigger;
+
+      // 第一步未满足：不命中、不记录状态
+      const first = evaluateTriggersDetailed([trigger], { price: 79000, now });
+      expect(first.hits).toHaveLength(0);
+      expect(first.states[trigger.id]).toBeUndefined();
+
+      // 第一步满足：**不叫醒**，只把进度推进到第 2 步
+      const armed = evaluateTriggersDetailed([trigger], { price: 80100, now });
+      expect(armed.hits).toHaveLength(0);
+      expect(armed.states[trigger.id]).toEqual({
+        step: 1,
+        armedAt: new Date(now).toISOString(),
+      });
+
+      // 带上进度：第二步满足 → 命中，进度重置
+      const hit = evaluateTriggersDetailed(
+        [{ ...trigger, chainState: armed.states[trigger.id] }],
+        { price: 79400, now: now + 60_000 },
+      );
+      expect(hit.hits).toHaveLength(1);
+      expect(hit.states[trigger.id]).toEqual({ step: 0 });
+    });
+
+    it("链式条件：前一步超过有效期就退回第一步（不拿旧信号拼假信号）", () => {
+      const added = addTrigger(
+        home,
+        {
+          kind: "chain",
+          op: ">=",
+          value: 0,
+          steps: [
+            { kind: "price", op: ">=", value: 80000 },
+            { kind: "price", op: "<=", value: 79500 },
+          ],
+          chainExpireMin: 60,
+        },
+        "live",
+        now,
+      );
+      if (!added.ok) throw new Error("add failed");
+      const armed = {
+        ...added.trigger,
+        chainState: { step: 1, armedAt: new Date(now).toISOString() },
+      };
+      const late = evaluateTriggersDetailed([armed], {
+        price: 79400,
+        now: now + 61 * 60_000,
+      });
+      expect(late.hits).toHaveLength(0);
+      expect(late.states[added.trigger.id]).toEqual({ step: 0 });
+    });
+
+    it("链式条件：步数不足/过多、缺数据不推进", () => {
+      const two = [
+        { kind: "price", op: ">=", value: 80000 },
+        { kind: "price", op: "<=", value: 79500 },
+      ];
+      const one = addTrigger(
+        home,
+        { kind: "chain", op: ">=", value: 0, steps: two.slice(0, 1) },
+        "live",
+        now,
+      );
+      expect(one.ok).toBe(false);
+      if (!one.ok) expect(one.error).toMatch(/2–3 步/);
+
+      const four = addTrigger(
+        home,
+        { kind: "chain", op: ">=", value: 0, steps: [...two, ...two] },
+        "live",
+        now,
+      );
+      expect(four.ok).toBe(false);
+
+      const bad = addTrigger(
+        home,
+        {
+          kind: "chain",
+          op: ">=",
+          value: 0,
+          steps: [{ kind: "price", op: ">=", value: -1 }, two[1]],
+        },
+        "live",
+        now,
+      );
+      expect(bad.ok).toBe(false);
+
+      // 链式条件里含指标步：缺数据时停在原处
+      const withIndicator = addTrigger(
+        home,
+        {
+          kind: "chain",
+          op: ">=",
+          value: 0,
+          steps: [
+            { kind: "indicator", op: "<=", value: 30, name: "rsi", timeframe: "1h" },
+            { kind: "price", op: ">=", value: 80000 },
+          ],
+        },
+        "live",
+        now,
+      );
+      if (!withIndicator.ok) throw new Error("add failed");
+      const missing = evaluateTriggersDetailed([withIndicator.trigger], {
+        price: 79000,
+        now,
+      });
+      expect(missing.hits).toHaveLength(0);
+      expect(missing.states[withIndicator.trigger.id]).toBeUndefined();
+    });
+
+    it("链式条件的进度会写回文件（下一轮接着用）", () => {
+      const added = addTrigger(
+        home,
+        {
+          kind: "chain",
+          op: ">=",
+          value: 0,
+          steps: [
+            { kind: "price", op: ">=", value: 80000 },
+            { kind: "price", op: "<=", value: 79500 },
+          ],
+        },
+        "live",
+        now,
+      );
+      if (!added.ok) throw new Error("add failed");
+      const armedAt = new Date(now).toISOString();
+      recordEvaluation(
+        home,
+        [added.trigger],
+        { price: 80100, now },
+        [],
+        "live",
+        { [added.trigger.id]: { step: 1, armedAt } },
+      );
+      const reloaded = readTriggers(home, "live");
+      expect(reloaded[0].chainState).toEqual({ step: 1, armedAt });
     });
 
     it("拒绝永远不会命中的条件（负数价格、越界 RSI、非法 op）", () => {
