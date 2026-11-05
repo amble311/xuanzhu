@@ -24,7 +24,7 @@ modes: [btc]
 | 字段 | 判读 |
 |---|---|
 | `timeframes.1d.bars` | 日线根数与最新时间；少于 200 根时回测/信号会直接报数据不足 |
-| `timeframes.1h.bars` | 小时线；少于 120 根时三阶段会 `degraded=true` |
+| `timeframes.1h.bars` | 小时线；少于 120 根时 1h 择时会 `degraded=true`（4h 判势需要更多） |
 | `timeframes.*.last_utc` | 与当前时间差超过 2 天（日线）就该同步 |
 | `db_path` | 本地库位置，排查「同步了但没生效」时看它对不对 |
 

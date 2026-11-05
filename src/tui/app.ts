@@ -15,8 +15,11 @@ import type { AgentMode } from "../modes";
 import { activeExchange } from "../exchange";
 import { fetchAccountSnapshot, type AccountSnapshot } from "../btc/account";
 import { runRunner } from "../btc/python";
-import { readActions } from "../btc/actions";
+import { readActions, type BtcAction } from "../btc/actions";
+import { liveBackend } from "../btc/daemon";
+import { readTriggers, type Trigger } from "../btc/triggers";
 import { readPause, setPaused } from "../btc/pause";
+import { resetPaperLedger } from "../btc/paper-reset";
 import { buildPreflight, liquidationGapPct } from "../btc/preflight";
 import {
   currentInspectOffset,
@@ -141,6 +144,37 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+/** 面板里的倒计时：≤0 视作马上（调度在巡检中时会出现负值） */
+function formatCountdown(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "即将";
+  const seconds = Math.ceil(ms / 1000);
+  if (seconds < 60) return `${seconds} 秒后`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return rest > 0 ? `${minutes} 分 ${rest} 秒后` : `${minutes} 分钟后`;
+}
+
+/** 叫醒条件的一行紧凑描述（完整版在 `btc_trigger list`） */
+function describeTriggerBrief(trigger: Trigger): string {
+  const target =
+    trigger.kind === "price"
+      ? `价格 ${trigger.op} ${trigger.value}`
+      : `${trigger.timeframe ?? "1h"} ${trigger.name} ${trigger.op} ${trigger.value}`;
+  const seen =
+    typeof trigger.lastSeenValue === "number"
+      ? ` · 现 ${trigger.lastSeenValue.toLocaleString("en-US", {
+          maximumFractionDigits: 2,
+        })}`
+      : "";
+  const window = trigger.window
+    ? ` · 仅 ${trigger.window.startHour}–${
+        trigger.window.endHour === 0 ? 24 : trigger.window.endHour
+      } 点`
+    : "";
+  const repeat = trigger.once ? "" : " · 持续";
+  return `${target}${seen}${window}${repeat}`;
+}
+
 /** 模拟盘面板数据（来自 Python 的 paper-status） */
 interface PaperPanelData {
   price: number;
@@ -166,6 +200,18 @@ interface PaperPanelData {
   trades: number;
   win_rate: number;
   realized_pnl: number;
+  /** 价格来源：mark = 实时标记价，close = 库内收盘价（可能滞后） */
+  price_source?: "mark" | "close";
+  /** 最近几笔已平仓记录（btc_paper_status 才会带） */
+  recent_trades?: Array<{
+    side: string;
+    qty: number;
+    entry_price: number;
+    exit_price: number;
+    pnl: number;
+    exit_ts: string | null;
+    exit_reason?: string | null;
+  }>;
 }
 
 export interface TuiAppOptions {
@@ -310,6 +356,14 @@ export class TuiApp {
     queue: ScheduleEntry[];
     riskState: HardRiskState;
     riskSettings: HardRiskSettings;
+    /** 当前启用的叫醒条件（面板展示前几条） */
+    triggers: Trigger[];
+    /** 后端算出的下次触发器评估时间（ISO） */
+    nextTriggerEvalAt?: string;
+    /** 后端进程是否在跑（旧版后端不会上报 nextTriggerEvalAt，需要区分「没跑」与「没上报」） */
+    backendRunning: boolean;
+    /** 最近几条真实交易动作（实盘用；模拟盘看 paper.recent_trades） */
+    actions: BtcAction[];
   };
   private btcPanelTimer?: NodeJS.Timeout;
   private btcRefreshing = false;
@@ -1740,10 +1794,13 @@ export class TuiApp {
       return;
     }
 
-    const result = await runRunner<{ reset: boolean; capital: number }>(
-      "paper-reset",
-      capital === undefined ? {} : { capital },
-    );
+    // 重置 + 写记忆走同一条路径（与 btc_paper_reset 工具一致）：
+    // 只把钱改回去不留言，下一轮对话里模型不知道是用户重置的、还是数据丢了。
+    const result = await resetPaperLedger({
+      home: this.cwd,
+      capital,
+      source: "command",
+    });
 
     if (!result.ok) {
       this.lines.push(
@@ -1751,10 +1808,23 @@ export class TuiApp {
           (result.detail ? `\n${ansi.gray}${result.detail}${ansi.reset}` : ""),
       );
     } else {
+      const cleared = result.data.cleared;
       this.lines.push(
         `${ansi.green}✓${ansi.reset} 模拟盘已重置，初始资金 ` +
-          `${ansi.bold}${result.data.capital}${ansi.reset} USDT（持仓、挂单、成交记录已清空）。`,
+          `${ansi.bold}${result.data.capital}${ansi.reset} USDT（清空 ${cleared.trades} 笔成交、` +
+          `${cleared.open_orders} 张挂单、${cleared.position ? "1 个持仓" : "无持仓"}）。`,
       );
+      if (result.memoryFile) {
+        this.lines.push(
+          `${ansi.gray}  已记入项目记忆：${result.memoryFile}${ansi.reset}`,
+        );
+      }
+      if (result.memoryWarning) {
+        this.lines.push(`${ansi.yellow}  ⚠ ${result.memoryWarning}${ansi.reset}`);
+      }
+      // 系统提示词是构造时缓存的一份快照：不刷新的话，本次会话里模型仍看不到
+      // 刚落盘的重置记录（与 `/memory clear` 同一个坑）。
+      this.agent.reloadSystemPrompt();
       // 立刻刷新面板，不必等 8 秒的定时器
       void this.refreshBtcPanel();
     }
@@ -2841,8 +2911,13 @@ export class TuiApp {
         break;
       }
       case "auto": {
+        // 不带参数 = 打开（用户设定的默认值 on）；要关必须显式 `/auto off`
         const next =
-          arg === "on" ? true : arg === "off" ? false : !this.autoApprove;
+          arg === "off"
+            ? false
+            : arg === "on" || arg === ""
+              ? true
+              : !this.autoApprove;
         this.autoApprove = next;
         // 走自治等级而不是只改 autoApprove：两者各写一套会让
         // 「明明开了 /auto，为什么还在确认」（或反过来）变得无法解释
@@ -4682,7 +4757,7 @@ export class TuiApp {
       `  /feed          开关后台巡检过程流（思考 / 工具调用实时显示，btc 模式）`,
       `  /stop          暂停后端巡检与自动交易（btc 模式；/stop resume 恢复）`,
       `  /reset         重置对话上下文`,
-      `  /reset moni [初始资金]  重置模拟盘账本（仅 xzh btc moni 下有意义）`,
+      `  /reset moni [初始资金]  重置模拟盘账本并记入记忆（仅 xzh btc moni 下有意义）`,
       `  /undo [N]      撤销玄猪最近 N 次文件修改（默认 1，最多 20；改前自动备份）`,
       `  /resume [编号]  列出 / 恢复历史会话（对话历史会自动保存）`,
       `  /cwd           显示当前工作目录`,
@@ -5102,11 +5177,19 @@ export class TuiApp {
         queue: readScheduleQueue(this.cwd, role),
         riskState: readRiskState(this.cwd),
         riskSettings: readRiskSettings(this.cwd),
+        triggers: readTriggers(this.cwd, role),
+        // 后端把「下次评估时间」写进 state；旧版后端没有这个字段，面板要能区分「没跑」与「没上报」
+        nextTriggerEvalAt: liveBackend(this.cwd, role)?.nextTriggerEvalAt,
+        backendRunning: liveBackend(this.cwd, role) !== null,
+        actions: readActions(this.cwd).slice(-4).reverse(),
       };
 
       if (role === "paper") {
-        // 模拟盘不能读真实账户：那是两套账，混在一起会让人误判
-        const paper = await runRunner<PaperPanelData>("paper-status");
+        // 模拟盘不能读真实账户：那是两套账，混在一起会让人误判。
+        // 传入实时标记价：否则顶部是实时价、浮盈按库内旧收盘价算，看起来就是「价格跌了却在亏」。
+        const paper = await runRunner<PaperPanelData>("paper-status", {
+          mark_price: ticker?.price,
+        });
         this.btcPanel = {
           ...base,
           account: null,
@@ -5288,28 +5371,6 @@ export class TuiApp {
     }
 
     divider();
-    push(` ${ansi.gray}巡检${ansi.reset}`);
-    const upcoming = data.queue.slice(0, 2);
-    if (upcoming.length === 0) {
-      push(`${ansi.gray}  无排期（到兜底间隔会自行巡检）${ansi.reset}`);
-    }
-    for (const entry of upcoming) {
-      const wait = Math.max(
-        0,
-        Math.round((Date.parse(entry.at) - Date.now()) / 60_000),
-      );
-      const clock = new Date(entry.at).toLocaleTimeString("zh-CN", {
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false,
-      });
-      push(
-        ` ${clock} · ${wait} 分钟后${entry.slot === "extra" ? "（额外）" : ""}`,
-      );
-      push(`${ansi.gray}  ${entry.reason}${ansi.reset}`);
-    }
-
-    divider();
     if (data.role === "paper") {
       push(` ${ansi.gray}风控${ansi.reset} ${ansi.gray}模拟盘不触发硬性风控${ansi.reset}`);
     } else {
@@ -5324,6 +5385,105 @@ export class TuiApp {
         `${ansi.gray}  持仓亏损 ${data.riskSettings.maxPositionLossPct}% · ` +
           `当日 ${data.riskSettings.maxDailyLossPct}%${ansi.reset}`,
       );
+    }
+
+    // 叫醒条件：用户最常问「它现在到底在盯什么、什么时候再看」，所以放在账户后面
+    divider();
+    push(` ${ansi.gray}监控${ansi.reset}${ansi.gray}（每 5 分钟）${ansi.reset}`);
+    if (data.triggers.length === 0) {
+      push(`${ansi.gray}  无叫醒条件 · btc_trigger 可加${ansi.reset}`);
+    } else {
+      const nextAt = data.nextTriggerEvalAt
+        ? Date.parse(data.nextTriggerEvalAt)
+        : NaN;
+      // 有条件但没有时间戳：后端没在跑，或跑的是不会上报该字段的旧版本
+      const countdown = Number.isNaN(nextAt)
+        ? data.backendRunning
+          ? "后端未上报（重启后生效）"
+          : "后端未运行"
+        : formatCountdown(nextAt - Date.now());
+      push(` ${data.triggers.length} 条条件 · 下次评估 ${countdown}`);
+      for (const trigger of data.triggers.slice(0, 2)) {
+        push(`${ansi.gray}  · ${describeTriggerBrief(trigger)}${ansi.reset}`);
+      }
+      if (data.triggers.length > 2) {
+        push(
+          `${ansi.gray}  …还有 ${data.triggers.length - 2} 条（btc_trigger list）${ansi.reset}`,
+        );
+      }
+    }
+
+    divider();
+    push(` ${ansi.gray}最近交易${ansi.reset}`);
+    const clock = (iso: string | null | undefined): string => {
+      if (!iso) return "--:--";
+      const date = new Date(iso);
+      if (Number.isNaN(date.getTime())) return "--:--";
+      return date.toLocaleTimeString("zh-CN", {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
+    };
+    if (data.role === "paper") {
+      const trades = data.paper?.recent_trades ?? [];
+      if (trades.length === 0) {
+        push(`${ansi.gray}  暂无已平仓交易${ansi.reset}`);
+      } else {
+        for (const trade of trades.slice(0, 3)) {
+          const tag =
+            trade.side === "long"
+              ? `${ansi.green}多${ansi.reset}`
+              : `${ansi.red}空${ansi.reset}`;
+          push(
+            ` ${ansi.gray}${clock(trade.exit_ts)}${ansi.reset} ${tag} ${trade.qty} ` +
+              `${amount(trade.entry_price)}→${amount(trade.exit_price)} ` +
+              `${trade.pnl >= 0 ? ansi.green : ansi.red}${signed(trade.pnl)}${ansi.reset}`,
+          );
+        }
+      }
+    } else {
+      const actions = data.actions
+        .filter((item) => item.kind === "open" || item.kind === "close")
+        .slice(0, 3);
+      if (actions.length === 0) {
+        push(`${ansi.gray}  暂无我们发起的交易${ansi.reset}`);
+      } else {
+        for (const action of actions) {
+          const kind = action.kind === "close" ? "平" : "开";
+          const side =
+            action.side === "long" ? "多" : action.side === "short" ? "空" : "";
+          const price = action.limitPrice ? amount(action.limitPrice) : "—";
+          const pnl =
+            typeof action.pnl === "number"
+              ? ` ${action.pnl >= 0 ? ansi.green : ansi.red}${signed(action.pnl)}${ansi.reset}`
+              : "";
+          const status =
+            action.status === "pending" ? `${ansi.gray}· 待核对${ansi.reset}` : "";
+          push(
+            ` ${ansi.gray}${clock(action.ts)}${ansi.reset} ${kind}${side} ${price}${pnl}${status}`,
+          );
+        }
+      }
+    }
+
+    divider();
+    push(` ${ansi.gray}巡检${ansi.reset}`);
+    const upcoming = data.queue.slice(0, 2);
+    if (upcoming.length === 0) {
+      push(`${ansi.gray}  无排期（到兜底间隔会自行巡检）${ansi.reset}`);
+    }
+    for (const entry of upcoming) {
+      const wait = Math.max(
+        0,
+        Math.round((Date.parse(entry.at) - Date.now()) / 60_000),
+      );
+      push(
+        ` ${clock(entry.at)} · ${wait} 分钟后${
+          entry.slot === "extra" ? "（额外）" : ""
+        }`,
+      );
+      push(`${ansi.gray}  ${entry.reason}${ansi.reset}`);
     }
 
     // 风险提示放在最后：这两条比巡检排期更该被看见

@@ -199,6 +199,8 @@ describe("工具的模式归属", () => {
       "btc_schedule",
       "btc_unschedule",
       "btc_policy",
+      "btc_trigger",
+      "btc_renew",
       "btc_paper_status",
       "btc_paper_open",
       "btc_paper_close",

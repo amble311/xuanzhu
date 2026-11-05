@@ -125,6 +125,24 @@ def cmd_signal(_payload: dict) -> dict:
     return result
 
 
+def cmd_probe(payload: dict) -> dict:
+    """指标探测：给后台触发器的「条件是否成立」提供数据。
+
+    只读本地库、只算几个字段，5 分钟一次的调用开销可以忽略；
+    与 `signal` 分开是因为触发器不该顺带跑完整三阶段（那会算一堆用不上的指标）。
+    """
+    import market
+
+    timeframes = payload.get("timeframes") or ["1h", "4h", "1d"]
+    formulas = payload.get("formulas") or []
+    price = payload.get("price")
+    return market.probe_timeframes(
+        [str(tf) for tf in timeframes],
+        [item for item in formulas if isinstance(item, dict)],
+        None if price is None else float(price),
+    )
+
+
 def cmd_backtest(payload: dict) -> dict:
     from core.bt_engine import Backtest, check_targets, indicators, load_data
     from core.config import settings
@@ -187,13 +205,21 @@ def _paper_args(payload: dict) -> dict:
             payload.get("capital")
             or os.getenv("BTC_PAPER_CAPITAL", "100000")
         ),
+        # 实时标记价：撮合/估值/平仓共用它，避免面板顶部与浮盈用两个价格
+        "mark": payload.get("mark_price"),
+        # 挂单时效（分钟）：到点未成交由后端叫醒巡检处理
+        "ttl_minutes": payload.get("expires_min"),
+        # 杠杆：保证金 = 名义/杠杆，与实盘口径一致（缺省 1x）
+        "leverage": payload.get("leverage"),
     }
 
 
 def cmd_paper_status(payload: dict) -> dict:
     paper, conn = _paper_conn(payload)
     args = _paper_args(payload)
-    data = paper.status(conn, args["symbol"], args["timeframe"], args["capital"])
+    data = paper.status(
+        conn, args["symbol"], args["timeframe"], args["capital"], args["mark"]
+    )
     data["recent_trades"] = paper.recent_trades(
         conn, int(payload.get("limit") or 5)
     )
@@ -215,8 +241,12 @@ def cmd_paper_open(payload: dict) -> dict:
         limit_price=float(payload.get("limit_price")),
         stop_price=payload.get("stop_price"),
         reason=str(payload.get("reason") or ""),
+        ttl_minutes=args["ttl_minutes"],
+        leverage=args["leverage"],
     )
-    status = paper.status(conn, args["symbol"], args["timeframe"], args["capital"])
+    status = paper.status(
+        conn, args["symbol"], args["timeframe"], args["capital"], args["mark"]
+    )
     status["recent_trades"] = paper.recent_trades(conn, 5)
     result["status"] = status
     return result
@@ -230,8 +260,11 @@ def cmd_paper_close(payload: dict) -> dict:
         symbol=args["symbol"],
         timeframe=args["timeframe"],
         reason=str(payload.get("reason") or ""),
+        mark=args["mark"],
     )
-    status = paper.status(conn, args["symbol"], args["timeframe"], args["capital"])
+    status = paper.status(
+        conn, args["symbol"], args["timeframe"], args["capital"], args["mark"]
+    )
     status["recent_trades"] = paper.recent_trades(conn, 5)
     result["status"] = status
     return result
@@ -243,7 +276,9 @@ def cmd_paper_cancel(payload: dict) -> dict:
     args = _paper_args(payload)
     order_id = payload.get("order_id")
     result = paper.cancel_order(conn, int(order_id) if order_id else None)
-    status = paper.status(conn, args["symbol"], args["timeframe"], args["capital"])
+    status = paper.status(
+        conn, args["symbol"], args["timeframe"], args["capital"], args["mark"]
+    )
     status["recent_trades"] = paper.recent_trades(conn, 5)
     result["status"] = status
     return result
@@ -255,16 +290,35 @@ def cmd_paper_reset(payload: dict) -> dict:
     return paper.reset(conn, args["capital"])
 
 
+def cmd_paper_expired(payload: dict) -> dict:
+    """已过时效仍未成交的模拟挂单（只读，不撮合、不改账本）。"""
+    paper, conn = _paper_conn(payload)
+    return {"orders": paper.expired_orders(conn)}
+
+
+def cmd_paper_renew(payload: dict) -> dict:
+    """给未成交挂单续期（模型判断继续等时用）。"""
+    paper, conn = _paper_conn(payload)
+    return paper.renew_orders(
+        conn,
+        float(payload.get("expires_min") or 60),
+        payload.get("order_id"),
+    )
+
+
 COMMANDS = {
     "status": cmd_status,
     "save": cmd_save,
     "signal": cmd_signal,
+    "probe": cmd_probe,
     "backtest": cmd_backtest,
     "paper-status": cmd_paper_status,
     "paper-open": cmd_paper_open,
     "paper-cancel": cmd_paper_cancel,
     "paper-close": cmd_paper_close,
     "paper-reset": cmd_paper_reset,
+    "paper-expired": cmd_paper_expired,
+    "paper-renew": cmd_paper_renew,
 }
 
 

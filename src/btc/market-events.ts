@@ -5,9 +5,9 @@
  * 分工：
  * - **模型**决定常规节奏（`btc_schedule`，10 分钟–12 小时）；
  * - **代码**兜住「不管模型怎么排，这些时刻一定会看」：
- *   1. 日线收盘后（UTC 00:00，北京 08:00）—— 三阶段信号依赖日线，收盘才算新数据；
+ *   1. 日线收盘后（UTC 00:00，北京 08:00）—— 三周期打分依赖日线，收盘才算新数据；
  *   2. 资金费结算后（UTC 00/08/16，北京 08/16/00）—— 持仓成本突变、常有插针；
- *   3. 4 小时线整点后（**仅在有持仓/挂单时**）—— 4h 是第三阶段，持仓时不能不看；
+ *   3. 4 小时线整点后（**仅在有持仓/挂单时**）—— 4h 是判势周期之一，持仓时不能不看；
  *   4. 价格剧烈波动（相对上次巡检 ≥ 阈值）—— 这是唯一依赖实时数据的判定。
  *
  * 为什么不用「把这些时点写进队列」：每天 4 条固定 + 持仓时每小时 1 条，很快把
@@ -91,7 +91,7 @@ export function dueMarketEvent(
     {
       kind: "daily-close",
       at: lastDailyClose(now),
-      reason: "日线收盘后复核（三阶段依赖日线）",
+      reason: "日线收盘后复核（三周期打分依赖日线）",
     },
     {
       kind: "funding",
@@ -167,6 +167,11 @@ export interface EventsState {
   /** 上次巡检完成时的价格（波动比较基准） */
   lastPrice?: number;
   lastVolatilityAt?: number;
+  /**
+   * 已经因「挂单超时」叫醒过的单：`action:<id>` / `paper:<id>` → 叫醒时间。
+   * 没有它的话，超时后每 5 分钟叫一次，会变成烧钱循环。
+   */
+  orderTtlNotified?: Record<string, string>;
 }
 
 export function eventsStatePath(home = getBtcHome()): string {
@@ -182,6 +187,7 @@ export function readEventsState(home = getBtcHome()): EventsState {
       lastHandled: parsed.lastHandled ?? {},
       lastPrice: parsed.lastPrice,
       lastVolatilityAt: parsed.lastVolatilityAt,
+      orderTtlNotified: parsed.orderTtlNotified ?? {},
     };
   } catch {
     return { lastHandled: {} };

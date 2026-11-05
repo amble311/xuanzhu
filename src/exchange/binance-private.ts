@@ -225,6 +225,29 @@ export async function createOrder(
   );
 }
 
+/**
+ * 查询交易对当前杠杆。
+ *
+ * 开仓前算保证金要用已知杠杆：模型没显式给时不能假设 1x（BTC 永续常见 5–10x，
+ * 按 1x 估算会把可用保证金高估成 1/9，明明能开的单被拒）。
+ */
+export async function fetchLeverage(
+  params: { symbol: string },
+  credential: PrivateCredential,
+): Promise<number> {
+  const result = await signedRequest<{ leverage?: number }>(
+    {
+      method: "GET",
+      base: FUTURES_BASE,
+      path: "/fapi/v1/leverage",
+      params: { symbol: params.symbol },
+    },
+    credential,
+  );
+  const leverage = Number(result?.leverage);
+  return Number.isFinite(leverage) && leverage > 0 ? leverage : 0;
+}
+
 /** 查单（确认限价单是否成交） */
 export async function queryOrder(
   params: { symbol: string; orderId: string | number },

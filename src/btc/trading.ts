@@ -3,6 +3,7 @@ import {
   cancelAllOrders,
   cancelOrder,
   createOrder,
+  fetchLeverage,
   setLeverage,
   transferContractToSpot,
   type OrderResponse,
@@ -14,6 +15,7 @@ import { fetchAccountSnapshot } from "./account";
 import { appendAction } from "./actions";
 import { getCredential } from "./credentials";
 import { getSymbolFilters, quantizePrice, quantizeQty } from "./market-meta";
+import { computeExpiresAt } from "./order-ttl";
 import { readRiskSettings, readRiskState } from "./risk";
 
 /** taker 手续费率（0.05%）：只在估算已实现盈亏时用，不改交易所实际扣费 */
@@ -32,41 +34,81 @@ const FEE_RATE = 0.0005;
  * 3. 划转只允许「合约 → 现货」，且不超过可用余额的 95%（留保证金余量）。
  */
 
-export interface OpenPositionInput {
-  /** `long` 买、`short` 卖 */
-  side: "long" | "short";
-  /**
-   * 限价（必填）。
-   *
-   * 开仓**统一用限价单**：不追价、不立即成交，挂到下一次买卖点或主动撤单为止。
-   * 数量按这个价格折算（成交价不会比限价更差）。
-   */
+/** 一档限价：多档 = 分批建仓，摊薄成本 */
+export interface OrderLeg {
   limitPrice: number;
   /** 名义金额（USDT）；与 quantity 二选一 */
   notional?: number;
   quantity?: number;
+}
+
+export interface OpenPositionInput {
+  /** `long` 买、`short` 卖 */
+  side: "long" | "short";
+  /**
+   * 单档快捷方式（与 `orders` 二选一）。
+   *
+   * 开仓**统一用限价单**：不追价、不立即成交，挂到时效或主动撤单为止。
+   * 数量按这个价格折算（成交价不会比限价更差）。
+   */
+  limitPrice?: number;
+  notional?: number;
+  quantity?: number;
+  /** 多档限价：每档独立挂单、独立时效；适合「分批接」的策略 */
+  orders?: OrderLeg[];
+  /**
+   * 杠杆。缺省读交易所当前杠杆 —— 算保证金必须知道倍数，
+   * 按 1x 猜会把可用额度高估成 1/9。
+   */
   leverage?: number;
   stopLoss?: number;
   takeProfit?: number;
   /** 开仓依据（写进动作账本，供下一轮巡检核对） */
   reason?: string;
+  /**
+   * 挂单时效（分钟）。到点仍未成交 / 只部分成交，后端会叫醒一轮巡检来处理。
+   * 缺省 60 分钟（`DEFAULT_ORDER_TTL_MIN`），最长 24 小时。
+   */
+  ttlMinutes?: number;
+}
+
+export interface OpenedLeg {
+  orderId?: number;
+  quantity: string;
+  limitPrice: string;
+  notional: number;
+  expiresAt?: string;
 }
 
 export interface OpenPositionResult {
   symbol: string;
   side: "long" | "short";
+  /** 总数量 */
   quantity: string;
+  /** 各档加权均价 */
   limitPrice: string;
   orderId?: number;
-  /** `NEW` 表示挂单中（限价单不会立即成交） */
+  /** 第一档的状态；每档明细见 `legs` */
   status?: string;
   leverage?: number;
   /** 成功挂上的保护单 */
   protection: string[];
-  /** 保护单失败等非致命问题 */
+  /** 第一档的时效（每档自己的时效在 `legs[].expiresAt`） */
+  expiresAt?: string;
+  /** 保护单失败、部分档位失败等非致命问题 */
   warnings: string[];
-  /** 动作账本 id（下一轮巡检据此核对是否成交） */
+  /** 动作账本 id（第一档；每档各自记一条） */
   actionId?: string;
+  /** 每档明细（单档也有 1 条） */
+  legs: OpenedLeg[];
+  /** 保证金占用估算（开仓前核对用） */
+  margin: {
+    totalNotional: number;
+    required: number;
+    fee: number;
+    available: number;
+    leverage: number;
+  };
 }
 
 function resolveSymbol(): string {
@@ -123,32 +165,99 @@ export async function openPosition(
   input: OpenPositionInput,
 ): Promise<OpenPositionResult> {
   assertTradingAllowed();
+
   // 参数校验放在凭据之前：缺参数是调用方的问题，不必先去读密钥
-  if (!(input.limitPrice > 0)) {
-    throw new Error("开仓统一使用限价单，必须给 limitPrice（大于 0）");
+  const legs: OrderLeg[] =
+    input.orders && input.orders.length > 0
+      ? input.orders
+      : input.limitPrice
+        ? [
+            {
+              limitPrice: input.limitPrice,
+              notional: input.notional,
+              quantity: input.quantity,
+            },
+          ]
+        : [];
+  if (legs.length === 0) {
+    throw new Error(
+      "开仓统一使用限价单：单档给 limitPrice，多档给 orders[]（每档 limitPrice + notional/quantity）",
+    );
   }
-  if (!(input.quantity ?? input.notional)) {
-    throw new Error("请给 notional（USDT）或 quantity 其中之一");
+  if (input.orders && input.limitPrice) {
+    throw new Error("orders 与 limitPrice 只能二选一（单档用 limitPrice，多档用 orders）");
   }
+  legs.forEach((leg, index) => {
+    if (!(leg.limitPrice > 0)) {
+      throw new Error(`第 ${index + 1} 档限价必须大于 0`);
+    }
+    if (!(leg.quantity ?? leg.notional)) {
+      throw new Error(`第 ${index + 1} 档需要 notional（USDT）或 quantity`);
+    }
+  });
+
   const credential = credentialOrThrow();
   const symbol = resolveSymbol();
+
+  // 杠杆：显式给了就用它，否则读交易所当前杠杆 —— 算保证金必须知道倍数
+  let leverage = input.leverage;
+  if (leverage !== undefined) {
+    if (!(leverage >= 1 && leverage <= 125)) {
+      throw new Error("杠杆必须在 1–125 之间");
+    }
+  } else {
+    const current = await fetchLeverage({ symbol }, credential).catch(() => 0);
+    if (!(current > 0)) {
+      throw new Error("无法读取当前杠杆，请显式给 leverage（1–125）后再下单");
+    }
+    leverage = current;
+  }
+
   const filters = await getSymbolFilters(symbol);
   const price = await markPrice(symbol);
 
-  // 用限价折算数量：成交价不会比限价更差，按限价算不会超额
-  const rawQty = input.quantity ?? (input.notional ? input.notional / input.limitPrice : 0);
-  const quantity = quantizeQty(rawQty, filters.stepSize);
-  assertOrderQuantity(Number(quantity), price, filters.minNotional);
+  // 先量化每一档，再按总额核对保证金（多档分开算会漏掉合计）
+  const prepared = legs.map((leg) => {
+    const rawQty =
+      leg.quantity ?? (leg.notional ? leg.notional / leg.limitPrice : 0);
+    const quantity = quantizeQty(rawQty, filters.stepSize);
+    const limitPrice = quantizePrice(leg.limitPrice, filters.tickSize);
+    assertOrderQuantity(Number(quantity), Number(limitPrice), filters.minNotional);
+    return {
+      quantity,
+      limitPrice,
+      notional: Number(quantity) * Number(limitPrice),
+    };
+  });
+  const totalNotional = prepared.reduce((sum, leg) => sum + leg.notional, 0);
+
+  const snapshot = await fetchAccountSnapshot({ force: true });
+  if (!snapshot.ok) {
+    throw new Error(
+      `读取账户失败，无法核对可用保证金：${snapshot.error ?? "未知原因"}`,
+    );
+  }
+  const available = snapshot.wallet?.available ?? 0;
+  const required = totalNotional / leverage;
+  const fee = totalNotional * FEE_RATE;
+  // 留 5% 缓冲：手续费、价格波动、资金费都会吃到保证金
+  const budget = available * 0.95;
+  if (required + fee > budget) {
+    const maxNotional = (budget * leverage) / (1 + FEE_RATE * leverage);
+    throw new Error(
+      `保证金不足：这批挂单总名义 ${totalNotional.toFixed(2)} USDT，` +
+        `按 ${leverage}x 需要 ${required.toFixed(2)} + 手续费约 ${fee.toFixed(2)}，` +
+        `可用 ${available.toFixed(2)}（留 5% 后 ${budget.toFixed(2)}）。` +
+        `当前杠杆下最多可开约 ${maxNotional.toFixed(2)} USDT 名义 —— ` +
+        "请减少档位/名义、提高杠杆（风险更高），或先平掉部分仓位。",
+    );
+  }
 
   const warnings: string[] = [];
-  let appliedLeverage: number | undefined;
+  let appliedLeverage = leverage;
   if (input.leverage !== undefined) {
-    if (!(input.leverage >= 1 && input.leverage <= 125)) {
-      throw new Error("杠杆必须在 1–125 之间");
-    }
     try {
       await setLeverage({ symbol, leverage: input.leverage }, credential);
-      appliedLeverage = input.leverage;
     } catch (err) {
       // 杠杆设置失败不阻断下单：可能是已有持仓不允许改，报出来让用户判断
       warnings.push(
@@ -158,19 +267,70 @@ export async function openPosition(
   }
 
   const side: OrderSide = input.side === "long" ? "BUY" : "SELL";
-  const limitPrice = quantizePrice(input.limitPrice, filters.tickSize);
-  // GTC：一直挂到撤单为止 —— 这是「不追价、等回踩」的执行方式
-  const order = await createOrder(
-    {
-      symbol,
-      side,
-      type: "LIMIT",
-      quantity,
-      price: limitPrice,
-      timeInForce: "GTC",
-    },
-    credential,
-  );
+  const opened: OpenedLeg[] = [];
+  const actionIds: string[] = [];
+  for (const [index, leg] of prepared.entries()) {
+    // 限价已在现价另一侧时真实交易所会立即吃单（成交价更差），必须提前说清
+    const crossed =
+      input.side === "long"
+        ? Number(leg.limitPrice) >= price
+        : Number(leg.limitPrice) <= price;
+    if (crossed) {
+      warnings.push(
+        `第 ${index + 1} 档限价 ${leg.limitPrice} 已越过现价 ${price.toFixed(2)}，` +
+          "会立即成交（等同市价，可能有滑点）",
+      );
+    }
+
+    try {
+      // GTC：一直挂到时效到期或主动撤单 —— 这是「不追价、等回踩」的执行方式
+      const order = await createOrder(
+        {
+          symbol,
+          side,
+          type: "LIMIT",
+          quantity: leg.quantity,
+          price: leg.limitPrice,
+          timeInForce: "GTC",
+        },
+        credential,
+      );
+
+      const expiresAt = computeExpiresAt(input.ttlMinutes);
+      const action = appendAction(getBtcHome(), {
+        kind: "open",
+        symbol,
+        side: input.side,
+        qty: Number(leg.quantity),
+        limitPrice: Number(leg.limitPrice),
+        orderId: order.orderId,
+        status: "pending",
+        reason:
+          (input.reason ?? "") +
+          (prepared.length > 1 ? `（第 ${index + 1}/${prepared.length} 档）` : ""),
+        note: warnings.length > 0 ? warnings.join("；").slice(0, 300) : undefined,
+        expiresAt,
+      });
+      actionIds.push(action.id);
+      opened.push({
+        orderId: order.orderId,
+        quantity: leg.quantity,
+        limitPrice: leg.limitPrice,
+        notional: leg.notional,
+        expiresAt,
+      });
+    } catch (err) {
+      // 后面的档位大概率同样失败（参数/权限问题），不连环下单
+      warnings.push(
+        `第 ${index + 1} 档挂单失败（${leg.limitPrice}）：` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      break;
+    }
+  }
+  if (opened.length === 0) {
+    throw new Error(`所有档位都挂单失败：${warnings.join("；")}`);
+  }
 
   const closeSide: OrderSide = input.side === "long" ? "SELL" : "BUY";
   const protection: string[] = [];
@@ -186,8 +346,8 @@ export async function openPosition(
           side: closeSide,
           type: kind,
           stopPrice: quantizePrice(trigger, filters.tickSize),
-          // 用 closePosition 而不是 reduceOnly+quantity：限价开仓可能还没成交，
-          // 数量锁定会与真实仓位对不上；closePosition 在触发时按当时仓位全平。
+          // closePosition 按触发时仓位全平：多档建仓时各档成交数量不确定，
+          // 锁数量会对不上；这也是限价单还没成交时挂保护单的唯一安全写法。
           closePosition: true,
           workingType: "MARK_PRICE",
         },
@@ -195,38 +355,57 @@ export async function openPosition(
       );
       protection.push(`${label} ${trigger}`);
     } catch (err) {
-      // 主仓已经成交，保护单失败要明确告警（用户需要手动挂）
       warnings.push(
         `${label}单挂单失败（请手动设置）：${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
 
-  // 记账：这单现在只是「挂出去了」，成交与否要等下一轮核对（见 preflight）
-  const action = appendAction(getBtcHome(), {
-    kind: "open",
-    symbol,
-    side: input.side,
-    qty: Number(quantity),
-    limitPrice: Number(limitPrice),
-    orderId: order.orderId,
-    status: "pending",
-    reason: input.reason ?? "",
-    note: warnings.length > 0 ? warnings.join("；").slice(0, 300) : undefined,
-  });
+  const totalQty = opened.reduce((sum, leg) => sum + Number(leg.quantity), 0);
+  const weighted =
+    totalQty > 0
+      ? opened.reduce(
+          (sum, leg) => sum + Number(leg.quantity) * Number(leg.limitPrice),
+          0,
+        ) / totalQty
+      : 0;
 
   return {
     symbol,
     side: input.side,
-    quantity,
-    limitPrice,
-    orderId: order.orderId,
-    status: order.status,
+    quantity: String(Number(totalQty.toFixed(8))),
+    limitPrice: weighted.toFixed(2),
+    orderId: opened[0].orderId,
+    status: "NEW",
     leverage: appliedLeverage,
     protection,
+    expiresAt: opened[0].expiresAt,
     warnings,
-    actionId: action.id,
+    actionId: actionIds[0],
+    legs: opened,
+    margin: {
+      totalNotional: Number(totalNotional.toFixed(2)),
+      required: Number(required.toFixed(2)),
+      fee: Number(fee.toFixed(2)),
+      available: Number(available.toFixed(2)),
+      leverage,
+    },
   };
+}
+
+export interface ClosePositionInput {
+  /**
+   * `market`（默认）= 确定出场，接受滑点；`limit` = 控滑点，但可能不成交。
+   *
+   * 选择原则：临近止损/强平、行情快速、流动性差时用市价 —— 出场确定性优先；
+   * 价格合适、只想在某个价位了结时用限价，但必须接受「没成交仓位就还在」。
+   */
+  mode?: "market" | "limit";
+  /** 限价平仓必填 */
+  limitPrice?: number;
+  /** 限价平仓的时效（分钟，默认 60）：到点未成交由后端叫醒处理 */
+  ttlMinutes?: number;
+  reason?: string;
 }
 
 export interface ClosePositionResult {
@@ -235,11 +414,33 @@ export interface ClosePositionResult {
   quantity: string;
   orderId?: number;
   status?: string;
+  /** 市价：成交均价；限价：委托价 */
   price?: number;
+  mode: "market" | "limit";
+  /** 限价单的时效（市价没有） */
+  expiresAt?: string;
+  /** 限价在现价的不利侧：只有价格回来才成交，仓位仍在 */
+  mayNotFill?: boolean;
+  warnings: string[];
+  /** 市价平仓才有已实现盈亏（限价未成交时无从计算） */
+  pnl?: number;
 }
 
-/** 市价平仓（只减仓）；没有持仓时返回 null */
-export async function closePosition(): Promise<ClosePositionResult | null> {
+/**
+ * 平仓（只减仓）；没有持仓时返回 null。
+ *
+ * 默认市价：出场要确定。限价平仓是「想在更好的价位了结」的工具，
+ * 代价是**不成交时仓位与止损都还在** —— 所以限价单也带时效，
+ * 超时由后端叫醒，避免「以为平了、实际还裸着」。
+ */
+export async function closePosition(
+  input: ClosePositionInput = {},
+): Promise<ClosePositionResult | null> {
+  const mode = input.mode === "limit" ? "limit" : "market";
+  // 参数校验放在凭据之前：缺参数是调用方的问题，不必先去读密钥
+  if (mode === "limit" && !(typeof input.limitPrice === "number" && input.limitPrice > 0)) {
+    throw new Error("限价平仓必须给 limitPrice（大于 0）");
+  }
   const credential = credentialOrThrow();
   const symbol = resolveSymbol();
   const filters = await getSymbolFilters(symbol);
@@ -251,13 +452,88 @@ export async function closePosition(): Promise<ClosePositionResult | null> {
   const position = snapshot.positions.find((item) => item.symbol === symbol);
   if (!position) return null;
 
+  const side: OrderSide = position.side === "long" ? "SELL" : "BUY";
+  const quantity = quantizeQty(position.qty, filters.stepSize);
+  const warnings: string[] = [];
+
+  // 已经有一张未成交的平仓挂单时，再平一次会出现「两张单抢同一批仓位」：
+  // 先成交的那张把仓位吃掉，后一张变成 reduceOnly 被拒或部分成交，容易误判。
+  const pendingClose = snapshot.orders.filter(
+    (item) => item.reduceOnly && !item.closePosition && item.stopPrice === 0,
+  );
+  if (pendingClose.length > 0) {
+    warnings.push(
+      `已有未成交的平仓挂单 ${pendingClose
+        .map((item) => `#${item.orderId}`)
+        .join("、")}：建议先 btc_cancel 再平，避免两张单重复平仓`,
+    );
+  }
+
+  if (mode === "limit") {
+    if (!(typeof input.limitPrice === "number" && input.limitPrice > 0)) {
+      throw new Error("限价平仓必须给 limit_price（大于 0）");
+    }
+    const price = quantizePrice(input.limitPrice, filters.tickSize);
+    const order = await createOrder(
+      {
+        symbol,
+        side,
+        type: "LIMIT",
+        quantity,
+        price,
+        timeInForce: "GTC",
+        reduceOnly: true,
+      },
+      credential,
+    );
+
+    // 平多在「现价及以上」、平空在「现价及以下」才可能立刻成交；
+    // 挂在不利侧只是排队等人接，不能当成「已经平了」。
+    const mayNotFill =
+      position.side === "long"
+        ? Number(price) < position.markPrice
+        : Number(price) > position.markPrice;
+    if (mayNotFill) {
+      warnings.push(
+        `限价 ${price} 在现价 ${position.markPrice} 的不利侧：只有价格回到该位才成交；` +
+          "未成交前仓位与止损仍然有效",
+      );
+    }
+
+    const expiresAt = computeExpiresAt(input.ttlMinutes);
+    appendAction(getBtcHome(), {
+      kind: "close",
+      symbol,
+      side: position.side,
+      qty: position.qty,
+      orderId: order.orderId,
+      status: "pending",
+      reason: input.reason ?? "限价平仓",
+      note: `限价 ${price}${mayNotFill ? "（需价格回到该位）" : "（可立即成交侧）"}`,
+      expiresAt,
+    });
+
+    return {
+      symbol,
+      side: position.side,
+      quantity: String(position.qty),
+      orderId: order.orderId,
+      status: order.status,
+      price: Number(price),
+      mode: "limit",
+      expiresAt,
+      mayNotFill,
+      warnings,
+    };
+  }
+
   const order = await createOrder(
     {
       symbol,
       // 平仓方向与持仓相反；reduceOnly 保证不会反向开仓
-      side: position.side === "long" ? "SELL" : "BUY",
+      side,
       type: "MARKET",
-      quantity: quantizeQty(position.qty, filters.stepSize),
+      quantity,
       reduceOnly: true,
     },
     credential,
@@ -279,7 +555,7 @@ export async function closePosition(): Promise<ClosePositionResult | null> {
     qty: position.qty,
     orderId: order.orderId,
     status: "pending",
-    reason: "平仓",
+    reason: input.reason ?? "市价平仓",
     note: `成交价约 ${price}`,
     pnl,
   });
@@ -291,6 +567,9 @@ export async function closePosition(): Promise<ClosePositionResult | null> {
     orderId: order.orderId,
     status: order.status,
     price,
+    mode: "market",
+    warnings,
+    pnl,
   };
 }
 

@@ -34,6 +34,8 @@ export interface AccountOrder {
   type: string;
   price: number;
   qty: number;
+  /** 已成交数量：0 < filledQty < qty 表示部分成交（挂单时效检查要看它） */
+  filledQty: number;
   reduceOnly: boolean;
   /** 条件单的触发价（保护单识别用；普通单为 0） */
   stopPrice: number;
@@ -87,6 +89,8 @@ interface RawOrder {
   type?: string;
   price?: string;
   origQty?: string;
+  /** 已成交数量（部分成交判断用） */
+  executedQty?: string;
   stopPrice?: string;
   reduceOnly?: boolean;
   closePosition?: boolean;
@@ -170,6 +174,7 @@ export async function fetchAccountSnapshot(
         type: item.type ?? "",
         price: num(item.price),
         qty: num(item.origQty),
+        filledQty: num(item.executedQty),
         reduceOnly: item.reduceOnly === true,
         stopPrice: num(item.stopPrice),
         closePosition: item.closePosition === true,

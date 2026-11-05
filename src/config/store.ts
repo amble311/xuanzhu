@@ -147,6 +147,8 @@ export interface XuanZhuConfig {
    * 界面内可用 `/autonomy` 切换。
    */
   autonomy?: "ask" | "observe" | "auto";
+  /** 兼容默认值迁移的标记：写过一次就不再覆写用户的自治等级选择 */
+  autonomyMigrated?: boolean;
   /**
    * 是否让玄猪接管鼠标（滚轮滚动输出区 + 拖拽选中复制）。
    *
@@ -244,6 +246,9 @@ export const DEFAULT_CONFIG: XuanZhuConfig = {
   // 因此放宽是安全的。
   maxToolRounds: 200,
   autoApprove: true,
+  // 自治等级默认 auto：与 autoApprove=true 一致，但显式写出来 ——
+  // 否则读配置的人只能靠「未设置时按 autoApprove 推导」这条隐式规则去猜。
+  autonomy: "auto",
   // 默认接管鼠标：滚轮滚动输出区，且拖拽即可选中复制（选择由玄猪自己实现，
   // 所以不再以「失去原生选择」为代价）。想用终端原生选择则改为 false。
   mouseCapture: true,
@@ -267,6 +272,35 @@ export const DEFAULT_CONFIG: XuanZhuConfig = {
   },
 };
 
+/**
+ * 一次性迁移：把**显式设置过的** `ask` / `observe` 覆写成 `auto`。
+ *
+ * 用户要求自治等级默认 auto，而旧配置文件里可能写着之前手动切的 `ask`。
+ * 只迁移一次（写 `autonomyMigrated` 标记）：否则以后用 `/autonomy ask` 切换，
+ * 重启又会被改回 auto，等于选择无效。
+ */
+function migrateAutonomy(
+  file: string,
+  parsed: Partial<XuanZhuConfig>,
+): Partial<XuanZhuConfig> {
+  if (parsed.autonomyMigrated) return parsed;
+  const wasManual = parsed.autonomy === "ask" || parsed.autonomy === "observe";
+  const next: Partial<XuanZhuConfig> = {
+    ...parsed,
+    autonomy: "auto",
+    autonomyMigrated: true,
+  };
+  if (wasManual) {
+    // 迁移要落盘：只在内存里改，下次启动还是旧值
+    try {
+      fs.writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+    } catch {
+      // 写不进去就只在本次生效，不影响启动
+    }
+  }
+  return next;
+}
+
 /** 读取配置；不存在时返回默认配置（不写盘） */
 export function loadConfig(): XuanZhuConfig {
   const file = getConfigPath();
@@ -279,7 +313,7 @@ export function loadConfig(): XuanZhuConfig {
     }
     const raw = fs.readFileSync(file, "utf8");
     const parsed = JSON.parse(raw) as Partial<XuanZhuConfig>;
-    return mergeConfig(parsed);
+    return mergeConfig(migrateAutonomy(file, parsed));
   } catch (err) {
     throw new Error(
       `读取配置失败（${file}）：${err instanceof Error ? err.message : String(err)}`,
@@ -336,6 +370,8 @@ function mergeConfig(partial: Partial<XuanZhuConfig>): XuanZhuConfig {
     providers: { ...DEFAULT_CONFIG.providers, ...(partial.providers ?? {}) },
     maxToolRounds: partial.maxToolRounds ?? DEFAULT_CONFIG.maxToolRounds,
     autoApprove: partial.autoApprove ?? DEFAULT_CONFIG.autoApprove,
+    autonomy: partial.autonomy ?? DEFAULT_CONFIG.autonomy,
+    autonomyMigrated: partial.autonomyMigrated,
     mouseCapture: partial.mouseCapture ?? DEFAULT_CONFIG.mouseCapture,
     confirmSensitiveRead:
       partial.confirmSensitiveRead ?? DEFAULT_CONFIG.confirmSensitiveRead,

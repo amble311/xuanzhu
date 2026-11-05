@@ -36,19 +36,26 @@ const INSPECT_PROMPT = `你现在处于**后台巡检**：没有用户在终端�
 
 步骤（btc_* 工具可用）：
 1. 先 \`btc_status\` 看环境与数据新鲜度；数据落后就 \`btc_sync\`。
-2. \`btc_signal\` 拿三阶段结论（若 1h 数据不足会 degraded，先补 1h 再判断）。
+2. \`btc_signal\` 拿两层结论：\`side_filter\`（三周期允许的方向）与
+   \`stage4_1h\`（1 小时线机会评分 / 形态 / 失效条件）。\`side_filter\` 为 none / unknown、
+   或 \`stage4_1h.entry=wait\` 时不做；1h 不足会 degraded，先补 1h 再判断。
 3. 需要评估参数时才用 \`btc_backtest\`，不要为了"更全面"反复回测。
-4. **结束前必须调用 \`btc_schedule\`**，自己判断下次巡检时间并说明理由：
-   - 信号刚触发、价格临近关键位或止损位 → 15–60 分钟后再看；
-   - 明确 stand_aside / 观望、数据刚同步过 → 2–8 小时后再看；
-   - 预计日线收盘、数据更新等事件之前需要确认 → 定在该事件之前。
+4. **结束前必须把「怎么再次叫醒我」注入监控**（三件事，按需使用）：
+   a. \`btc_schedule\`（必须有）：自己判断下次巡检时间并说明理由 ——
+      信号刚触发/临近关键位 → 15–60 分钟；明确观望、刚同步过 → 2–8 小时；
+      日线收盘等事件前 → 定在事件之前；
+   b. \`btc_trigger\`：本轮结论**依赖某个具体价位或指标**时把阈值落盘
+      （例：站上 81200 才追多、1h RSI 回到 40 以上再看）。不要只靠「等时间」，
+      关键位到了就该看一眼 —— 但条件要具体可验证，别自己随手加一堆（上限 10 条）；
+   c. 有未成交挂单时：确认时效是否合理 —— 判断继续等就 \`btc_renew\` 续期并说明理由，
+      不该继续等就撤单。**不要放任它挂着过期**（过期后端会叫醒你，但那是兜底，不是常规）。
 5. 最后用一段话总结本轮结论（会写进巡检日志供复盘）。
 
 硬约束：
 - 你**有真实下单能力**（\`btc_order\` / \`btc_close\` / \`btc_cancel\`），动的是真钱：
   没有明确信号不得开仓，也不得声称成交 —— 以工具返回为准。
 - 后台无人确认，需要用户批准的操作不可用；不要尝试绕过。
-- 工具调用控制在 8 次以内，不要重复取同一份数据。
+- 工具轮数由代码限制（约 8 轮），不要重复取同一份数据；能一次拿到的就别分多次。
 - **日线收盘、资金费结算、价格剧烈波动由代码自动触发额外巡检**，
   你排期时不必刻意去覆盖这些时点；但仍要根据信号状态决定下次时间。
 - 拿不到数据就如实说，不要编造价格或指标。
@@ -77,6 +84,16 @@ export interface InspectOptions {
    * 传了它就意味着「用户设的硬线被击穿」，优先级高于一切策略偏好。
    */
   riskAlert?: { reason?: string; detail?: string };
+  /**
+   * 本轮是被哪条「叫醒条件」触发的（价格 / 指标阈值）。
+   * 不注入的话，模型只会看到一次莫名其妙的常规巡检，容易回一句「无变化」。
+   */
+  triggerNote?: string;
+  /**
+   * 超时挂单的明细（哪张单、超了多久、部分成交多少）。
+   * 需要模型给出「撤单 / 改价 / 继续等」的明确处理，而不是当普通巡检走过场。
+   */
+  orderNote?: string;
 }
 
 export interface InspectResult {
@@ -232,6 +249,21 @@ export async function runInspectCycle(
       }\n- 本轮**禁止开新仓**；先判断现有持仓该持有、减仓还是平仓。\n- 必须用 \`btc_policy\` 落盘**调整后的策略**（例如降低单笔风险、只在趋势确认时才交易），\n  让接下来的巡检按新约束执行，而不是继续用原来那套。\n- 结论开头写明「已按硬性风控重估策略」。`
     : "";
 
+  // 挂单超时要给出明确处理，不能当普通巡检走过去
+  const orderSection = options.orderNote
+    ? `\n\n## 挂单已超时（需要你处理）\n${options.orderNote}\n` +
+      "- 三选一：撤单重挂（`btc_cancel` / `btc_paper_cancel`）、改价、或明确「继续等」并给出**新的时效**；\n" +
+      "- 不要默认继续挂着 —— 超时说明当初的理由可能已经不成立；\n" +
+      "- 部分成交时，剩余部分的风险比全未成交更大（方向可能已经变了）。"
+    : "";
+
+  // 被叫醒的一轮要说清「谁叫的、条件是什么」，否则模型会当成常规巡检
+  const triggerSection = options.triggerNote
+    ? `\n\n## 本轮由叫醒条件触发（用户/你自己设定的阈值）\n${options.triggerNote}\n` +
+      "- 先确认条件**现在是否仍成立**（价格/指标可能已经回头），再决定做不做；\n" +
+      "- 被叫醒不等于必须交易：条件成立但三周期打分否决，就明确说不做并排下一次。"
+    : "";
+
   const controller = new AbortController();
   const timer = setTimeout(
     () => controller.abort(),
@@ -243,8 +275,10 @@ export async function runInspectCycle(
       INSPECT_PROMPT +
         (options.paper ? PAPER_PROMPT_SECTION : "") +
         preflightSection +
+        orderSection +
         policySection +
-        riskSection,
+        riskSection +
+        triggerSection,
       controller.signal,
     );
   } catch (err) {

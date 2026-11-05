@@ -41,6 +41,10 @@ export interface BackendState {
   nextCheckReason?: string;
   /** 排期队列长度（可能有多条：后台的下次 + 前台手动加的检查点） */
   queueSize?: number;
+  /** 当前启用的叫醒条件条数（面板展示） */
+  triggerCount?: number;
+  /** 下次评估叫醒条件的时间（ISO）；面板据此显示倒计时 */
+  nextTriggerEvalAt?: string;
   /** 连续失败次数（用于退避） */
   consecutiveFailures?: number;
   /** 是否被 `/stop` 暂停（进程在、队列在，只是不自动执行） */

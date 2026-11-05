@@ -88,8 +88,15 @@ const eventsOf = (confirmed: ConfirmRequest[]): AgentEvents => ({
 
 describe("autonomyModeOf", () => {
   it("未设置时按 autoApprove 推导（旧配置行为不变）", () => {
-    expect(autonomyModeOf({ ...DEFAULT_CONFIG, autoApprove: true })).toBe("auto");
-    expect(autonomyModeOf({ ...DEFAULT_CONFIG, autoApprove: false })).toBe("ask");
+    const base = { ...DEFAULT_CONFIG, autonomy: undefined };
+    expect(autonomyModeOf({ ...base, autoApprove: true })).toBe("auto");
+    expect(autonomyModeOf({ ...base, autoApprove: false })).toBe("ask");
+  });
+
+  it("默认配置显式就是 auto，不再依赖推导", () => {
+    expect(DEFAULT_CONFIG.autonomy).toBe("auto");
+    // 即便旧字段 autoApprove=false，默认自治等级也是 auto（用户要求）
+    expect(autonomyModeOf({ ...DEFAULT_CONFIG, autoApprove: false })).toBe("auto");
   });
 
   it("显式设置优先，非法值退回推导", () => {

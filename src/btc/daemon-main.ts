@@ -26,6 +26,24 @@ import {
 } from "./account";
 import { runInspectCycle, SUMMARY_LIMIT } from "./inspect";
 import { syncMarketData } from "./market-data";
+import { runRunner } from "./python";
+import { readActions } from "./actions";
+import {
+  describeExpiredOrders,
+  findExpiredOrders,
+  ORDER_TTL_CHECK_INTERVAL_MS,
+  type PaperOpenOrder,
+} from "./order-ttl";
+import {
+  describeHit,
+  evaluateTriggers,
+  indicatorKey,
+  markTriggerErrors,
+  readTriggers,
+  recordEvaluation,
+  TRIGGER_EVAL_INTERVAL_MS,
+  type TriggerHit,
+} from "./triggers";
 import { consecutiveLosses, dailyLossPct } from "./performance";
 import { readPause } from "./pause";
 import {
@@ -155,6 +173,10 @@ export async function runBtcBackend(
   let running = false;
   /** 上次尝试巡检的时间（成功失败都算）：兜底判断用它，避免写盘失败后每分钟重试 */
   let lastAttemptAt = 0;
+  /** 上次评估叫醒条件的 5 分钟节流（tick 是 1 分钟一次） */
+  let lastTriggerEvalAt = 0;
+  /** 上次检查挂单时效的时间（同样 5 分钟一次，避免频繁读账户/起 python） */
+  let lastOrderTtlCheckAt = 0;
 
   const onSignal = (signal: string) => {
     if (stopping) return;
@@ -164,13 +186,27 @@ export async function runBtcBackend(
   process.on("SIGTERM", () => onSignal("SIGTERM"));
   process.on("SIGINT", () => onSignal("SIGINT"));
 
-  /** 把队列现状同步进 state（每分钟刷新一次，供 `xzh btc status` 读） */
+  /** 把队列与叫醒条件现状同步进 state（供面板 / `xzh btc status` 读） */
   const refreshQueueState = (): void => {
     const queue = readScheduleQueue(home, role);
     const next = queue[0] ?? null;
     state.queueSize = queue.length;
     state.nextCheckAt = next?.at;
     state.nextCheckReason = next ? next.reason : "队列为空（到兜底间隔会自行巡检）";
+
+    // 叫醒条件的倒计时：面板要显示「还有多久评估下一次」。
+    // lastTriggerEvalAt 为 0 表示刚启动、还没评估过 —— 那一次就是现在。
+    const triggers = readTriggers(home, role);
+    state.triggerCount = triggers.length;
+    state.nextTriggerEvalAt =
+      triggers.length === 0
+        ? undefined
+        : new Date(
+            lastTriggerEvalAt > 0
+              ? lastTriggerEvalAt + TRIGGER_EVAL_INTERVAL_MS
+              : Date.now(),
+          ).toISOString();
+
     writeBackendState(home, state);
   };
 
@@ -266,10 +302,230 @@ export async function runBtcBackend(
     return { reason: volatilityReason(check.changePct), price };
   };
 
+  /**
+   * 检查用户/模型设的「叫醒条件」（`run/triggers.json`）。
+   *
+   * 与市场事件的分工：市场事件是代码自己认定的关键时点，这里是人给的条件。
+   * 评估成本刻意压低：价格用一次 ticker，指标用本地库一次 probe；
+   * **只有命中才调模型**，所以 5 分钟一次也不会烧 token。
+   *
+   * 命中即把条件记入状态（一次性条件直接失效），并把「谁叫醒的」带给巡检 ——
+   * 否则模型只会看到一次莫名其妙的常规巡检，容易答一句「无变化」就排下一次。
+   */
+  const checkTriggers = async (): Promise<{
+    reason: string;
+    price?: number;
+    triggerNote?: string;
+    /** 巡检成功后才执行：写回命中（一次性条件在此失效） */
+    commit: () => void;
+  } | null> => {
+    const now = Date.now();
+    if (now - lastTriggerEvalAt < TRIGGER_EVAL_INTERVAL_MS) return null;
+
+    const triggers = readTriggers(home, role);
+    if (triggers.length === 0) return null;
+    // 先占住这一轮：即使取价/算指标失败，也等到下个 5 分钟再试，
+    // 否则网络抖动时会变成每分钟都起一次 python
+    lastTriggerEvalAt = now;
+
+    // 公式条件也可能引用实时价（`price` 变量），所以它也要求取一次 ticker
+    const formulaTriggers = triggers.filter(
+      (item) => item.kind === "formula" && typeof item.expression === "string",
+    );
+    const needPrice =
+      triggers.some((item) => item.kind === "price") || formulaTriggers.length > 0;
+    let price: number | undefined;
+    if (needPrice) {
+      try {
+        const ticker = await activeExchange(home).exchange.fetchTicker(
+          process.env.BTC_SYMBOL?.trim() || "BTC/USDT",
+        );
+        price = ticker.price;
+      } catch {
+        // 取不到价只影响价格条件；指标条件仍然可以判
+        log("叫醒条件：取价失败，本轮跳过价格条件");
+      }
+    }
+
+    const frames = [
+      ...new Set([
+        ...triggers
+          .filter((item) => item.kind === "indicator")
+          .map((item) => item.timeframe ?? "1h"),
+        // 公式可能同时引用 1h/4h/1d，统一取三档（probe 只读本地库，成本可忽略）
+        ...(formulaTriggers.length > 0 ? (["1h", "4h", "1d"] as const) : []),
+      ]),
+    ];
+    const indicators: Record<string, number | null> = {};
+    const formulas: Record<string, number> = {};
+    const formulaErrors: Record<string, string> = {};
+    if (frames.length > 0 || formulaTriggers.length > 0) {
+      const probe = await runRunner<Record<string, unknown>>(
+        "probe",
+        {
+          timeframes: frames,
+          ...(formulaTriggers.length > 0
+            ? {
+                // 公式求值在计算层（AST 白名单），Node 侧只传表达式拿结果
+                formulas: formulaTriggers.map((item) => ({
+                  id: item.id,
+                  expression: item.expression,
+                })),
+                price,
+              }
+            : {}),
+        },
+        { timeoutMs: 30_000 },
+      );
+      if (probe.ok) {
+        for (const tf of frames) {
+          const snap = probe.data?.[tf] as
+            | (Record<string, unknown> & { error?: string })
+            | undefined;
+          if (!snap || snap.error) continue;
+          for (const name of ["rsi", "adx", "ma_gap_pct", "macd_hist"]) {
+            const value = snap[name];
+            if (typeof value === "number" && Number.isFinite(value)) {
+              indicators[indicatorKey(tf, name)] = value;
+            }
+          }
+        }
+        const results = (probe.data?.formulas ?? {}) as Record<
+          string,
+          { value?: number; error?: string }
+        >;
+        for (const [id, item] of Object.entries(results)) {
+          if (typeof item?.value === "number") formulas[id] = item.value;
+          else if (typeof item?.error === "string") formulaErrors[id] = item.error;
+        }
+      } else {
+        log(`叫醒条件：指标探测失败（${probe.error}）`);
+      }
+    }
+    const observation = { price, indicators, formulas, now };
+    const hits: TriggerHit[] = evaluateTriggers(triggers, observation);
+
+    // 求值失败要写回条件本身：否则它只是「永远不命中」，用户看不出来。
+    // 必须在 recordEvaluation **之后** —— 它会按内存里的旧对象整份写回，
+    // 先写 lastError 会被随后那次覆盖掉（这个顺序错了就等于没记）。
+    const flushFormulaErrors = (): void => {
+      if (Object.keys(formulaErrors).length > 0) {
+        markTriggerErrors(home, formulaErrors, role);
+      }
+    };
+
+    if (hits.length === 0) {
+      // 未命中：只回写观测值（用户能看到「离条件多远」），不动条件本身
+      recordEvaluation(home, triggers, observation, [], role);
+      flushFormulaErrors();
+      refreshQueueState();
+      return null;
+    }
+
+    // 命中时**先不落盘**：一次性条件一旦删除，这轮巡检失败（超时/限流）就再也不会叫了。
+    // 由调用方在巡检成功后执行 commit；失败时条件原样保留，下一轮会再叫。
+    const detail = hits.map((hit) => describeHit(hit)).join("；");
+    log(`叫醒条件命中：${detail}`);
+    return {
+      reason: `叫醒条件命中：${detail}`,
+      price,
+      triggerNote: hits.map((hit) => describeHit(hit)).join("\n"),
+      commit: () => {
+        recordEvaluation(home, triggers, observation, hits, role);
+        flushFormulaErrors();
+        refreshQueueState();
+      },
+    };
+  };
+
+  /**
+   * 检查「挂单时效」：超时且仍未成交 / 只部分成交 → 叫醒一轮巡检处理。
+   *
+   * 为什么要代码来管：模型把巡检定在 8 小时后，这单会一直挂在盘上等一个
+   * 已经不成立的价格；「单子还在不在、成交了多少」只有实时账户知道，
+   * 不能靠模型记性。叫醒只把问题摆到眼前，撤单/改价仍由模型决定。
+   */
+  const checkOrderTtl = async (
+    snapshot: AccountSnapshot | null,
+  ): Promise<{
+    reason: string;
+    orderNote: string;
+    /** 巡检成功后才执行：把「已叫醒」落盘（失败则保留，下一轮再叫） */
+    commit: () => void;
+  } | null> => {
+    const now = Date.now();
+    if (now - lastOrderTtlCheckAt < ORDER_TTL_CHECK_INTERVAL_MS) return null;
+    lastOrderTtlCheckAt = now;
+
+    const actions = readActions(home);
+    // 开仓单与平仓单都算：平仓单超时意味着「仓位还在」，更需要账户快照
+    const livePending = actions.some(
+      (item) =>
+        (item.kind === "open" || item.kind === "close") &&
+        item.status === "pending" &&
+        item.expiresAt,
+    );
+
+    // 实盘必须能读到挂单，否则分不清「还在盘上」与「已成交 / 已撤销」
+    if (!paper && livePending && !snapshot?.ok) return null;
+
+    let paperOrders: PaperOpenOrder[] = [];
+    if (paper) {
+      const result = await runRunner<{ orders: PaperOpenOrder[] }>(
+        "paper-expired",
+        {},
+        { timeoutMs: 20_000 },
+      );
+      if (result.ok) {
+        paperOrders = result.data?.orders ?? [];
+      } else {
+        log(`挂单时效：读取模拟盘过期挂单失败（${result.error}）`);
+      }
+    }
+
+    const events = readEventsState(home);
+    const expired = findExpiredOrders({
+      actions: paper ? [] : actions,
+      paperOrders,
+      snapshot: paper ? null : snapshot,
+      now,
+      notified: events.orderTtlNotified ?? {},
+    });
+    if (expired.length === 0) return null;
+
+    const detail = describeExpiredOrders(expired);
+    log(`挂单超时：${expired.length} 张\n${detail}`);
+    return {
+      reason: `挂单超过时效仍未成交（${expired.length} 张）`,
+      orderNote: detail,
+      // 先不落盘：巡检失败时保持「未叫醒」，下一轮还会再叫。
+      // 落盘时顺手清掉 7 天前的键，避免文件越写越大。
+      commit: () => {
+        const current = readEventsState(home);
+        const cutoff = now - 7 * 24 * 3_600_000;
+        const marks: Record<string, string> = {};
+        for (const [key, at] of Object.entries(current.orderTtlNotified ?? {})) {
+          const parsed = Date.parse(at);
+          if (!Number.isNaN(parsed) && parsed >= cutoff) marks[key] = at;
+        }
+        for (const order of expired) marks[order.key] = new Date(now).toISOString();
+        current.orderTtlNotified = marks;
+        writeEventsState(home, current);
+      },
+    };
+  };
+
   /** 跑一轮巡检；`trigger` 说明这一轮为什么被叫醒（队列 / 市场事件 / 兜底） */
   const runInspect = async (
-    trigger: { reason: string; price?: number } | null,
-  ): Promise<void> => {
+    trigger: {
+      reason: string;
+      price?: number;
+      /** 叫醒条件的具体内容（注入提示词） */
+      triggerNote?: string;
+      /** 超时挂单的明细（注入提示词） */
+      orderNote?: string;
+    } | null,
+  ): Promise<boolean> => {
     lastAttemptAt = Date.now();
     log(trigger ? `触发巡检：${trigger.reason}` : "队列为空，按兜底规则巡检");
 
@@ -280,7 +536,13 @@ export async function runBtcBackend(
         ? { reason: riskState.reason, detail: riskState.detail }
         : undefined;
 
-    const result = await runInspectCycle({ log, paper, riskAlert });
+    const result = await runInspectCycle({
+      log,
+      paper,
+      riskAlert,
+      triggerNote: trigger?.triggerNote,
+      orderNote: trigger?.orderNote,
+    });
     if (result.ok && riskAlert) markRiskDelivered(home);
     state.riskTriggered = riskState.triggered;
     state.riskReason = riskState.reason;
@@ -315,6 +577,7 @@ export async function runBtcBackend(
         `巡检完成（${result.toolCalls} 次工具调用）；` +
           (next ? `下一条计划 ${next.at}` : "队列已空，等待兜底"),
       );
+      return true;
     } else {
       const failures = (state.consecutiveFailures ?? 0) + 1;
       state.consecutiveFailures = failures;
@@ -341,15 +604,31 @@ export async function runBtcBackend(
           "\n",
         ),
       );
+      // 失败时**不**执行 commit：一次性条件不删除、超时标记不写盘，
+      // 下一轮还会再叫 —— 否则「巡检失败一次」就等于永久静音。
+      return false;
     }
   };
 
-  /** 仅数据同步（`BTC_INSPECT_ENABLED=0`）：按固定间隔检查是否该同步 */
+  /**
+   * 按固定间隔同步行情（**与是否巡检无关**）。
+   *
+   * 以前只在 `BTC_INSPECT_ENABLED=0` 时同步，等于「巡检模式下行情靠模型自觉」——
+   * 而三周期打分、1h 机会评分、触发器指标全都读本地库，数据过期时这些结论全是错的
+   * （典型表现：1h 停在几小时前，RSI/ADX 还是旧值）。
+   *
+   * 失败也节流：用独立的 `lastSyncAttemptAt`，否则网络断时会每分钟重试，
+   * 也会把巡检兜底的 `lastAttemptAt` 提前，导致「队列空也不兜底」。
+   */
+  let lastSyncAttemptAt = 0;
   const runSyncIfDue = async (now: number): Promise<boolean> => {
-    const last = state.lastSyncAt ? Date.parse(state.lastSyncAt) : 0;
+    const last = Math.max(
+      state.lastSyncAt ? Date.parse(state.lastSyncAt) : 0,
+      lastSyncAttemptAt,
+    );
     if (last && now - last < syncIntervalMin * 60_000) return false;
 
-    lastAttemptAt = now;
+    lastSyncAttemptAt = now;
     const result = await syncMarketData({ log });
     state.cycles = (state.cycles ?? 0) + 1;
     if (result.error) {
@@ -362,6 +641,24 @@ export async function runBtcBackend(
       log(`同步完成，写入 ${result.written} 根`);
     }
     writeBackendState(home, state);
+    return true;
+  };
+
+  /**
+   * 监控叫醒的频率上限：10 分钟内最多 2 次。
+   *
+   * TTL 与叫醒条件各自去重，但「多条条件 + 多张挂单」可以连着叫醒，
+   * 短时间多轮模型调用纯属烧钱。超限就留到下一轮 —— 条件与挂单都还在，不会丢。
+   */
+  let monitorWakeWindowAt = 0;
+  let monitorWakeCount = 0;
+  const monitorWakeAllowed = (now: number): boolean => {
+    if (now - monitorWakeWindowAt > 10 * 60_000) {
+      monitorWakeWindowAt = now;
+      monitorWakeCount = 0;
+    }
+    if (monitorWakeCount >= 2) return false;
+    monitorWakeCount += 1;
     return true;
   };
 
@@ -383,8 +680,11 @@ export async function runBtcBackend(
     // 不代表可以不管风险 —— 用户完全可能在前台手动交易，浮亏一样要监控。
     const snapshot = await checkRisk();
 
+    // 同步与巡检模式无关：巡检模式下模型不一定每轮都 btc_sync，
+    // 而所有指标都读本地库 —— 数据过期等于策略算错。
+    await runSyncIfDue(now);
+
     if (!inspectEnabled) {
-      await runSyncIfDue(now);
       refreshQueueState();
       return;
     }
@@ -404,6 +704,53 @@ export async function runBtcBackend(
         running = false;
         refreshQueueState();
       }
+      return;
+    }
+
+    // 挂单时效：超时未成交/只部分成交 → 叫醒一轮，让模型决定撤单/改价/继续等
+    const ttlTrigger = await checkOrderTtl(snapshot);
+    if (ttlTrigger) {
+      if (!monitorWakeAllowed(now)) {
+        log("监控叫醒已达 10 分钟上限，本轮跳过（条件保留，下一轮再试）");
+        refreshQueueState();
+        return;
+      }
+      running = true;
+      let ok = false;
+      try {
+        ok = await runInspect(ttlTrigger);
+      } catch (err) {
+        state.lastError = err instanceof Error ? err.message : String(err);
+        log(`巡检异常：${state.lastError}`);
+      } finally {
+        running = false;
+        refreshQueueState();
+      }
+      // 只有巡检成功才把「已叫醒」落盘；失败则保留，下一轮再叫
+      if (ok) ttlTrigger.commit();
+      return;
+    }
+
+    // 用户/模型设的叫醒条件：5 分钟节流，命中就立刻跑一轮（不占排期队列）
+    const triggerHit = await checkTriggers();
+    if (triggerHit) {
+      if (!monitorWakeAllowed(now)) {
+        log("监控叫醒已达 10 分钟上限，本轮跳过（条件保留，下一轮再试）");
+        refreshQueueState();
+        return;
+      }
+      running = true;
+      let ok = false;
+      try {
+        ok = await runInspect(triggerHit);
+      } catch (err) {
+        state.lastError = err instanceof Error ? err.message : String(err);
+        log(`巡检异常：${state.lastError}`);
+      } finally {
+        running = false;
+        refreshQueueState();
+      }
+      if (ok) triggerHit.commit();
       return;
     }
 

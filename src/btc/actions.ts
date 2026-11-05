@@ -36,6 +36,11 @@ export interface BtcAction {
   note?: string;
   /** 平仓的已实现盈亏（含手续费估算）；只有 close 动作有 */
   pnl?: number;
+  /**
+   * 挂单时效（ISO）。到点仍未成交 / 只部分成交时，后端会叫醒一轮巡检来处理。
+   * 只对 `kind=open` 有意义。
+   */
+  expiresAt?: string;
 }
 
 const MAX_KEEP = 200;
@@ -92,6 +97,7 @@ export interface AppendActionInput {
   reason: string;
   note?: string;
   pnl?: number;
+  expiresAt?: string;
 }
 
 export function appendAction(
@@ -111,6 +117,7 @@ export function appendAction(
     reason: input.reason,
     note: input.note,
     pnl: input.pnl,
+    expiresAt: input.expiresAt,
   };
   const existing = readActions(home);
   existing.push(action);
@@ -121,13 +128,45 @@ export function appendAction(
 export function updateAction(
   home: string,
   id: string,
-  patch: Partial<Pick<BtcAction, "status" | "note" | "qty" | "orderId" | "pnl">>,
+  patch: Partial<
+    Pick<BtcAction, "status" | "note" | "qty" | "orderId" | "pnl" | "expiresAt">
+  >,
 ): void {
   const actions = readActions(home);
   const target = actions.find((item) => item.id === id);
   if (!target) return;
   Object.assign(target, patch);
   writeAll(home, actions);
+}
+
+export interface RenewResult {
+  renewed: BtcAction[];
+  expiresAt: string;
+}
+
+/**
+ * 给「还在挂着的单」续期（模型判断继续等时用）。
+ *
+ * 只改动作账本里的 `expiresAt`；订单本身不动（撤单重挂会丢队列位置，
+ * 也可能在撤与挂之间错过成交）。
+ */
+export function renewActionTtls(
+  home: string,
+  options: { orderId?: number; minutes: number; now?: number },
+): RenewResult {
+  const now = options.now ?? Date.now();
+  const expiresAt = new Date(now + options.minutes * 60_000).toISOString();
+  const actions = readActions(home);
+  const renewed = actions.filter(
+    (item) =>
+      (item.kind === "open" || item.kind === "close") &&
+      item.status === "pending" &&
+      (options.orderId === undefined || item.orderId === options.orderId),
+  );
+  if (renewed.length === 0) return { renewed: [], expiresAt };
+  for (const item of renewed) item.expiresAt = expiresAt;
+  writeAll(home, actions);
+  return { renewed, expiresAt };
 }
 
 /** 还没结算的动作（主要是未成交的限价开仓单） */

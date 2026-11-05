@@ -3,7 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { quantizePrice, quantizeQty } from "../src/btc/market-meta";
-import { openPosition } from "../src/btc/trading";
+import { closePosition, openPosition } from "../src/btc/trading";
 import { triggerHardRisk, clearHardRisk } from "../src/btc/risk";
 
 /**
@@ -61,5 +61,34 @@ describe("下单前置校验", () => {
     await expect(
       openPosition({ side: "long", limitPrice: 90_000 }),
     ).rejects.toThrow(/notional|quantity/);
+  });
+
+  it("多档建仓：每档都要有限价与数量，且不能和单档 limit_price 混用", async () => {
+    await expect(
+      openPosition({
+        side: "long",
+        limitPrice: 90_000,
+        notional: 100,
+        orders: [{ limitPrice: 89_000, notional: 100 }],
+      }),
+    ).rejects.toThrow(/二选一/);
+
+    await expect(
+      openPosition({
+        side: "long",
+        orders: [{ limitPrice: 89_000 }],
+      }),
+    ).rejects.toThrow(/notional|quantity/);
+
+    await expect(
+      openPosition({
+        side: "long",
+        orders: [{ limitPrice: 0, notional: 100 }],
+      }),
+    ).rejects.toThrow(/限价/);
+  });
+
+  it("限价平仓缺 limit_price 时直接拒绝（不先去读凭据）", async () => {
+    await expect(closePosition({ mode: "limit" })).rejects.toThrow(/limitPrice/);
   });
 });
