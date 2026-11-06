@@ -17,7 +17,12 @@ import { fetchAccountSnapshot, type AccountSnapshot } from "../btc/account";
 import { runRunner } from "../btc/python";
 import { readActions, type BtcAction } from "../btc/actions";
 import { liveBackend } from "../btc/daemon";
-import { readTriggers, type Trigger } from "../btc/triggers";
+import {
+  describeStep,
+  describeTrigger,
+  readTriggers,
+  type Trigger,
+} from "../btc/triggers";
 import { readPause, setPaused } from "../btc/pause";
 import { resetPaperLedger } from "../btc/paper-reset";
 import { buildPreflight, liquidationGapPct } from "../btc/preflight";
@@ -159,7 +164,11 @@ function describeTriggerBrief(trigger: Trigger): string {
   const target =
     trigger.kind === "price"
       ? `价格 ${trigger.op} ${trigger.value}`
-      : `${trigger.timeframe ?? "1h"} ${trigger.name} ${trigger.op} ${trigger.value}`;
+      : trigger.kind === "formula"
+        ? `公式 ${trigger.expression} ${trigger.op} ${trigger.value}`
+        : trigger.kind === "chain"
+          ? `链式 ${(trigger.steps ?? []).map(describeStep).join(" → ")}`
+          : `${trigger.timeframe ?? "1h"} ${trigger.name ?? "?"} ${trigger.op} ${trigger.value}`;
   const seen =
     typeof trigger.lastSeenValue === "number"
       ? ` · 现 ${trigger.lastSeenValue.toLocaleString("en-US", {
@@ -1776,6 +1785,58 @@ export class TuiApp {
   }
 
   /**
+   * `/monitor`：把叫醒条件完整打印到对话区。
+   *
+   * 右侧面板只有几十列，公式/链式条件折行后仍会被截；这里不经过模型，
+   * 直接读 `~/.btc/run/triggers*.json`，看到的就是后端要评估的那份配置。
+   */
+  private showMonitor(): void {
+    if (this.mode?.name !== "btc") {
+      this.lines.push(
+        `${ansi.gray}/monitor 只在 xzh btc 模式下有意义（监控条件属于 btc 后端）。${ansi.reset}`,
+      );
+      this.scheduleRender();
+      return;
+    }
+    const role = currentScheduleRole();
+    const triggers = readTriggers(this.cwd, role);
+    const state = liveBackend(this.cwd, role);
+    const next = state?.nextTriggerEvalAt
+      ? formatCountdown(Date.parse(state.nextTriggerEvalAt) - Date.now())
+      : null;
+
+    if (triggers.length === 0) {
+      this.lines.push(
+        `${ansi.gray}当前没有叫醒条件。对 xzh 说「到 80000 提醒我」即可添加。${ansi.reset}`,
+      );
+      this.scheduleRender();
+      return;
+    }
+
+    const out: string[] = [
+      `叫醒条件 ${triggers.length} 条` +
+        (next ? ` · 下次评估 ${next}` : " · 后端未运行（或未上报）"),
+      "",
+    ];
+    triggers.forEach((trigger, index) => {
+      out.push(`${index + 1}. ${describeTrigger(trigger)}`);
+      const progress =
+        trigger.kind === "chain" && trigger.chainState
+          ? `当前进度：第 ${trigger.chainState.step + 1} 步`
+          : "";
+      const seen =
+        typeof trigger.lastSeenValue === "number"
+          ? `最近观测 ${trigger.lastSeenValue}`
+          : "";
+      const extra = [progress, seen].filter(Boolean).join(" · ");
+      if (extra) out.push(`   ${extra}`);
+    });
+    out.push("", "多条之间是「或」；要「且」用 formula，要「先…再…」用 chain。");
+    this.lines.push(`${ansi.gray}${out.join("\n")}${ansi.reset}`);
+    this.scheduleRender();
+  }
+
+  /**
    * `/reset moni [初始资金]`：清空模拟盘账本。
    *
    * 与 `/reset`（对话）分开：重置账本不该把对话历史一起丢掉，
@@ -2783,6 +2844,9 @@ export class TuiApp {
         break;
       case "jobs":
         this.handleJobsCommand(arg);
+        break;
+      case "monitor":
+        this.showMonitor();
         break;
       case "autonomy":
         this.handleAutonomyCommand(arg);
@@ -4757,6 +4821,7 @@ export class TuiApp {
       `  /feed          开关后台巡检过程流（思考 / 工具调用实时显示，btc 模式）`,
       `  /stop          暂停后端巡检与自动交易（btc 模式；/stop resume 恢复）`,
       `  /reset         重置对话上下文`,
+      `  /monitor       查看全部叫醒条件（面板只显示前 2 条，长公式会折行）`,
       `  /reset moni [初始资金]  重置模拟盘账本并记入记忆（仅 xzh btc moni 下有意义）`,
       `  /undo [N]      撤销玄猪最近 N 次文件修改（默认 1，最多 20；改前自动备份）`,
       `  /resume [编号]  列出 / 恢复历史会话（对话历史会自动保存）`,
@@ -5243,6 +5308,24 @@ export class TuiApp {
     const push = (text: string): void => {
       if (rows.length < height) rows.push(truncate(text, width));
     };
+    /**
+     * 折行而不是截断：监控条件（尤其公式/链式）经常比右栏宽，
+     * 直接 truncate 会把阈值后半段吃掉 —— 用户看不全就只能去翻 `btc_trigger list`。
+     * 续行多缩进两格，并限制最多 `maxLines` 行，避免一条长公式挤满整个面板。
+     */
+    const pushWrapped = (text: string, indent = "  ", maxLines = 3): void => {
+      const inner = Math.max(8, width - indent.length);
+      const pieces = wrapText(text, inner);
+      for (let index = 0; index < pieces.length && index < maxLines; index += 1) {
+        if (rows.length >= height) break;
+        const lead = index === 0 ? indent : `${indent}  `;
+        const tail =
+          index === maxLines - 1 && pieces.length > maxLines ? "…" : "";
+        rows.push(
+          `${ansi.gray}${truncate(`${lead}${pieces[index]}${tail}`, width)}${ansi.reset}`,
+        );
+      }
+    };
     const divider = (): void =>
       push(`${ansi.gray}${"─".repeat(Math.max(4, width - 1))}${ansi.reset}`);
     const amount = (value: number, digits = 2): string =>
@@ -5404,11 +5487,11 @@ export class TuiApp {
         : formatCountdown(nextAt - Date.now());
       push(` ${data.triggers.length} 条条件 · 下次评估 ${countdown}`);
       for (const trigger of data.triggers.slice(0, 2)) {
-        push(`${ansi.gray}  · ${describeTriggerBrief(trigger)}${ansi.reset}`);
+        pushWrapped(`· ${describeTriggerBrief(trigger)}`, "  ", 3);
       }
       if (data.triggers.length > 2) {
         push(
-          `${ansi.gray}  …还有 ${data.triggers.length - 2} 条（btc_trigger list）${ansi.reset}`,
+          `${ansi.gray}  …还有 ${data.triggers.length - 2} 条，/monitor 看全部${ansi.reset}`,
         );
       }
     }

@@ -893,7 +893,8 @@ export function recordEvaluation(
 }
 
 /** 人类可读的一行（list / 日志 / 提示词共用） */
-function describeStep(step: ChainStep): string {
+/** 一步链式条件的简短描述（面板与 `describeTrigger` 共用） */
+export function describeStep(step: ChainStep): string {
   return step.kind === "price"
     ? `价格 ${step.op} ${step.value}`
     : `${step.timeframe ?? "1h"} ${step.name} ${step.op} ${step.value}`;
