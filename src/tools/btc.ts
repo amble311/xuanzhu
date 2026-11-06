@@ -34,6 +34,7 @@ import {
   type TriggerOp,
 } from "../btc/triggers";
 import { readRiskSettings } from "../btc/risk";
+import { suggestLeverage } from "../btc/leverage";
 import { decideSideGate, evaluateSideGate } from "../btc/side-gate";
 import { resetPaperLedger } from "../btc/paper-reset";
 import { readActions, renewActionTtls } from "../btc/actions";
@@ -119,6 +120,12 @@ async function fetchMarkPrice(): Promise<number | undefined> {
 }
 
 function formatSignal(data: unknown): string {
+  const info = (data ?? {}) as {
+    confidence?: number;
+    stage4_1h?: { score?: number };
+  };
+  // 倍率建议放在结论旁：模型下单时不必再回翻 signal 找 confidence
+  const hint = suggestLeverage(info.confidence, info.stage4_1h?.score);
   const payload = JSON.stringify(data, null, 2);
   const clipped =
     payload.length > 12_000
@@ -132,7 +139,9 @@ function formatSignal(data: unknown): string {
     "`stage4_1h` 是 **1 小时线机会评估**：`score`（0–100，≥60 且形态成立才 `entry=now`）、" +
     "`opportunity`（pullback / breakout / none）、`levels`、`invalidation`。" +
     "`degraded=true` 时结论必须写「1 小时线未确认，不做」。\n" +
-    "`btc_order` 会按同一套结论做方向闸门：反向、none、unknown 都会被直接拒绝。"
+    "`btc_order` 会按同一套结论做方向闸门：反向、none、unknown 都会被直接拒绝。\n" +
+    `建议倍率：**${hint.min}–${hint.max}x**（${hint.reason}）—— 默认 9x，` +
+    "最终由你按合约钱包可用余额与本次信心决定（占用超过可用一半就该降）。"
   );
 }
 
@@ -647,8 +656,10 @@ const orderTool: ToolDefinition = {
       leverage: {
         type: "number",
         description:
-          "杠杆 1–125：**建仓前必须考虑倍数**（保证金 ≈ 总名义 / 杠杆）。" +
-          "不传则读交易所当前杠杆",
+          "倍率 1–125，**默认 9x**。具体值由你按「合约钱包可用余额」与「本次信心」自主决定：" +
+          "confidence ≥0.75 且 1h 机会评分 ≥75 → 9–12x；0.6–0.75 / 60–75 → 6–9x；" +
+          "更低 → 3–6x。占用保证金 ≈ 总名义 ÷ 倍率，超过可用余额一半要主动降倍率或减名义。" +
+          "不传会按 9x 设置（不是沿用交易所旧值）",
       },
       stop_loss: { type: "number", description: "止损触发价（可选）" },
       take_profit: { type: "number", description: "止盈触发价（可选）" },
@@ -1063,6 +1074,12 @@ interface PaperStatusData {
     expires_at?: string | null;
   }>;
   cash: number;
+  /** 可用余额（已扣保证金与手续费）；旧脚本可能没有该字段 */
+  available?: number;
+  /** 占用保证金（持仓 + 未成交挂单） */
+  margin_used?: number;
+  /** 当前持仓倍率（无持仓为 null） */
+  leverage?: number | null;
   equity: number;
   return_pct: number;
   price: number;
@@ -1106,6 +1123,9 @@ function formatPaperStatus(data: PaperStatusData): string {
     )} · 权益 ${formatNumber(data.equity)}（${data.return_pct >= 0 ? "+" : ""}${formatNumber(
       data.return_pct,
     )}%）`,
+    `  可用 ${formatNumber(data.available ?? data.cash)} · ` +
+      `占用保证金 ${formatNumber(data.margin_used)}` +
+      (data.leverage ? ` · 持仓倍率 ${data.leverage}x` : ""),
   ];
 
   const pending = data.open_orders ?? [];
@@ -1184,7 +1204,12 @@ const paperOpenTool: ToolDefinition = {
   name: "btc_paper_open",
   modes: BTC_MODES,
   description:
-    "在模拟盘（虚拟账本）**挂限价单**：价格到达限价即视为全部成交（扣 0.05%）。" +
+    "在模拟盘（虚拟账本）**挂限价单**。**这是合约**：现金只占用保证金（名义 ÷ 倍率），" +
+    "所以下单前必须一起考虑**钱包余额与倍率** —— 倍率越高、同样名义占用的保证金越少，" +
+    "但强平风险同步放大。**默认 9x**（可用 leverage 覆盖，或设 BTC_PAPER_LEVERAGE），" +
+    "由你按可用余额与本次信心自主调整。" +
+    "余额不足会被拒绝，并给出「已挂单已占用多少、还差多少」。" +
+    "价格到达限价即视为全部成交（扣 0.05%）。" +
     "**限价已在市场另一侧时会挂出即成交**（真实交易所的吃单行为），成交价取限价与市价中更优者，" +
     "工具返回会明确区分「已成交」与「已挂单」。" +
     "**不涉及真钱**。同一时间只允许一个持仓、一张未成交挂单；开仓前说清方向、限价、名义金额、止损与依据。",
@@ -1237,12 +1262,20 @@ const paperOpenTool: ToolDefinition = {
       : `\n\n⚠ 与三周期方向闸门不符（实盘会被拒绝）：${gateDecision.message.split("\n")[0]}\n` +
         "  模拟盘照常放行，用于验证想法；真钱下单前请先让三周期同向。";
 
+    // 模拟盘是**合约**：倍率默认 9x（与实盘一致），未指定就交给计算层回落
+    // BTC_PAPER_LEVERAGE / 9x。不再去读实盘杠杆 —— 「默认 9x」必须是确定的数。
+    const leverage =
+      typeof args.leverage === "number" ? args.leverage : undefined;
+
     const result = await runRunner<{
       order_id: number;
       side: string;
       qty: number;
       limit_price: number;
       expires_at?: string;
+      leverage?: number;
+      /** 余额不足被自动提高倍率（调用方要显著提醒） */
+      leverage_auto?: boolean;
       status: PaperStatusData;
     }>("paper-open", {
       side,
@@ -1252,7 +1285,7 @@ const paperOpenTool: ToolDefinition = {
       reason: String(args.reason ?? ""),
       expires_min:
         typeof args.expires_min === "number" ? args.expires_min : undefined,
-      leverage: typeof args.leverage === "number" ? args.leverage : undefined,
+      leverage,
       mark_price: await fetchMarkPrice(),
     });
 
@@ -1285,6 +1318,14 @@ const paperOpenTool: ToolDefinition = {
         `模拟盘已挂${data.side === "long" ? "买" : "卖"}单 #${data.order_id}：` +
           `${data.qty} @ ${formatNumber(data.limit_price)}`,
         "  未成交前不算持仓；价格到达限价即视为全部成交（下次查看状态时结算）。",
+      );
+      lines.push(
+        `  倍率 ${data.leverage ?? data.status?.leverage ?? 1}x` +
+          (data.leverage_auto
+            ? "（余额不足，已自动提高；强平价更近）"
+            : "") +
+          ` · 占用保证金 ${formatNumber(data.status?.margin_used)} · ` +
+          `可用 ${formatNumber(data.status?.available ?? data.status?.cash)}`,
       );
       if (data.expires_at) {
         const clock = new Date(data.expires_at).toLocaleTimeString("zh-CN", {

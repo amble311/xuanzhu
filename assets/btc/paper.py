@@ -14,11 +14,14 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
 FEE_RATE = 0.0005
+#: 余额不足时自动提高倍率的上限（与 Node 侧 `MAX_AUTO_LEVERAGE` 一致）
+MAX_AUTO_LEVERAGE = 20.0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS paper_account (
@@ -369,6 +372,18 @@ def status(
             "unrealized_pct": round(unrealized / notional * 100, 2) if notional else 0.0,
         }
 
+    # 占用保证金 = 持仓占用 + 未成交挂单占用；「可用」就是 cash（已扣过占用）
+    pending_margin = 0.0
+    for row in conn.execute(
+        "SELECT notional, leverage FROM paper_orders WHERE status='open'"
+    ).fetchall():
+        pending_margin += float(row["notional"] or 0) / _lev(row["leverage"])
+    position_margin = (
+        float(account["entry_notional"]) / _lev(account["leverage"])
+        if account["side"]
+        else 0.0
+    )
+
     initial = float(account["initial_capital"])
     return {
         "symbol": symbol,
@@ -377,7 +392,10 @@ def status(
         "price_source": "mark" if _mark(mark) is not None else "close",
         "initial_capital": round(initial, 2),
         "cash": round(cash, 2),
+        "available": round(cash, 2),
         "equity": round(equity, 2),
+        "margin_used": round(position_margin + pending_margin, 2),
+        "leverage": _lev(account["leverage"]) if account["side"] else None,
         "return_pct": round((equity - initial) / initial * 100, 2) if initial else 0.0,
         "position": position,
         "open_orders": open_orders(conn),
@@ -424,7 +442,14 @@ def place_order(
     if pending is not None and int(pending["n"]) >= 5:
         raise RuntimeError("未成交挂单已有 5 张（多档上限），先撤掉不用的再挂")
 
-    lev = _lev(leverage)
+    # 模拟盘是**合约**：没有倍率就没有意义。优先级：
+    # 调用方显式给 → BTC_PAPER_LEVERAGE → 默认 9（与内置策略的 leverage=9 一致）
+    explicit_leverage = leverage is not None
+    lev = (
+        _lev(leverage)
+        if explicit_leverage
+        else _lev(os.getenv("BTC_PAPER_LEVERAGE") or 9)
+    )
     qty = notional / limit_price
     margin = notional / lev
     fee = notional * FEE_RATE
@@ -436,10 +461,35 @@ def place_order(
         "SELECT notional, leverage FROM paper_orders WHERE status='open'"
     ).fetchall():
         occupied += float(row["notional"] or 0) / _lev(row["leverage"])
+
+    # 余额不足且倍率是默认值（不是调用方指定）时，允许自动提高到刚好够开，上限 20x。
+    # 显式指定 5x 说明调用方想保守，不能悄悄改成 20x。
+    auto_bumped = False
+    need = 0.0
+    room = cash - occupied - fee
+    if room > 0 and notional > 0:
+        need = math.ceil(notional / room)
+    if occupied + margin + fee > cash + 1e-9 and not explicit_leverage:
+        if room > 0 and need <= MAX_AUTO_LEVERAGE and need > lev:
+            lev = float(need)
+            margin = notional / lev
+            auto_bumped = True
+
     if occupied + margin + fee > cash + 1e-9:
+        need_text = (
+            f"至少需要 {need:g}x（上限 {MAX_AUTO_LEVERAGE:g}x）"
+            if need > 0
+            else "可用余额不足以覆盖已挂单占用与手续费"
+        )
+        if explicit_leverage:
+            raise RuntimeError(
+                f"可用保证金不足：按你指定的 {lev:g}x 本单需 {margin:.2f}"
+                f"（名义 {notional:.2f}）+ 手续费 {fee:.2f}，已挂单占用 {occupied:.2f}，"
+                f"当前可用 {cash:.2f}；{need_text}，或减少名义金额。"
+            )
         raise RuntimeError(
-            f"可用保证金不足：按 {lev:g}x 本单需 {margin:.2f}（名义 {notional:.2f}）"
-            f" + 手续费 {fee:.2f}，已挂单占用 {occupied:.2f}，当前可用 {cash:.2f}"
+            f"可用保证金不足：{need_text}。名义 {notional:.2f}、手续费 {fee:.2f}、"
+            f"已挂单占用 {occupied:.2f}、当前可用 {cash:.2f} —— 请减少名义或先入金。"
         )
 
     minutes = 60.0
@@ -469,6 +519,8 @@ def place_order(
         "status": "open",
         "expires_at": expires_at,
         "leverage": lev,
+        # 余额不足被自动提上来的倍率（调用方要据此提醒「强平更近」）
+        "leverage_auto": auto_bumped,
     }
 
 

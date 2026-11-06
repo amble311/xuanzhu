@@ -189,12 +189,16 @@ interface PaperPanelData {
   price: number;
   initial_capital: number;
   cash: number;
+  available?: number;
+  margin_used?: number;
   equity: number;
   return_pct: number;
   position: {
     side: string;
     qty: number;
     entry_price: number;
+    /** 合约倍率（旧脚本可能没有） */
+    leverage?: number;
     unrealized: number;
     unrealized_pct: number;
     stop_price: number | null;
@@ -5369,7 +5373,10 @@ export class TuiApp {
           ` ${ansi.gray}权益${ansi.reset} ${amount(paper.equity)}` +
             `（${signed(paper.return_pct)}%）`,
         );
-        push(` ${ansi.gray}现金${ansi.reset} ${amount(paper.cash)}`);
+        push(
+          ` ${ansi.gray}可用${ansi.reset} ${amount(paper.available ?? paper.cash)}` +
+            `${ansi.gray} 占用${ansi.reset} ${amount(paper.margin_used ?? 0)}`,
+        );
         if (paper.position) {
           const position = paper.position;
           const tag =
@@ -5379,7 +5386,7 @@ export class TuiApp {
           push(
             ` ${ansi.gray}持仓${ansi.reset} ${tag} ${position.qty} @ ${amount(
               position.entry_price,
-            )}`,
+            )}${position.leverage ? ` ${position.leverage}x` : ""}`,
           );
           push(
             `${ansi.gray}    ${signed(position.unrealized)}（${signed(

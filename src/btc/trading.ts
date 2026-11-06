@@ -14,6 +14,12 @@ import { getBtcHome } from "../utils/paths";
 import { fetchAccountSnapshot } from "./account";
 import { appendAction } from "./actions";
 import { getCredential } from "./credentials";
+import {
+  MAX_AUTO_LEVERAGE,
+  maxNotionalFor,
+  requiredLeverageFor,
+  resolveLeverage,
+} from "./leverage";
 import { getSymbolFilters, quantizePrice, quantizeQty } from "./market-meta";
 import { computeExpiresAt } from "./order-ttl";
 import { readRiskSettings, readRiskState } from "./risk";
@@ -57,8 +63,8 @@ export interface OpenPositionInput {
   /** 多档限价：每档独立挂单、独立时效；适合「分批接」的策略 */
   orders?: OrderLeg[];
   /**
-   * 杠杆。缺省读交易所当前杠杆 —— 算保证金必须知道倍数，
-   * 按 1x 猜会把可用额度高估成 1/9。
+   * 倍率。缺省 **9x**（`BTC_LEVERAGE` 可覆盖），并由模型按「可用余额 + 本次信心」调整。
+   * 缺省时也会显式设置一次，避免「按 9x 算、实际是旧杠杆」。
    */
   leverage?: number;
   stopLoss?: number;
@@ -199,18 +205,33 @@ export async function openPosition(
   const credential = credentialOrThrow();
   const symbol = resolveSymbol();
 
-  // 杠杆：显式给了就用它，否则读交易所当前杠杆 —— 算保证金必须知道倍数
-  let leverage = input.leverage;
-  if (leverage !== undefined) {
-    if (!(leverage >= 1 && leverage <= 125)) {
-      throw new Error("杠杆必须在 1–125 之间");
+  // 倍率：默认 9x（用户设定），具体值由模型按「可用余额 + 本次信心」自主给。
+  // 缺省时**也要显式设置一次**：否则会按 9x 算保证金、实际杠杆却还是交易所的旧值
+  // （比如 5x），占用估算会偏小，平仓/强平判断全跟着错。
+  let leverage = resolveLeverage(input.leverage);
+  if (!(leverage >= 1 && leverage <= 125)) {
+    throw new Error("杠杆必须在 1–125 之间");
+  }
+
+  // 必须在算保证金**之前**把杠杆确定下来：设置失败时要退回实际杠杆重算，
+  // 否则会按 9x 估出一个偏小的占用，直到下单被交易所拒绝才发现。
+  const warnings: string[] = [];
+  let appliedLeverage = leverage;
+  try {
+    await setLeverage({ symbol, leverage }, credential);
+    if (input.leverage === undefined) {
+      warnings.push(`未指定倍率，按默认 ${leverage}x 设置（可用 leverage 参数覆盖）`);
     }
-  } else {
-    const current = await fetchLeverage({ symbol }, credential).catch(() => 0);
-    if (!(current > 0)) {
-      throw new Error("无法读取当前杠杆，请显式给 leverage（1–125）后再下单");
+  } catch (err) {
+    warnings.push(
+      `设置 ${leverage}x 失败：${err instanceof Error ? err.message : String(err)}`,
+    );
+    const actual = await fetchLeverage({ symbol }, credential).catch(() => 0);
+    if (actual > 0 && actual !== leverage) {
+      leverage = actual;
+      appliedLeverage = actual;
+      warnings.push(`已按交易所实际 ${actual}x 计算保证金`);
     }
-    leverage = current;
   }
 
   const filters = await getSymbolFilters(symbol);
@@ -238,32 +259,63 @@ export async function openPosition(
     );
   }
   const available = snapshot.wallet?.available ?? 0;
-  const required = totalNotional / leverage;
   const fee = totalNotional * FEE_RATE;
   // 留 5% 缓冲：手续费、价格波动、资金费都会吃到保证金
   const budget = available * 0.95;
-  if (required + fee > budget) {
-    const maxNotional = (budget * leverage) / (1 + FEE_RATE * leverage);
-    throw new Error(
-      `保证金不足：这批挂单总名义 ${totalNotional.toFixed(2)} USDT，` +
-        `按 ${leverage}x 需要 ${required.toFixed(2)} + 手续费约 ${fee.toFixed(2)}，` +
-        `可用 ${available.toFixed(2)}（留 5% 后 ${budget.toFixed(2)}）。` +
-        `当前杠杆下最多可开约 ${maxNotional.toFixed(2)} USDT 名义 —— ` +
-        "请减少档位/名义、提高杠杆（风险更高），或先平掉部分仓位。",
-    );
-  }
+  let required = totalNotional / leverage;
 
-  const warnings: string[] = [];
-  let appliedLeverage = leverage;
-  if (input.leverage !== undefined) {
-    try {
-      await setLeverage({ symbol, leverage: input.leverage }, credential);
-    } catch (err) {
-      // 杠杆设置失败不阻断下单：可能是已有持仓不允许改，报出来让用户判断
+  if (required + fee > budget) {
+    // 用户设定：余额不足时允许**自动提高倍率**去够到可开仓，但硬上限 20x。
+    // 只在没显式指定倍率时自动提；显式给了 5x 就说明模型想要保守，不能悄悄改成 20x。
+    const need = requiredLeverageFor(totalNotional, budget, FEE_RATE);
+    const canAuto = input.leverage === undefined;
+
+    if (canAuto && need <= MAX_AUTO_LEVERAGE) {
+      try {
+        await setLeverage({ symbol, leverage: need }, credential);
+      } catch (err) {
+        throw new Error(
+          `保证金不足，尝试自动把倍率提高到 ${need}x 失败：` +
+            `${err instanceof Error ? err.message : String(err)}。` +
+            "请手动降低名义金额或先入金。",
+        );
+      }
+      const previous = leverage;
+      leverage = need;
+      appliedLeverage = need;
+      required = totalNotional / leverage;
       warnings.push(
-        `设置杠杆失败：${err instanceof Error ? err.message : String(err)}`,
+        `余额不足：倍率已从 ${previous}x 自动提高到 ${need}x（上限 ${MAX_AUTO_LEVERAGE}x）。` +
+          "强平价会同步拉近，务必按新倍率重算风险。",
+      );
+    } else if (canAuto) {
+      const maxNotional = maxNotionalFor(budget, MAX_AUTO_LEVERAGE, FEE_RATE);
+      throw new Error(
+        `保证金不足：这批挂单总名义 ${totalNotional.toFixed(2)} USDT，` +
+          `即使按上限 ${MAX_AUTO_LEVERAGE}x 也开不了（需要 ${need}x）。` +
+          `可用 ${available.toFixed(2)}，${MAX_AUTO_LEVERAGE}x 下最多可开约 ` +
+          `${maxNotional.toFixed(2)} USDT 名义 —— 请减少档位/名义或先入金。`,
+      );
+    } else {
+      const maxNotional = maxNotionalFor(budget, MAX_AUTO_LEVERAGE, FEE_RATE);
+      throw new Error(
+        `保证金不足：这批挂单总名义 ${totalNotional.toFixed(2)} USDT，` +
+          `按你指定的 ${leverage}x 需要 ${required.toFixed(2)} + 手续费约 ${fee.toFixed(2)}，` +
+          `可用 ${available.toFixed(2)}。至少需要 ${need}x（上限 ${MAX_AUTO_LEVERAGE}x）` +
+          `或把名义降到 ${maxNotional.toFixed(2)} USDT 以内；显式倍率不会被自动改写。`,
       );
     }
+  }
+
+  const usage = available > 0 ? (required + fee) / available : 0;
+  if (usage > 0.5) {
+    // 超过一半可用余额去占保证金时，留给波动与追加的空间已经很小 ——
+    // 这时候「倍率再高一点就能开」是错觉，先提醒降倍率/减名义。
+    warnings.push(
+      `保证金占用约 ${(usage * 100).toFixed(0)}% 可用余额` +
+        `（${(required + fee).toFixed(2)}/${available.toFixed(2)}）：` +
+        "已超过一半，建议降倍率或减少名义",
+    );
   }
 
   const side: OrderSide = input.side === "long" ? "BUY" : "SELL";
