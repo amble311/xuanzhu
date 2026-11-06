@@ -357,6 +357,8 @@ export class TuiApp {
     /** 观察（真实账户）还是模拟盘 —— 决定右栏展示哪套数据 */
     role: "live" | "paper";
     ticker: { price: number; changePct: number } | null;
+    /** 取价失败的原因（面板直接显示，别让它只显示「不可用」） */
+    tickerError?: string;
     /** 后端是否被 `/stop` 暂停 */
     paused: boolean;
     account: AccountSnapshot | null;
@@ -375,6 +377,9 @@ export class TuiApp {
     nextTriggerEvalAt?: string;
     /** 后端进程是否在跑（旧版后端不会上报 nextTriggerEvalAt，需要区分「没跑」与「没上报」） */
     backendRunning: boolean;
+    /** 行情连续失败次数（后端 health check 上报） */
+    marketFailures?: number;
+    lastMarketError?: string;
     /** 最近几条真实交易动作（实盘用；模拟盘看 paper.recent_trades） */
     actions: BtcAction[];
   };
@@ -5232,10 +5237,17 @@ export class TuiApp {
     try {
       const symbol = process.env.BTC_SYMBOL?.trim() || "BTC/USDT";
       const role = currentScheduleRole();
+      let tickerError: string | undefined;
       const ticker = await activeExchange()
         .exchange.fetchTicker(symbol)
-        .catch(() => null);
+        .catch((err: unknown) => {
+          // 记下原因：面板只写「不可用」时，用户与我们都无法判断是网络、
+          // 代理还是接口变更 —— 那是最难排查的一类问题。
+          tickerError = err instanceof Error ? err.message : String(err);
+          return null;
+        });
 
+      const backend = liveBackend(this.cwd, role);
       const base = {
         updatedAt: Date.now(),
         paused: readPause(this.cwd).paused,
@@ -5243,13 +5255,16 @@ export class TuiApp {
         ticker: ticker
           ? { price: ticker.price, changePct: ticker.changePct }
           : null,
+        tickerError,
         queue: readScheduleQueue(this.cwd, role),
         riskState: readRiskState(this.cwd),
         riskSettings: readRiskSettings(this.cwd),
         triggers: readTriggers(this.cwd, role),
         // 后端把「下次评估时间」写进 state；旧版后端没有这个字段，面板要能区分「没跑」与「没上报」
-        nextTriggerEvalAt: liveBackend(this.cwd, role)?.nextTriggerEvalAt,
-        backendRunning: liveBackend(this.cwd, role) !== null,
+        nextTriggerEvalAt: backend?.nextTriggerEvalAt,
+        backendRunning: backend !== null,
+        marketFailures: backend?.marketFailures ?? 0,
+        lastMarketError: backend?.lastMarketError,
         actions: readActions(this.cwd).slice(-4).reverse(),
       };
 
@@ -5359,7 +5374,10 @@ export class TuiApp {
           `${up ? ansi.green : ansi.red}${signed(data.ticker.changePct)}%${ansi.reset}`,
       );
     } else {
-      push(`${ansi.gray} 价格 —（行情接口不可用）${ansi.reset}`);
+      const reason = data.tickerError
+        ? `：${truncate(data.tickerError, Math.max(12, width - 18))}`
+        : "";
+      push(`${ansi.gray} 价格 —（行情接口不可用${reason}）${ansi.reset}`);
     }
     divider();
 
@@ -5501,6 +5519,18 @@ export class TuiApp {
           `${ansi.gray}  …还有 ${data.triggers.length - 2} 条，/monitor 看全部${ansi.reset}`,
         );
       }
+    }
+    // 行情故障要显眼：它会让所有「基于价格」的结论失效，而面板其他数字看起来都正常
+    if ((data.marketFailures ?? 0) > 0) {
+      push(
+        `${ansi.yellow} 行情连续失败 ${data.marketFailures} 次${ansi.reset}` +
+          (data.lastMarketError
+            ? `${ansi.gray}：${truncate(
+                data.lastMarketError,
+                Math.max(10, width - 20),
+              )}${ansi.reset}`
+            : ""),
+      );
     }
 
     divider();

@@ -57,6 +57,12 @@ export interface BackendState {
   lastSyncAt?: string;
   lastSyncWritten?: number;
   lastError?: string | null;
+  /** 连续行情获取失败次数（ticker 健康检查 + K 线同步，任一成功即清零） */
+  marketFailures?: number;
+  /** 最近一次行情失败的原因 */
+  lastMarketError?: string;
+  /** 行情最近一次成功的时间（ISO） */
+  lastMarketOkAt?: string;
 }
 
 export interface BackendPaths {

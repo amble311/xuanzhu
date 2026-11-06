@@ -35,6 +35,10 @@ import {
   type PaperOpenOrder,
 } from "./order-ttl";
 import {
+  MARKET_HEALTH_INTERVAL_MS,
+  shouldAlertMarket,
+} from "./market-health";
+import {
   describeHit,
   evaluateTriggersDetailed,
   indicatorKey,
@@ -526,6 +530,8 @@ export async function runBtcBackend(
       triggerNote?: string;
       /** 超时挂单的明细（注入提示词） */
       orderNote?: string;
+      /** 行情获取连续失败的说明（注入提示词，要求排查原因） */
+      marketNote?: string;
     } | null,
   ): Promise<boolean> => {
     lastAttemptAt = Date.now();
@@ -544,6 +550,7 @@ export async function runBtcBackend(
       riskAlert,
       triggerNote: trigger?.triggerNote,
       orderNote: trigger?.orderNote,
+      marketNote: trigger?.marketNote,
     });
     if (result.ok && riskAlert) markRiskDelivered(home);
     state.riskTriggered = riskState.triggered;
@@ -623,6 +630,52 @@ export async function runBtcBackend(
    * 也会把巡检兜底的 `lastAttemptAt` 提前，导致「队列空也不兜底」。
    */
   let lastSyncAttemptAt = 0;
+
+  // ── 行情健康：连续失败要叫醒模型排查（用户设定：连续两次） ──
+  let marketFailures = 0;
+  let marketAlerted = false;
+  let lastMarketHealthAt = 0;
+  let lastMarketOkAt: string | undefined;
+  let lastMarketError: string | undefined;
+
+  const recordMarketOk = (): void => {
+    marketFailures = 0;
+    marketAlerted = false;
+    lastMarketError = undefined;
+    lastMarketOkAt = new Date().toISOString();
+    state.marketFailures = 0;
+    state.lastMarketError = undefined;
+    state.lastMarketOkAt = lastMarketOkAt;
+  };
+
+  const recordMarketFail = (error: string): void => {
+    marketFailures += 1;
+    lastMarketError = error;
+    state.marketFailures = marketFailures;
+    state.lastMarketError = error;
+    log(`行情获取失败（连续 ${marketFailures} 次）：${error}`);
+  };
+
+  /**
+   * 每 5 分钟探一次行情（ticker）。
+   *
+   * 与 K 线同步共用同一个失败计数器：只盯同步的话，最坏要 30 分钟才发现故障；
+   * 只盯 ticker 的话，K 线接口单独坏掉又看不出来。
+   */
+  const checkMarketHealth = async (now: number): Promise<void> => {
+    if (now - lastMarketHealthAt < MARKET_HEALTH_INTERVAL_MS) return;
+    lastMarketHealthAt = now;
+    try {
+      const ticker = await activeExchange(home).exchange.fetchTicker(
+        process.env.BTC_SYMBOL?.trim() || "BTC/USDT",
+      );
+      if (!(ticker.price > 0)) throw new Error("返回的价格不是正数");
+      recordMarketOk();
+    } catch (err) {
+      recordMarketFail(err instanceof Error ? err.message : String(err));
+    }
+    writeBackendState(home, state);
+  };
   const runSyncIfDue = async (now: number): Promise<boolean> => {
     const last = Math.max(
       state.lastSyncAt ? Date.parse(state.lastSyncAt) : 0,
@@ -635,11 +688,13 @@ export async function runBtcBackend(
     state.cycles = (state.cycles ?? 0) + 1;
     if (result.error) {
       state.lastError = result.error;
+      recordMarketFail(result.error);
       log(`同步失败：${result.error}`);
     } else {
       state.lastError = null;
       state.lastSyncAt = new Date().toISOString();
       state.lastSyncWritten = result.written;
+      recordMarketOk();
       log(`同步完成，写入 ${result.written} 根`);
     }
     writeBackendState(home, state);
@@ -685,9 +740,40 @@ export async function runBtcBackend(
     // 同步与巡检模式无关：巡检模式下模型不一定每轮都 btc_sync，
     // 而所有指标都读本地库 —— 数据过期等于策略算错。
     await runSyncIfDue(now);
+    // 行情健康与巡检模式无关：数据拉不到时，任何结论都建立在旧 K 线上
+    await checkMarketHealth(now);
 
     if (!inspectEnabled) {
       refreshQueueState();
+      return;
+    }
+
+    // 连续两次拿不到行情 → 叫醒模型排查（用户设定：不是等下一次常规巡检，
+    // 那可能是几小时后，期间还可能按旧数据下单）
+    if (shouldAlertMarket(marketFailures, marketAlerted)) {
+      if (!monitorWakeAllowed(now)) {
+        log("行情故障叫醒已达 10 分钟上限，本轮跳过");
+        refreshQueueState();
+        return;
+      }
+      running = true;
+      let ok = false;
+      try {
+        ok = await runInspect({
+          reason: `行情获取连续失败 ${marketFailures} 次`,
+          marketNote:
+            `连续失败 ${marketFailures} 次；最近错误：${lastMarketError ?? "未知"}\n` +
+            `最后一次成功：${lastMarketOkAt ?? "启动以来没有成功过"}`,
+        });
+      } catch (err) {
+        state.lastError = err instanceof Error ? err.message : String(err);
+        log(`巡检异常：${state.lastError}`);
+      } finally {
+        running = false;
+        refreshQueueState();
+      }
+      // 只有巡检真的跑成功才标记「已叫醒」；失败则下一轮再叫
+      if (ok) marketAlerted = true;
       return;
     }
 

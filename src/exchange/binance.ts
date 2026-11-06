@@ -1,4 +1,8 @@
-import { fetch as undiciFetch } from "undici";
+import {
+  fetch as undiciFetch,
+  ProxyAgent,
+  type Dispatcher,
+} from "undici";
 import type {
   ExchangeAdapter,
   FetchKlinesOptions,
@@ -24,6 +28,74 @@ import { intervalMs } from "./types";
  */
 function runtimeFetch(): typeof undiciFetch {
   return (globalThis as { fetch?: typeof undiciFetch }).fetch ?? undiciFetch;
+}
+
+/** shell 里配置的代理（很多环境靠它，而 Node 原生 fetch 不认这些变量） */
+function firstProxyEnv(): string | undefined {
+  for (const key of ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]) {
+    const value = process.env[key]?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
+
+let envDispatcher: Dispatcher | undefined;
+let envDispatcherUrl: string | undefined;
+
+/** 懒建一个走 env 代理的 fetch（同一代理复用连接池，不每次新建 Agent） */
+function envProxyFetch(): typeof undiciFetch | null {
+  const proxy = firstProxyEnv();
+  if (!proxy) return null;
+  if (!envDispatcher || envDispatcherUrl !== proxy) {
+    envDispatcher = new ProxyAgent(proxy);
+    envDispatcherUrl = proxy;
+  }
+  const dispatcher = envDispatcher;
+  return ((input, init) =>
+    undiciFetch(input, {
+      ...(init ?? {}),
+      dispatcher,
+    })) as typeof undiciFetch;
+}
+
+/**
+ * 交易所请求：**先直连，失败再走 shell 代理**。
+ *
+ * 为什么不在 `applyProxyConfig` 里统一回落：那会影响模型请求（本地端点、国内 API
+ * 可能反而不该走代理）。交易所行情是明确的外部地址，按需回退最安全 ——
+ * 也不会因为「全局关了代理」就把行情一起关死。
+ */
+let preferProxy = false;
+
+async function request(
+  url: URL,
+  init: Parameters<typeof undiciFetch>[1],
+): Promise<Awaited<ReturnType<typeof undiciFetch>>> {
+  const direct = runtimeFetch();
+
+  if (preferProxy) {
+    const proxied = envProxyFetch();
+    if (proxied) {
+      try {
+        return await proxied(url, init);
+      } catch (err) {
+        // 代理挂了就回到直连，别把「代理不可用」变成「行情永久不可用」
+        preferProxy = false;
+        throw err;
+      }
+    }
+    preferProxy = false;
+  }
+
+  try {
+    return await direct(url, init);
+  } catch (err) {
+    const proxied = envProxyFetch();
+    if (!proxied) throw err;
+    // 直连失败一次就记住：后续直接走代理，避免每次刷新都先等一遍 10s 超时
+    preferProxy = true;
+    return await proxied(url, init);
+  }
 }
 
 const SPOT_BASE = "https://api.binance.com";
@@ -87,7 +159,7 @@ export const binanceExchange: ExchangeAdapter = {
     const url = new URL(`${base}${ticker}`);
     url.searchParams.set("symbol", binanceExchange.toNativeSymbol(symbol));
 
-    const response = await runtimeFetch()(url, {
+    const response = await request(url, {
       signal: AbortSignal.timeout(options.timeoutMs ?? 15_000),
       headers: { "user-agent": "xzh-btc/1.0" },
     });
@@ -129,7 +201,7 @@ export const binanceExchange: ExchangeAdapter = {
       if (cursor > 0) url.searchParams.set("startTime", String(cursor));
       if (options.endMs) url.searchParams.set("endTime", String(options.endMs));
 
-      const response = await runtimeFetch()(url, {
+      const response = await request(url, {
         signal: AbortSignal.timeout(timeoutMs),
         headers: { "user-agent": "xzh-btc/1.0" },
       });

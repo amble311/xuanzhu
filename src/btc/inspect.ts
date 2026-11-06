@@ -7,6 +7,7 @@ import { createBtcMode } from "../modes";
 import { getBtcHome } from "../utils/paths";
 import { fetchAccountSnapshot } from "./account";
 import { readActions, updateAction } from "./actions";
+import { canAutoApproveUnattended } from "./unattended";
 import { appendInspectEvent } from "./inspect-stream";
 import { buildPreflight } from "./preflight";
 import { readPolicy } from "./policy";
@@ -18,8 +19,8 @@ import { readPolicy } from "./policy";
  * 结束时由模型自己通过 `btc_schedule` 决定下次什么时候再看，而不是死板地每 15 分钟一次。
  *
  * 三条硬约束（都靠代码，不靠提示词）：
- * 1. `confirm: () => false` —— 后台无人值守，任何需要用户批准的操作一律拒绝。
- *    将来接入下单工具时，模型无法在半夜自己批准一笔真实交易；
+ * 1. 无人值守白名单（`unattended.ts`）—— 交易动作直接放行（用户要求「自主决策到底」），
+ *    清账本 / 资金划转 / 写文件 / 执行命令仍需确认 → 一律拒绝；
  * 2. 不写会话、不写自动记忆、不维护任务账本（`sessionFile` / `autoMemory` /
  *    `taskLedger` 全关）：巡检是独立轮次，攒历史只会把上下文撑爆；
  * 3. 工具轮数有上限，避免「再查一次就好」把一轮巡检跑成几十次调用。
@@ -30,9 +31,20 @@ const DEFAULT_TIMEOUT_MS = 8 * 60_000;
 /** 巡检结论写进状态/日志时截断到这个长度，避免把整段分析塞进 state */
 export const SUMMARY_LIMIT = 600;
 
-const INSPECT_PROMPT = `你现在处于**后台巡检**：没有用户在终端前，只有这一轮机会。
+const INSPECT_PROMPT = `你现在处于**后台巡检 / 无人值守**：没有用户在终端前，也没有人会回答你的提问。
+这一轮你必须**自主决策到底** —— 该开就开、该平就平、该撤就撤，直接调用工具执行；
+不要写「请确认」「等你回复」（没有人会回），也不要只给方案不执行。
 
 任务：判断当前是否有值得执行的 BTC 交易机会，并决定下次巡检时间。
+
+无人值守规则：
+- 交易动作（btc_order / btc_close / btc_cancel / btc_renew / 排期 / 叫醒条件）**已获授权**，
+  不经确认直接执行；
+- 硬性风控、三周期方向闸门、保证金与倍率校验仍是**代码强制**：被拒绝时看懂原因再决定，
+  不要反复重试同一条被拒的操作；
+- 需要取舍时按最保守的方案执行，并在结论里写明理由（为什么开 / 为什么不做 / 为什么减仓）；
+- 确实缺外部条件（凭据失效、交易所故障、资金不足且无法降档）时，明确写「需要用户处理什么」，
+  并把下次巡检排近一点；**不要假装执行过**（结论里不能出现没调用过的成交）。
 
 步骤（btc_* 工具可用）：
 1. 先 \`btc_status\` 看环境与数据新鲜度；数据落后就 \`btc_sync\`。
@@ -95,6 +107,8 @@ export interface InspectOptions {
    * 需要模型给出「撤单 / 改价 / 继续等」的明确处理，而不是当普通巡检走过场。
    */
   orderNote?: string;
+  /** 行情获取连续失败的说明：要求先排查原因，修好前不交易 */
+  marketNote?: string;
 }
 
 export interface InspectResult {
@@ -201,8 +215,9 @@ export async function runInspectCycle(
       log(`  ${message}`);
       emit("notice", message);
     },
-    // 后台无人值守：需要确认的操作一律拒绝（这是代码级闸门，不依赖提示词）
-    confirm: async () => false,
+    // 无人值守：交易动作（下单/平仓/撤单/续期/排期/叫醒条件）直接放行 ——
+    // 用户不在旁边，等确认等于永远不执行。其余需要确认的操作仍拒绝（清账本、划转、写文件）。
+    confirm: async (request) => canAutoApproveUnattended(request.tool),
     onRoundLimit: async () => false,
   };
 
@@ -250,6 +265,17 @@ export async function runInspectCycle(
       }\n- 本轮**禁止开新仓**；先判断现有持仓该持有、减仓还是平仓。\n- 必须用 \`btc_policy\` 落盘**调整后的策略**（例如降低单笔风险、只在趋势确认时才交易），\n  让接下来的巡检按新约束执行，而不是继续用原来那套。\n- 结论开头写明「已按硬性风控重估策略」。`
     : "";
 
+  // 行情拉不到时，所有基于价格的结论都不可信 —— 这一轮以「修数据」为目标
+  const marketSection = options.marketNote
+    ? `\n\n## 行情获取连续失败（需要你排查并修复）\n${options.marketNote}\n` +
+      "- 先定位原因再谈策略：`btc_status` 看数据新鲜度与 `lastError`，`btc_price` 试实时价；\n" +
+      "  必要时用 bash 测网络与代理（curl 交易所接口、检查 `HTTPS_PROXY` / `xzh vpn` 配置）；\n" +
+      "- 常见原因：代理没开或规则不对、DNS/网络中断、交易所限频（418/429）、本机时间偏差过大；\n" +
+      "- **修好之前不要下单**：行情不可用时三周期评分、止损价、挂单时效全部不可信；\n" +
+      "- 能自己修的修（重试 `btc_sync`、切换代理、等限频恢复），修不了的明确告诉用户要做什么；\n" +
+      "- 没重新取到价格之前，不要说「已恢复」。"
+    : "";
+
   // 挂单超时要给出明确处理，不能当普通巡检走过去
   const orderSection = options.orderNote
     ? `\n\n## 挂单已超时（需要你处理）\n${options.orderNote}\n` +
@@ -276,6 +302,7 @@ export async function runInspectCycle(
       INSPECT_PROMPT +
         (options.paper ? PAPER_PROMPT_SECTION : "") +
         preflightSection +
+        marketSection +
         orderSection +
         policySection +
         riskSection +
