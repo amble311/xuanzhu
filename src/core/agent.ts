@@ -560,7 +560,8 @@ export class Agent {
   private readonly config: XuanZhuConfig;
   private cwd: string;
   /** 专用模式（`xzh btc`）；普通模式为 undefined */
-  private readonly mode?: AgentMode;
+  /** 当前模式；`/btc` 会在运行中替换它（见 `setMode`），所以不能是 readonly */
+  private mode?: AgentMode;
   private readonly events: AgentEvents;
   private systemPrompt: string;
   /** 是否已就「系统提示词撑满窗口」提示过（避免每条消息都刷一遍） */
@@ -1642,6 +1643,19 @@ export class Agent {
   /** 当前工作目录 */
   getCwd(): string {
     return this.cwd;
+  }
+
+  /**
+   * 切换模式（工具集 / 系统提示词随之变化）。
+   *
+   * 用于 `/btc`：在不重启进程的前提下进入专用模式。目录要由调用方**先切**——
+   * 因为 `setCwd` 会拒绝「模式锁定目录但目标不一致」的切换，顺序反了就静默不生效。
+   */
+  setMode(mode: AgentMode | undefined): void {
+    this.mode = mode;
+    this.systemPrompt = this.composeSystemPrompt();
+    this.task = undefined;
+    this.taskLoaded = false;
   }
 
   /** 切换工作目录：更新工具上下文、项目规则与系统提示词（保留对话历史） */

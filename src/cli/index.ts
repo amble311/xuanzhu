@@ -33,6 +33,7 @@ import { promptCommand } from "./commands/prompt";
 import { autonomyCommand } from "./commands/autonomy";
 import { setupCommand } from "./commands/setup";
 import { vpnCommand } from "./commands/vpn";
+import { gatewayCommand } from "./gateway";
 import { skillCommand } from "./commands/skill";
 import { recordErrorReport } from "../utils/error-reports";
 import {
@@ -233,6 +234,9 @@ async function main(): Promise<void> {
       return;
     case "vpn":
       await vpnCommand(args.slice(1));
+      return;
+    case "gateway":
+      await gatewayCommand(args.slice(1));
       return;
     case "device":
       await deviceCommand(args.slice(1));
@@ -525,6 +529,7 @@ ${ansi.bold}用法${ansi.reset}
   ${ansi.green}xzh config path${ansi.reset}         打印配置文件路径
   ${ansi.green}xzh config init${ansi.reset}         生成默认配置文件
   ${ansi.green}xzh vpn${ansi.reset}                 交互式设置 / 探测 / 测试全局 HTTP(S)/SOCKS5 代理
+  ${ansi.green}xzh gateway${ansi.reset}             启动常驻 gateway（stop / restart / status / autostart）
   ${ansi.green}xzh setup${ansi.reset}               检查并安装依赖（剪贴板工具 + 技能 CLI）
   ${ansi.green}xzh init${ansi.reset}                搭建 AGENTS.md 与 docs/ 初始框架（确定性，不调用模型）
   ${ansi.green}xzh init --dry-run${ansi.reset}      只预览将生成的内容，不写文件

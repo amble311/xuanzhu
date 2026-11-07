@@ -4,6 +4,8 @@
 
 ## [未发布]
 
+## [0.14.1] — 2026-11-07
+
 ## [0.14.0] — 2026-11-06
 
 ## [0.13.0] — 2026-11-06
@@ -15,6 +17,20 @@
 ## [0.10.0] — 2026-11-05
 
 ### 新增
+
+- **`xzh gateway` 常驻服务**：把「在 `~/.xzh_gateway` 里启动 xzh」做成后台服务，
+  为将来对接微信频道留入口。
+  - `xzh gateway` 启动（detached，`stdio` 接日志）、`stop` 停止（SIGTERM → 5 秒后 SIGKILL）、
+    `restart` 重启、`status` 查看、`autostart [on|off]` 开关自启；
+  - **常驻语义**：进程忽略 SIGHUP，关终端 / SSH 断线不退出；没有 TUI，也就没有 `quit`/`exit`
+    能让它消失；`run/gateway.lock` 原子抢锁保证单实例，状态 `updatedAt` 每 30 秒心跳；
+  - **本地接口**（127.0.0.1:17890，`XZH_GATEWAY_PORT` 可改）：`GET /health`、
+    `POST /message`（`{"text":"..."}` → Agent 回复，串行处理）、`POST /shutdown`；
+  - **开机自启**：首次启动（默认目录）写 `~/.config/systemd/user/xzh-gateway.service` 并
+    `systemctl --user enable`，`Restart=always`；无 systemd 只提示不阻断；
+    自定义 `XZH_GATEWAY_HOME` 时不装自启（调试/多实例不该改写系统服务）；
+  - `confirm` 目前恒拒绝并说明原因（gateway 无交互式确认通道），未来接频道时在这处换成
+    「发消息问用户」。
 
 - **面板长条件折行 + `/monitor` 命令**：监控描述（尤其公式与链式）超过右栏宽度时按显示宽度
   折行（每条最多 3 行、续行缩进），不再被 `truncate` 截掉后半段；新增 `/monitor` 直接把
@@ -97,6 +113,15 @@
     （关键价位/指标）+ 有挂单时确认时效（继续等就 `btc_renew`）。
 
 ### 修复
+
+- **对话内 `/btc [moni]` 直接切模式**：以前进 btc 只能退出后跑 `xzh btc` / `xzh btc moni`。
+  现在普通对话里 `/btc` 切实盘、`/btc moni` 切模拟盘、`/btc off` 回到原项目：
+  - 工作目录切到 `~/.btc`（`switchDirectory` 复用原有逻辑：项目目录、会话、记忆一起切）；
+  - `XZH_BTC_ROLE` 跟着设成 `live` / `paper`，面板与排期读对应那一套；
+  - 计算脚本按指纹补释放一次（不走启动流程，缺资产会「未知命令」）；
+  - **不自动拉起常驻后端** —— 拉起会立刻开始无人值守巡检（现在可下真单），
+    只是切视图不该触发；需要巡检时显式 `xzh btc serve` 或退出重进；
+  - 顺序上先切目录再换模式：反过来会踩 `setCwd` 的 cwdLocked 闸门，目录静默不切。
 
 - **后台巡检改为「无人值守自主决策」**：以前巡检的 `confirm` 恒为 `false`，模型看到机会也
   执行不了（只能写方案等一个不会出现的确认）。用户要求「被唤醒时自主决策到底」，现在：

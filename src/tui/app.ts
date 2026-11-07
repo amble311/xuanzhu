@@ -12,6 +12,7 @@ import {
 } from "../core/prompt";
 import type { AskUserAnswer, AskUserRequest } from "../tools/types";
 import type { AgentMode } from "../modes";
+import { createBtcMode } from "../modes/btc";
 import { activeExchange } from "../exchange";
 import { fetchAccountSnapshot, type AccountSnapshot } from "../btc/account";
 import { runRunner } from "../btc/python";
@@ -89,7 +90,7 @@ import {
   sniffImageMime,
   type ClipboardImage,
 } from "../utils/clipboard";
-import { expandHome, getConfigDir } from "../utils/paths";
+import { expandHome, getBtcHome, getConfigDir } from "../utils/paths";
 import { VERSION } from "../utils/version";
 import { composeHeaderBlocks } from "./header-layout";
 import {
@@ -345,7 +346,10 @@ export class TuiApp {
   private readonly markdown = new MarkdownRenderer();
   private cwd: string;
   /** 专用模式（`xzh btc`）；普通模式为 undefined */
-  private readonly mode?: AgentMode;
+  /** 当前模式；`/btc` 会在运行中替换它（所以不能是 readonly） */
+  private mode?: AgentMode;
+  /** `/btc` 切进来之前的工作目录，`/btc off` 用它回去 */
+  private btcReturnCwd?: string;
   /**
    * btc 模式右侧仪表盘的数据快照。
    *
@@ -2959,6 +2963,19 @@ export class TuiApp {
       case "cwd":
         this.lines.push(`${ansi.gray}${this.cwd}${ansi.reset}`);
         break;
+      case "btc": {
+        const sub = arg.trim().toLowerCase();
+        if (sub === "off" || sub === "exit") {
+          this.switchBackFromBtc();
+        } else if (sub === "" || sub === "moni" || sub === "paper") {
+          this.switchToBtc(sub !== "");
+        } else {
+          this.lines.push(
+            `${ansi.gray}用法：/btc（实盘）· /btc moni（模拟盘）· /btc off（回到原项目）${ansi.reset}`,
+          );
+        }
+        break;
+      }
       case "switch": {
         if (!arg) {
           this.lines.push(`${ansi.gray}当前目录：${this.cwd}${ansi.reset}`);
@@ -3844,6 +3861,79 @@ export class TuiApp {
    * 在新项目里聊的内容会一直记在原项目名下，从新项目里永远 `/resume` 不到。
    * 代价是当前对话就此中断：它已增量存档在原项目的会话文件里，切回去即可找回。
    */
+  /**
+   * `/btc [moni]`：把当前会话切进 btc 专用模式，不重启进程。
+   *
+   * 顺序是硬要求：**先切目录，再换模式**。反过来会踩 `setCwd` 的 cwdLocked 闸门
+   * （btc 模式锁定 `~/.btc`，而此刻 cwd 还是原项目）→ 目录静默不切，模式却已生效，
+   * 结果「提示切过去了，工具在看错误的目录」。
+   *
+   * 刻意**不自动拉起常驻后端**：拉起进程会立刻开始自主巡检（现在是无人值守可下单），
+   * 用户只是切个视图不该触发真钱动作。要跑巡检就显式 `xzh btc serve` 或退出重进。
+   */
+  private switchToBtc(paper: boolean): void {
+    const home = getBtcHome();
+    const role = paper ? "paper" : "live";
+    if (this.mode?.name === "btc") {
+      this.lines.push(
+        `${ansi.gray}已在 ${paper ? "BTC 模拟盘" : "BTC 量化交易"} 模式` +
+          `${paper ? "（/btc moni）" : ""}；/btc off 可回到原项目${ansi.reset}`,
+      );
+      this.scheduleRender();
+      return;
+    }
+
+    this.btcReturnCwd = this.cwd;
+    // 1) 先切目录（此时还是普通模式，setCwd 不会被锁）
+    this.switchDirectory(home);
+    // 2) 再换模式（角色环境变量决定 schedule / 面板读哪套数据）
+    process.env.XZH_BTC_ROLE = role;
+    const mode = createBtcMode({ paper });
+    this.mode = mode;
+    this.agent.setMode(mode);
+    // 计算脚本按内容指纹释放：切换不走启动流程，这里补一次（缺资产会「未知命令」）
+    try {
+      mode.bootstrap?.(home);
+    } catch {
+      // 释放失败不阻断：btc_status 会显示环境未就绪
+    }
+
+    this.lines.push(
+      `${ansi.green}✓ 已切换到 ${mode.label}${ansi.reset}` +
+        `${ansi.gray}（工作目录 ${home}，不可 /switch；/btc off 返回原项目）${ansi.reset}`,
+    );
+    if (!liveBackend(home, role)) {
+      this.lines.push(
+        `${ansi.yellow}  常驻后端未运行${ansi.reset}${ansi.gray}：切模式不会自动拉起进程；` +
+          `需要自主巡检时执行 ${ansi.reset}xzh btc serve${ansi.gray}（或退出重进）。${ansi.reset}`,
+      );
+    }
+    this.ensureBtcPanelTimer();
+    void this.refreshBtcPanel();
+    this.scheduleRender();
+  }
+
+  /** `/btc off`：退出 btc 模式，回到切换前的项目目录 */
+  private switchBackFromBtc(): void {
+    if (this.mode?.name !== "btc") {
+      this.lines.push(`${ansi.gray}当前不在 btc 模式${ansi.reset}`);
+      this.scheduleRender();
+      return;
+    }
+    const back = this.btcReturnCwd;
+    // 先清模式再切目录：否则 cwdLocked 会拒绝回到原项目
+    this.mode = undefined;
+    this.agent.setMode(undefined);
+    process.env.XZH_BTC_ROLE = "live";
+    this.btcReturnCwd = undefined;
+    if (back) this.switchDirectory(back);
+    this.lines.push(
+      `${ansi.green}✓ 已退出 btc 模式${ansi.reset}` +
+        `${ansi.gray}${back ? `，回到 ${back}` : ""}${ansi.reset}`,
+    );
+    this.scheduleRender();
+  }
+
   private switchDirectory(input: string): void {
     // 专用模式（如 btc）把工作目录固定成模式数据目录。
     // 不是「懒得做」而是语义不允许：该目录下的数据库、脚本、记忆、会话是一个整体，
@@ -4831,6 +4921,7 @@ export class TuiApp {
       `  /stop          暂停后端巡检与自动交易（btc 模式；/stop resume 恢复）`,
       `  /reset         重置对话上下文`,
       `  /monitor       查看全部叫醒条件（面板只显示前 2 条，长公式会折行）`,
+      `  /btc [moni]    切到 btc 模式（moni = 模拟盘）；/btc off 回到原项目`,
       `  /reset moni [初始资金]  重置模拟盘账本并记入记忆（仅 xzh btc moni 下有意义）`,
       `  /undo [N]      撤销玄猪最近 N 次文件修改（默认 1，最多 20；改前自动备份）`,
       `  /resume [编号]  列出 / 恢复历史会话（对话历史会自动保存）`,
@@ -5204,18 +5295,45 @@ export class TuiApp {
         hour12: false,
       });
       const label = labels[event.kind] ?? event.kind;
-      const body = event.text.replace(/\s+/g, " ").trim().slice(0, 240);
-      if (!body) continue;
-      const tinted =
+
+      // 思考流压平成一行的意义是「省屏幕」；但输出/结论/错误是用户真正要看的内容，
+      // 压平 + 240 字截断会把一整段结论切成半句（看起来像对话被截断）。
+      if (event.kind === "reasoning") {
+        const body = event.text.replace(/\s+/g, " ").trim().slice(0, 240);
+        if (!body) continue;
+        this.lines.push(
+          `${ansi.gray}[后台 ${clock}]${ansi.reset} ${label}：${body}`,
+        );
+        this.lastFeedLine = `${clock} ${label}：${body.slice(0, 50)}`;
+        continue;
+      }
+
+      const MAX_CHARS = 1600;
+      const MAX_LINES = 12;
+      const raw = event.text.trim();
+      if (!raw) continue;
+      const body =
+        raw.length > MAX_CHARS ? `${raw.slice(0, MAX_CHARS)}\n…（已截断）` : raw;
+      const bodyLines = body
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .slice(0, MAX_LINES);
+
+      const tint = (line: string): string =>
         event.kind === "error"
-          ? `${ansi.red}${body}${ansi.reset}`
+          ? `${ansi.red}${line}${ansi.reset}`
           : event.kind === "round-end"
-            ? `${ansi.cyan}${body}${ansi.reset}`
-            : body;
+            ? `${ansi.cyan}${line}${ansi.reset}`
+            : line;
+
       this.lines.push(
-        `${ansi.gray}[后台 ${clock}]${ansi.reset} ${label}：${tinted}`,
+        `${ansi.gray}[后台 ${clock}]${ansi.reset} ${label}：${tint(bodyLines[0] ?? "")}`,
       );
-      this.lastFeedLine = `${clock} ${label}：${body.slice(0, 50)}`;
+      for (const line of bodyLines.slice(1)) {
+        this.lines.push(`  ${ansi.gray}${tint(line)}${ansi.reset}`);
+      }
+      this.lastFeedLine = `${clock} ${label}：${(bodyLines[0] ?? "").slice(0, 50)}`;
     }
     this.scheduleRender();
   }

@@ -188,6 +188,19 @@ xzh
 | `xzh config path` | 打印配置文件路径 |
 | `xzh config init` | 生成默认配置文件 |
 | `xzh vpn` | 交互式设置 / 探测 / 测试 / 启停全局 HTTP(S)/SOCKS5 代理 |
+| `xzh gateway` | 启动常驻 gateway 服务（工作目录 `~/.xzh_gateway`，首次启动自动开机自启） |
+| `xzh gateway stop\|restart\|status` | 停止 / 重启 / 查看 gateway |
+| `xzh gateway autostart [on\|off]` | 开/关开机自启（systemd user unit） |
+
+**gateway 是什么**：等价于在 `~/.xzh_gateway` 目录里启动一个 xzh，但没有界面、不会因为
+`quit`/`exit` 或关终端而退出 —— 它是给「外部消息通道」（先留好接口，未来接微信）用的常驻进程。
+
+- 工作目录 `~/.xzh_gateway`（`XZH_GATEWAY_HOME` 可改），记忆/会话独立，不混进日常项目；
+- 本地接口：`GET /health`、`POST /message`（`{"text":"..."}` → 回复文本）、`POST /shutdown`，
+  默认端口 17890（`XZH_GATEWAY_PORT` 可改），只监听 127.0.0.1；
+- 首次 `xzh gateway` 会顺手装好 **systemd user 开机自启**（`Restart=always`）；
+  没有 systemd 的环境只提示、不影响服务；`xzh gateway autostart off` 可关闭；
+- 日志：`~/.xzh_gateway/logs/gateway.log`。
 | `xzh setup` | 检查并自动安装依赖（玄猪自身 + 技能：playwright / officecli / 剪贴板工具等） |
 | `xzh init` | 扫描项目并生成 / 补全 `AGENTS.md` 与 `docs/`（已有内容只补缺失小节） |
 | `xzh init --dry-run` | 只预览将生成的内容，不写文件 |
@@ -235,6 +248,7 @@ xzh
 | `/auto [on\|off]` | 自动批准（**不带参数 = 开**，`/auto off` 才关；写入配置） |
 | `/autonomy [ask\|observe\|auto]` | 自治等级：逐项确认 / 只观察 / 全自动 |
 | `/monitor` | 查看全部叫醒条件（完整阈值 / 公式 / 链式进度）；面板只显示前 2 条 |
+| `/btc [moni]` | 在当前会话切进 btc 模式（`moni` = 模拟盘）；`/btc off` 回到原项目。工作目录切到 `~/.btc`，不会自动拉起常驻后端 |
 | `/compact` / `/context` / `/usage` | 压缩历史 / 看上下文预算 / 看 token 用量 |
 | `/tools` | 列出本轮发给模型的工具（排查「某个工具没被调用」） |
 | `/memory` | 查看项目记忆（`show`、`global`、`clear`） |
