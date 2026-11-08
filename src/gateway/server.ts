@@ -26,6 +26,7 @@ import {
 } from "./service";
 import { loadAccount } from "./weixin/paths";
 import { startWeixinChannel, type WeixinChannel } from "./weixin/channel";
+import { startFeedForwarder, type FeedForwarder } from "./feed";
 
 /**
  * `xzh gateway run`：常驻后台进程。
@@ -396,6 +397,7 @@ export async function runGateway(): Promise<void> {
   });
 
   let weixin: WeixinChannel | null = null;
+  let feed: FeedForwarder | null = null;
 
   server.listen(port, "127.0.0.1", () => {
     log(`gateway 已启动 pid=${process.pid} port=${port} cwd=${home}`);
@@ -418,6 +420,12 @@ export async function runGateway(): Promise<void> {
         onMessage: (text) => handleMessage(text),
       });
       log(`微信频道已启动 account=${account.accountId}`);
+      // 巡检内容转发：btc 后端结论 / 错误、A 股选股 / 买卖，推给最近对话的对端
+      feed = startFeedForwarder({
+        gatewayHome: home,
+        log,
+        send: (text) => (weixin ? weixin.sendToLastPeer(text) : Promise.resolve(false)),
+      });
     } else {
       log("微信未登录（要接微信请运行 xzh gateway weixin login）");
     }
@@ -455,6 +463,7 @@ export async function runGateway(): Promise<void> {
     if (closing) return;
     closing = true;
     log("gateway 正在退出");
+    feed?.stop();
     weixin?.stop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     cleanup();

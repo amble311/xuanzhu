@@ -25,6 +25,13 @@ export interface WeixinChannelOptions {
 export interface WeixinChannel {
   stop: () => void;
   readonly running: boolean;
+  /**
+   * 主动把一条文本发给最近联系的对端（巡检 / 监控推送用）。
+   *
+   * 返回 false 表示当前没有可发的对象（微信未绑定 / 没有历史会话），
+   * 调用方应保留未发送内容，下次再试。
+   */
+  sendToLastPeer: (text: string) => Promise<boolean>;
 }
 
 /** 单条消息的长度上限：微信气泡太长了体验很差，按行切成多块 */
@@ -69,6 +76,8 @@ export function startWeixinChannel(options: WeixinChannelOptions): WeixinChannel
   let syncBuf = loadSyncBuf(home);
   const tokens = loadContextTokens(home);
   const seen = new Map<string, number>();
+  /** 最近一次对话的对端：主动推送（巡检 / 监控）只发给 TA */
+  let lastPeer: string | undefined;
 
   const remember = (key: string): boolean => {
     const now = Date.now();
@@ -94,6 +103,7 @@ export function startWeixinChannel(options: WeixinChannelOptions): WeixinChannel
 
   const handle = async (message: WeixinMessage): Promise<void> => {
     const peer = message.fromUserId;
+    lastPeer = peer;
     if (allowed.length > 0 && !allowed.includes(peer)) {
       log(`微信：忽略非白名单用户 ${peer}`);
       return;
@@ -174,10 +184,24 @@ export function startWeixinChannel(options: WeixinChannelOptions): WeixinChannel
 
   void loop();
 
+  const sendToLastPeer = async (text: string): Promise<boolean> => {
+    // 重启后没有 lastPeer 时，若历史里只有一个对端（自己扫码绑定的），就用它
+    const peer = lastPeer ?? (Object.keys(tokens).length === 1 ? Object.keys(tokens)[0] : undefined);
+    if (!peer) return false;
+    try {
+      await sendChunks(peer, text);
+      return true;
+    } catch (err) {
+      log(`微信：推送失败 ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  };
+
   return {
     stop: () => {
       stopped = true;
     },
+    sendToLastPeer,
     get running() {
       return !stopped;
     },

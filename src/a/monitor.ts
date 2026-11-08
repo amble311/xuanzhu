@@ -77,6 +77,11 @@ function actionsPath(): string {
   return path.join(monitorDir(), ACTIONS_FILE);
 }
 
+/** 巡检动作账本路径（gateway 转发微信用） */
+export function aActionsPath(): string {
+  return actionsPath();
+}
+
 function iso(now: Date): string {
   return now.toISOString();
 }
