@@ -92,6 +92,7 @@ describe("gateway", () => {
     expect(parseGatewayCommand("/btc off")).toEqual({ kind: "xzh" });
     expect(parseGatewayCommand("/a off")).toEqual({ kind: "xzh" });
     expect(parseGatewayCommand("/help")).toEqual({ kind: "help" });
+    expect(parseGatewayCommand("/info")).toEqual({ kind: "info" });
     expect(parseGatewayCommand("/nope")).toMatchObject({ kind: "usage" });
     // 中文输入法的全角斜杠也认作命令
     expect(parseGatewayCommand("／btc moni")).toEqual({ kind: "btc", paper: true });

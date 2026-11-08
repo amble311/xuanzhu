@@ -13,6 +13,7 @@ export function commandHelpLines(): string[] {
   return [
     `${ansi.bold}玄猪 内置命令${ansi.reset}`,
     `  /help          显示本帮助`,
+    `  /info          输出右侧面板的详细信息（btc / btc moni / a 模式）`,
     `  /clear         清空屏幕`,
     `  /tools         列出本轮发给模型的工具（排查「某个工具似乎没被调用过」）`,
     `  /context       查看上下文预算（系统 / 工具 / 历史 / 状态各占多少）`,

@@ -6,6 +6,17 @@ import { goalContinuePrompt, goalStartPrompt } from "../core/goal";
 import { commandHelpLines } from "../core/help-text";
 import { readObservedActions } from "../core/autonomy";
 import {
+  btcInfoLines,
+  collectBtcPanelData,
+  type BtcPanelData,
+  type PaperPanelData,
+} from "../btc/panel-data";
+import {
+  aInfoLines,
+  collectASharePanelData,
+  type APanelData,
+} from "../a/info";
+import {
   defaultPartText,
   OVERRIDABLE_PARTS,
   promptDefaultsHash,
@@ -26,9 +37,6 @@ import type { AgentMode } from "../modes";
 import { createAShareMode } from "../modes/a";
 import { createBtcMode } from "../modes/btc";
 import { activeExchange } from "../exchange";
-import { fetchAccountSnapshot, type AccountSnapshot } from "../btc/account";
-import { runRunner } from "../btc/python";
-import { readActions, type BtcAction } from "../btc/actions";
 import { liveBackend } from "../btc/daemon";
 import {
   describeStep,
@@ -38,17 +46,10 @@ import {
 } from "../btc/triggers";
 import { readPause, setPaused } from "../btc/pause";
 import { resetPaperLedger } from "../btc/paper-reset";
-import { buildPreflight, liquidationGapPct } from "../btc/preflight";
 import {
   currentInspectOffset,
   readInspectEvents,
 } from "../btc/inspect-stream";
-import {
-  readRiskSettings,
-  readRiskState,
-  type HardRiskSettings,
-  type HardRiskState,
-} from "../btc/risk";
 import {
   currentScheduleRole,
   readScheduleQueue,
@@ -197,48 +198,6 @@ function describeTriggerBrief(trigger: Trigger): string {
   return `${target}${seen}${window}${repeat}`;
 }
 
-/** 模拟盘面板数据（来自 Python 的 paper-status） */
-interface PaperPanelData {
-  price: number;
-  initial_capital: number;
-  cash: number;
-  available?: number;
-  margin_used?: number;
-  equity: number;
-  return_pct: number;
-  position: {
-    side: string;
-    qty: number;
-    entry_price: number;
-    /** 合约倍率（旧脚本可能没有） */
-    leverage?: number;
-    unrealized: number;
-    unrealized_pct: number;
-    stop_price: number | null;
-  } | null;
-  /** 未成交的限价挂单 */
-  open_orders?: Array<{
-    id: number;
-    side: string;
-    qty: number;
-    limit_price: number;
-  }>;
-  trades: number;
-  win_rate: number;
-  realized_pnl: number;
-  /** 价格来源：mark = 实时标记价，close = 库内收盘价（可能滞后） */
-  price_source?: "mark" | "close";
-  /** 最近几笔已平仓记录（btc_paper_status 才会带） */
-  recent_trades?: Array<{
-    side: string;
-    qty: number;
-    entry_price: number;
-    exit_price: number;
-    pnl: number;
-    exit_ts: string | null;
-    exit_reason?: string | null;
-  }>;
-}
 
 export interface TuiAppOptions {
   provider: LLMProvider;
@@ -368,46 +327,11 @@ export class TuiApp {
    * 数据放在 TUI 侧而不是「每次渲染都拉网络」：账户接口有频率权重，
    * 渲染每秒可能发生多次，必须由定时器统一刷新。
    */
-  private btcPanel?: {
-    updatedAt: number;
-    /** 观察（真实账户）还是模拟盘 —— 决定右栏展示哪套数据 */
-    role: "live" | "paper";
-    ticker: { price: number; changePct: number } | null;
-    /** 取价失败的原因（面板直接显示，别让它只显示「不可用」） */
-    tickerError?: string;
-    /** 后端是否被 `/stop` 暂停 */
-    paused: boolean;
-    account: AccountSnapshot | null;
-    /** 持仓没有任何止损/止盈单 */
-    unprotected?: boolean;
-    /** 持仓距强平的最小百分比（无持仓为 undefined） */
-    liqGapPct?: number;
-    paper: PaperPanelData | null;
-    paperError?: string;
-    queue: ScheduleEntry[];
-    riskState: HardRiskState;
-    riskSettings: HardRiskSettings;
-    /** 当前启用的叫醒条件（面板展示前几条） */
-    triggers: Trigger[];
-    /** 后端算出的下次触发器评估时间（ISO） */
-    nextTriggerEvalAt?: string;
-    /** 后端进程是否在跑（旧版后端不会上报 nextTriggerEvalAt，需要区分「没跑」与「没上报」） */
-    backendRunning: boolean;
-    /** 行情连续失败次数（后端 health check 上报） */
-    marketFailures?: number;
-    lastMarketError?: string;
-    /** 最近几条真实交易动作（实盘用；模拟盘看 paper.recent_trades） */
-    actions: BtcAction[];
-  };
+  private btcPanel?: BtcPanelData;
   private btcPanelTimer?: NodeJS.Timeout;
   private btcRefreshing = false;
-  /** A 股模拟盘面板：指数 + 账本（不拉全市场，8 秒一次只查指数与持仓） */
-  private aPanel?: {
-    updatedAt: number;
-    indices: Array<{ name: string; price: number; pct: number }>;
-    account?: PaperAccount;
-    error?: string;
-  };
+  /** A 股模拟盘面板：指数 + 账本 + 自选股现价（不拉全市场，8 秒一次） */
+  private aPanel?: APanelData;
   private aPanelTimer?: NodeJS.Timeout;
   private aRefreshing = false;
   /**
@@ -2864,6 +2788,32 @@ export class TuiApp {
         break;
       case "clear":
         this.lines = [];
+        break;
+      case "info":
+        void (async () => {
+          try {
+            if (this.mode?.name === "btc") {
+              const data = await collectBtcPanelData(
+                this.cwd,
+                process.env.XZH_BTC_ROLE === "paper" ? "paper" : "live",
+              );
+              this.lines.push(...btcInfoLines(data));
+            } else if (this.mode?.name === "a") {
+              const data = await collectASharePanelData();
+              this.lines.push(...aInfoLines(data));
+            } else {
+              this.lines.push(
+                `${ansi.gray}当前是普通模式；/info 在 btc / btc moni / a 模式下输出右侧面板详情${ansi.reset}`,
+              );
+            }
+          } catch (err) {
+            this.lines.push(
+              `${ansi.red}✗ /info 失败：${err instanceof Error ? err.message : String(err)}${ansi.reset}`,
+            );
+          } finally {
+            this.scheduleRender();
+          }
+        })();
         break;
       case "tools":
         this.printTools();
@@ -5395,69 +5345,7 @@ export class TuiApp {
     if (this.btcRefreshing) return;
     this.btcRefreshing = true;
     try {
-      const symbol = process.env.BTC_SYMBOL?.trim() || "BTC/USDT";
-      const role = currentScheduleRole();
-      let tickerError: string | undefined;
-      const ticker = await activeExchange()
-        .exchange.fetchTicker(symbol)
-        .catch((err: unknown) => {
-          // 记下原因：面板只写「不可用」时，用户与我们都无法判断是网络、
-          // 代理还是接口变更 —— 那是最难排查的一类问题。
-          tickerError = err instanceof Error ? err.message : String(err);
-          return null;
-        });
-
-      const backend = liveBackend(this.cwd, role);
-      const base = {
-        updatedAt: Date.now(),
-        paused: readPause(this.cwd).paused,
-        role,
-        ticker: ticker
-          ? { price: ticker.price, changePct: ticker.changePct }
-          : null,
-        tickerError,
-        queue: readScheduleQueue(this.cwd, role),
-        riskState: readRiskState(this.cwd),
-        riskSettings: readRiskSettings(this.cwd),
-        triggers: readTriggers(this.cwd, role),
-        // 后端把「下次评估时间」写进 state；旧版后端没有这个字段，面板要能区分「没跑」与「没上报」
-        nextTriggerEvalAt: backend?.nextTriggerEvalAt,
-        backendRunning: backend !== null,
-        marketFailures: backend?.marketFailures ?? 0,
-        lastMarketError: backend?.lastMarketError,
-        actions: readActions(this.cwd).slice(-4).reverse(),
-      };
-
-      if (role === "paper") {
-        // 模拟盘不能读真实账户：那是两套账，混在一起会让人误判。
-        // 传入实时标记价：否则顶部是实时价、浮盈按库内旧收盘价算，看起来就是「价格跌了却在亏」。
-        const paper = await runRunner<PaperPanelData>("paper-status", {
-          mark_price: ticker?.price,
-        });
-        this.btcPanel = {
-          ...base,
-          account: null,
-          paper: paper.ok ? paper.data : null,
-          paperError: paper.ok ? undefined : paper.error,
-        };
-      } else {
-        const account = await fetchAccountSnapshot();
-        // 与巡检用同一套核对逻辑：面板和后台看到的风险必须一致
-        const preflight = buildPreflight({
-          snapshot: account,
-          actions: readActions(this.cwd),
-        });
-        const gaps = account.positions
-          .map((position) => liquidationGapPct(position))
-          .filter((gap): gap is number => gap !== null);
-        this.btcPanel = {
-          ...base,
-          account,
-          unprotected: preflight.unprotected,
-          liqGapPct: gaps.length > 0 ? Math.min(...gaps) : undefined,
-          paper: null,
-        };
-      }
+      this.btcPanel = await collectBtcPanelData(this.cwd, currentScheduleRole());
       this.scheduleRender();
     } catch {
       // 刷新失败继续显示上一份数据：面板不是错误输出区
@@ -5486,49 +5374,12 @@ export class TuiApp {
     if (this.aRefreshing) return;
     this.aRefreshing = true;
     try {
-      const indices = await Promise.all(
-        [
-          { code: "1A0001", label: "上证" },
-          { code: "399001", label: "深证" },
-          { code: "399006", label: "创业板" },
-          { code: "1B0300", label: "沪深300" },
-          { code: "1B0905", label: "中证500" },
-          { code: "1B0016", label: "上证50" },
-        ].map(async (item) => {
-          try {
-            const quote = await fetchQuote(item.code);
-            return { name: item.label, price: quote.price, pct: quote.changePct };
-          } catch {
-            return null;
-          }
-        }),
-      );
-      const rows: Array<{ name: string; price: number; pct: number }> = [];
-      for (const item of indices) if (item) rows.push(item);
-
-      const account = loadPaperAccount();
-      const codes = account.positions.slice(0, 10).map((position) => position.code);
-      const quotes = await Promise.all(
-        codes.map((code) => fetchQuote(code).catch(() => null)),
-      );
-      const map = new Map<string, Quote>();
-      for (const quote of quotes) if (quote) map.set(quote.code, quote);
-
-      this.aPanel = {
-        updatedAt: Date.now(),
-        indices: rows,
-        account: markPaperAccount(account, map),
-      };
-    } catch (err) {
-      this.aPanel = {
-        updatedAt: Date.now(),
-        indices: this.aPanel?.indices ?? [],
-        account: this.aPanel?.account,
-        error: err instanceof Error ? err.message : String(err),
-      };
+      this.aPanel = await collectASharePanelData();
+      this.scheduleRender();
+    } catch {
+      // 刷新失败继续显示上一份数据：面板不是错误输出区
     } finally {
       this.aRefreshing = false;
-      this.scheduleRender();
     }
   }
 
@@ -5642,10 +5493,19 @@ export class TuiApp {
     if (service.running && service.state?.nextRunAt) {
       push(`${ansi.gray}   下一轮 ${service.state.nextRunAt.slice(11, 16)}${ansi.reset}`);
     }
-    for (const item of watch.items.slice(0, 3)) {
-      push(
-        `${ansi.gray}   ${item.code} ${truncate(item.name, 6)} ${item.score} 分${ansi.reset}`,
-      );
+    if (watch.items.length > 0) {
+      push(` ${ansi.gray}监控（${watch.items.length}/10 · ★=持仓）${ansi.reset}`);
+      for (const item of data.watch.slice(0, 4)) {
+        const star = item.held ? `${ansi.red}★ ${ansi.reset}` : "";
+        const price =
+          item.price > 0
+            ? `${amount(item.price)} ${pct(item.pct)}`
+            : `${ansi.gray}—${ansi.reset}`;
+        push(`  ${star}${item.code} ${truncate(item.name, 6)} ${item.score}分 ${price}`);
+      }
+      if (watch.items.length > 4) {
+        push(`${ansi.gray}   … 共 ${watch.items.length} 只${ansi.reset}`);
+      }
     }
     push(`${ansi.gray} 模拟盘 · T+1 · 100 股整手 · 费用已计${ansi.reset}`);
     if (data.updatedAt > 0) {

@@ -342,6 +342,7 @@ export type GatewayCommand =
   | { kind: "a" }
   | { kind: "xzh" }
   | { kind: "help" }
+  | { kind: "info" }
   | { kind: "usage"; message: string };
 
 /**
@@ -361,6 +362,7 @@ export function parseGatewayCommand(text: string): GatewayCommand | null {
 
   if (!name || name === "help") return { kind: "help" };
   if (name === "xzh") return { kind: "xzh" };
+  if (name === "info") return { kind: "info" };
   if (name === "a") {
     if (!arg) return { kind: "a" };
     if (arg === "off" || arg === "exit") return { kind: "xzh" };

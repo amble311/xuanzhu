@@ -4,6 +4,8 @@ import * as path from "node:path";
 import { Agent, type AgentEvents } from "../core/agent";
 import { activeModelEntry, loadConfig } from "../config/store";
 import { commandHelpLines } from "../core/help-text";
+import { btcInfoLines, collectBtcPanelData } from "../btc/panel-data";
+import { aInfoLines, collectASharePanelData } from "../a/info";
 import { createProvider } from "../llm";
 import { createAShareMode } from "../modes/a";
 import { createBtcMode } from "../modes/btc";
@@ -207,6 +209,21 @@ export async function runGateway(): Promise<void> {
     if (!command) return null;
     if (command.kind === "help") return commandHelp();
     if (command.kind === "usage") return command.message;
+
+    if (command.kind === "info") {
+      if (!modeState) {
+        return "当前是普通模式；发送 /btc、/btc moni 或 /a 切换模式后，/info 才有右侧面板详情可看。";
+      }
+      if (modeState.name === "btc") {
+        const data = await collectBtcPanelData(
+          getBtcHome(),
+          modeState.paper ? "paper" : "live",
+        );
+        return btcInfoLines(data).join("\n");
+      }
+      const data = await collectASharePanelData();
+      return aInfoLines(data).join("\n");
+    }
 
     if (command.kind === "xzh") {
       if (!modeState) return `当前已是 xzh 普通模式（${home}）。`;
