@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { createAShareMode } from "./a";
 import { createBtcMode } from "./btc";
 import type { AgentMode } from "./types";
 
@@ -11,13 +12,14 @@ import type { AgentMode } from "./types";
  * `modes: [名字]` 就会自动归属，不用改技能发现逻辑。
  */
 export type { AgentMode } from "./types";
+export { A_MODE_NAME, createAShareMode } from "./a";
 export { BTC_MODE_NAME, createBtcMode } from "./btc";
 // home 的解析在 utils/paths（btc 的资产与工具也用它，放这里会形成循环依赖）
-export { getBtcHome } from "../utils/paths";
+export { getAShareHome, getBtcHome } from "../utils/paths";
 
 /** 全部已注册的模式（顺序即 help 里的展示顺序） */
 export function allModes(): AgentMode[] {
-  return [createBtcMode()];
+  return [createBtcMode(), createAShareMode()];
 }
 
 /** 按名字查找模式（大小写不敏感）；未注册返回 undefined */

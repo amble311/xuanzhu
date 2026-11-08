@@ -2,6 +2,7 @@ import type { ToolSpec } from "../llm/types";
 import { taskTool } from "./agent";
 import { askUserTool } from "./ask";
 import { bashTool } from "./bash";
+import { aShareTools } from "./a-share";
 import { btcTools } from "./btc";
 import { bashKillTool, bashOutputTool } from "./job-tools";
 import {
@@ -55,6 +56,7 @@ export const TOOLS: ToolDefinition[] = [
   bashKillTool,
   ...deviceTools,
   ...btcTools,
+  ...aShareTools,
 ];
 
 /**

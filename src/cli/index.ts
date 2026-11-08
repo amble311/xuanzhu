@@ -25,6 +25,7 @@ import {
   markSessionStart,
   recordCrash,
 } from "../utils/crash";
+import { aCommand } from "./commands/a";
 import { configCommand } from "./commands/config";
 import { errorsCommand } from "./commands/errors";
 import { initCommand } from "./commands/init";
@@ -37,6 +38,7 @@ import { gatewayCommand } from "./gateway";
 import { skillCommand } from "./commands/skill";
 import { recordErrorReport } from "../utils/error-reports";
 import {
+  A_MODE_NAME,
   allModes,
   BTC_MODE_NAME,
   createBtcMode,
@@ -148,6 +150,16 @@ async function main(): Promise<void> {
   const mode = findMode(command);
   if (mode) {
     const sub = args[1];
+    // A 股：有子命令交给数据探针（quote / bars / snapshot / screen / sync …），
+    // 没有则进入模式本体。模式内的工具与提示词在 src/modes/a.ts。
+    if (mode.name === A_MODE_NAME) {
+      if (sub) {
+        await aCommand(args.slice(1));
+        return;
+      }
+      await startChat(mode.home, intentOverride, mode);
+      return;
+    }
     if (mode.name === BTC_MODE_NAME) {
       if (sub === "setup") {
         await btcSetupCommand(args.slice(2));
@@ -186,20 +198,31 @@ async function main(): Promise<void> {
         await startChat(mode.home, intentOverride, createBtcMode({ paper: true }));
         return;
       }
+      if (sub) {
+        process.stdout.write(
+          `${ansi.red}未知子命令：${command} ${sub}${ansi.reset}\n` +
+            `${ansi.gray}${command} 模式目前支持：` +
+            `${command}${ansi.gray}（进入模式）、${command} moni（模拟盘）、${command} apikey（凭据管理）、` +
+            `${command} fk（硬性风控）、${command} platform（交易平台）、${command} setup、` +
+            `${command} stop、${command} status${ansi.reset}\n`,
+        );
+        process.exitCode = 1;
+        return;
+      }
+      // 实盘启动前确认凭据：没有就进交互式管理（用户选过「跳过」就不再问）
+      await btcEnsureCredential();
+      await startChat(mode.home, intentOverride, mode);
+      return;
     }
+    // 其他模式（将来新增）：有子命令就报未知，没有就进入模式
     if (sub) {
       process.stdout.write(
         `${ansi.red}未知子命令：${command} ${sub}${ansi.reset}\n` +
-          `${ansi.gray}${command} 模式目前支持：` +
-          `${command}${ansi.gray}（进入模式）、${command} moni（模拟盘）、${command} apikey（凭据管理）、` +
-          `${command} fk（硬性风控）、${command} platform（交易平台）、${command} setup、` +
-          `${command} stop、${command} status${ansi.reset}\n`,
+          `${ansi.gray}${command} 模式暂不支持子命令${ansi.reset}\n`,
       );
       process.exitCode = 1;
       return;
     }
-    // 实盘启动前确认凭据：没有就进交互式管理（用户选过「跳过」就不再问）
-    await btcEnsureCredential();
     await startChat(mode.home, intentOverride, mode);
     return;
   }
@@ -207,6 +230,11 @@ async function main(): Promise<void> {
   switch (command) {
     case undefined:
       await startChat(undefined, intentOverride);
+      return;
+    // A 股：当前只有数据探针子命令；模式本体（`xzh a` 直接进入模拟交易）后续接入。
+    // 注意模式注册后会先被上面的 findMode() 拦截，届时子命令要一并搬进模式分支。
+    case "a":
+      await aCommand(args.slice(1));
       return;
     case "model":
       await modelCommand(args.slice(1));
@@ -512,6 +540,13 @@ ${ansi.bold}用法${ansi.reset}
   ${ansi.green}xzh btc platform${ansi.reset}       选择交易平台（默认币安；已接入的只有币安）
   ${ansi.green}xzh btc stop${ansi.reset}           停止 btc 常驻后端（退出界面不会停它；${ansi.gray}--paper${ansi.reset} 只停模拟盘）
   ${ansi.green}xzh btc status${ansi.reset}         查看观察 / 模拟盘两个后端与排期队列
+  ${ansi.green}xzh a${ansi.reset}                   进入 A 股分析模式：工作目录固定为 ${ansi.gray}~/.a${ansi.reset}（不可 /switch）
+  ${ansi.green}xzh a quote <代码...>${ansi.reset}    实时快照；指数写 1A0001
+  ${ansi.green}xzh a bars <代码>${ansi.reset}        K 线（--period / --adjust / --limit / --from）
+  ${ansi.green}xzh a snapshot${ansi.reset}           全市场温度（涨跌家数 / 涨跌停 / 成交额 / 分布）
+  ${ansi.green}xzh a screen${ansi.reset}             横截面筛选（--pct-min / --amount-min / --above-ma20 …）
+  ${ansi.green}xzh a market${ansi.reset}             主要指数一览
+  ${ansi.green}xzh a sync|status${ansi.reset}        建股票池 + 预计算指标 / 查看缓存状态
   ${ansi.green}xzh --intent${ansi.reset}            本次启动启用意图分析（默认关闭）
   ${ansi.green}xzh --no-intent${ansi.reset}         本次启动强制关闭意图分析
   ${ansi.green}xzh model${ansi.reset}               交互式管理多模型（新增 / 删除 / 查看全部）

@@ -92,6 +92,29 @@ describe("项目扫描", () => {
     expect(facts.fileCount).toBeLessThan(20);
   });
 
+  it("docs 子目录：递归扫描（最多两层），隐藏目录与更深层不进入", () => {
+    const root = tmpProject();
+    makeNodeProject(root);
+    write(root, "docs/guides/README.md", "# 安装指南\n\n本目录放部署与排障流程。\n");
+    write(root, "docs/guides/setup.md", "# 本地安装\n\n步骤。\n");
+    write(root, "docs/reference/api/auth.md", "# 鉴权\n");
+    write(root, "docs/guides/.draft/hidden.md", "# 草稿\n");
+    write(root, "docs/a/b/c/deep.md", "# 太深\n");
+
+    const facts = scanProject(root);
+    expect(facts.docs).toContain("docs/guides/setup.md");
+    expect(facts.docs).toContain("docs/reference/api/auth.md");
+    expect(facts.docs).not.toContain("docs/guides/.draft/hidden.md");
+    expect(facts.docs).not.toContain("docs/a/b/c/deep.md");
+
+    const paths = facts.docGroups.map((group) => group.path);
+    expect(paths).toContain("docs");
+    expect(paths).toContain("docs/guides");
+    expect(paths).toContain("docs/reference/api");
+    // 子目录 README 的一级标题作为目录说明
+    expect(facts.docGroups.find((group) => group.path === "docs/guides")?.title).toBe("安装指南");
+  });
+
   it("没有 package.json 时用目录名兜底，不产生命令之外的事实", () => {
     const root = tmpProject();
     write(root, "main.go", "package main\n");
@@ -132,6 +155,27 @@ describe("计划与写入", () => {
     expect(docsIndex.content).toContain("对应关系");
     expect(docsIndex.content).toContain("AGENTS.md");
     expect(docsIndex.content).toContain("docs/ARCHITECTURE.md");
+  });
+
+  it("docs 子目录：AGENTS 按目录汇总，docs/README.md 分组列出", () => {
+    const root = tmpProject();
+    makeNodeProject(root);
+    write(root, "docs/guides/setup.md", "# 本地安装\n");
+    write(root, "docs/reference/api/auth.md", "# 鉴权\n");
+
+    const plan = planInit(root);
+    const agents = plan.files.find((file) => file.relPath === "AGENTS.md")!;
+    expect(agents.content).toContain("`docs/guides/`（1 篇）— 操作指南");
+    expect(agents.content).toContain("`docs/reference/api/`（1 篇）— 参考手册");
+    expect(agents.content).toContain("完整文档地图（含子目录）见 `docs/README.md`");
+    // 子目录里的文件不逐条进 AGENTS
+    expect(agents.content).not.toContain("docs/guides/setup.md");
+
+    const index = plan.files.find((file) => file.relPath === "docs/README.md")!;
+    expect(index.content).toContain("## 目录分工");
+    expect(index.content).toContain("`docs/guides/` | 操作指南");
+    expect(index.content).toContain("### `docs/guides/` — 操作指南");
+    expect(index.content).toContain("`docs/reference/api/auth.md`");
   });
 
   it("写入后再计划 → 全部跳过（幂等，无变化不写盘）", () => {

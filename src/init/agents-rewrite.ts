@@ -5,15 +5,37 @@ import { createProvider } from "../llm";
 import type { ChatMessage, LLMProvider } from "../llm/types";
 import type { ModelEntry, XuanZhuConfig } from "../config/store";
 import { resolveAgentsFilePath } from "../workspace";
-import { buildAgentsDoc, generateProjectDocs } from "./generate";
+import { buildAgentsDoc, DOCS_SUBDIRS, generateProjectDocs } from "./generate";
 import { scanProject, type ProjectFacts } from "./scan";
 
-const ALLOWED_DOCS = new Set([
+/** 入口级文档：`/init` 模型阶段默认读取这些文件的摘要 */
+const DOC_ENTRY_FILES = [
   "docs/README.md",
   "docs/ARCHITECTURE.md",
   "docs/COMMANDS.md",
   "docs/CONVENTIONS.md",
-]);
+];
+
+/** docs/ 下允许的路径段数：docs + 最多两层子目录 + 文件名 */
+const MAX_DOC_SEGMENTS = 4;
+
+/**
+ * `docs/` 下允许写入的路径。
+ *
+ * 从「固定四文件白名单」放宽到「docs/ 下任意 md」：专题文档要能落到
+ * `docs/guides/`、`docs/reference/`、`docs/decisions/` 等子目录。放宽的同时守住边界：
+ * 必须在 `docs/` 内、只能是 md/mdx、最多两层子目录、不允许 `..` / 隐藏目录 / 空段。
+ */
+export function isAllowedDocPath(rel: string): boolean {
+  const normalized = rel.replace(/\\/g, "/").replace(/^\.\//, "");
+  if (!normalized.startsWith("docs/")) return false;
+  if (!/\.(md|mdx)$/i.test(normalized)) return false;
+  const segments = normalized.split("/");
+  if (segments.length > MAX_DOC_SEGMENTS) return false;
+  return segments.every(
+    (segment) => segment.length > 0 && segment !== "." && segment !== ".." && !segment.startsWith("."),
+  );
+}
 
 /**
  * 对话内 `/init` 的模型完善阶段：
@@ -94,6 +116,9 @@ function buildPrompt(
     "固定设计（必须遵守）：",
     "1. **AGENTS.md 只描述入口级大纲**，详细内容写在 `docs/` 下的文件或子文件中；",
     "   不要在 AGENTS.md 展开完整命令表、目录树、模块职责、代码片段或长篇说明。",
+    `   \`docs/\` 根只放入口级四件套；专题文档放子目录：${DOCS_SUBDIRS.map(
+      (item) => `\`${item.path}/\`（${item.label}）`,
+    ).join("、")}，最多两层。`,
     "2. **尽量简短**：目标是让 Agent 在 1 分钟内知道「项目是什么、怎么验证、去哪里看细节」，",
     "   全文控制在 3000 字符以内；能链接到 docs 的就不要抄进 AGENTS。",
     "3. 固定保持这些小节：项目概览、常用命令（只列关键命令）、目录结构（只列顶层/入口）、",
@@ -109,7 +134,8 @@ function buildPrompt(
     "<AGENTS>",
     "（完整 AGENTS.md 正文）",
     "</AGENTS>",
-    "如需修改 docs，额外输出（只输出需要修改的文件，最多 4 个）：",
+    "如需修改 docs，额外输出（只输出需要修改的文件，最多 6 个；路径必须在 `docs/` 下，" +
+      "可以是 `docs/guides/xxx.md` 这类子目录文件，最多两层）：",
     "<DOC path=\"docs/README.md\">",
     "（完整文件正文）",
     "</DOC>",
@@ -135,7 +161,7 @@ export function parseAgentsRewriteResponse(raw: string): {
   const docs: AgentsDocUpdate[] = [];
   for (const match of raw.matchAll(/<DOC\s+path="([^"]+)">\s*([\s\S]*?)\s*<\/DOC>/gi)) {
     const rel = match[1].trim().replace(/\\/g, "/").replace(/^\.\//, "");
-    if (!ALLOWED_DOCS.has(rel)) continue;
+    if (!isAllowedDocPath(rel)) continue;
     const content = extractAgentsMarkdown(match[2]);
     if (content.trim()) docs.push({ path: rel, content });
   }
@@ -145,11 +171,24 @@ export function parseAgentsRewriteResponse(raw: string): {
   };
 }
 
-function docsContext(cwd: string): string {
+/**
+ * 给模型的 docs 上下文：入口文档给摘要，子目录只给**清单**。
+ *
+ * 子目录可能有几十篇，全文塞进 prompt 只会挤掉扫描事实；模型需要清单来判断
+ * 「已经有哪一类文档、新内容该放哪里」。
+ */
+function docsContext(cwd: string, facts: ProjectFacts): string {
   const chunks: string[] = [];
-  for (const rel of ALLOWED_DOCS) {
+  for (const rel of DOC_ENTRY_FILES) {
     const text = readExcerpt(path.join(cwd, rel), 2_000);
     if (text) chunks.push(`### ${rel}\n${text}`);
+  }
+  for (const group of facts.docGroups) {
+    if (group.path === "docs") continue;
+    chunks.push(
+      `### ${group.path}/（${group.files.length} 篇）\n` +
+        group.files.map((rel) => `- ${rel}`).join("\n"),
+    );
   }
   return chunks.join("\n\n");
 }
@@ -233,7 +272,7 @@ export async function generateAgentsRewrite(
           facts,
           generated,
           existing,
-          docsContext(cwd),
+          docsContext(cwd, facts),
         ),
       },
     ],
@@ -263,7 +302,7 @@ export function writeDocsFiles(
   const results: Array<{ target: string; backup?: string }> = [];
   for (const file of files) {
     const rel = file.path.replace(/\\/g, "/").replace(/^\.\//, "");
-    if (!ALLOWED_DOCS.has(rel)) continue;
+    if (!isAllowedDocPath(rel)) continue;
     const target = path.join(root, rel);
     const resolved = path.resolve(target);
     if (!resolved.startsWith(`${path.join(root, "docs")}${path.sep}`)) continue;

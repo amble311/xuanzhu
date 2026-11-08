@@ -27,6 +27,16 @@ export interface ProjectDirectory {
   dirs: number;
 }
 
+/** `docs/` 下的一个文档分组（根目录或子目录） */
+export interface ProjectDocGroup {
+  /** 相对项目根的目录（`docs`、`docs/guides`） */
+  path: string;
+  /** 目录说明：取该目录 `README.md` 的一级标题；没有则为空 */
+  title?: string;
+  /** 该目录下的文档（相对路径） */
+  files: string[];
+}
+
 export interface ProjectFacts {
   root: string;
   name: string;
@@ -39,8 +49,10 @@ export interface ProjectFacts {
   commands: ProjectCommand[];
   /** 顶层目录（已排除 node_modules / .git 等） */
   directories: ProjectDirectory[];
-  /** 既有文档（相对路径） */
+  /** 既有文档（相对路径，含 docs/ 子目录） */
   docs: string[];
+  /** docs/ 下的分组（根目录 + 一层/两层子目录），供文档索引分组展示 */
+  docGroups: ProjectDocGroup[];
   /** 探测到的配置文件（相对路径） */
   configs: string[];
   /** 项目根下是否已有 AGENTS.md（大小写不敏感） */
@@ -398,25 +410,81 @@ function scanDirectories(root: string): ProjectDirectory[] {
     .slice(0, 20);
 }
 
-/** 收集既有文档（含 docs 下第一层 md） */
-function scanDocs(root: string): string[] {
+/** 文档扫描上限：总量 / 单个分组，避免超大仓库把索引撑爆 */
+const MAX_DOCS = 60;
+const MAX_DOCS_PER_GROUP = 20;
+/** docs/ 下允许的子目录层数（1 = docs/a，2 = docs/a/b） */
+const MAX_DOC_DEPTH = 2;
+
+/** 读子目录 README 的一级标题作为目录说明 */
+function readDocTitle(file: string): string | undefined {
+  const text = readUtf8(file, 2_000);
+  if (!text) return undefined;
+  for (const line of text.split("\n")) {
+    const match = /^#\s+(.+)$/.exec(line.trim());
+    if (match) return match[1].trim().slice(0, 60);
+  }
+  return undefined;
+}
+
+/**
+ * 收集既有文档：项目根候选 + `docs/` 递归（两层子目录）。
+ *
+ * 只认 `.md` / `.mdx`；隐藏目录与忽略目录不进入。分组按「目录」聚合，
+ * 供 `docs/README.md` 做分层索引 —— 文档一多，平铺列表就没法看。
+ */
+function scanDocs(root: string): { docs: string[]; groups: ProjectDocGroup[] } {
   const docs: string[] = [];
+  const groups: ProjectDocGroup[] = [];
   for (const candidate of DOC_CANDIDATES) {
     if (exists(root, candidate)) docs.push(candidate);
   }
 
-  try {
-    const entries = fs.readdirSync(path.join(root, "docs"), { withFileTypes: true });
-    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-      if (!entry.isFile() || !/\.(md|mdx)$/i.test(entry.name)) continue;
-      const rel = `docs/${entry.name}`;
-      if (!docs.includes(rel)) docs.push(rel);
-      if (docs.length >= 20) break;
+  const walk = (relDir: string, depth: number): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(path.join(root, relDir), { withFileTypes: true });
+    } catch {
+      return;
     }
-  } catch {
-    // 没有 docs 目录
-  }
-  return docs;
+
+    const files: string[] = [];
+    const subdirs: string[] = [];
+    const sorted = entries
+      .filter((entry) => !entry.name.startsWith("."))
+      .sort((a, b) => {
+        if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+
+    for (const entry of sorted) {
+      if (entry.isDirectory()) {
+        if (IGNORED_DIRS.has(entry.name)) continue;
+        if (depth < MAX_DOC_DEPTH) subdirs.push(`${relDir}/${entry.name}`);
+        continue;
+      }
+      if (!entry.isFile() || !/\.(md|mdx)$/i.test(entry.name)) continue;
+      const rel = `${relDir}/${entry.name}`;
+      if (!docs.includes(rel)) {
+        if (docs.length >= MAX_DOCS) continue;
+        docs.push(rel);
+      }
+      files.push(rel);
+    }
+
+    if (files.length > 0) {
+      groups.push({
+        path: relDir,
+        title: relDir === "docs" ? undefined : readDocTitle(path.join(root, relDir, "README.md")),
+        files: files.slice(0, MAX_DOCS_PER_GROUP),
+      });
+    }
+
+    for (const subdir of subdirs) walk(subdir, depth + 1);
+  };
+
+  walk("docs", 0);
+  return { docs, groups };
 }
 
 /** 扫描项目，返回生成规范所需的事实 */
@@ -473,6 +541,8 @@ export function scanProject(cwd: string): ProjectFacts {
     if (typeof value === "string") rawScripts[key] = value;
   }
 
+  const scannedDocs = scanDocs(root);
+
   return {
     root,
     name,
@@ -483,7 +553,8 @@ export function scanProject(cwd: string): ProjectFacts {
     testFramework: detectTestFramework(root, pkg),
     commands,
     directories: scanDirectories(root),
-    docs: scanDocs(root),
+    docs: scannedDocs.docs,
+    docGroups: scannedDocs.groups,
     configs,
     hasAgents,
     hasDocsDir,

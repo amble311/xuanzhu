@@ -4,6 +4,30 @@
 
 ## [未发布]
 
+## [0.15.0] — 2026-11-08
+
+### 新增
+
+- **A 股分析模式（`xzh a`）**：同花顺免鉴权行情（实时快照 / K 线 / 分时 / 指数），
+  全市场快照与横截面筛选（白名单字段 + 盘后预计算指标），只读工具
+  `a_snapshot` / `a_screen` / `a_quote` / `a_bars`。工作目录固定 `~/.a`
+  （`XZH_A_HOME` 可重定向）；没有 `moni` 子命令，模拟交易后续接入。
+- **微信频道（iLink Bot，个人微信）**：`xzh gateway weixin login` 扫码绑定后，微信私聊直接
+  和 gateway 的 agent 对话（参考 hermes-agent 的 `plugins/platforms/weixin`）。
+  - 长轮询 `ilink/bot/getupdates` 收消息，不需要公网 webhook / 端口映射；
+  - 回复回显对端 `context_token` 并落盘，重启不丢上下文；`get_updates_buf` 断点续传；
+  - 消息 ID 5 分钟去重（iLink 会重复投递）；文本按 1500 字分块；
+  - `-14` 会话过期提示重新扫码，`-2` 限频退避 30 秒；
+  - 凭据存 `~/.xzh_gateway/weixin/account.json`（0600），`logout` 一次清干净；
+  - 白名单 `XZH_WEIXIN_ALLOWED_USERS`（不设 = 只服务扫码绑定的人）；
+  - **只支持文本**：图片/语音/文件（AES-128-ECB CDN）与群聊暂未接入；
+    iLink bot 身份通常进不了普通群，实际可用的是私聊。
+
+### 变更
+
+- README 不再介绍 `xzh btc` 与 `xzh a`：两者作为隐藏功能保留，仅通过
+  `xzh --help` / 界面 `/help` 查阅；对应章节与命令表条目已移除。
+
 ## [0.14.1] — 2026-11-07
 
 ## [0.14.0] — 2026-11-06

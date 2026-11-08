@@ -18,6 +18,32 @@ export const COMMANDS_FILE = "docs/COMMANDS.md";
 export const CONVENTIONS_FILE = "docs/CONVENTIONS.md";
 export const DOCS_INDEX_FILE = "docs/README.md";
 
+/**
+ * docs/ 的目录分工：根目录放**入口级四件套**，专题文档进子目录。
+ *
+ * 只描述约定，不预创建目录 —— 空目录进不了 git，也只会让人以为「这里该写点什么」。
+ */
+export const DOCS_SUBDIRS: Array<{ path: string; label: string; purpose: string }> = [
+  { path: "docs/guides", label: "操作指南", purpose: "步骤、流程、排障（how-to）" },
+  { path: "docs/reference", label: "参考手册", purpose: "API、配置项、数据字典" },
+  { path: "docs/decisions", label: "架构决策记录", purpose: "一篇一个决定，文件名 `NNNN-短标题.md`" },
+];
+
+/** 文档是否位于「入口层」（项目根 或 docs/ 根），子目录文档不算 */
+function isEntryDoc(rel: string): boolean {
+  if (!rel.includes("/")) return true;
+  if (!rel.startsWith("docs/")) return false;
+  return !rel.slice("docs/".length).includes("/");
+}
+
+/** 子目录的中文说明：先按最长前缀匹配内置约定，再看该目录 README 的一级标题 */
+function groupLabel(groupPath: string, title?: string): string {
+  const preset = DOCS_SUBDIRS.filter(
+    (item) => groupPath === item.path || groupPath.startsWith(`${item.path}/`),
+  ).sort((a, b) => b.path.length - a.path.length)[0];
+  return preset?.label ?? title ?? "专题文档";
+}
+
 const GENERATED_MARK = (version: string, date: string): string =>
   `> 本文件由 \`xzh init\` 扫描生成（xzh v${version}，${date}）。可直接编辑；` +
   `再次运行只会补充缺失的 \`## 小节\`，不会覆盖已有内容。`;
@@ -89,13 +115,20 @@ function docLine(rel: string): string {
     "CHANGELOG.md": "变更记录",
     "CONTRIBUTING.md": "贡献指南",
     "SECURITY.md": "安全策略",
-    [ARCHITECTURE_FILE]: "架构与目录说明（本文件）",
+    [ARCHITECTURE_FILE]: "架构与目录说明",
     [COMMANDS_FILE]: "命令手册",
     [CONVENTIONS_FILE]: "编码与工程约定",
+    [DOCS_INDEX_FILE]: "文档索引",
   };
   return `- \`${rel}\`${known[rel] ? ` — ${known[rel]}` : ""}`;
 }
 
+/**
+ * AGENTS.md 的文档索引：入口文档逐条列，子目录**按目录汇总**。
+ *
+ * 不能把 docs/ 下所有文件都列出来 —— 文档一多，AGENTS 就变成第二个索引，
+ * 违背「只放入口级信息」的设计。完整列表在 `docs/README.md`。
+ */
 function docIndex(facts: ProjectFacts, generated: string[]): string {
   const files: string[] = [];
   for (const rel of [...facts.docs, ...generated]) {
@@ -103,7 +136,25 @@ function docIndex(facts: ProjectFacts, generated: string[]): string {
     if (!files.includes(rel)) files.push(rel);
   }
   if (files.length === 0) return "";
-  return `## 文档索引\n\n${files.map(docLine).join("\n")}`;
+
+  const entryDocs = files.filter(isEntryDoc);
+  const groups = facts.docGroups.filter((group) => group.path !== "docs");
+  const lines = entryDocs.map(docLine);
+
+  for (const group of groups) {
+    const names = group.files.map((rel) => path.basename(rel));
+    const shown = names.slice(0, 6).join("、");
+    lines.push(
+      `- \`${group.path}/\`（${names.length} 篇）— ${groupLabel(group.path, group.title)}` +
+        `：${shown}${names.length > 6 ? " 等" : ""}`,
+    );
+  }
+
+  const hint =
+    files.length > entryDocs.length
+      ? "\n\n> 完整文档地图（含子目录）见 `docs/README.md`。"
+      : "";
+  return `## 文档索引\n\n${lines.join("\n")}${hint}`;
 }
 
 /**
@@ -178,14 +229,11 @@ export function buildAgentsDoc(
   return `${sections.join("\n\n")}\n`;
 }
 
-/** 生成 docs/README.md：文档入口与 AGENTS 的映射 */
+/** 生成 docs/README.md：文档入口、目录分工与分层索引 */
 export function buildDocsIndexDoc(
   facts: ProjectFacts,
   options: { version: string; date: string; generatedDocs: string[] },
 ): string {
-  const links = [
-    ...new Set(["AGENTS.md", ...options.generatedDocs, DOCS_INDEX_FILE]),
-  ];
   const has = (file: string): boolean =>
     file === DOCS_INDEX_FILE || options.generatedDocs.includes(file);
   const rows = [
@@ -194,12 +242,54 @@ export function buildDocsIndexDoc(
     has(COMMANDS_FILE) ? "| 安装 / 构建 / 测试 / 校验命令 | `docs/COMMANDS.md` |" : "",
     has(CONVENTIONS_FILE) ? "| 编码风格、配置与环境约定 | `docs/CONVENTIONS.md` |" : "",
   ].filter(Boolean);
+
+  const convention = [
+    "| 位置 | 放什么 |",
+    "| --- | --- |",
+    "| `docs/` 根 | 入口级四件套：`README.md`（本索引）、`ARCHITECTURE.md`、`COMMANDS.md`、`CONVENTIONS.md` |",
+    ...DOCS_SUBDIRS.map((item) => `| \`${item.path}/\` | ${item.label}：${item.purpose} |`),
+  ].join("\n");
+
+  const allDocs: string[] = [];
+  for (const rel of [...facts.docs, ...options.generatedDocs, DOCS_INDEX_FILE]) {
+    if (rel.toLowerCase() === "agents.md") continue; // 不自引用
+    if (!allDocs.includes(rel)) allDocs.push(rel);
+  }
+  const rootDocs = allDocs.filter((rel) => !rel.includes("/"));
+  const docsRoot = allDocs.filter(
+    (rel) => rel.startsWith("docs/") && isEntryDoc(rel),
+  );
+  const groups = facts.docGroups.filter((group) => group.path !== "docs");
+
+  const existing: string[] = [];
+  if (rootDocs.length > 0) {
+    existing.push(`### 项目根\n\n${rootDocs.map(docLine).join("\n")}`);
+  }
+  if (docsRoot.length > 0) {
+    existing.push(`### \`docs/\`\n\n${docsRoot.map(docLine).join("\n")}`);
+  }
+  for (const group of groups) {
+    existing.push(
+      `### \`${group.path}/\` — ${groupLabel(group.path, group.title)}\n\n` +
+        group.files.map(docLine).join("\n"),
+    );
+  }
+
   return `# ${facts.name} 文档索引
 
 ${GENERATED_MARK(options.version, options.date)}
 
 > \`AGENTS.md\` 只放大纲；本目录存放详细说明。Agent 先读 AGENTS.md，再按需打开对应文档。
 > 修改代码后同步维护对应 md；md 改动涉及设计变化时，必须在回复中额外说明。
+
+## 目录分工
+
+${convention}
+
+- 子目录按主题划分，最多两层（\`docs/<主题>/[<子主题>/]<文件>.md\`），文件名用小写连字符。
+- **只有真的写了文档才建目录**，不要提交空目录占位；子目录可选一个 \`README.md\` 作该目录索引，
+  它的一级标题会作为目录说明。
+- 入口级文档只放四件套，新增长篇说明应落到 \`guides/\`、\`reference/\` 或 \`decisions/\`，别继续堆在根上。
 
 ## 对应关系
 
@@ -209,7 +299,7 @@ ${rows.join("\n")}
 
 ## 已有文档
 
-${links.map((item) => `- \`${item}\``).join("\n")}
+${existing.length > 0 ? existing.join("\n\n") : "（暂无）"}
 `;
 }
 
@@ -236,6 +326,17 @@ export function buildArchitectureDoc(
           .map((command) => `- **${command.name}**：\`${command.command}\``)
           .join("\n");
 
+  const docLines = [
+    "- `docs/` —— 入口级四件套：`README.md`（索引）、`ARCHITECTURE.md`（本文件）、" +
+      "`COMMANDS.md`、`CONVENTIONS.md`",
+    ...facts.docGroups
+      .filter((group) => group.path !== "docs")
+      .map(
+        (group) =>
+          `- \`${group.path}/\` —— ${group.files.length} 篇：${groupLabel(group.path, group.title)}`,
+      ),
+  ].join("\n");
+
   return `# ${facts.name} 架构说明
 
 ${GENERATED_MARK(options.version, options.date)}
@@ -249,6 +350,13 @@ ${renderTree(facts.root, 2, 60)}
 ## 模块概览
 
 ${modules}
+
+## 文档组织
+
+${docLines}
+
+> 文档按主题进子目录（\`guides/\` / \`reference/\` / \`decisions/\`），根目录只留入口级四件套；
+> 完整索引见 \`docs/README.md\`。
 
 ## 入口与运行
 

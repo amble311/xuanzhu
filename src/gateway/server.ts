@@ -13,6 +13,8 @@ import {
   writeGatewayState,
   type GatewayState,
 } from "./service";
+import { loadAccount } from "./weixin/paths";
+import { startWeixinChannel, type WeixinChannel } from "./weixin/channel";
 
 /**
  * `xzh gateway run`：常驻后台进程。
@@ -239,10 +241,32 @@ export async function runGateway(): Promise<void> {
     process.exit(1);
   });
 
+  let weixin: WeixinChannel | null = null;
+
   server.listen(port, "127.0.0.1", () => {
     log(`gateway 已启动 pid=${process.pid} port=${port} cwd=${home}`);
     // 启动即写一次状态：`xzh gateway` 的等待逻辑靠它判断「起来了」
     writeGatewayState(state, home);
+
+    // 微信频道：登录过才启动（没登录不该在日志里刷重试）
+    const account = loadAccount(home);
+    if (account) {
+      const allowed = (process.env.XZH_WEIXIN_ALLOWED_USERS ?? "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+      weixin = startWeixinChannel({
+        home,
+        account,
+        log,
+        allowedUsers: allowed,
+        // 与 HTTP /message 共用同一条串行队列：同一个 Agent 实例不能并发
+        onMessage: (text) => handleMessage(text),
+      });
+      log(`微信频道已启动 account=${account.accountId}`);
+    } else {
+      log("微信未登录（要接微信请运行 xzh gateway weixin login）");
+    }
   });
 
   const heartbeat = setInterval(() => {
@@ -277,6 +301,7 @@ export async function runGateway(): Promise<void> {
     if (closing) return;
     closing = true;
     log("gateway 正在退出");
+    weixin?.stop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     cleanup();
     process.exit(code);

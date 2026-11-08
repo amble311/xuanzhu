@@ -45,6 +45,18 @@ export function getBtcHome(): string {
   return path.join(os.homedir(), ".btc");
 }
 
+/**
+ * A 股模式的数据目录，默认 `~/.a`（可用 `XZH_A_HOME` 重定向）。
+ *
+ * 与 `~/.btc` 同理：这里是 A 股行情缓存、股票池与（将来的）模拟账本，
+ * **不跟随 `XZH_HOME`**（那是玄猪的全局配置）。
+ */
+export function getAShareHome(): string {
+  const override = process.env.XZH_A_HOME?.trim();
+  if (override) return path.resolve(expandHome(override));
+  return path.join(os.homedir(), ".a");
+}
+
 /** 旧版全局目录：~/.xuanzhu（v0.1.0 及更早使用，仅供迁移检测） */
 export function getLegacyConfigDir(): string {
   return path.join(os.homedir(), ".xuanzhu");

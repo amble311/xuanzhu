@@ -14,6 +14,7 @@ import {
   uninstallAutostart,
 } from "../gateway/service";
 import { runGateway, tailGatewayLog } from "../gateway/server";
+import { weixinCommand } from "./weixin";
 
 function line(text = ""): void {
   process.stdout.write(`${text}\n`);
@@ -73,6 +74,11 @@ export async function gatewayCommand(args: string[]): Promise<void> {
   // 常驻进程本体（systemd / detached 拉起时用；手动跑就是前台调试）
   if (sub === "run") {
     await runGateway();
+    return;
+  }
+
+  if (sub === "weixin") {
+    await weixinCommand(args.slice(1));
     return;
   }
 
