@@ -11,7 +11,7 @@ import { getDisabledSkillNames } from "./state";
  * 用 `load_skill` 加载完整指南，再借助 `bash` 工具执行对应命令。
  *
  * 技能来源分两级（全局通用），优先级从高到低，同名时高优先级覆盖：
- *   1. 用户：~/.xzh/skills
+ *   1. 用户：~/.xzh/data/skills
  *   2. 内置：<安装目录>/skills（打包后为 dist/skills）
  */
 

@@ -3,7 +3,7 @@ import * as path from "path";
 import { getBtcHome } from "../utils/paths";
 
 /**
- * 后端「暂停」开关（`~/.btc/run/paused.json`）。
+ * 后端「暂停」开关（`~/.xzh_btc/run/paused.json`）。
  *
  * 与 `xzh btc stop` 的区别：
  * - **暂停**（对话内 `/stop`）：进程还在、队列还在、状态还在，只是不再按队列执行巡检、

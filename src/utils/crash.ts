@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { getConfigDir } from "./paths";
+import { ensureDir, getCrashLogPath, getSessionLockPath } from "./paths";
 
 /**
  * 异常退出诊断。
@@ -16,14 +16,6 @@ import { getConfigDir } from "./paths";
  * 并把日志内容提示给用户 —— 这条路径不依赖崩溃当时能否写 stdout，
  * 连 OOM 这种来不及执行任何 JS 的终止也能被下一次启动发现。
  */
-
-function lockPath(): string {
-  return path.join(getConfigDir(), "session.lock");
-}
-
-function logPath(): string {
-  return path.join(getConfigDir(), "crash.log");
-}
 
 export interface PreviousExit {
   /** 上次启动的时间（ISO 字符串），读取失败时为 undefined */
@@ -42,9 +34,9 @@ export interface PreviousExit {
 export function markSessionStart(version: string): PreviousExit | null {
   const previous: PreviousExit | null = readPrevious();
   try {
-    fs.mkdirSync(getConfigDir(), { recursive: true });
+    ensureDir(path.dirname(getSessionLockPath()));
     fs.writeFileSync(
-      lockPath(),
+      getSessionLockPath(),
       JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), version }),
       { mode: 0o600 },
     );
@@ -58,7 +50,7 @@ export function markSessionStart(version: string): PreviousExit | null {
 function readPrevious(): PreviousExit | null {
   let raw: string;
   try {
-    raw = fs.readFileSync(lockPath(), "utf8");
+    raw = fs.readFileSync(getSessionLockPath(), "utf8");
   } catch {
     return null; // 没有锁文件 = 上次正常退出，或首次运行
   }
@@ -74,7 +66,7 @@ function readPrevious(): PreviousExit | null {
 
   try {
     // 只保留最近一段，避免日志无限增长
-    const log = fs.readFileSync(logPath(), "utf8");
+    const log = fs.readFileSync(getCrashLogPath(), "utf8");
     info.crashLog = log.slice(-4000);
   } catch {
     // 没有日志（例如被 OOM 直接杀掉，来不及写）
@@ -96,8 +88,8 @@ export function recordCrash(kind: string, error: unknown): void {
       .join("\n") +
     "\n";
   try {
-    fs.mkdirSync(getConfigDir(), { recursive: true });
-    fs.appendFileSync(logPath(), entry, "utf8");
+    ensureDir(path.dirname(getCrashLogPath()));
+    fs.appendFileSync(getCrashLogPath(), entry, "utf8");
   } catch {
     // 尽力而为
   }
@@ -106,8 +98,8 @@ export function recordCrash(kind: string, error: unknown): void {
 /** 正常退出时清除标记与旧日志 */
 export function markSessionEnd(): void {
   try {
-    fs.rmSync(lockPath(), { force: true });
-    fs.rmSync(logPath(), { force: true });
+    fs.rmSync(getSessionLockPath(), { force: true });
+    fs.rmSync(getCrashLogPath(), { force: true });
   } catch {
     // 忽略
   }
@@ -115,5 +107,5 @@ export function markSessionEnd(): void {
 
 /** 崩溃日志路径（用于提示用户） */
 export function crashLogPath(): string {
-  return logPath();
+  return getCrashLogPath();
 }

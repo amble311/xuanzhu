@@ -2,7 +2,7 @@ import { execFileSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { getConfigDir } from "../utils/paths";
+import { getApksDir } from "../utils/paths";
 
 /**
  * AutoJs6 安装包的**定位与安装引导**。
@@ -23,7 +23,7 @@ export const AUTOJS6_RELEASES_URL =
 
 /** 本机 APK 缓存目录：有就优先用，没有就引导去官方下载 */
 export function apkCacheDir(): string {
-  return path.join(getConfigDir(), "apks");
+  return getApksDir();
 }
 
 export type AndroidAbi = "arm64-v8a" | "armeabi-v7a" | "x86_64" | "x86";

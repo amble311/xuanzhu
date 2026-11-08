@@ -8,7 +8,7 @@ import {
   saveConfig,
 } from "../../config/store";
 import { ansi } from "../../utils/ansi";
-import { ensureDir, getConfigDir, getConfigPath } from "../../utils/paths";
+import { ensureDir, getConfigSubdir, getConfigPath } from "../../utils/paths";
 
 /**
  * `xzh config`        查看配置（脱敏）
@@ -26,7 +26,7 @@ export async function configCommand(args: string[]): Promise<void> {
       process.stdout.write(`${getConfigPath()}\n`);
       return;
     case "init": {
-      ensureDir(getConfigDir());
+      ensureDir(getConfigSubdir());
       if (configExists()) {
         process.stdout.write(
           `${ansi.yellow}配置文件已存在：${getConfigPath()}${ansi.reset}\n`,
@@ -67,7 +67,7 @@ function showConfig(): void {
 }
 
 function openInEditor(): void {
-  ensureDir(getConfigDir());
+  ensureDir(getConfigSubdir());
   const file = getConfigPath();
   if (!fs.existsSync(file)) {
     saveConfig({ ...DEFAULT_CONFIG });

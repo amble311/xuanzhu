@@ -9,7 +9,7 @@ import { getBtcHome } from "../utils/paths";
  * **两处存储，各司其职**：
  * - 明文（apiKey / apiSecret）交给全局加密库 `~/.xzh/vault/`（AES-256-GCM，0600），
  *   与项目里其它凭据同一套机制，不另造加密；
- * - 索引 `~/.btc/credentials.json` 只存「平台 → 引用 id + 别名 + 时间」，
+ * - 索引 `~/.xzh_btc/credentials.json` 只存「平台 → 引用 id + 别名 + 时间」，
  *   属于 btc 模式的数据目录。
  *
  * 为什么不像 vault 那样只存一份：vault 只按明文摘要去重，没有平台概念，

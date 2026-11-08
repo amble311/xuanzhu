@@ -67,7 +67,7 @@ export interface BackendState {
 
 export interface BackendPaths {
   role: BackendRole;
-  /** 运行时目录：~/.btc/run */
+  /** 运行时目录：~/.xzh_btc/run */
   dir: string;
   lockFile: string;
   stateFile: string;

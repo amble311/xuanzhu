@@ -1,13 +1,15 @@
 import * as fs from "fs";
 import * as path from "path";
-import { ensureDir, getConfigDir } from "../utils/paths";
+import { ensureDir, getSkillStatePath } from "../utils/paths";
+
+export { getSkillStatePath };
 
 /**
  * 技能的启用 / 禁用状态，存放在全局目录的 `skills.json`。
  *
  * 为什么是「名字清单」而不是删目录：技能有两种来源 ——
  *   - 内置（随包分发，位于 dist/skills，重装 / 升级都会还原）；
- *   - 用户自建（~/.xzh/skills/<name>，归用户所有）。
+ *   - 用户自建（~/.xzh/data/skills/<name>，归用户所有）。
  * 「禁用内置技能」不可能靠删文件实现，所以统一记名字；「删除」则只对用户技能生效。
  *
  * 与 `config.json` 分开的原因：config.json 是**模型配置**（provider / key / 模型列表），
@@ -22,10 +24,6 @@ export interface SkillState {
 }
 
 export const SKILL_STATE_VERSION = 1;
-
-export function getSkillStatePath(): string {
-  return path.join(getConfigDir(), "skills.json");
-}
 
 /** 读取技能状态；文件缺失 / 损坏时返回默认值（损坏不报错 —— 状态丢了最多是全部恢复启用） */
 export function loadSkillState(): SkillState {
@@ -44,7 +42,7 @@ export function loadSkillState(): SkillState {
 }
 
 export function saveSkillState(state: SkillState): void {
-  ensureDir(getConfigDir());
+  ensureDir(path.dirname(getSkillStatePath()));
   fs.writeFileSync(
     getSkillStatePath(),
     `${JSON.stringify(state, null, 2)}\n`,

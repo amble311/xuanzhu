@@ -27,7 +27,7 @@ export { binanceExchange } from "./binance";
 
 export const EXCHANGES: ExchangeAdapter[] = [binanceExchange];
 
-/** 默认平台；`BTC_EXCHANGE` 可覆盖（写在 `~/.btc/.env` 或环境变量里） */
+/** 默认平台；`BTC_EXCHANGE` 可覆盖（写在 `~/.xzh_btc/.env` 或环境变量里） */
 export const DEFAULT_EXCHANGE_ID = "binance";
 
 export function findExchange(id: string | undefined): ExchangeAdapter | undefined {
@@ -51,7 +51,7 @@ export interface ActiveExchange {
 /**
  * 当前使用的交易所。
  *
- * 优先级：`BTC_EXCHANGE` 环境变量 > `~/.btc/platform.json` > 默认 binance。
+ * 优先级：`BTC_EXCHANGE` 环境变量 > `~/.xzh_btc/platform.json` > 默认 binance。
  * 环境变量优先是为了 CI / 多环境脚本能临时覆盖，不被交互选择的值锁死。
  *
  * 写了不存在的平台时**不静默回退** —— 否则用户以为在用 OKX，实际数据来自币安，

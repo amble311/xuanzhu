@@ -1,7 +1,7 @@
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
-import { getConfigDir } from "./paths";
+import { getErrorsDir } from "./paths";
 import { VERSION } from "./version";
 
 /**
@@ -10,7 +10,7 @@ import { VERSION } from "./version";
  * 目的：用户反馈「用着用着报错了」时，能拿到**可复现的现场**，而不是一句转述。
  * 因此把「出了什么错 + 在什么环境下出的」落成结构化文件，而不是只往 `crash.log` 里
  * 追加一段给人看的文本：
- *   - 位置：`~/.xzh/errors/`（全局，因为它描述的是**玄猪本身**的问题，与项目无关；
+ *   - 位置：`~/.xzh/state/errors/`（全局，因为它描述的是**玄猪本身**的问题，与项目无关；
  *     报告里带 `cwd` / `project` 作为上下文）；
  *   - 一份报告 = 一个文件，文件名是**签名哈希**：同样的错误反复出现只累加 `count`，
  *     不会刷出几十份重复文件（这类噪音会让真正的新问题被埋掉）；
@@ -20,9 +20,9 @@ import { VERSION } from "./version";
  * 也不记用户的配置错误之外的普通提示 —— 那是使用方式问题，不是 bug。
  */
 
-/** 报告目录：`~/.xzh/errors` */
+/** 报告目录：`~/.xzh/state/errors` */
 export function errorReportsDir(): string {
-  return path.join(getConfigDir(), "errors");
+  return getErrorsDir();
 }
 
 /** 最多保留多少份不同签名的报告 */

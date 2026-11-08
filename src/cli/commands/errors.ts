@@ -15,7 +15,7 @@ import { promptConfirm } from "../prompt";
  * `xzh errors` —— 查看 / 清理玄猪自己记录的错误报告。
  *
  * 报告由 `src/utils/error-reports.ts` 在异常路径上写入（未捕获异常、工具抛错、
- * 整轮失败），存放在 `~/.xzh/errors/`。这个命令只做三件事：列出来、看细节、清掉，
+ * 整轮失败），存放在 `~/.xzh/state/errors/`。这个命令只做三件事：列出来、看细节、清掉，
  * 目的是让用户反馈问题时能直接把文件（或 `show` 的输出）贴出来。
  */
 
@@ -138,7 +138,7 @@ async function clear(yes: boolean): Promise<void> {
 }
 
 function printHelp(): void {
-  out(`${ansi.bold}xzh errors${ansi.reset} —— 查看玄猪记录的错误报告（~/.xzh/errors/）
+  out(`${ansi.bold}xzh errors${ansi.reset} —— 查看玄猪记录的错误报告（~/.xzh/state/errors/）
   ${ansi.green}xzh errors${ansi.reset}              列出报告（最近的在前）
   ${ansi.green}xzh errors show <序号|签名>${ansi.reset}  查看一份报告的完整内容（JSON）
   ${ansi.green}xzh errors path${ansi.reset}         打印报告目录

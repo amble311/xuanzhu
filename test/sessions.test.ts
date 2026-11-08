@@ -83,6 +83,6 @@ describe("会话持久化", () => {
       .update(path.resolve(projectCwd))
       .digest("hex")
       .slice(0, 10);
-    return path.join(home, "sessions", `${path.basename(projectCwd)}-${hash}`);
+    return path.join(home, "data", "sessions", `${path.basename(projectCwd)}-${hash}`);
   }
 });

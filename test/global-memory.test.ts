@@ -45,7 +45,7 @@ const tmpProject = (): string =>
   fs.mkdtempSync(path.join(os.tmpdir(), "xzh-global-project-"));
 
 beforeEach(() => {
-  fs.rmSync(path.join(home, "memory"), { recursive: true, force: true });
+  fs.rmSync(path.join(home, "data", "memory"), { recursive: true, force: true });
   fs.rmSync(path.join(home, "vault"), { recursive: true, force: true });
   fs.mkdirSync(home, { recursive: true });
 });

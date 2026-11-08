@@ -128,7 +128,7 @@ export async function runRunner<T = unknown>(
           (envelope.data as { traceback?: string } | undefined)?.traceback ??
           stderr.trim().slice(-800);
         const message = envelope.error ?? "计算失败";
-        // 「未知命令」几乎总是同一个原因：`~/.btc/runner.py` 还是旧版，
+        // 「未知命令」几乎总是同一个原因：`~/.xzh_btc/runner.py` 还是旧版，
         // 而 CLI 已经在调新命令（例如 paper-status）。不点明的话，
         // 用户会以为「模拟盘没初始化」而不是「脚本该更新了」。
         const stale = message.includes("未知命令") || message.includes("unknown command");

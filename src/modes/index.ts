@@ -30,9 +30,9 @@ export function findMode(name: string | undefined): AgentMode | undefined {
 }
 
 /**
- * 按目录反查模式：`xzh ~/.btc` 与 `xzh btc` 应该进入同一个模式。
+ * 按目录反查模式：`xzh ~/.xzh_btc` 与 `xzh btc` 应该进入同一个模式。
  *
- * 用 realpath 比较，因为用户可能通过软链接（`~/.btc -> /data/btc`）进入；
+ * 用 realpath 比较，因为用户可能通过软链接（`~/.xzh_btc -> /data/btc`）进入；
  * 任一侧解析失败就退化为 `path.resolve` 比较，不能因为权限问题把模式丢给普通流程。
  */
 export function modeForHome(dir: string): AgentMode | undefined {

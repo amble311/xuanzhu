@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { ansi, padEnd, truncate } from "../../utils/ansi";
-import { getConfigDir } from "../../utils/paths";
+import { getSkillStatePath } from "../../utils/paths";
 import {
   discoverSkills,
   setSkillDisabled,
@@ -18,10 +18,10 @@ const DESCRIPTION_LIMIT = 52;
  * 无参数时进入交互菜单；`list` / `enable` / `disable` / `delete` 是同一套能力的
  * 非交互形式（便于脚本与远程使用）。
  *
- * 状态存放在 `~/.xzh/skills.json`（见 src/skills/state.ts）：
+ * 状态存放在 `~/.xzh/config/skills.json`（见 src/skills/state.ts）：
  *   - **禁用**：往名字清单里记一笔，`list_skills` / `load_skill` 就不再看见它
  *     （内置技能删不掉，禁用是唯一的隐藏手段）；
- *   - **删除**：只对**用户技能**（~/.xzh/skills/<name>）生效 —— 内置技能随包分发、
+ *   - **删除**：只对**用户技能**（~/.xzh/data/skills/<name>）生效 —— 内置技能随包分发、
  *     重装即还原，删除没有意义，一律引导改用禁用。
  */
 
@@ -72,7 +72,7 @@ function printSkillTable(includeDisabled: boolean): void {
   const builtin = skills.filter((s) => s.source === "builtin").length;
   const user = skills.length - builtin;
 
-  const statePath = path.join(getConfigDir(), "skills.json");
+  const statePath = getSkillStatePath();
   process.stdout.write(
     `\n${ansi.bold}玄猪技能列表${ansi.reset} ` +
       `${ansi.gray}(内置 ${builtin} · 用户 ${user} · ` +
@@ -83,7 +83,7 @@ function printSkillTable(includeDisabled: boolean): void {
     process.stdout.write(
       `  ${ansi.yellow}没有发现任何技能。${ansi.reset}\n` +
         `  ${ansi.gray}把含 SKILL.md 的目录放进 ` +
-        `${ansi.reset}~/.xzh/skills/<name>${ansi.gray} 即可。${ansi.reset}\n`,
+        `${ansi.reset}~/.xzh/data/skills/<name>${ansi.gray} 即可。${ansi.reset}\n`,
     );
     return;
   }
@@ -206,7 +206,7 @@ async function deleteCommand(args: string[]): Promise<void> {
     );
     if (userSkills.length === 0) {
       process.stdout.write(
-        `${ansi.yellow}没有可删除的用户技能${ansi.gray}（~/.xzh/skills/ 下没有自建技能）。${ansi.reset}\n` +
+        `${ansi.yellow}没有可删除的用户技能${ansi.gray}（~/.xzh/data/skills/ 下没有自建技能）。${ansi.reset}\n` +
           `${ansi.gray}内置技能不可删除，如需隐藏请用 ${ansi.reset}xzh skill disable <名称>${ansi.gray}。${ansi.reset}\n`,
       );
       return;
@@ -330,9 +330,9 @@ function printSkillHelp(): void {
       `                            删除技能（仅限用户技能；内置技能请改用 disable）`,
       "",
       `${ansi.bold}说明${ansi.reset}`,
-      `  状态保存在 ${ansi.gray}${path.join(getConfigDir(), "skills.json")}${ansi.reset}。`,
+      `  状态保存在 ${ansi.gray}${getSkillStatePath()}${ansi.reset}。`,
       "  禁用 = list_skills / load_skill 不再可见（可随时恢复）；",
-      "  删除 = 从磁盘移除技能目录，仅对用户技能（~/.xzh/skills/<name>）生效。",
+      "  删除 = 从磁盘移除技能目录，仅对用户技能（~/.xzh/data/skills/<name>）生效。",
       "",
     ].join("\n"),
   );

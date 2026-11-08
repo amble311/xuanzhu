@@ -5,12 +5,12 @@ import { getBtcHome } from "../utils/paths";
 /**
  * 平台选择（`xzh btc platform`）。
  *
- * 为什么单独存文件，而不是让用户去改 `~/.btc/.env`：
+ * 为什么单独存文件，而不是让用户去改 `~/.xzh_btc/.env`：
  * 交互式命令选完要**立刻生效并持久化**，而手写 `.env` 既要记变量名、又要重启进程；
  * 配置文件还能被 `xzh btc status` 读出来展示「当前用的是哪个平台、这个值来自哪」。
  *
  * 优先级（`activeExchange` 里实现）：
- * `BTC_EXCHANGE` 环境变量 > `~/.btc/platform.json` > 默认 binance。
+ * `BTC_EXCHANGE` 环境变量 > `~/.xzh_btc/platform.json` > 默认 binance。
  * 环境变量优先是为了 CI / 多环境：脚本里临时切换不该被文件覆盖。
  */
 

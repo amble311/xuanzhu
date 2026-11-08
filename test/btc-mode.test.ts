@@ -3,6 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { allModes, createBtcMode, findMode, modeForHome } from "../src/modes";
+import { resolveModeHomeDir } from "../src/utils/paths";
 import { buildSystemPrompt } from "../src/core/prompt";
 import { discoverSkills, parseFrontmatter } from "../src/skills";
 import { TOOLS, toolVisibleInMode } from "../src/tools";
@@ -131,7 +132,7 @@ describe("技能的模式归属（frontmatter: modes）", () => {
   });
 
   function writeSkill(name: string, frontmatter: string): void {
-    const dir = path.join(home, "skills", name);
+    const dir = path.join(home, "data", "skills", name);
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(
       path.join(dir, "SKILL.md"),
@@ -176,8 +177,9 @@ describe("技能的模式归属（frontmatter: modes）", () => {
 
   it("模式过滤与禁用标记互不影响", () => {
     writeSkill("btc-only", "modes: [btc]\n");
+    fs.mkdirSync(path.join(home, "config"), { recursive: true });
     fs.writeFileSync(
-      path.join(home, "skills.json"),
+      path.join(home, "config", "skills.json"),
       JSON.stringify({ version: 1, disabled: ["btc-only"] }),
     );
     expect(discoverSkills({ mode: "btc" })).toEqual([]);
@@ -653,5 +655,48 @@ describe("btc 计算层 bootstrap", () => {
 
     expect(fs.readFileSync(path.join(home, ".env"), "utf8")).toContain("ETH/USDT");
     expect(fs.readFileSync(path.join(home, "data", "btc.db"), "utf8")).toBe("keep");
+  });
+});
+
+describe("模式数据目录解析", () => {
+  const home = "/home/tester";
+  const options = { current: ".xzh_btc", legacy: ".btc" };
+
+  it("没有旧目录时用新默认目录", () => {
+    expect(resolveModeHomeDir(home, { ...options, exists: () => false })).toBe(
+      "/home/tester/.xzh_btc",
+    );
+    expect(
+      resolveModeHomeDir(home, {
+        current: ".xzh_a",
+        legacy: ".a",
+        exists: () => false,
+      }),
+    ).toBe("/home/tester/.xzh_a");
+  });
+
+  it("旧目录存在且新目录不存在时继续沿用旧目录（不自动搬迁）", () => {
+    expect(
+      resolveModeHomeDir(home, {
+        ...options,
+        exists: (target) => target.endsWith("/.btc"),
+      }),
+    ).toBe("/home/tester/.btc");
+  });
+
+  it("新旧目录都存在时优先新目录", () => {
+    expect(resolveModeHomeDir(home, { ...options, exists: () => true })).toBe(
+      "/home/tester/.xzh_btc",
+    );
+  });
+
+  it("环境变量覆盖优先于任何默认 / 旧目录", () => {
+    expect(
+      resolveModeHomeDir(home, {
+        ...options,
+        override: "/data/btc",
+        exists: () => true,
+      }),
+    ).toBe("/data/btc");
   });
 });

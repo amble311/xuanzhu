@@ -55,7 +55,8 @@ describe("技能启用 / 禁用状态", () => {
     // 重复禁用返回 false（状态未变化）
     expect(setSkillDisabled("demo", true)).toBe(false);
 
-    const file = path.join(home, "skills.json");
+    fs.mkdirSync(path.join(home, "config"), { recursive: true });
+    const file = path.join(home, "config", "skills.json");
     expect(fs.existsSync(file)).toBe(true);
     expect(loadSkillState().disabled).toContain("demo");
 
@@ -72,7 +73,7 @@ describe("技能启用 / 禁用状态", () => {
 
   it("discoverSkills 默认过滤掉禁用项，includeDisabled 可看全量", () => {
     // 造一个用户技能
-    const dir = path.join(home, "skills", "demo-skill");
+    const dir = path.join(home, "data", "skills", "demo-skill");
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(
       path.join(dir, "SKILL.md"),

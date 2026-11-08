@@ -125,7 +125,7 @@ const READ_TOOLS = new Set(["read_file", "list_dir", "glob", "grep"]);
 
 /**
  * 读取时需要额外确认的敏感路径：凭据、密钥、版本控制与云服务配置。
- * 典型场景是 `read_file ~/.xzh/config.json` —— 那里存着明文的模型 apiKey，
+ * 典型场景是 `read_file ~/.xzh/config/config.json` —— 那里存着明文的模型 apiKey，
  * 一旦被读进上下文就等于把它发给了模型服务商。
  */
 const SENSITIVE_PATH_PATTERN =
@@ -2737,7 +2737,7 @@ export class Agent {
    * 而它们并无实际风险 —— 既然用户选择了自动批准，就不该被这类无关确认打断。
    *
    * 真正值得拦一次的只有凭据文件：它们一旦被读进上下文，就会随请求发送给
-   * 模型服务商（`~/.xzh/config.json` 里就存着明文 apiKey）。这类读取极少发生，
+   * 模型服务商（`~/.xzh/config/config.json` 里就存着明文 apiKey）。这类读取极少发生，
    * 因此不会影响正常体验。
    */
   private touchesSensitivePath(toolName: string, rawArgs: string): boolean {
@@ -2801,7 +2801,7 @@ export class Agent {
     //  1. autoApprove（**默认开启**）下所有工具直接执行 —— 包括执行命令、写文件、
     //     读取工作区外的文件。用户选择「全自动」意味着接受相应风险，
     //     不应再用逐项确认打断他（danger 字段仍用于确认框的醒目标记）。
-    //  2. 读取**凭据类文件**（~/.ssh、.env、~/.xzh/config.json 等）默认也不拦。
+    //  2. 读取**凭据类文件**（~/.ssh、.env、~/.xzh/config/config.json 等）默认也不拦。
     //     想恢复这道防线时把 `confirmSensitiveRead` 设为 true —— 它防的是
     //     「凭据被读进上下文、转手发给模型服务商」，与「是否信任模型执行命令」
     //     是两个问题，但默认关闭以免破坏「自动放行」的预期。

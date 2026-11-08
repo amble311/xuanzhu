@@ -1,13 +1,13 @@
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
-import { ensureDir, getConfigDir } from "./paths";
+import { ensureDir, getBackupsDir } from "./paths";
 
 /**
  * 文件修改的**撤销快照**。
  *
  * write_file / edit_file 在真正写盘前调用 `snapshotForUndo()` 把改动前的内容
- * 拷贝到 `~/.xzh/backups/<项目>-<哈希>/`，并以 JSONL 清单按序记录；
+ * 拷贝到 `~/.xzh/data/backups/<项目>-<哈希>/`，并以 JSONL 清单按序记录；
  * `/undo` 弹出最近一条记录恢复原内容。
  *
  * 为什么不用 git：项目可能根本不是 git 仓库，也可能有大量未提交改动 ——
@@ -38,7 +38,7 @@ function backupDirFor(cwd: string): string {
     .digest("hex")
     .slice(0, 10);
   const name = path.basename(cwd) || "project";
-  return path.join(getConfigDir(), "backups", `${name}-${hash}`);
+  return path.join(getBackupsDir(), `${name}-${hash}`);
 }
 
 function manifestPath(cwd: string): string {

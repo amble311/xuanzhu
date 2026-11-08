@@ -90,7 +90,7 @@ import {
   sniffImageMime,
   type ClipboardImage,
 } from "../utils/clipboard";
-import { expandHome, getBtcHome, getConfigDir } from "../utils/paths";
+import { expandHome, getBtcHome, getKeysLogPath } from "../utils/paths";
 import { VERSION } from "../utils/version";
 import { composeHeaderBlocks } from "./header-layout";
 import {
@@ -1293,7 +1293,7 @@ export class TuiApp {
       .replace(/\n/g, "\\n");
     try {
       fs.appendFileSync(
-        path.join(getConfigDir(), "keys.log"),
+        getKeysLogPath(),
         `${new Date().toISOString()}  hex=[${hex}]  raw=${JSON.stringify(readable)}\n`,
       );
     } catch {
@@ -1801,7 +1801,7 @@ export class TuiApp {
    * `/monitor`：把叫醒条件完整打印到对话区。
    *
    * 右侧面板只有几十列，公式/链式条件折行后仍会被截；这里不经过模型，
-   * 直接读 `~/.btc/run/triggers*.json`，看到的就是后端要评估的那份配置。
+   * 直接读 `~/.xzh_btc/run/triggers*.json`，看到的就是后端要评估的那份配置。
    */
   private showMonitor(): void {
     if (this.mode?.name !== "btc") {
@@ -3690,7 +3690,7 @@ export class TuiApp {
       this.lines.push(
         `${ansi.gray}  · /memory clear 清空项目记忆 · /memory global 查看全局记忆` +
           `${ansi.reset}${ansi.gray}（/memory clear global 清空全局；均需确认；` +
-          `不会删除 ~/.xzh/sessions 的会话存档）${ansi.reset}`,
+          `不会删除 ~/.xzh/data/sessions 的会话存档）${ansi.reset}`,
       );
       return;
     }
@@ -3739,8 +3739,8 @@ export class TuiApp {
       const more =
         files.length > MAX_SHOWN ? `\n  …还有 ${files.length - MAX_SHOWN} 个文件` : "";
       const clearHint = targetGlobal
-        ? "⚠ 全局记忆会注入所有项目，清空后不可恢复；不会删除 ~/.xzh/sessions 里的会话存档。"
-        : "⚠ 此操作不可恢复；不会删除 ~/.xzh/sessions 里的会话存档。";
+        ? "⚠ 全局记忆会注入所有项目，清空后不可恢复；不会删除 ~/.xzh/data/sessions 里的会话存档。"
+        : "⚠ 此操作不可恢复；不会删除 ~/.xzh/data/sessions 里的会话存档。";
       const approved = await this.requestConfirm(
         {
           tool: "memory_clear",
@@ -3865,7 +3865,7 @@ export class TuiApp {
    * `/btc [moni]`：把当前会话切进 btc 专用模式，不重启进程。
    *
    * 顺序是硬要求：**先切目录，再换模式**。反过来会踩 `setCwd` 的 cwdLocked 闸门
-   * （btc 模式锁定 `~/.btc`，而此刻 cwd 还是原项目）→ 目录静默不切，模式却已生效，
+   * （btc 模式锁定 `~/.xzh_btc`，而此刻 cwd 还是原项目）→ 目录静默不切，模式却已生效，
    * 结果「提示切过去了，工具在看错误的目录」。
    *
    * 刻意**不自动拉起常驻后端**：拉起进程会立刻开始自主巡检（现在是无人值守可下单），

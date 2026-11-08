@@ -3,7 +3,7 @@ import * as path from "path";
 import { getBtcHome } from "../utils/paths";
 
 /**
- * 巡检排期队列（`~/.btc/run/schedules.json`）。
+ * 巡检排期队列（`~/.xzh_btc/run/schedules.json`）。
  *
  * 模型每次调用 `btc_schedule` 就往队列里放一条计划；后台每 60 秒检查一次，
  * 把**已到期**的条目取出来执行（取出即出队）。

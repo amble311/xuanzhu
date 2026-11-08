@@ -4,7 +4,7 @@ import { getBtcHome } from "../utils/paths";
 import type { ScheduleRole } from "./schedule";
 
 /**
- * 用户的「叫醒条件」（`~/.btc/run/triggers.json`）。
+ * 用户的「叫醒条件」（`~/.xzh_btc/run/triggers.json`）。
  *
  * 解决的问题：模型只能通过 `btc_schedule` 决定「什么时候看」，而用户真正关心的是
  * 「到了某个价位 / 某个指标值再看」。若把「跌破 80000 提醒我」写成一次排期，

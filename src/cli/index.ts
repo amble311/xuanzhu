@@ -14,8 +14,11 @@ import { restoreTerminalSafely, TuiApp } from "../tui/app";
 import { ansi } from "../utils/ansi";
 import {
   expandHome,
+  getAShareHome,
+  getBtcHome,
   getConfigDir,
   getConfigPath,
+  migrateConfigLayout,
   migrateLegacyConfigDir,
 } from "../utils/paths";
 import { VERSION } from "../utils/version";
@@ -129,6 +132,14 @@ async function main(): Promise<void> {
     process.stdout.write(
       `${ansi.gray}已将全局目录迁移至 ${getConfigDir()}` +
         `${migrated.from ? `（原 ${migrated.from}）` : ""}${ansi.reset}\n`,
+    );
+  }
+  // 全局目录内部布局（config / data / state / runtime）一次性整理。
+  // 同样必须早于任何配置读写；幂等，已整理过时是 11 次 stat。
+  const layout = migrateConfigLayout();
+  if (layout.migrated) {
+    process.stdout.write(
+      `${ansi.gray}已整理全局目录布局（config / data / state / runtime）${ansi.reset}\n`,
     );
   }
 
@@ -286,7 +297,7 @@ async function main(): Promise<void> {
       }
 
       // 位置参数：作为项目目录启动，例如 `xzh /home`、`xzh .`
-      // 目录正好是某个模式的固定目录时（`xzh ~/.btc`），进入对应模式，
+      // 目录正好是某个模式的固定目录时（`xzh ~/.xzh_btc`），进入对应模式，
       // 保证「同一个目录不管从哪条路径进来，约束都一样」。
       const dir = resolveDirectory(command);
       if (dir) {
@@ -353,7 +364,7 @@ async function startChat(
     return;
   }
 
-  // 模式的固定目录必须存在：首次 `xzh btc` 时 `~/.btc` 还没有。
+  // 模式的固定目录必须存在：首次 `xzh btc` 时 `~/.xzh_btc` 还没有。
   // 这里只建空目录（记忆与会话会在启动流程里初始化），不联网、不落业务数据 ——
   // 计算脚本与行情库由模式自己的 bootstrap 负责，不能拖慢每次启动。
   /** 常驻服务的启动结果，稍后并进界面顶部提示 */
@@ -531,7 +542,7 @@ ${ansi.brightMagenta}${ansi.bold}玄猪 XuanZhu${ansi.reset} ${ansi.gray}v${VERS
 ${ansi.bold}用法${ansi.reset}
   ${ansi.green}xzh${ansi.reset}                     在当前目录启动交互式终端界面
   ${ansi.green}xzh <目录>${ansi.reset}              在指定项目目录启动，例如 ${ansi.gray}xzh /home${ansi.reset}
-  ${ansi.green}xzh btc${ansi.reset}                进入 BTC 量化交易模式：工作目录固定为 ${ansi.gray}~/.btc${ansi.reset}
+  ${ansi.green}xzh btc${ansi.reset}                进入 BTC 量化交易模式：工作目录固定为 ${ansi.gray}${getBtcHome()}${ansi.reset}
                             （${ansi.gray}XZH_BTC_HOME${ansi.reset} 可重定向、不可 /switch、只加载交易相关技能）
   ${ansi.green}xzh btc setup${ansi.reset}          重建 btc 计算环境（首次进入模式时自动执行；此处用于修复 / ${ansi.gray}--force${ansi.reset} 重装）
   ${ansi.green}xzh btc moni${ansi.reset}           进入 BTC 模拟盘：虚拟账本开平仓，不涉及真钱（独立后端）
@@ -540,7 +551,7 @@ ${ansi.bold}用法${ansi.reset}
   ${ansi.green}xzh btc platform${ansi.reset}       选择交易平台（默认币安；已接入的只有币安）
   ${ansi.green}xzh btc stop${ansi.reset}           停止 btc 常驻后端（退出界面不会停它；${ansi.gray}--paper${ansi.reset} 只停模拟盘）
   ${ansi.green}xzh btc status${ansi.reset}         查看观察 / 模拟盘两个后端与排期队列
-  ${ansi.green}xzh a${ansi.reset}                   进入 A 股分析模式：工作目录固定为 ${ansi.gray}~/.a${ansi.reset}（不可 /switch）
+  ${ansi.green}xzh a${ansi.reset}                   进入 A 股分析模式：工作目录固定为 ${ansi.gray}${getAShareHome()}${ansi.reset}（不可 /switch）
   ${ansi.green}xzh a quote <代码...>${ansi.reset}    实时快照；指数写 1A0001
   ${ansi.green}xzh a bars <代码>${ansi.reset}        K 线（--period / --adjust / --limit / --from）
   ${ansi.green}xzh a snapshot${ansi.reset}           全市场温度（涨跌家数 / 涨跌停 / 成交额 / 分布）
@@ -582,7 +593,7 @@ ${ansi.bold}用法${ansi.reset}
   ${ansi.green}xzh autonomy${ansi.reset}           查看自治等级（ask / observe / auto）与最近拦截记录
   ${ansi.green}xzh autonomy <档位>${ansi.reset}    切换自治等级；observe = 只观察、改动一律拦截并记账
   ${ansi.green}xzh autonomy log [N]${ansi.reset}   打印观察日志（.xuanzhu/state/observe.log）
-  ${ansi.green}xzh errors${ansi.reset}              查看玄猪记录的错误报告（~/.xzh/errors/，等价 errors list）
+  ${ansi.green}xzh errors${ansi.reset}              查看玄猪记录的错误报告（~/.xzh/state/errors/，等价 errors list）
   ${ansi.green}xzh errors list${ansi.reset}         列出全部报告（最近的在前）
   ${ansi.green}xzh errors show <序号|签名>${ansi.reset}  查看一份报告的完整内容
   ${ansi.green}xzh errors path${ansi.reset}         打印报告目录

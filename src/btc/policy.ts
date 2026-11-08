@@ -3,7 +3,7 @@ import * as path from "path";
 import { getBtcHome } from "../utils/paths";
 
 /**
- * 决策指令（`~/.btc/policy.md`）。
+ * 决策指令（`~/.xzh_btc/policy.md`）。
  *
  * 解决的问题：后台巡检是**独立进程、独立轮次**，用户在 TUI 里说「以后别逆势，单笔最多 1%」
  * 这句话不会进下一轮巡检的上下文 —— 只答应一句「记住了」等于没记。

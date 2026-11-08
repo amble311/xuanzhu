@@ -4,6 +4,27 @@
 
 ## [未发布]
 
+## [0.15.1] — 2026-11-08
+
+### 修复
+
+- **Windows 兼容**：`xzh btc` 的 venv 解释器按平台解析（Windows 为
+  `venv\Scripts\python.exe`，原来写死 `venv/bin/python` 导致永远判定环境未安装）；
+  右侧终端面板在 Windows 改用 `COMSPEC` + `/d /s /c`（原来固定 `/bin/bash -c`），
+  并不再使用 `detached` 进程组。
+
+### 变更
+
+- **全局目录布局 v2**：`~/.xzh` 按生命周期拆成 `config/`（config.json、skills.json）、
+  `data/`（skills、memory、sessions、backups、apks）、`state/`（errors、crash.log、keys.log）、
+  `cache/`、`runtime/`（session.lock），`vault/` 保持独立（0700、不参与同步）。
+  旧的平铺条目在启动时一次性搬进子目录：幂等、目标已存在则跳过、失败不阻断启动。
+  `XZH_HOME` 仍指向整个全局目录，用法不变。
+- **专用模式的数据目录改名**：btc 默认 `~/.xzh_btc`、A 股默认 `~/.xzh_a`（避免
+  `~/.btc` / `~/.a` 这种短目录被其他工具占用）。旧的 `~/.btc` / `~/.a` 存在且新目录
+  不存在时**自动沿用旧目录**，不自动搬迁（btc 的 venv 与行情库含绝对路径）。
+  `XZH_BTC_HOME` / `XZH_A_HOME` 仍优先。
+
 ## [0.15.0] — 2026-11-08
 
 ### 新增

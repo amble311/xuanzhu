@@ -2,13 +2,13 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import type { ChatMessage } from "../llm/types";
-import { ensureDir, getConfigDir } from "../utils/paths";
+import { ensureDir, getSessionsDir } from "../utils/paths";
 
 /**
  * 会话的**增量持久化**。
  *
  * 对话历史原本只在内存（Agent.history），退出 / 崩溃即丢失。
- * 每个会话对应一个 JSONL 文件（`~/.xzh/sessions/<项目>-<哈希>/<时间戳>.jsonl`）：
+ * 每个会话对应一个 JSONL 文件（`~/.xzh/data/sessions/<项目>-<哈希>/<时间戳>.jsonl`）：
  * 第一行是元信息，其后每行一条消息 —— 每次提交历史时**增量追加**，
  * 因此即使进程崩溃，最多丢掉崩溃瞬间未提交的那一轮。
  *
@@ -21,7 +21,7 @@ import { ensureDir, getConfigDir } from "../utils/paths";
  */
 
 function sessionsRoot(): string {
-  return path.join(getConfigDir(), "sessions");
+  return getSessionsDir();
 }
 
 /** 会话目录按项目隔离：cwd 的 sha1 前 10 位 + 目录名 */

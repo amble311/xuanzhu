@@ -7,7 +7,7 @@ import { VERSION } from "../utils/version";
 /**
  * btc 模式的 Python 计算层落盘（bootstrap）。
  *
- * 为什么不在 `dist` 里直接跑：计算层要读写 `~/.btc/data/btc.db`、加载 `~/.btc/.env`，
+ * 为什么不在 `dist` 里直接跑：计算层要读写 `~/.xzh_btc/data/btc.db`、加载 `~/.xzh_btc/.env`，
  * 而 `core/config.py` 是按**自身位置**推项目根的（`parent.parent`）。把它放到
  * `<home>/core/` 之后，所有路径自动对齐到用户数据目录，一份代码只服务一处数据。
  *
@@ -15,7 +15,7 @@ import { VERSION } from "../utils/version";
  *
  * 早期按 `VERSION` 判断：「版本号没变就跳过复制」。这在开发期直接踩坑 ——
  * 一个版本里加了 `paper.py`、给 `runner.py` 添了 `paper-status` 命令，
- * 但 `package.json` 还没升版本，于是 `~/.btc` 里永远是旧脚本，
+ * 但 `package.json` 还没升版本，于是 `~/.xzh_btc` 里永远是旧脚本，
  * 面板报「未知命令：paper-status」，看起来像「模拟盘没初始化」。
  *
  * 现在改为遍历资产算 SHA-1 指纹（十几个小文件，耗时 < 5ms），
@@ -62,12 +62,17 @@ function readStamp(file: string): Stamp | null {
  * 计算层使用的 python 解释器。
  *
  * 优先 `XZH_BTC_PYTHON`（已有一套装好 numpy/pandas 的环境时不必再建 venv，
- * 测试与容器里也用得上），否则用 `~/.btc/venv`。
+ * 测试与容器里也用得上），否则用 `~/.xzh_btc/venv`。
  */
-export function btcPythonPath(home = getBtcHome()): string {
+export function btcPythonPath(
+  home = getBtcHome(),
+  platform: NodeJS.Platform = process.platform,
+): string {
   const override = process.env.XZH_BTC_PYTHON?.trim();
   if (override) return override;
-  return path.join(home, "venv", "bin", "python");
+  // Windows 的 venv 是 `Scripts\python.exe`，POSIX 是 `bin/python`。
+  // 写死 `bin/python` 会让 Windows 上「永远判定环境未安装」。
+  return path.join(home, btcPythonRelPath(platform));
 }
 
 export function btcVenvReady(home = getBtcHome()): boolean {
@@ -75,6 +80,13 @@ export function btcVenvReady(home = getBtcHome()): boolean {
   // 真不可用会在 spawn 时给出「无法启动 python」。
   if (process.env.XZH_BTC_PYTHON?.trim()) return true;
   return fs.existsSync(btcPythonPath(home));
+}
+
+/** 当前平台 venv 内的解释器相对路径（供 setup 提示与测试使用） */
+export function btcPythonRelPath(platform: NodeJS.Platform = process.platform): string {
+  return platform === "win32"
+    ? path.join("venv", "Scripts", "python.exe")
+    : path.join("venv", "bin", "python");
 }
 
 /** 计算脚本是否已就位（runner.py 在 home 根） */
@@ -153,7 +165,7 @@ function sameFingerprint(
 }
 
 /**
- * 确保 `~/.btc` 下是**当前版本**的计算脚本；返回是否可用。
+ * 确保 `~/.xzh_btc` 下是**当前版本**的计算脚本；返回是否可用。
  *
  * 只做本地文件复制（毫秒级），**不建 venv、不联网** —— 因此可以安全地在启动时调用。
  * venv 与依赖安装是显式操作（`xzh btc setup`），因为它要下载几十 MB。

@@ -1,6 +1,6 @@
 # 
 
-> 切换平台：`xzh btc platform`（交互式，写入 `~/.btc/platform.json`）；
+> 切换平台：`xzh btc platform`（交互式，写入 `~/.xzh_btc/platform.json`）；
 > 环境变量 `BTC_EXCHANGE` 优先级更高。新增平台 = 加 `src/exchange/<id>.ts` 适配器 + 同步一份
 > 对应的 `exchange-<id>.md`。
 

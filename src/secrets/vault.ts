@@ -1,7 +1,7 @@
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
-import { getConfigDir } from "../utils/paths";
+import { getVaultDir } from "../utils/paths";
 
 /**
  * 本地加密凭据库（~/.xzh/vault/）。
@@ -46,7 +46,7 @@ const KEY_FILE = "key";
 const ENTRIES_FILE = "entries.json";
 
 export function vaultDir(): string {
-  return path.join(getConfigDir(), VAULT_DIR);
+  return getVaultDir();
 }
 
 function keyFile(): string {

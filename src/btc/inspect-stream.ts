@@ -3,7 +3,7 @@ import * as path from "path";
 import { getBtcHome } from "../utils/paths";
 
 /**
- * 后台巡检的**过程流**（`~/.btc/logs/inspect-stream.log`，JSONL）。
+ * 后台巡检的**过程流**（`~/.xzh_btc/logs/inspect-stream.log`，JSONL）。
  *
  * 为什么需要它：巡检跑在独立进程里，前端只看得到 `backend.json` 里的一条摘要 ——
  * 用户不知道它「想了什么、调了什么工具、为什么得出这个结论」。

@@ -70,7 +70,7 @@ import {
  * btc 常驻后端（`xzh btc serve`，由 `xzh btc` 自动拉起）。
  *
  * 调度模型是**队列 + 定时器**：
- * - 模型每次调用 `btc_schedule` 就往 `~/.btc/run/schedules.json` 里放一条计划；
+ * - 模型每次调用 `btc_schedule` 就往 `~/.xzh_btc/run/schedules.json` 里放一条计划；
  * - 进程每 60 秒读一次队列，把**已到期**的条目取出来执行（取出即出队）；
  * - 不做 sleep：空闲时只是在等定时器，收到停止信号能立刻退出；
  *   前台随时可以追加计划，后台下一分钟就能看到。

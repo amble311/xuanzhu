@@ -27,7 +27,7 @@ xzh                 # 启动
 - **多模型支持**：DeepSeek、Anthropic Claude、OpenAI、Google Gemini、智谱 GLM、通义千问、Groq、Ollama，以及任意 OpenAI 兼容端点。
 - **内置工具**：读取 / 写入 / 编辑文件、列目录、glob 查找、grep 搜索、执行 shell 命令。
 - **流式响应**：实时渲染 Markdown，支持代码块，中文对齐正确。
-- **默认全自动**：`autoApprove` 默认为 `true`，**所有工具都直接执行、不做任何确认** —— 包括写文件、执行命令、读取工作区之外的文件，以及读取凭据类文件（`~/.ssh`、`.env`、`~/.xzh/config.json` 等）。开箱即用，不打断。`/auto off` 可切换为写文件与执行命令逐项确认。
+- **默认全自动**：`autoApprove` 默认为 `true`，**所有工具都直接执行、不做任何确认** —— 包括写文件、执行命令、读取工作区之外的文件，以及读取凭据类文件（`~/.ssh`、`.env`、`~/.xzh/config/config.json` 等）。开箱即用，不打断。`/auto off` 可切换为写文件与执行命令逐项确认。
   - 如果希望读取凭据类文件时确认一次（防止密钥被读进上下文后转交给模型服务商），把 `confirmSensitiveRead` 设为 `true`，默认关闭。
 - **多轮自主执行**：自动串联工具调用完成任务，可随时 `Ctrl+C` 中断。
 - **后台任务**：跑测试 / 起 dev server 这类长命令可以 `run_in_background` 发出去 ——
@@ -220,7 +220,7 @@ xzh
 | `xzh autonomy` | 查看自治等级与最近被拦截的操作 |
 | `xzh autonomy ask\|observe\|auto` | 切换自治等级（`observe` = 改动一律拦截并记账） |
 | `xzh autonomy log [N]` | 打印观察日志（`.xuanzhu/state/observe.log`）最近 N 条 |
-| `xzh errors` | 列出玄猪自动记录的错误报告（`~/.xzh/errors/`，等价 `errors list`） |
+| `xzh errors` | 列出玄猪自动记录的错误报告（`~/.xzh/state/errors/`，等价 `errors list`） |
 | `xzh errors list` | 列出全部报告（最近的在前） |
 | `xzh errors show <序号\|签名>` | 查看一份报告的完整内容（JSON） |
 | `xzh errors path` | 打印报告目录 |
@@ -266,7 +266,7 @@ xzh
 
 ## 配置
 
-配置文件位于 `~/.xzh/config.json`（权限 `600`）。可用环境变量 `XZH_HOME` 整体重定向 ——
+配置文件位于 `~/.xzh/config/config.json`（权限 `600`）。可用环境变量 `XZH_HOME` 整体重定向 ——
 它指向**全局目录本身**（不是家目录）：
 
 ```bash
@@ -554,7 +554,7 @@ xzh prompt set core core.md   # 只覆盖这一段，其余继续跟随升级
 xzh prompt reset core         # 取消覆盖
 ```
 
-- 覆盖写进 `~/.xzh/config.json` 的 `promptOverrides`；内容为空 = 删掉该段；
+- 覆盖写进 `~/.xzh/config/config.json` 的 `promptOverrides`；内容为空 = 删掉该段；
 - 内置提示词升级后会提示「你覆盖的那段原文已变」（记录在 `promptOverridesBase` 指纹里），
   不会静默把你的文本换成新默认；
 - 界面里 `/prompt` 查看与重置，`/prompt show <段落>` 看某段内容。
@@ -714,7 +714,7 @@ xzh prompt reset core         # 取消覆盖
 ```
 
 `/compact` 的摘要会同时写入任务账本；它只压缩**内存里的对话**，不重写
-`~/.xzh/sessions` 存档，`/resume` 恢复的仍是原始会话。
+`~/.xzh/data/sessions` 存档，`/resume` 恢复的仍是原始会话。
 
 ## 仓库地图与符号检索
 
@@ -873,7 +873,7 @@ AutoX.js 那侧也可用环境变量 `XZH_DEVICE_PORT` 指定端口。
 1. **探测该用哪个 ABI**：`adb` 能读到设备就精确判断（`ro.product.cpu.abi`），
    否则默认 `arm64-v8a`（2018 年后的手机几乎都是 64 位 ARM，`x86_64` 基本只出现在模拟器）；
 2. **给出官方下载页**：<https://github.com/SuperMonster003/AutoJs6/releases/>；
-3. **顺带看一眼本机缓存**：`~/.xzh/apks/` 里有匹配的包就直接给出路径（不联网也能装）。
+3. **顺带看一眼本机缓存**：`~/.xzh/data/apks/` 里有匹配的包就直接给出路径（不联网也能装）。
 
 `xzh device connect` 连不上时，会把「装 App → 开服务器模式 → 填 IP」的完整引导打出来，
 并**停止无谓的重试**（连续失败 3 次即放弃，避免对着填错的地址无限刷屏）。
@@ -940,17 +940,17 @@ AutoX.js 那侧也可用环境变量 `XZH_DEVICE_PORT` 指定端口。
   `/memory global` 查看全局记忆状态、`/memory show [global]` 查看全文；
   `/memory clear [global]` 清空对应记忆。
   清空**必须二次确认**：确认框默认停在「拒绝」，要按 `y`（或 ← → 切到「允许」再回车）才会执行，
-  一个回车不会误删。它只删对应 `memory/` 下的记忆文件，**不会**删除 `~/.xzh/sessions/` 的会话存档，
+  一个回车不会误删。它只删对应 `memory/` 下的记忆文件，**不会**删除 `~/.xzh/data/sessions/` 的会话存档，
   清空后系统提示词立即刷新（后续请求不再注入旧记忆）
 
 ### 全局记忆（跨项目）
 
-除项目记忆外，`~/.xzh/memory/` 还有一份**全局记忆**，对所有项目生效：
+除项目记忆外，`~/.xzh/data/memory/` 还有一份**全局记忆**，对所有项目生效：
 
 | 路径 | 用途 |
 | --- | --- |
-| `~/.xzh/memory/MEMORY.md` | 跨项目长期记忆：用户偏好、环境约定、sudo 使用方式、本机代理地址等 |
-| `~/.xzh/memory/YYYY-MM-DD.md` | 全局每日日志（可选） |
+| `~/.xzh/data/memory/MEMORY.md` | 跨项目长期记忆：用户偏好、环境约定、sudo 使用方式、本机代理地址等 |
+| `~/.xzh/data/memory/YYYY-MM-DD.md` | 全局每日日志（可选） |
 
 - 启动时先注入全局记忆，再注入项目记忆；全局记忆默认上限 `globalMemoryMaxChars=4000`，
   超限自动去重/裁剪，仍超限时用 `memory_compact target=global` 语义精简。
@@ -1001,7 +1001,7 @@ v2ray / Clash / mihomo / sing-box **本地 SOCKS/HTTP 入站端口**，验证后
 - 代理只在单条命令的进程内生效，命令结束自动还原；`NO_PROXY` 始终包含
   `127.0.0.1,localhost,::1`，不会把本地模型端点绕进代理。
 
-> 技能与 CLI 为**全局通用**：技能位于 `~/.xzh/skills`（叠加内置），CLI 安装在系统，均不受项目限制。
+> 技能与 CLI 为**全局通用**：技能位于 `~/.xzh/data/skills`（叠加内置），CLI 安装在系统，均不受项目限制。
 
 ## 初始化项目规范（`xzh init` / `/init`）
 
@@ -1088,7 +1088,7 @@ v2ray / Clash / mihomo / sing-box **本地 SOCKS/HTTP 入站端口**，验证后
 
 ### 自定义技能
 
-在 `~/.xzh/skills/<name>/SKILL.md` 放置自己的技能即可被自动发现（同名时覆盖内置技能）：
+在 `~/.xzh/data/skills/<name>/SKILL.md` 放置自己的技能即可被自动发现（同名时覆盖内置技能）：
 
 ```markdown
 ---
@@ -1233,10 +1233,10 @@ kitty / Ghostty 会把该 xterm 兼容序列映射成「所有按键都用转义
 想弄清你的终端到底发了什么、或试用另一种上报协议：
 
 ```bash
-# 诊断：把终端送来的原始字节记到 ~/.xzh/keys.log
+# 诊断：把终端送来的原始字节记到 ~/.xzh/state/keys.log
 XZH_DEBUG_KEYS=1 xzh
 # 按几下 Ctrl+Enter / Shift+Enter，退出后查看
-cat ~/.xzh/keys.log
+cat ~/.xzh/state/keys.log
 
 # 备选协议：改用 kitty 键盘协议上报修饰键（部分终端据此可用 Shift+Enter）
 XZH_KITTY_KEYS=1 xzh
@@ -1260,7 +1260,7 @@ XZH_KITTY_KEYS=1 xzh
 | 工具实现抛异常 | 该工具返回失败、对话继续，同时留一份报告 |
 | 整轮对话失败（回退链走完仍失败） | 界面上提示「已记录错误报告：…」 |
 
-报告存放在 `~/.xzh/errors/`，每份包含：版本 / Node / 平台 / 项目目录 / 当前模型与 provider /
+报告存放在 `~/.xzh/state/errors/`，每份包含：版本 / Node / 平台 / 项目目录 / 当前模型与 provider /
 错误消息与堆栈 / 最近几条消息（均截断）。写入前会**对常见密钥格式脱敏**
 （`sk-*`、`AIza*`、`gh*_`、`Bearer …`、`api_key=` 等），但发到公开 issue 前仍建议自己扫一眼。
 同一类错误只保留一份并累加次数，最多 50 份。
@@ -1272,7 +1272,7 @@ xzh errors path            # 报告目录
 xzh errors clear --yes     # 清空
 ```
 
-反馈时把 `xzh errors show <序号>` 的输出（或整个 `~/.xzh/errors/` 目录）附上即可。
+反馈时把 `xzh errors show <序号>` 的输出（或整个 `~/.xzh/state/errors/` 目录）附上即可。
 
 ## 项目结构
 

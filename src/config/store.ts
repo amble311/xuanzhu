@@ -1,5 +1,5 @@
 import * as fs from "fs";
-import { ensureDir, getConfigDir, getConfigPath } from "../utils/paths";
+import { ensureDir, getConfigSubdir, getConfigPath } from "../utils/paths";
 import {
   DEFAULT_GLOBAL_MEMORY_MAX_CHARS,
   DEFAULT_MEMORY_MAX_CHARS,
@@ -167,12 +167,12 @@ export interface XuanZhuConfig {
    */
   mouseCapture?: boolean;
   /**
-   * 读取凭据类文件时是否要求确认（`.env`、`~/.ssh`、`~/.xzh/config.json`、
+   * 读取凭据类文件时是否要求确认（`.env`、`~/.ssh`、`~/.xzh/config/config.json`、
    * `*.pem`、`id_rsa` 等）。
    *
    * false（默认）：**完全自动放行** —— 与其他工具一致，不再打断。
    * true：读取这类路径时确认一次。防的是「凭据被读进上下文、转手发给模型服务商」
-   *   （`~/.xzh/config.json` 里就存着明文 API Key），与「是否信任模型执行命令」
+   *   （`~/.xzh/config/config.json` 里就存着明文 API Key），与「是否信任模型执行命令」
    *   是两个问题。默认关闭是因为绝大多数使用场景并不涉及这些路径，
    *   而每次都弹确认对「全自动」的预期是一种破坏。
    */
@@ -193,7 +193,7 @@ export interface XuanZhuConfig {
    */
   memoryMaxChars?: number;
   /**
-   * 全局长期记忆（~/.xzh/memory/MEMORY.md）的字符上限。默认 4000。
+   * 全局长期记忆（~/.xzh/data/memory/MEMORY.md）的字符上限。默认 4000。
    *
    * 全局记忆会注入**每个项目**的系统提示词，因此上限比项目记忆更紧；
    * 设为 0 表示不限制（仍会去重）。
@@ -401,9 +401,9 @@ function mergeConfig(partial: Partial<XuanZhuConfig>): XuanZhuConfig {
   };
 }
 
-/** 保存配置到 ~/.xzh/config.json（权限 600） */
+/** 保存配置到 ~/.xzh/config/config.json（权限 600） */
 export function saveConfig(config: XuanZhuConfig): void {
-  ensureDir(getConfigDir());
+  ensureDir(getConfigSubdir());
   const file = getConfigPath();
   const data = JSON.stringify(config, null, 2) + "\n";
 

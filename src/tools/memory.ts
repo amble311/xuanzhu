@@ -14,7 +14,7 @@ import type { ToolDefinition, ToolResult } from "./types";
 
 const MAX_DISPLAY = 12_000;
 
-/** 记忆作用域：项目（默认）/ 全局（~/.xzh/memory）/ 同时读取 */
+/** 记忆作用域：项目（默认）/ 全局（~/.xzh/data/memory）/ 同时读取 */
 type MemoryTarget = "project" | "global" | "all";
 
 function parseTarget(value: unknown): MemoryTarget {
@@ -61,7 +61,7 @@ export const memoryReadTool: ToolDefinition = {
   name: "memory_read",
   description:
     "读取记忆。target=project（默认）读取当前项目 `<项目>/.xuanzhu/memory/`；" +
-    "target=global 读取跨项目全局记忆 `~/.xzh/memory/`；target=all 同时读取。" +
+    "target=global 读取跨项目全局记忆 `~/.xzh/data/memory/`；target=all 同时读取。" +
     "长期记忆 MEMORY.md 是按主题整理的结论库，另附最近一份每日日志。" +
     "开始处理需要背景的任务前、写长期记忆前都应当先读；" +
     "当系统提示词提示「长期记忆过长」时，也应先用它读取全文，再调用 memory_compact 精简。",

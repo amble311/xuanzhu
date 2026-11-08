@@ -46,11 +46,20 @@ function detectScript(): "linux" | "bsd" | null {
   return scriptPlan;
 }
 
-/** 组装实际要执行的 [命令, 参数]，优先经 `script` 包装以获得 PTY */
-function buildSpawnPlan(
+/**
+ * 组装实际要执行的 [命令, 参数]，优先经 `script` 包装以获得 PTY。
+ *
+ * Windows 没有 `script`，且 `cmd.exe` 不接受 `-c`：必须用 `/d /s /c`。
+ * 导出仅为便于测试（平台参数可注入），业务侧不应直接调用。
+ */
+export function buildSpawnPlan(
   shell: string,
   cmd: string,
+  platform: NodeJS.Platform = process.platform,
 ): { file: string; args: string[] } {
+  if (platform === "win32") {
+    return { file: shell, args: ["/d", "/s", "/c", cmd] };
+  }
   const kind = detectScript();
   if (kind === "linux") {
     return { file: "script", args: ["-qec", cmd, "/dev/null"] };
@@ -157,8 +166,11 @@ export class ShellPanel {
       `${ansi.brightGreen}❯${ansi.reset} ${ansi.bold}${cmd}${ansi.reset}`,
     );
 
-    const shell = process.env.SHELL || "/bin/bash";
-    const launch = buildSpawnPlan(shell, cmd);
+    const isWindows = process.platform === "win32";
+    const shell = isWindows
+      ? process.env.COMSPEC || "cmd.exe"
+      : process.env.SHELL || "/bin/bash";
+    const launch = buildSpawnPlan(shell, cmd, process.platform);
     let child: ChildProcess;
     try {
       child = spawn(launch.file, launch.args, {
@@ -174,8 +186,10 @@ export class ShellPanel {
         // stdin 必须可写：命令运行时按键要转发给子进程，否则
         // `npm init` 这类交互式提示会「等输入而用户输不进去」，看起来像卡死。
         stdio: ["pipe", "pipe", "pipe"],
-        // 独立进程组：中断时可以向整组发信号，避免留下孤儿进程
-        detached: true,
+        // 独立进程组：中断时可以向整组发信号，避免留下孤儿进程。
+        // Windows 不支持负 pid 进程组，detached 反而会弹新控制台窗口。
+        detached: !isWindows,
+        windowsHide: isWindows,
       });
     } catch (err) {
       this.pushLine(

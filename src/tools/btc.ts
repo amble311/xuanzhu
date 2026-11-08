@@ -48,7 +48,7 @@ import type { ToolDefinition, ToolResult } from "./types";
  * 分工（这也是「xzh 当常驻后端」的落地方式）：
  * - **Node 侧**：网络（交易所行情，经 `src/exchange` 适配层）、分页、时间窗口、错误归类；
  * - **Python 侧**：指标、三周期打分 / 1h 择时、回测（pandas），只依赖 numpy + pandas；
- * - **数据**：`~/.btc/data/btc.db`，只由 Python 读写（时间戳口径集中在一处）。
+ * - **数据**：`~/.xzh_btc/data/btc.db`，只由 Python 读写（时间戳口径集中在一处）。
  *
  * 所有工具都标了 `modes: ["btc"]`：普通 xzh 会话看不到、也执行不了它们。
  */
@@ -1706,7 +1706,7 @@ const triggerTool: ToolDefinition = {
   modes: BTC_MODES,
   description:
     "设置**叫醒条件**：价格或技术指标到什么值时把后台巡检叫醒。用户说「到 8 万提醒我」" +
-    "「RSI 跌破 30 就看一眼」「跌破 MA20 叫我」时用。条件落在 `~/.btc/run/triggers.json`，" +
+    "「RSI 跌破 30 就看一眼」「跌破 MA20 叫我」时用。条件落在 `~/.xzh_btc/run/triggers.json`，" +
     "常驻后端**每 5 分钟评估一次**（纯计算，不调模型），命中才跑一轮巡检。" +
     "**它只叫醒、绝不下单** —— 下单仍要走三周期打分与风控。" +
     "默认一次性（命中即失效）；要持续监控设 once=false 并给 cooldown_min。" +

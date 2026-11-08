@@ -33,8 +33,9 @@ describe.skipIf(!hasScript)("TUI pty 冒烟", () => {
     execFileSync("node", ["esbuild.js"], { cwd: root, stdio: "ignore" });
     home = fs.mkdtempSync(path.join(os.tmpdir(), "xzh-tui-home-"));
     project = fs.mkdtempSync(path.join(os.tmpdir(), "xzh-tui-project-"));
+    fs.mkdirSync(path.join(home, "config"), { recursive: true });
     fs.writeFileSync(
-      path.join(home, "config.json"),
+      path.join(home, "config", "config.json"),
       JSON.stringify({
         version: 1,
         provider: "custom",

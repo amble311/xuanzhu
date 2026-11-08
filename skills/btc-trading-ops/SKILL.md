@@ -171,7 +171,7 @@ modes: [btc]
 **没有任何工具能读到它**。因此：
 
 - 绝不要要求用户在对话里粘贴 API Key / Secret（会被会话记录与模型上下文带走）；
-- 不要尝试读取 `~/.btc/credentials.json` 或 `~/.xzh/vault/` 的内容；
+- 不要尝试读取 `~/.xzh_btc/credentials.json` 或 `~/.xzh/vault/` 的内容；
 - 用户问「怎么配凭据」→ 让他运行 `xzh btc apikey`（首次进入实盘也会自动提示）。
 
 ## 标准分析顺序

@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { getConfigDir } from "../utils/paths";
+import { getGlobalMemoryDir } from "../utils/paths";
 import { pruneAutoMemory } from "./memory-retrieval";
 
 export {
@@ -60,9 +60,9 @@ export interface MemoryPaths {
   dailyTitle: string;
 }
 
-/** 全局记忆：~/.xzh/memory/（跨项目，随 XZH_HOME 重定向） */
+/** 全局记忆：~/.xzh/data/memory/（跨项目，随 XZH_HOME 重定向） */
 export function resolveGlobalMemoryPaths(): MemoryPaths {
-  const memoryDir = path.join(getConfigDir(), "memory");
+  const memoryDir = getGlobalMemoryDir();
   return {
     memoryDir,
     longTermFile: path.join(memoryDir, LONG_TERM_FILE),
@@ -218,7 +218,7 @@ export function readProjectMemory(cwd: string): ProjectMemory {
   return readMemoryAt(projectMemoryPaths(cwd));
 }
 
-/** 读取全局记忆：~/.xzh/memory/MEMORY.md + 最近一份日志 */
+/** 读取全局记忆：~/.xzh/data/memory/MEMORY.md + 最近一份日志 */
 export function readGlobalMemory(): ProjectMemory {
   return readMemoryAt(resolveGlobalMemoryPaths());
 }
@@ -737,7 +737,7 @@ export interface ClearedProjectMemory {
  * 清空当前项目的记忆（`/memory clear`）。
  *
  * 只删 `MEMORY.md` 与 `YYYY-MM-DD.md`，**不碰**目录里的其它文件、也不动
- * `~/.xzh/sessions` 的会话存档（两者是不同概念：记忆是给模型的结论库，
+ * `~/.xzh/data/sessions` 的会话存档（两者是不同概念：记忆是给模型的结论库，
  * 会话是可 `/resume` 的原始记录）。
  *
  * 失败（权限等）不抛异常：返回实际删掉的文件，调用方据此如实告知用户。
@@ -775,7 +775,7 @@ export function clearProjectMemory(cwd: string): ClearedProjectMemory {
 
 // ------------------------------------------------------------ 全局记忆
 
-/** 追加写入全局记忆（~/.xzh/memory） */
+/** 追加写入全局记忆（~/.xzh/data/memory） */
 export function appendGlobalMemory(
   content: string,
   scope: MemoryScope,

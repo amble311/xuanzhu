@@ -229,7 +229,7 @@ export const GLOBAL_MEMORY_EXCERPT_CHARS = 2500;
 /** 全局记忆段落的固定说明（可覆盖；动态节选由代码追加） */
 function globalMemoryIntro(): string {
   return `## 全局记忆（跨项目）
-全局记忆存放在 \`~/.xzh/memory/\`，内容对**所有项目**生效。
+全局记忆存放在 \`~/.xzh/data/memory/\`，内容对**所有项目**生效。
 - 当用户明确说「全局 / 所有项目 / 以后都 / 统一 / 跨项目」，或提供跨项目环境事实
   （代理地址、常用安装方式、sudo 使用方式、个人偏好）时，用
   \`memory_write target=global\` 记录。
@@ -242,7 +242,7 @@ function globalMemoryIntro(): string {
 
 function compactGlobalMemoryIntro(): string {
   return `## 全局记忆（跨项目）
-- 路径 \`~/.xzh/memory\`；用户说「全局/所有项目/以后都」时用 \`memory_write target=global\`；项目内容仍写项目记忆。
+- 路径 \`~/.xzh/data/memory\`；用户说「全局/所有项目/以后都」时用 \`memory_write target=global\`；项目内容仍写项目记忆。
 - 密码/Token/UUID/API Key 原文**禁止出现在回复里**；记忆工具会自动加密为\`[加密凭据 ...]\` 引用，不要读取或猜测其值。`;
 }
 
@@ -505,7 +505,7 @@ export function buildSystemPrompt(
   deviceEnabled = false,
   /** 小上下文精简档：去掉冗长示例与规则，只保留必须遵守的部分 */
   compact = false,
-  /** 跨项目全局记忆（~/.xzh/memory） */
+  /** 跨项目全局记忆（~/.xzh/data/memory） */
   globalMemory?: { longTerm: string; recentDaily: string } | null,
   globalMemoryMaxChars?: number,
   /** 已配置并可用（上次测试通过）的全局 HTTP/SOCKS 代理 */
