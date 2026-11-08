@@ -8,9 +8,13 @@ import {
   isDefaultGatewayHome,
 } from "../src/gateway/paths";
 import {
+  gatewayModeFile,
   isPidAlive,
+  parseGatewayCommand,
+  readGatewayMode,
   readGatewayState,
   systemdUnitFile,
+  writeGatewayMode,
   writeGatewayState,
 } from "../src/gateway/service";
 
@@ -74,5 +78,32 @@ describe("gateway", () => {
     expect(unit).toContain("Restart=always");
     expect(unit).toContain("WantedBy=default.target");
     expect(unit).toContain("TimeoutStopSec=10");
+  });
+
+  it("解析对话内命令：/btc、/btc moni、/a、/xzh，普通文本返回 null", () => {
+    expect(parseGatewayCommand("你好")).toBeNull();
+    expect(parseGatewayCommand("/btc")).toEqual({ kind: "btc", paper: false });
+    expect(parseGatewayCommand("/btc moni")).toEqual({ kind: "btc", paper: true });
+    expect(parseGatewayCommand("/btc paper")).toEqual({ kind: "btc", paper: true });
+    expect(parseGatewayCommand("/a")).toEqual({ kind: "a" });
+    expect(parseGatewayCommand("/xzh")).toEqual({ kind: "xzh" });
+    expect(parseGatewayCommand("/btc off")).toEqual({ kind: "xzh" });
+    expect(parseGatewayCommand("/a off")).toEqual({ kind: "xzh" });
+    expect(parseGatewayCommand("/help")).toEqual({ kind: "help" });
+    expect(parseGatewayCommand("/nope")).toMatchObject({ kind: "usage" });
+  });
+
+  it("模式持久化：写读一致，坏文件 / 非法模式返回 null", () => {
+    writeGatewayMode({ name: "btc", paper: true });
+    expect(readGatewayMode()).toEqual({ name: "btc", paper: true });
+
+    writeGatewayMode({ name: "a" });
+    expect(readGatewayMode()).toEqual({ name: "a" });
+
+    fs.writeFileSync(gatewayModeFile(), "{ bad", "utf8");
+    expect(readGatewayMode()).toBeNull();
+
+    writeGatewayMode(null);
+    expect(readGatewayMode()).toBeNull();
   });
 });

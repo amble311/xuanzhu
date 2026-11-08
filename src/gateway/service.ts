@@ -83,6 +83,70 @@ function cliEntry(): string {
   return process.argv[1] ?? path.join(__dirname, "cli.js");
 }
 
+// ─────────────────────── Windows 登录自启 ───────────────────────
+//
+// Windows 没有 systemd：用 HKCU\...\Run 注册一个 **wscript 隐藏启动器**。
+// 不直接注册 node.exe —— 控制台程序会弹黑窗口；wscript 以 `//B` 后台运行，
+// 由 VBS 用 `sh.Run(..., 0, True)` 等待 node 退出，崩了 3 秒后重拉，
+// 与 systemd 的 `Restart=always` 对齐。
+//
+// 停止时写 `run/autostart.stop`：VBS 看到它就退出循环，不会把刚停掉的服务又拉起来；
+// 下次自启/手动启动时删除该文件。
+
+const WINDOWS_RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const WINDOWS_RUN_VALUE = "XuanZhuGateway";
+
+export function windowsLauncherPath(home = gatewayHome()): string {
+  return path.join(gatewayPaths(home).run, "autostart.vbs");
+}
+
+export function windowsStopFilePath(home = gatewayHome()): string {
+  return path.join(gatewayPaths(home).run, "autostart.stop");
+}
+
+/** 注册表 Run 项里保存的启动命令 */
+export function windowsAutostartCommand(home = gatewayHome()): string {
+  return `wscript.exe //B //Nologo "${windowsLauncherPath(home)}"`;
+}
+
+function vbsString(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+/** 隐藏启动器脚本（UTF-16LE + BOM 写入，避免中文用户名路径被按 ANSI 解析） */
+export function windowsLauncherScript(
+  execPath: string,
+  entry: string,
+  home: string,
+): string {
+  return [
+    'Set sh = CreateObject("WScript.Shell")',
+    `sh.CurrentDirectory = ${vbsString(home)}`,
+    `stopFile = ${vbsString(windowsStopFilePath(home))}`,
+    `nodeExe = ${vbsString(execPath)}`,
+    `entry = ${vbsString(entry)}`,
+    'Set fso = CreateObject("Scripting.FileSystemObject")',
+    'If fso.FileExists(stopFile) Then fso.DeleteFile stopFile, True',
+    'cmd = Chr(34) & nodeExe & Chr(34) & " " & Chr(34) & entry & Chr(34) & " gateway run"',
+    "Do",
+    "  sh.Run cmd, 0, True",
+    "  WScript.Sleep 3000",
+    "Loop While Not fso.FileExists(stopFile)",
+    "",
+  ].join("\r\n");
+}
+
+function windowsRunValue(): string | undefined {
+  const result = spawnSync(
+    "reg",
+    ["query", WINDOWS_RUN_KEY, "/v", WINDOWS_RUN_VALUE],
+    { encoding: "utf8", windowsHide: true },
+  );
+  if (result.status !== 0) return undefined;
+  const match = /REG_SZ\s+(.+)\s*$/m.exec(result.stdout ?? "");
+  return match?.[1].trim();
+}
+
 export interface StartGatewayResult {
   ok: boolean;
   /** 本次是否新拉起（已在运行时为 false） */
@@ -106,6 +170,9 @@ export async function startGateway(
   fs.mkdirSync(paths.home, { recursive: true });
   fs.mkdirSync(paths.logs, { recursive: true });
   fs.mkdirSync(paths.run, { recursive: true });
+  // 注意：Windows 的 `autostart.stop` 是**锁存**标记，只在下次登录时由启动器清除。
+  // 这里不能删它 —— 否则 `stop` 后立刻 `restart` 时，尚未退出的 VBS 循环会看到
+  // 标记消失，再拉起第二个 node（端口冲突、反复重试）。
 
   const existing = readGatewayState(home);
   if (existing && isPidAlive(existing.pid)) {
@@ -137,6 +204,8 @@ export async function startGateway(
       stdio: ["ignore", logFd, logFd],
       cwd: home,
       env: { ...process.env },
+      // Windows 上 detached 会分配新控制台；stdio 已重定向，隐藏即可
+      windowsHide: true,
     });
     child.unref();
   } catch (err) {
@@ -204,6 +273,16 @@ export async function stopGateway(
     return { ok: true, stopped: false };
   }
 
+  // 先让 Windows 自启启动器退出循环，否则 SIGTERM 后 3 秒它会把 gateway 又拉起来
+  if (process.platform === "win32") {
+    try {
+      fs.mkdirSync(paths.run, { recursive: true });
+      fs.writeFileSync(windowsStopFilePath(home), new Date().toISOString(), "utf8");
+    } catch {
+      // 写不了也只影响「停完又被拉起」，不阻断停止
+    }
+  }
+
   try {
     process.kill(state.pid, "SIGTERM");
   } catch (err) {
@@ -254,6 +333,91 @@ export async function restartGateway(
   }
   const started = await startGateway({ home });
   return { ...started, stopped: stopped.stopped };
+}
+
+// ─────────────────────── 对话内模式命令 ───────────────────────
+
+export type GatewayCommand =
+  | { kind: "btc"; paper: boolean }
+  | { kind: "a" }
+  | { kind: "xzh" }
+  | { kind: "help" }
+  | { kind: "usage"; message: string };
+
+/**
+ * 解析 gateway 收到的 `/` 命令（微信消息与 HTTP `/message` 共用）。
+ *
+ * 只认以 `/` 开头的整条消息；返回 null 表示「这是普通对话」，应交给模型。
+ * 命令不进入对话历史 —— 切模式本身不该被模型当成用户需求去执行。
+ */
+export function parseGatewayCommand(text: string): GatewayCommand | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/")) return null;
+  const parts = trimmed.slice(1).trim().split(/\s+/);
+  const name = (parts.shift() ?? "").toLowerCase();
+  const arg = (parts.shift() ?? "").toLowerCase();
+
+  if (!name || name === "help") return { kind: "help" };
+  if (name === "xzh") return { kind: "xzh" };
+  if (name === "a") {
+    if (!arg) return { kind: "a" };
+    if (arg === "off" || arg === "exit") return { kind: "xzh" };
+    return { kind: "usage", message: "用法：/a（进入 A 股分析）· /xzh（回到普通模式）" };
+  }
+  if (name === "btc") {
+    if (!arg || arg === "start" || arg === "live") return { kind: "btc", paper: false };
+    if (arg === "moni" || arg === "paper") return { kind: "btc", paper: true };
+    if (arg === "off" || arg === "exit") return { kind: "xzh" };
+    return {
+      kind: "usage",
+      message: "用法：/btc（实盘）· /btc moni（模拟盘）· /xzh（回到普通模式）",
+    };
+  }
+  return {
+    kind: "usage",
+    message: `未知命令 /${name}；可用 /btc、/btc moni、/a、/xzh`,
+  };
+}
+
+export interface GatewayModeState {
+  name: "btc" | "a";
+  /** 仅 btc：模拟盘 */
+  paper?: boolean;
+}
+
+export function gatewayModeFile(home = gatewayHome()): string {
+  return path.join(gatewayPaths(home).run, "mode.json");
+}
+
+/** 读取持久化的模式（gateway 重启后仍保持在 btc / a） */
+export function readGatewayMode(home = gatewayHome()): GatewayModeState | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(gatewayModeFile(home), "utf8")) as Partial<GatewayModeState>;
+    if (parsed?.name !== "btc" && parsed?.name !== "a") return null;
+    return {
+      name: parsed.name,
+      ...(parsed.name === "btc" ? { paper: parsed.paper === true } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function writeGatewayMode(
+  state: GatewayModeState | null,
+  home = gatewayHome(),
+): void {
+  const file = gatewayModeFile(home);
+  try {
+    if (!state) {
+      fs.rmSync(file, { force: true });
+      return;
+    }
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  } catch {
+    // 写不了只影响重启后恢复模式，不阻断本次切换
+  }
 }
 
 // ─────────────────────────── 开机自启 ───────────────────────────
@@ -313,6 +477,12 @@ export function systemdUnitFile(
 }
 
 export function autostartStatus(): AutostartStatus {
+  if (process.platform === "win32") {
+    const file = windowsLauncherPath();
+    const installed = fs.existsSync(file);
+    const enabled = installed && windowsRunValue() === windowsAutostartCommand();
+    return { supported: true, installed, enabled, path: file };
+  }
   if (process.platform !== "linux") {
     return {
       supported: false,
@@ -358,6 +528,51 @@ export function installAutostart(): {
   if (!status.supported) {
     return { ok: false, error: status.reason };
   }
+  if (process.platform === "win32") {
+    const home = gatewayHome();
+    const file = windowsLauncherPath(home);
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      // UTF-16LE + BOM：WSH 对无 BOM 的 UTF-8 会按 ANSI 解析，中文用户名路径会乱码
+      fs.writeFileSync(
+        file,
+        `\uFEFF${windowsLauncherScript(process.execPath, cliEntry(), home)}`,
+        "utf16le",
+      );
+    } catch (err) {
+      return {
+        ok: false,
+        path: file,
+        error: `写入启动器失败：${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    const added = spawnSync(
+      "reg",
+      [
+        "add",
+        WINDOWS_RUN_KEY,
+        "/v",
+        WINDOWS_RUN_VALUE,
+        "/t",
+        "REG_SZ",
+        "/d",
+        windowsAutostartCommand(home),
+        "/f",
+      ],
+      { encoding: "utf8", windowsHide: true },
+    );
+    if (added.error || added.status !== 0) {
+      return {
+        ok: false,
+        path: file,
+        error:
+          added.error?.message ||
+          (added.stderr ?? "").trim() ||
+          `reg add 退出码 ${added.status}`,
+      };
+    }
+    return { ok: true, path: file };
+  }
   const file = systemdUnitPath();
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(
@@ -396,6 +611,26 @@ export function installAutostart(): {
 export function uninstallAutostart(): { ok: boolean; error?: string } {
   const status = autostartStatus();
   if (!status.supported) return { ok: false, error: status.reason };
+  if (process.platform === "win32") {
+    const home = gatewayHome();
+    // 先写 stop 文件：正在跑的 VBS 循环会在 node 退出后读到它并结束
+    try {
+      fs.mkdirSync(gatewayPaths(home).run, { recursive: true });
+      fs.writeFileSync(windowsStopFilePath(home), new Date().toISOString(), "utf8");
+    } catch {
+      // 写不了也只影响「停完又被拉起」
+    }
+    spawnSync("reg", ["delete", WINDOWS_RUN_KEY, "/v", WINDOWS_RUN_VALUE, "/f"], {
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    try {
+      fs.rmSync(windowsLauncherPath(home), { force: true });
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+    return { ok: true };
+  }
   spawnSync("systemctl", ["--user", "disable", UNIT_NAME], { encoding: "utf8" });
   try {
     fs.rmSync(systemdUnitPath(), { force: true });

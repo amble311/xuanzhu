@@ -1,6 +1,12 @@
 import * as path from "path";
 import { describe, expect, it } from "vitest";
 import { btcPythonPath, btcPythonRelPath } from "../src/btc/bootstrap";
+import {
+  windowsAutostartCommand,
+  windowsLauncherPath,
+  windowsLauncherScript,
+  windowsStopFilePath,
+} from "../src/gateway/service";
 import { buildSpawnPlan } from "../src/tui/terminal";
 
 /**
@@ -40,5 +46,30 @@ describe("Windows 兼容", () => {
     const plan = buildSpawnPlan("/bin/bash", "ls -la", "linux");
     expect(plan.args).toContain("ls -la");
     expect(["script", "/bin/bash"]).toContain(plan.file);
+  });
+
+  it("gateway 的 Windows 自启用 wscript 隐藏启动器 + 停止标记", () => {
+    const saved = process.env.XZH_GATEWAY_HOME;
+    const home = path.join(path.sep === "\\" ? "C:\\users\\demo" : "/home/demo", ".xzh_gateway");
+    process.env.XZH_GATEWAY_HOME = home;
+    try {
+      const vbs = windowsLauncherPath(home);
+      expect(vbs).toBe(path.join(home, "run", "autostart.vbs"));
+      expect(windowsStopFilePath(home)).toBe(path.join(home, "run", "autostart.stop"));
+
+      const command = windowsAutostartCommand(home);
+      expect(command).toContain("wscript.exe //B //Nologo");
+      expect(command).toContain(vbs);
+
+      const script = windowsLauncherScript("C:\\node\\node.exe", "C:\\xzh\\bin\\xzh.js", home);
+      expect(script).toContain('CreateObject("WScript.Shell")');
+      expect(script).toContain("gateway run");
+      expect(script).toContain("Loop While Not fso.FileExists(stopFile)");
+      expect(script).toContain("C:\\node\\node.exe");
+      expect(script).toContain("C:\\xzh\\bin\\xzh.js");
+    } finally {
+      if (saved === undefined) delete process.env.XZH_GATEWAY_HOME;
+      else process.env.XZH_GATEWAY_HOME = saved;
+    }
   });
 });

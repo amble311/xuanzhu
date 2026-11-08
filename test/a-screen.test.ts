@@ -89,14 +89,21 @@ function indicators(code: string, overrides: Partial<Indicators> = {}): Indicato
 }
 
 describe("模式与工具注册", () => {
-  it("`xzh a` 已注册为模式，4 个只读工具只在 a 模式可见", () => {
+  it("`xzh a` 已注册为模式，6 个工具只在 a 模式可见", () => {
     const mode = findMode("a");
     expect(mode?.name).toBe("a");
     expect(mode?.cwdLocked).toBe(true);
     expect(mode?.promptSection).toContain("只分析个股");
 
     const names = TOOLS.filter((tool) => tool.modes?.includes("a")).map((tool) => tool.name);
-    expect(names.sort()).toEqual(["a_bars", "a_quote", "a_screen", "a_snapshot"]);
+    expect(names.sort()).toEqual([
+      "a_account",
+      "a_bars",
+      "a_order",
+      "a_quote",
+      "a_screen",
+      "a_snapshot",
+    ]);
     const screen = TOOLS.find((tool) => tool.name === "a_screen")!;
     expect(toolVisibleInMode(screen, "a")).toBe(true);
     expect(toolVisibleInMode(screen, undefined)).toBe(false);

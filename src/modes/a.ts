@@ -1,3 +1,4 @@
+import { startAService } from "../a/monitor";
 import { getAShareHome } from "../utils/paths";
 import type { AgentMode } from "./types";
 
@@ -20,7 +21,16 @@ export function createAShareMode(): AgentMode {
     cwdLocked: true,
     startupHint:
       `A 股模式：工作目录固定为 ${home}（不可 /switch）；` +
-      `分析工具 a_* 已启用（模拟交易后续接入）`,
+      `分析工具 a_* 与模拟盘 a_account / a_order 已启用`,
+    ensureService: async () => {
+      const service = await startAService();
+      return {
+        ok: service.ok,
+        message: service.ok
+          ? `A 股巡检${service.started ? "已启动" : "已在运行"}（pid ${service.state?.pid}，盘中每 15 分钟）`
+          : `A 股巡检未启动：${service.error ?? "未知原因"}`,
+      };
+    },
     promptSection: `## 当前模式：A 股分析
 
 本次运行由 \`xzh a\` 启动，是**A 股个股分析**场景，不是通用编码场景。
@@ -37,8 +47,10 @@ export function createAShareMode(): AgentMode {
 - **筛选只用工具字段**：涨跌幅、成交额、换手、市值、板块、ST、均线位置、区间涨幅、
   距 20 日高。不要自己编 SQL / 表达式，也不要用对话里的旧价格代替工具返回值。
 - **复权口径**：指标（均线 / 区间涨幅 / 20 日高）用后复权；展示真实价格用 \`adjust=none\`。
-- **不得声称成交**：本模式尚未接入下单与模拟撮合，只能给方案（标的、依据、风险、观察点），
-  不能说「已买入 / 已卖出 / 已成交」。
+- **模拟盘规则与实盘一致**：用 \`a_order\` 下单、\`a_account\` 查账本。买入必须 100 股整数倍；
+  卖出受 T+1 可卖数量限制；涨停不买、跌停不卖、停牌拒单；限价不穿越现价时直接拒绝（不挂单）；
+  费用为佣金 0.025%（最低 5 元）+ 印花税卖出 0.05% + 过户费 0.001% 双边。
+  下单后按工具返回的成交价与费用回报，**这是模拟成交，不能声称是真钱交易**。
 - **结论要有数据依据**：价格、涨幅、成交额、均线位置、距 20 日高；拿不到数据就说拿不到，
   不预测涨停，不保证收益。
 - 用户要求长期跟踪的股票/条件，用 \`memory_write\` 落到项目记忆（${home}/.xuanzhu/memory），

@@ -140,9 +140,15 @@ export async function gatewayCommand(args: string[]): Promise<void> {
       line(
         `${ansi.green}✓ 已启用开机自启${ansi.reset}${ansi.gray}（${result.path}）${ansi.reset}`,
       );
-      line(
-        `${ansi.gray}  远程/无桌面登录时还需要一次：loginctl enable-linger ${process.env.USER ?? "$USER"}${ansi.reset}`,
-      );
+      if (process.platform === "linux") {
+        line(
+          `${ansi.gray}  远程/无桌面登录时还需要一次：loginctl enable-linger ${process.env.USER ?? "$USER"}${ansi.reset}`,
+        );
+      } else if (process.platform === "win32") {
+        line(
+          `${ansi.gray}  登录后由 wscript 隐藏拉起（崩溃 3 秒后自动重试）；关闭用 xzh gateway autostart off${ansi.reset}`,
+        );
+      }
       return;
     }
     printStatus();

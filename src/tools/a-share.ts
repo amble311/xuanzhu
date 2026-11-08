@@ -1,17 +1,22 @@
 import {
   INDICATORS_CACHE,
+  accountSummary,
   formatBars,
   formatIndicators,
   formatQuoteTable,
   formatScreen,
   formatSnapshot,
   loadIndicators,
+  loadPaperAccount,
   loadSnapshot,
+  markPaperAccount,
+  placePaperOrder,
   screenConditionFromInput,
   screenNeedsIndicators,
   screenStocks,
   summarizeSnapshot,
   type Indicators,
+  type PaperAccount,
 } from "../a";
 import {
   fetchBars,
@@ -20,6 +25,7 @@ import {
   toThsSymbol,
   type Adjust,
   type BarPeriod,
+  type Quote,
 } from "../exchange/ashare";
 import type { ToolContext, ToolDefinition, ToolResult } from "./types";
 
@@ -289,4 +295,135 @@ const barsTool: ToolDefinition = {
   },
 };
 
-export const aShareTools: ToolDefinition[] = [snapshotTool, screenTool, quoteTool, barsTool];
+// ─────────────────────────── 模拟盘 ───────────────────────────
+
+function formatPaperAccount(account: PaperAccount, withTrades = true): string {
+  const summary = accountSummary(account);
+  const lines = [
+    `模拟盘（初始 ${account.initial.toLocaleString("en-US")} · T+1 · 100 股整手）`,
+    `总资产 ${summary.equity.toLocaleString("en-US")} · 可用 ${summary.cash.toLocaleString("en-US")}` +
+      ` · 持仓市值 ${summary.marketValue.toLocaleString("en-US")}` +
+      ` · 总盈亏 ${summary.totalPnl >= 0 ? "+" : ""}${summary.totalPnl.toLocaleString("en-US")}` +
+      `（${summary.totalPnlPct >= 0 ? "+" : ""}${summary.totalPnlPct}%）`,
+  ];
+  if (account.positions.length === 0) {
+    lines.push("持仓：无");
+  } else {
+    lines.push("持仓：");
+    for (const position of account.positions) {
+      lines.push(
+        `  ${position.code} ${position.name} ${position.qty} 股（可卖 ${position.available}）` +
+          ` 成本 ${position.avgCost.toFixed(2)} 现价 ${position.lastPrice.toFixed(2)}` +
+          ` 盈亏 ${position.pnl >= 0 ? "+" : ""}${position.pnl.toFixed(2)}（${position.pnlPct}%）`,
+      );
+    }
+  }
+  if (withTrades) {
+    const recent = account.trades.slice(-5).reverse();
+    if (recent.length > 0) {
+      lines.push("最近成交：");
+      for (const trade of recent) {
+        lines.push(
+          `  ${trade.time.slice(0, 16).replace("T", " ")} ${trade.side === "buy" ? "买" : "卖"}` +
+            ` ${trade.code} ${trade.name} ${trade.qty} @ ${trade.price}（费用 ${trade.fees}）`,
+        );
+      }
+    }
+  }
+  return lines.join("\n");
+}
+
+const accountTool: ToolDefinition = {
+  name: "a_account",
+  modes: A_MODES,
+  description:
+    "查看 A 股模拟盘账本：总资产、可用资金、持仓（含 T+1 可卖数量）、最近成交。" +
+    "模拟盘不涉及真钱，但规则与实盘一致：T+1、100 股整手、涨跌停不成交、佣金/印花税/过户费。",
+  parameters: { type: "object", properties: {}, required: [] },
+  async execute(): Promise<ToolResult> {
+    try {
+      const account = loadPaperAccount();
+      if (account.positions.length === 0) {
+        return {
+          ok: true,
+          content: formatPaperAccount(account),
+          summary: `模拟盘总资产 ${accountSummary(account).equity}`,
+        };
+      }
+      const codes = account.positions.slice(0, 20).map((position) => position.code);
+      const quotes = await Promise.all(
+        codes.map((code) => fetchQuote(code).catch(() => null)),
+      );
+      const map = new Map<string, Quote>();
+      for (const quote of quotes) {
+        if (quote) map.set(quote.code, quote);
+      }
+      const marked = markPaperAccount(account, map);
+      return {
+        ok: true,
+        content: formatPaperAccount(marked),
+        summary: `模拟盘总资产 ${accountSummary(marked).equity}`,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        content: `✗ 读取模拟盘失败：${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  },
+};
+
+const orderTool: ToolDefinition = {
+  name: "a_order",
+  modes: A_MODES,
+  description:
+    "A 股**模拟盘**下单（立即成交，不涉及真钱）。买入必须 100 股整数倍；卖出受 T+1 可卖数量限制；" +
+    "涨停不买、跌停不卖、停牌拒单；限价不穿越现价时直接拒绝（不挂单排队）。" +
+    "费用：佣金 0.025%（最低 5 元）、印花税卖出 0.05%、过户费 0.001% 双边。" +
+    "下单前先看 a_account 的可用资金与可卖数量。",
+  parameters: {
+    type: "object",
+    properties: {
+      code: { type: "string", description: "股票代码" },
+      side: { type: "string", enum: ["buy", "sell"], description: "买入 / 卖出" },
+      qty: { type: "number", description: "股数（买入需 100 的整数倍）" },
+      price: { type: "number", description: "限价；不传 = 按现价成交" },
+    },
+    required: ["code", "side", "qty"],
+  },
+  async execute(args): Promise<ToolResult> {
+    const code = typeof args.code === "string" ? args.code : "";
+    const side = args.side === "buy" || args.side === "sell" ? args.side : null;
+    const qty = Number(args.qty);
+    const price = args.price === undefined ? undefined : Number(args.price);
+    if (!code) return { ok: false, content: "✗ 需要股票代码" };
+    if (!side) return { ok: false, content: "✗ side 只能是 buy 或 sell" };
+    if (!Number.isFinite(qty)) return { ok: false, content: "✗ qty 必须是数字" };
+    if (price !== undefined && !Number.isFinite(price)) {
+      return { ok: false, content: "✗ price 必须是数字" };
+    }
+    try {
+      const result = await placePaperOrder({ code, side, qty, price });
+      if (!result.ok) return { ok: false, content: `✗ ${result.message}` };
+      return {
+        ok: true,
+        content: `${result.message}\n${formatPaperAccount(result.account, false)}`,
+        summary: result.message,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        content: `✗ 下单失败：${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  },
+};
+
+export const aShareTools: ToolDefinition[] = [
+  snapshotTool,
+  screenTool,
+  quoteTool,
+  barsTool,
+  accountTool,
+  orderTool,
+];

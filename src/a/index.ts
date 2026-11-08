@@ -13,3 +13,7 @@ export * from "./indicators";
 export * from "./snapshot";
 export * from "./screen";
 export * from "./format";
+export * from "./paper";
+export * from "./watchlist";
+export * from "./score";
+export * from "./monitor";

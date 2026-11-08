@@ -4,13 +4,21 @@ import * as path from "node:path";
 import { Agent, type AgentEvents } from "../core/agent";
 import { activeModelEntry, loadConfig } from "../config/store";
 import { createProvider } from "../llm";
+import { createAShareMode } from "../modes/a";
+import { createBtcMode } from "../modes/btc";
+import type { AgentMode } from "../modes";
+import { getAShareHome, getBtcHome } from "../utils/paths";
 import { VERSION } from "../utils/version";
 import { gatewayHome, gatewayPaths } from "./paths";
 import {
   gatewayPort,
   isPidAlive,
+  parseGatewayCommand,
+  readGatewayMode,
   readGatewayState,
+  writeGatewayMode,
   writeGatewayState,
+  type GatewayModeState,
   type GatewayState,
 } from "./service";
 import { loadAccount } from "./weixin/paths";
@@ -118,6 +126,108 @@ export async function runGateway(): Promise<void> {
   /** 需要确认的工具：无人在场时拒绝，并把原因带回给调用方 */
   let deniedNote = "";
 
+  /** 当前模式（持久化在 run/mode.json，重启后仍是同一个频道模式） */
+  let modeState = readGatewayMode(home);
+  if (modeState?.name === "btc") {
+    process.env.XZH_BTC_ROLE = modeState.paper ? "paper" : "live";
+  }
+
+  const modeSpec = (
+    state: GatewayModeState | null,
+  ): { mode?: AgentMode; cwd: string; label: string } => {
+    if (state?.name === "btc") {
+      const mode = createBtcMode({ paper: state.paper === true });
+      return { mode, cwd: mode.home, label: mode.label };
+    }
+    if (state?.name === "a") {
+      const mode = createAShareMode();
+      return { mode, cwd: mode.home, label: mode.label };
+    }
+    return { cwd: home, label: "xzh 普通模式" };
+  };
+
+  /**
+   * 切换模式：先清旧模式再切目录（否则 cwdLocked 会拒绝），然后重新注入提示词/工具。
+   * 不启动 btc 常驻后端 —— 与 TUI 的 `/btc` 语义一致，避免切个模式就触发自主巡检。
+   */
+  const applyGatewayMode = (next: GatewayModeState | null): string => {
+    const spec = modeSpec(next);
+    process.env.XZH_BTC_ROLE =
+      next?.name === "btc" ? (next.paper ? "paper" : "live") : "live";
+
+    if (agent) {
+      agent.setMode(undefined);
+      if (path.resolve(agent.getCwd()) !== path.resolve(spec.cwd)) {
+        agent.setCwd(spec.cwd);
+      }
+      if (spec.mode) agent.setMode(spec.mode);
+    }
+    try {
+      spec.mode?.bootstrap?.(spec.cwd);
+    } catch {
+      // 资产释放失败不阻断；工具会自行报环境未就绪
+    }
+
+    modeState = next;
+    writeGatewayMode(next, home);
+    state.cwd = spec.cwd;
+    writeGatewayState(state, home);
+    log(`模式切换：${spec.label}（cwd=${spec.cwd}）`);
+    return spec.label;
+  };
+
+  const commandHelp = [
+    "可用命令：",
+    "/btc        BTC 量化交易模式（只读行情 + 交易工具）",
+    "/btc moni   BTC 模拟盘",
+    "/a          A 股分析模式",
+    "/xzh        回到普通模式（gateway 工作目录）",
+    "/help       显示本帮助",
+  ].join("\n");
+
+  /** 切模式后拉起对应后台（btc 的 live/paper 后端、A 股巡检）；已在运行时是「复用」 */
+  const ensureBackend = async (mode: AgentMode): Promise<string | undefined> => {
+    if (!mode.ensureService) return undefined;
+    try {
+      return (await mode.ensureService()).message || undefined;
+    } catch (err) {
+      return `后台进程启动失败：${err instanceof Error ? err.message : String(err)}`;
+    }
+  };
+
+  /** 返回 null 表示「不是命令」，应交给模型 */
+  const handleCommand = async (text: string): Promise<string | null> => {
+    const command = parseGatewayCommand(text);
+    if (!command) return null;
+    if (command.kind === "help") return commandHelp;
+    if (command.kind === "usage") return command.message;
+
+    if (command.kind === "xzh") {
+      if (!modeState) return `当前已是 xzh 普通模式（${home}）。`;
+      const previous = modeSpec(modeState).label;
+      applyGatewayMode(null);
+      return `✓ 已退出 ${previous}，回到 ${home}。`;
+    }
+
+    if (command.kind === "btc") {
+      if (modeState?.name === "btc" && (modeState.paper === true) === command.paper) {
+        const serviceMessage = await ensureBackend(createBtcMode({ paper: command.paper }));
+        return `已在 ${modeSpec(modeState).label}。${serviceMessage ? `\n${serviceMessage}` : ""}`;
+      }
+      const label = applyGatewayMode({ name: "btc", paper: command.paper });
+      const serviceMessage = await ensureBackend(createBtcMode({ paper: command.paper }));
+      return `✓ 已切换到 ${label}（工作目录 ${getBtcHome()}）。${serviceMessage ? `\n${serviceMessage}` : ""}`;
+    }
+
+    if (modeState?.name === "a") {
+      const serviceMessage = await ensureBackend(createAShareMode());
+      return `已在 A 股分析模式。${serviceMessage ? `\n${serviceMessage}` : ""}`;
+    }
+    const label = applyGatewayMode({ name: "a" });
+    const serviceMessage = await ensureBackend(createAShareMode());
+    return `✓ 已切换到 ${label}（工作目录 ${getAShareHome()}）。${serviceMessage ? `\n${serviceMessage}` : ""}`;
+  };
+
   const ensureAgent = (): Agent => {
     if (agent) return agent;
     const config = loadConfig();
@@ -146,13 +256,28 @@ export async function runGateway(): Promise<void> {
       onRoundLimit: async () => false,
     };
 
-    agent = new Agent(provider, config, home, events, active, {
+    const spec = modeSpec(modeState);
+    try {
+      spec.mode?.bootstrap?.(spec.cwd);
+    } catch {
+      // 资产释放失败不阻断；工具会自行报环境未就绪
+    }
+    agent = new Agent(provider, config, spec.cwd, events, active, {
+      mode: spec.mode,
       autoMemory: true,
       taskLedger: false,
       backgroundJobs: false,
       maxToolRounds: 60,
     });
+    // 重启后恢复到持久化的 btc / a 模式时，后台也要跟着拉起来
+    if (spec.mode?.ensureService) {
+      void spec.mode
+        .ensureService()
+        .then((result) => log(result.message))
+        .catch((err: unknown) => log(`后台拉起失败：${err instanceof Error ? err.message : String(err)}`));
+    }
     state.model = modelLabel;
+    state.cwd = spec.cwd;
     writeGatewayState(state, home);
     return agent;
   };
@@ -161,6 +286,10 @@ export async function runGateway(): Promise<void> {
   let queue: Promise<unknown> = Promise.resolve();
   const handleMessage = (text: string): Promise<string> => {
     const task = queue.then(async () => {
+      // `/btc` / `/a` / `/xzh` 这类命令不进入对话历史，也不调用模型
+      const commandReply = await handleCommand(text);
+      if (commandReply !== null) return commandReply;
+
       const runner = ensureAgent();
       replyBuffer = "";
       deniedNote = "";
@@ -189,6 +318,8 @@ export async function runGateway(): Promise<void> {
           uptimeSec: Math.round(process.uptime()),
           version: VERSION,
           model: modelLabel || null,
+          mode: modeState?.name ?? "xzh",
+          cwd: modeSpec(modeState).cwd,
           lastError: lastError ?? null,
         });
         return;

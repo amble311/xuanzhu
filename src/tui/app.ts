@@ -1,4 +1,5 @@
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import { Agent, type AgentEvents } from "../core/agent";
 import { goalContinuePrompt, goalStartPrompt } from "../core/goal";
@@ -11,7 +12,17 @@ import {
   type PromptPartKey,
 } from "../core/prompt";
 import type { AskUserAnswer, AskUserRequest } from "../tools/types";
+import {
+  accountSummary,
+  aServiceStatus,
+  loadPaperAccount,
+  loadWatchlist,
+  markPaperAccount,
+  type PaperAccount,
+} from "../a";
+import { fetchQuote, sessionKind, sessionLabel, type Quote } from "../exchange/ashare";
 import type { AgentMode } from "../modes";
+import { createAShareMode } from "../modes/a";
 import { createBtcMode } from "../modes/btc";
 import { activeExchange } from "../exchange";
 import { fetchAccountSnapshot, type AccountSnapshot } from "../btc/account";
@@ -90,7 +101,7 @@ import {
   sniffImageMime,
   type ClipboardImage,
 } from "../utils/clipboard";
-import { expandHome, getBtcHome, getKeysLogPath } from "../utils/paths";
+import { expandHome, getAShareHome, getBtcHome, getKeysLogPath } from "../utils/paths";
 import { VERSION } from "../utils/version";
 import { composeHeaderBlocks } from "./header-layout";
 import {
@@ -348,8 +359,8 @@ export class TuiApp {
   /** 专用模式（`xzh btc`）；普通模式为 undefined */
   /** 当前模式；`/btc` 会在运行中替换它（所以不能是 readonly） */
   private mode?: AgentMode;
-  /** `/btc` 切进来之前的工作目录，`/btc off` 用它回去 */
-  private btcReturnCwd?: string;
+  /** 进入专用模式之前的工作目录，`/xzh` 用它回去 */
+  private modeReturnCwd?: string;
   /**
    * btc 模式右侧仪表盘的数据快照。
    *
@@ -389,6 +400,15 @@ export class TuiApp {
   };
   private btcPanelTimer?: NodeJS.Timeout;
   private btcRefreshing = false;
+  /** A 股模拟盘面板：指数 + 账本（不拉全市场，8 秒一次只查指数与持仓） */
+  private aPanel?: {
+    updatedAt: number;
+    indices: Array<{ name: string; price: number; pct: number }>;
+    account?: PaperAccount;
+    error?: string;
+  };
+  private aPanelTimer?: NodeJS.Timeout;
+  private aRefreshing = false;
   /**
    * 后台巡检过程流的增量位置。
    *
@@ -920,6 +940,10 @@ export class TuiApp {
     if (this.btcPanelTimer) {
       clearInterval(this.btcPanelTimer);
       this.btcPanelTimer = undefined;
+    }
+    if (this.aPanelTimer) {
+      clearInterval(this.aPanelTimer);
+      this.aPanelTimer = undefined;
     }
     if (this.feedTimer) {
       clearInterval(this.feedTimer);
@@ -2966,16 +2990,32 @@ export class TuiApp {
       case "btc": {
         const sub = arg.trim().toLowerCase();
         if (sub === "off" || sub === "exit") {
-          this.switchBackFromBtc();
+          this.switchBackToXzh();
         } else if (sub === "" || sub === "moni" || sub === "paper") {
           this.switchToBtc(sub !== "");
         } else {
           this.lines.push(
-            `${ansi.gray}用法：/btc（实盘）· /btc moni（模拟盘）· /btc off（回到原项目）${ansi.reset}`,
+            `${ansi.gray}用法：/btc（实盘）· /btc moni（模拟盘）· /xzh（回到普通模式）${ansi.reset}`,
           );
         }
         break;
       }
+      case "a": {
+        const sub = arg.trim().toLowerCase();
+        if (sub === "off" || sub === "exit") {
+          this.switchBackToXzh();
+        } else if (sub === "") {
+          this.switchToAShare();
+        } else {
+          this.lines.push(
+            `${ansi.gray}用法：/a（进入 A 股分析）· /xzh（回到普通模式）${ansi.reset}`,
+          );
+        }
+        break;
+      }
+      case "xzh":
+        this.switchBackToXzh();
+        break;
       case "switch": {
         if (!arg) {
           this.lines.push(`${ansi.gray}当前目录：${this.cwd}${ansi.reset}`);
@@ -3868,68 +3908,128 @@ export class TuiApp {
    * （btc 模式锁定 `~/.xzh_btc`，而此刻 cwd 还是原项目）→ 目录静默不切，模式却已生效，
    * 结果「提示切过去了，工具在看错误的目录」。
    *
-   * 刻意**不自动拉起常驻后端**：拉起进程会立刻开始自主巡检（现在是无人值守可下单），
-   * 用户只是切个视图不该触发真钱动作。要跑巡检就显式 `xzh btc serve` 或退出重进。
+   * 切换成功后自动拉起对应角色（live / paper）的常驻后端 —— 与 CLI 启动 `xzh btc`
+   * 的语义一致；启动结果异步回报，失败不影响模式本身。
    */
+  /**
+   * 进入任意专用模式：先清旧模式再切目录（否则 cwdLocked 会挡住），
+   * 并记住进入前的项目目录供 `/xzh` 返回。
+   */
+  private enterMode(mode: AgentMode): void {
+    const target = mode.home ?? this.cwd;
+    if (!this.modeReturnCwd) this.modeReturnCwd = this.cwd;
+    this.mode = undefined;
+    this.agent.setMode(undefined);
+    this.switchDirectory(target);
+    this.mode = mode;
+    this.agent.setMode(mode);
+    try {
+      mode.bootstrap?.(target);
+    } catch {
+      // 释放失败不阻断：状态命令会显示环境未就绪
+    }
+  }
+
+  /** 切进专用模式后拉起对应的后端进程（已在运行时是「复用」） */
+  private ensureServiceFor(mode: AgentMode): void {
+    if (!mode.ensureService) return;
+    void mode
+      .ensureService()
+      .then((result) => {
+        if (result.message) {
+          this.lines.push(`${ansi.gray}  ${result.message}${ansi.reset}`);
+          this.scheduleRender();
+        }
+      })
+      .catch((err: unknown) => {
+        this.lines.push(
+          `${ansi.yellow}  后台进程启动失败：${err instanceof Error ? err.message : String(err)}${ansi.reset}`,
+        );
+        this.scheduleRender();
+      });
+  }
+
   private switchToBtc(paper: boolean): void {
     const home = getBtcHome();
     const role = paper ? "paper" : "live";
+    const mode = createBtcMode({ paper });
+
     if (this.mode?.name === "btc") {
+      // 已在 btc：`/btc moni` 与 `/btc` 之间切角色，不重复切目录
+      if ((process.env.XZH_BTC_ROLE === "paper") === paper) {
+        this.lines.push(
+          `${ansi.gray}已在 ${paper ? "BTC 模拟盘" : "BTC 量化交易"} 模式` +
+            `${paper ? "（/btc moni）" : ""}；/xzh 可回到原项目${ansi.reset}`,
+        );
+        this.ensureServiceFor(mode);
+        this.scheduleRender();
+        return;
+      }
+      process.env.XZH_BTC_ROLE = role;
+      this.mode = mode;
+      this.agent.setMode(mode);
       this.lines.push(
-        `${ansi.gray}已在 ${paper ? "BTC 模拟盘" : "BTC 量化交易"} 模式` +
-          `${paper ? "（/btc moni）" : ""}；/btc off 可回到原项目${ansi.reset}`,
+        `${ansi.green}✓ 已切换为 ${mode.label}${ansi.reset}${ansi.gray}（/xzh 返回原项目）${ansi.reset}`,
       );
+      this.ensureServiceFor(mode);
+      this.ensureBtcPanelTimer();
+      void this.refreshBtcPanel();
       this.scheduleRender();
       return;
     }
 
-    this.btcReturnCwd = this.cwd;
-    // 1) 先切目录（此时还是普通模式，setCwd 不会被锁）
-    this.switchDirectory(home);
-    // 2) 再换模式（角色环境变量决定 schedule / 面板读哪套数据）
     process.env.XZH_BTC_ROLE = role;
-    const mode = createBtcMode({ paper });
-    this.mode = mode;
-    this.agent.setMode(mode);
-    // 计算脚本按内容指纹释放：切换不走启动流程，这里补一次（缺资产会「未知命令」）
-    try {
-      mode.bootstrap?.(home);
-    } catch {
-      // 释放失败不阻断：btc_status 会显示环境未就绪
-    }
-
+    this.enterMode(mode);
     this.lines.push(
       `${ansi.green}✓ 已切换到 ${mode.label}${ansi.reset}` +
-        `${ansi.gray}（工作目录 ${home}，不可 /switch；/btc off 返回原项目）${ansi.reset}`,
+        `${ansi.gray}（工作目录 ${home}，不可 /switch；/xzh 返回原项目）${ansi.reset}`,
     );
-    if (!liveBackend(home, role)) {
-      this.lines.push(
-        `${ansi.yellow}  常驻后端未运行${ansi.reset}${ansi.gray}：切模式不会自动拉起进程；` +
-          `需要自主巡检时执行 ${ansi.reset}xzh btc serve${ansi.gray}（或退出重进）。${ansi.reset}`,
-      );
-    }
+    this.ensureServiceFor(mode);
     this.ensureBtcPanelTimer();
     void this.refreshBtcPanel();
     this.scheduleRender();
   }
 
-  /** `/btc off`：退出 btc 模式，回到切换前的项目目录 */
-  private switchBackFromBtc(): void {
-    if (this.mode?.name !== "btc") {
-      this.lines.push(`${ansi.gray}当前不在 btc 模式${ansi.reset}`);
+  /** `/a`：进入 A 股分析模式 */
+  private switchToAShare(): void {
+    if (this.mode?.name === "a") {
+      this.lines.push(`${ansi.gray}已在 A 股分析模式；/xzh 可回到原项目${ansi.reset}`);
+      this.ensureServiceFor(this.mode);
       this.scheduleRender();
       return;
     }
-    const back = this.btcReturnCwd;
+    process.env.XZH_BTC_ROLE = "live";
+    const mode = createAShareMode();
+    this.enterMode(mode);
+    this.lines.push(
+      `${ansi.green}✓ 已切换到 ${mode.label}${ansi.reset}` +
+        `${ansi.gray}（工作目录 ${getAShareHome()}，不可 /switch；/xzh 返回原项目）${ansi.reset}`,
+    );
+    this.ensureServiceFor(mode);
+    this.ensureASharePanelTimer();
+    void this.refreshASharePanel();
+    this.scheduleRender();
+  }
+
+  /** `/xzh` / `/btc off` / `/a off`：退出专用模式，回到进入前的项目目录 */
+  private switchBackToXzh(): void {
+    if (!this.mode) {
+      this.lines.push(
+        `${ansi.gray}当前已是 xzh 普通模式（${this.cwd}）${ansi.reset}`,
+      );
+      this.scheduleRender();
+      return;
+    }
+    const label = this.mode.label;
+    const back = this.modeReturnCwd ?? os.homedir();
     // 先清模式再切目录：否则 cwdLocked 会拒绝回到原项目
     this.mode = undefined;
     this.agent.setMode(undefined);
     process.env.XZH_BTC_ROLE = "live";
-    this.btcReturnCwd = undefined;
-    if (back) this.switchDirectory(back);
+    this.modeReturnCwd = undefined;
+    this.switchDirectory(back);
     this.lines.push(
-      `${ansi.green}✓ 已退出 btc 模式${ansi.reset}` +
-        `${ansi.gray}${back ? `，回到 ${back}` : ""}${ansi.reset}`,
+      `${ansi.green}✓ 已退出 ${label}${ansi.reset}${ansi.gray}，回到 ${back}${ansi.reset}`,
     );
     this.scheduleRender();
   }
@@ -4921,8 +5021,11 @@ export class TuiApp {
       `  /stop          暂停后端巡检与自动交易（btc 模式；/stop resume 恢复）`,
       `  /reset         重置对话上下文`,
       `  /monitor       查看全部叫醒条件（面板只显示前 2 条，长公式会折行）`,
-      `  /btc [moni]    切到 btc 模式（moni = 模拟盘）；/btc off 回到原项目`,
+      `  /btc [moni]    切到 btc 模式（moni = 模拟盘）；/xzh 回到普通模式`,
+      `  /a             切到 A 股分析模式；/xzh 回到普通模式`,
+      `  /xzh           退出专用模式，回到进入前的项目目录`,
       `  xzh a          A 股分析模式（命令行启动；进入后可用 a_* 分析工具）`,
+      `  xzh a serve    A 股独立巡检：盘中每 15 分钟选股 / 监控 / 模拟买卖`,
       `  /reset moni [初始资金]  重置模拟盘账本并记入记忆（仅 xzh btc moni 下有意义）`,
       `  /undo [N]      撤销玄猪最近 N 次文件修改（默认 1，最多 20；改前自动备份）`,
       `  /resume [编号]  列出 / 恢复历史会话（对话历史会自动保存）`,
@@ -5351,6 +5454,8 @@ export class TuiApp {
 
   /** 刷新面板数据（价格走公开接口，余额/持仓/挂单走签名接口，失败保留上次结果） */
   private async refreshBtcPanel(): Promise<void> {
+    // 已切到 A 股 / 普通模式时不再拉交易所数据（定时器仍在，靠这里短路）
+    if (this.mode?.name !== "btc") return;
     if (this.btcRefreshing) return;
     this.btcRefreshing = true;
     try {
@@ -5423,6 +5528,199 @@ export class TuiApp {
     } finally {
       this.btcRefreshing = false;
     }
+  }
+
+  /** A 股面板刷新定时器（只在 a 模式下真正拉数据） */
+  private ensureASharePanelTimer(): void {
+    if (this.aPanelTimer) return;
+    this.aPanelTimer = setInterval(() => {
+      void this.refreshASharePanel();
+    }, 8_000);
+    this.aPanelTimer.unref?.();
+  }
+
+  /**
+   * 刷新 A 股面板：6 个指数 + 模拟盘账本（持仓逐个取现价）。
+   *
+   * **不拉全市场快照**（5000+ 请求、几十秒）；面板只要指数与持仓，
+   * 8 秒一次的刷新必须足够轻。
+   */
+  private async refreshASharePanel(): Promise<void> {
+    if (this.mode?.name !== "a") return;
+    if (this.aRefreshing) return;
+    this.aRefreshing = true;
+    try {
+      const indices = await Promise.all(
+        [
+          { code: "1A0001", label: "上证" },
+          { code: "399001", label: "深证" },
+          { code: "399006", label: "创业板" },
+          { code: "1B0300", label: "沪深300" },
+          { code: "1B0905", label: "中证500" },
+          { code: "1B0016", label: "上证50" },
+        ].map(async (item) => {
+          try {
+            const quote = await fetchQuote(item.code);
+            return { name: item.label, price: quote.price, pct: quote.changePct };
+          } catch {
+            return null;
+          }
+        }),
+      );
+      const rows: Array<{ name: string; price: number; pct: number }> = [];
+      for (const item of indices) if (item) rows.push(item);
+
+      const account = loadPaperAccount();
+      const codes = account.positions.slice(0, 10).map((position) => position.code);
+      const quotes = await Promise.all(
+        codes.map((code) => fetchQuote(code).catch(() => null)),
+      );
+      const map = new Map<string, Quote>();
+      for (const quote of quotes) if (quote) map.set(quote.code, quote);
+
+      this.aPanel = {
+        updatedAt: Date.now(),
+        indices: rows,
+        account: markPaperAccount(account, map),
+      };
+    } catch (err) {
+      this.aPanel = {
+        updatedAt: Date.now(),
+        indices: this.aPanel?.indices ?? [],
+        account: this.aPanel?.account,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      this.aRefreshing = false;
+      this.scheduleRender();
+    }
+  }
+
+  /** A 股右侧仪表盘：指数 / 模拟盘总资产 / 持仓 / 最近成交 */
+  private buildASharePanel(
+    width: number,
+    height: number,
+  ): { rows: string[]; cursorRow: number; cursorCol: number } {
+    if (width <= 0 || height <= 0) {
+      return { rows: [], cursorRow: 0, cursorCol: 0 };
+    }
+    this.ensureASharePanelTimer();
+    if (!this.aPanel) void this.refreshASharePanel();
+
+    const rows: string[] = [];
+    const push = (text: string, raw = false): void => {
+      if (rows.length >= height) return;
+      rows.push(raw ? truncate(text, width) : truncate(text, width));
+    };
+    const divider = (): void =>
+      push(`${ansi.gray}${"─".repeat(Math.max(4, width - 1))}${ansi.reset}`);
+    const amount = (value: number, digits = 2): string =>
+      value.toLocaleString("en-US", {
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits,
+      });
+    const signed = (value: number, digits = 2): string =>
+      `${value >= 0 ? "+" : ""}${amount(value, digits)}`;
+    // A 股习惯：红涨绿跌（与 btc 面板相反）
+    const pct = (value: number): string =>
+      `${value >= 0 ? ansi.red : ansi.green}${signed(value)}%${ansi.reset}`;
+
+    push(
+      `${ansi.bgBlue}${ansi.brightWhite} ${this.mode?.label ?? "A 股分析"} ${ansi.reset}` +
+        `${ansi.gray} ${sessionLabel(sessionKind())}${ansi.reset}`,
+    );
+
+    const data = this.aPanel;
+    if (!data) {
+      push(`${ansi.gray}  正在加载…${ansi.reset}`);
+      while (rows.length < height) rows.push("");
+      return { rows, cursorRow: 0, cursorCol: 0 };
+    }
+
+    for (let index = 0; index < data.indices.length; index += 2) {
+      const pair = data.indices.slice(index, index + 2);
+      push(
+        " " +
+          pair
+            .map(
+              (item) =>
+                `${item.name} ${amount(item.price)} ${pct(item.pct)}`,
+            )
+            .join("  "),
+      );
+    }
+    if (data.error) {
+      push(`${ansi.yellow}  行情异常：${truncate(data.error, Math.max(8, width - 12))}${ansi.reset}`);
+    }
+    divider();
+
+    const account = data.account;
+    if (!account) {
+      push(`${ansi.gray}  模拟盘：未开始（初始 ${amount(1_000_000, 0)}）${ansi.reset}`);
+    } else {
+      const summary = accountSummary(account);
+      push(
+        ` ${ansi.gray}总资产${ansi.reset} ${amount(summary.equity)} ` +
+          `${summary.totalPnl >= 0 ? ansi.red : ansi.green}${signed(summary.totalPnl)}` +
+          `（${signed(summary.totalPnlPct)}%）${ansi.reset}`,
+      );
+      push(
+        ` ${ansi.gray}可用${ansi.reset} ${amount(summary.cash)}` +
+          `${ansi.gray} 市值${ansi.reset} ${amount(summary.marketValue)}` +
+          `${ansi.gray} 持仓${ansi.reset} ${summary.positionCount}`,
+      );
+      if (account.positions.length === 0) {
+        push(` ${ansi.gray}持仓${ansi.reset} 无`);
+      } else {
+        for (const position of account.positions.slice(0, 3)) {
+          push(
+            ` ${position.code} ${truncate(position.name, 6)} ${position.qty}股` +
+              `(${position.available}) ${amount(position.avgCost)}→${amount(position.lastPrice)}`,
+          );
+          push(
+            `${ansi.gray}   ${signed(position.pnl)}（${signed(position.pnlPct)}%）${ansi.reset}`,
+          );
+        }
+      }
+      const trades = account.trades.slice(-2).reverse();
+      if (trades.length > 0) {
+        push(` ${ansi.gray}成交${ansi.reset}`);
+        for (const trade of trades) {
+          push(
+            `${ansi.gray}   ${trade.side === "buy" ? "买" : "卖"} ${trade.code} ` +
+              `${trade.qty}@${amount(trade.price)}${ansi.reset}`,
+          );
+        }
+      }
+    }
+    divider();
+    const service = aServiceStatus();
+    const watch = loadWatchlist();
+    push(
+      ` ${ansi.gray}巡检${ansi.reset} ` +
+        (service.running
+          ? `${ansi.green}运行中${ansi.reset}${ansi.gray} pid ${service.state?.pid}`
+          : `${ansi.yellow}未运行${ansi.reset}${ansi.gray}（xzh a serve）`) +
+        `${ansi.gray} · 自选 ${watch.items.length}/10${ansi.reset}`,
+    );
+    if (service.running && service.state?.nextRunAt) {
+      push(`${ansi.gray}   下一轮 ${service.state.nextRunAt.slice(11, 16)}${ansi.reset}`);
+    }
+    for (const item of watch.items.slice(0, 3)) {
+      push(
+        `${ansi.gray}   ${item.code} ${truncate(item.name, 6)} ${item.score} 分${ansi.reset}`,
+      );
+    }
+    push(`${ansi.gray} 模拟盘 · T+1 · 100 股整手 · 费用已计${ansi.reset}`);
+    if (data.updatedAt > 0) {
+      push(
+        `${ansi.gray} 更新 ${new Date(data.updatedAt).toLocaleTimeString("zh-CN", {
+          hour12: false,
+        })}${ansi.reset}`,
+      );
+    }
+    while (rows.length < height) rows.push("");
+    return { rows, cursorRow: 0, cursorCol: 0 };
   }
 
   /**
@@ -5756,6 +6054,7 @@ export class TuiApp {
     height: number,
   ): { rows: string[]; cursorRow: number; cursorCol: number } {
     // btc 模式下右栏不是终端，而是只读仪表盘（价格 / 账户 / 巡检 / 风控）
+    if (this.mode?.name === "a") return this.buildASharePanel(width, height);
     if (this.mode?.name === "btc") return this.buildBtcPanel(width, height);
 
     if (width <= 0 || height <= 0) {

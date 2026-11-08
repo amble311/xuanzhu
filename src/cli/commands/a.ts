@@ -6,9 +6,23 @@ import {
   formatQuoteTable,
   formatScreen,
   formatSnapshot,
+  addWatchItem,
+  aServiceStatus,
+  heldCodes,
   loadIndicators,
+  loadPaperAccount,
   loadSnapshot,
+  loadWatchlist,
+  mergeWatchlist,
+  monitorLogPath,
+  removeWatchItem,
+  runAServe,
+  runMonitorCycle,
+  saveWatchlist,
   screenConditionFromInput,
+  selectTopWatchlist,
+  startAService,
+  stopAService,
   screenNeedsIndicators,
   screenStocks,
   summarizeSnapshot,
@@ -188,6 +202,14 @@ ${ansi.bold}横截面（全市场）${ansi.reset}
       ${ansi.gray}--pct-min 3 --pct-max 9.5 --amount-min 2亿 --turnover-min 3${ansi.reset}
       ${ansi.gray}--above-ma20 --near-high20 5 --ret20-min 10 --rank amount --limit 20${ansi.reset}
       ${ansi.gray}--where '{"boards":["sh-main"],"pctMin":3}' 直接给完整 JSON 条件${ansi.reset}
+
+${ansi.bold}监控（独立进程）${ansi.reset}
+  ${ansi.green}xzh a serve${ansi.reset}                     启动 A 股巡检（盘中每 15 分钟一轮）
+  ${ansi.green}xzh a serve status|stop${ansi.reset}         查看 / 停止巡检进程
+  ${ansi.green}xzh a watch${ansi.reset}                     查看自选股（监控池）
+  ${ansi.green}xzh a watch add|remove <代码>${ansi.reset}   手工增删（持仓不可删除）
+  ${ansi.green}xzh a watch refresh${ansi.reset}             立即全市场重选前 10
+  ${ansi.green}xzh a monitor once${ansi.reset}              手动跑一轮巡检（不常驻）
 
 ${ansi.bold}缓存${ansi.reset}
   ${ansi.green}xzh a sync${ansi.reset}                       建股票池 + 预计算全市场指标 + 交易日历（约 1-2 分钟）
@@ -468,8 +490,22 @@ async function statusCommand(parsed: ParsedArgs): Promise<void> {
   const cachedIndicators = readCache<Indicators[]>(INDICATORS_CACHE, Number.POSITIVE_INFINITY);
   const cachedCalendar = readCache<TradingCalendar>(CALENDAR_CACHE, Number.POSITIVE_INFINITY);
 
+  const service = aServiceStatus();
+  const watch = loadWatchlist();
   const status = {
     home: getAShareHome(),
+    service: {
+      running: service.running,
+      pid: service.state?.pid ?? null,
+      nextRunAt: service.state?.nextRunAt ?? null,
+      lastAction: service.state?.lastAction ?? null,
+    },
+    watchlist: watch.items.map((item) => ({
+      code: item.code,
+      name: item.name,
+      score: item.score,
+      source: item.source,
+    })),
     universe: {
       ...universe,
       count: cachedUniverse?.value.length ?? 0,
@@ -500,8 +536,150 @@ async function statusCommand(parsed: ParsedArgs): Promise<void> {
   line("指标", indicators, `${status.indicators.count} 只`);
   line("快照", snapshot, "");
   line("交易日历", calendar, `${status.calendar.days} 个交易日`);
+  process.stdout.write(
+    `  ${padEnd("巡检", 10)}${
+      service.running
+        ? `${ansi.green}运行中${ansi.reset}${ansi.gray} pid ${service.state?.pid} · 下一轮 ${service.state?.nextRunAt ?? "—"}${ansi.reset}`
+        : `${ansi.yellow}未运行${ansi.reset}${ansi.gray}（xzh a serve）${ansi.reset}`
+    }\n`,
+  );
+  process.stdout.write(
+    `  ${padEnd("自选股", 10)}${watch.items.length}/10` +
+      `${ansi.gray}${watch.items.length > 0 ? `：${watch.items.slice(0, 5).map((item) => `${item.code}(${item.score})`).join("、")}${watch.items.length > 5 ? " …" : ""}` : ""}${ansi.reset}\n`,
+  );
   if (!universe.exists || !indicators.exists || !calendar.exists) {
     process.stdout.write(`${ansi.gray}缺失的缓存可运行 xzh a sync 建立。${ansi.reset}\n`);
+  }
+}
+
+async function serveCommand(parsed: ParsedArgs): Promise<void> {
+  const action = (parsed.positional[1] ?? "start").toLowerCase();
+  if (action === "run") {
+    await runAServe();
+    return;
+  }
+  if (action === "stop") {
+    const result = await stopAService();
+    process.stdout.write(
+      result.ok
+        ? `${ansi.green}✓ ${result.stopped ? "A 股巡检已停止" : "巡检本来就没在运行"}${ansi.reset}\n`
+        : `${ansi.red}✗ 停止失败：${result.error}${ansi.reset}\n`,
+    );
+    return;
+  }
+
+  const status = aServiceStatus();
+  if (action === "status") {
+    if (!status.running) {
+      process.stdout.write(`${ansi.yellow}A 股巡检未运行${ansi.reset}\n`);
+      if (status.stale) process.stdout.write(`${ansi.gray}  有残留状态，下次启动会清理${ansi.reset}\n`);
+      return;
+    }
+    const state = status.state!;
+    process.stdout.write(
+      `${ansi.green}A 股巡检运行中${ansi.reset}${ansi.gray} pid ${state.pid} · ${state.version}` +
+        ` · 自选 ${state.watchlist} 只 · 持仓 ${state.holdings} 只${ansi.reset}\n` +
+        `${ansi.gray}  下一轮 ${state.nextRunAt}${state.lastAction ? ` · 最近：${state.lastAction}` : ""}${ansi.reset}\n` +
+        `${ansi.gray}  日志 ${monitorLogPath()}${ansi.reset}\n`,
+    );
+    if (state.lastError) process.stdout.write(`${ansi.yellow}  最近错误：${state.lastError}${ansi.reset}\n`);
+    return;
+  }
+
+  if (action !== "start" && action !== "") {
+    process.stdout.write(`${ansi.red}未知操作：serve ${action}${ansi.reset}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (status.running) {
+    process.stdout.write(
+      `${ansi.gray}A 股巡检已在运行（pid ${status.state?.pid}）${ansi.reset}\n`,
+    );
+    return;
+  }
+  const result = await startAService();
+  process.stdout.write(
+    result.ok
+      ? `${ansi.green}✓ A 股巡检已启动${ansi.reset}${ansi.gray} pid ${result.state?.pid} · 盘中每 15 分钟一轮${ansi.reset}\n`
+      : `${ansi.red}✗ 启动失败：${result.error}${ansi.reset}\n`,
+  );
+}
+
+function printWatchlist(): void {
+  const list = loadWatchlist();
+  process.stdout.write(
+    `${ansi.bold}A 股自选股${ansi.reset} ${ansi.gray}（${list.items.length}/10 · 全部纳入监控）${ansi.reset}\n`,
+  );
+  if (list.items.length === 0) {
+    process.stdout.write(`${ansi.gray}  空；运行 xzh a serve 或 xzh a watch refresh 选股${ansi.reset}\n`);
+    return;
+  }
+  for (const item of list.items) {
+    process.stdout.write(
+      `  ${item.code} ${padEnd(item.name, 10)} ${String(item.score).padStart(3)} 分` +
+        `${ansi.gray}  ${item.source === "held" ? "持仓" : item.source === "manual" ? "手工" : "选股"} · ${item.reason}${ansi.reset}\n`,
+    );
+  }
+}
+
+async function watchCommand(parsed: ParsedArgs): Promise<void> {
+  const action = (parsed.positional[1] ?? "list").toLowerCase();
+  const code = parsed.positional[2];
+  if (action === "list") {
+    printWatchlist();
+    return;
+  }
+  if (action === "add") {
+    if (!code) throw new Error("用法：xzh a watch add <代码>");
+    const quote = await fetchQuote(code);
+    const result = addWatchItem({
+      code: quote.code,
+      name: quote.name,
+      score: 0,
+      reason: "手工添加",
+      source: "manual",
+      addedAt: new Date().toISOString(),
+    });
+    if (!result.ok) throw new Error(result.error);
+    process.stdout.write(`${ansi.green}✓ 已加入自选股：${quote.code} ${quote.name}${ansi.reset}\n`);
+    printWatchlist();
+    return;
+  }
+  if (action === "remove") {
+    if (!code) throw new Error("用法：xzh a watch remove <代码>");
+    const result = removeWatchItem(code, heldCodes());
+    if (!result.ok) throw new Error(result.error);
+    process.stdout.write(`${ansi.green}✓ 已移除 ${code}${ansi.reset}\n`);
+    printWatchlist();
+    return;
+  }
+  if (action === "refresh") {
+    const picks = await selectTopWatchlist(10, (message) =>
+      process.stdout.write(`${ansi.gray}${message}${ansi.reset}\n`),
+    );
+    const held = loadPaperAccount().positions.map((position) => ({
+      code: position.code,
+      name: position.name,
+    }));
+    const merged = mergeWatchlist(picks, held);
+    saveWatchlist(merged);
+    process.stdout.write(`${ansi.green}✓ 已重选自选股${ansi.reset}\n`);
+    printWatchlist();
+    return;
+  }
+  throw new Error("用法：xzh a watch [list|add <代码>|remove <代码>|refresh]");
+}
+
+async function monitorCommand(parsed: ParsedArgs): Promise<void> {
+  const action = (parsed.positional[1] ?? "once").toLowerCase();
+  if (action !== "once") throw new Error("用法：xzh a monitor once");
+  const result = await runMonitorCycle();
+  if (result.actions.length === 0) {
+    process.stdout.write(`${ansi.gray}巡检完成：无动作${ansi.reset}\n`);
+    return;
+  }
+  for (const action of result.actions) {
+    process.stdout.write(`  ${action}\n`);
   }
 }
 
@@ -543,10 +721,19 @@ export async function aCommand(args: string[]): Promise<void> {
       case "status":
         await statusCommand(parsed);
         return;
+      case "serve":
+        await serveCommand(parsed);
+        return;
+      case "watch":
+        await watchCommand(parsed);
+        return;
+      case "monitor":
+        await monitorCommand(parsed);
+        return;
       default:
         process.stdout.write(
           `${ansi.red}未知子命令：a ${sub}${ansi.reset}\n` +
-            `${ansi.gray}可用：quote / bars / intraday / market / snapshot / screen / boards / sync / status${ansi.reset}\n`,
+            `${ansi.gray}可用：quote / bars / intraday / market / snapshot / screen / boards / sync / status / serve / watch / monitor${ansi.reset}\n`,
         );
         process.exitCode = 1;
     }

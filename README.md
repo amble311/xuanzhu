@@ -182,7 +182,7 @@ xzh
 | `xzh vpn` | 交互式设置 / 探测 / 测试 / 启停全局 HTTP(S)/SOCKS5 代理 |
 | `xzh gateway` | 启动常驻 gateway 服务（工作目录 `~/.xzh_gateway`，首次启动自动开机自启） |
 | `xzh gateway stop\|restart\|status` | 停止 / 重启 / 查看 gateway |
-| `xzh gateway autostart [on\|off]` | 开/关开机自启（systemd user unit） |
+| `xzh gateway autostart [on\|off]` | 开/关开机自启（Linux systemd / Windows 登录启动） |
 | `xzh gateway weixin login` | 扫码登录个人微信（iLink Bot），登录后 `xzh gateway restart` 生效 |
 | `xzh gateway weixin status\|logout` | 查看 / 清除微信登录 |
 
@@ -202,8 +202,9 @@ xzh
 - 工作目录 `~/.xzh_gateway`（`XZH_GATEWAY_HOME` 可改），记忆/会话独立，不混进日常项目；
 - 本地接口：`GET /health`、`POST /message`（`{"text":"..."}` → 回复文本）、`POST /shutdown`，
   默认端口 17890（`XZH_GATEWAY_PORT` 可改），只监听 127.0.0.1；
-- 首次 `xzh gateway` 会顺手装好 **systemd user 开机自启**（`Restart=always`）；
-  没有 systemd 的环境只提示、不影响服务；`xzh gateway autostart off` 可关闭；
+- 首次 `xzh gateway` 会顺手装好开机自启：Linux 写 **systemd user unit**（`Restart=always`），
+  Windows 写 **HKCU Run + wscript 隐藏启动器**（崩溃 3 秒后自动重拉，无需管理员）；
+  两者都不影响服务本体，`xzh gateway autostart off` 可关闭；
 - 日志：`~/.xzh_gateway/logs/gateway.log`。
 | `xzh setup` | 检查并自动安装依赖（玄猪自身 + 技能：playwright / officecli / 剪贴板工具等） |
 | `xzh init` | 扫描项目并生成 / 补全 `AGENTS.md` 与 `docs/`（已有内容只补缺失小节） |
