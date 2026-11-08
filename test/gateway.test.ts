@@ -7,6 +7,7 @@ import {
   gatewayPaths,
   isDefaultGatewayHome,
 } from "../src/gateway/paths";
+import { commandHelpLines } from "../src/core/help-text";
 import {
   gatewayModeFile,
   isPidAlive,
@@ -82,6 +83,7 @@ describe("gateway", () => {
 
   it("解析对话内命令：/btc、/btc moni、/a、/xzh，普通文本返回 null", () => {
     expect(parseGatewayCommand("你好")).toBeNull();
+    expect(parseGatewayCommand("  /a ")).toEqual({ kind: "a" });
     expect(parseGatewayCommand("/btc")).toEqual({ kind: "btc", paper: false });
     expect(parseGatewayCommand("/btc moni")).toEqual({ kind: "btc", paper: true });
     expect(parseGatewayCommand("/btc paper")).toEqual({ kind: "btc", paper: true });
@@ -91,6 +93,16 @@ describe("gateway", () => {
     expect(parseGatewayCommand("/a off")).toEqual({ kind: "xzh" });
     expect(parseGatewayCommand("/help")).toEqual({ kind: "help" });
     expect(parseGatewayCommand("/nope")).toMatchObject({ kind: "usage" });
+    // 中文输入法的全角斜杠也认作命令
+    expect(parseGatewayCommand("／btc moni")).toEqual({ kind: "btc", paper: true });
+    expect(parseGatewayCommand("／help")).toEqual({ kind: "help" });
+  });
+
+  it("/help 使用与 xzh 一致的帮助文本（含模式切换条目）", () => {
+    const lines = commandHelpLines();
+    expect(lines.length).toBeGreaterThan(30);
+    expect(lines.some((line) => line.includes("/btc [moni]"))).toBe(true);
+    expect(lines.some((line) => line.includes("xzh a serve"))).toBe(true);
   });
 
   it("模式持久化：写读一致，坏文件 / 非法模式返回 null", () => {

@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent, type AgentEvents } from "../core/agent";
 import { activeModelEntry, loadConfig } from "../config/store";
+import { commandHelpLines } from "../core/help-text";
 import { createProvider } from "../llm";
 import { createAShareMode } from "../modes/a";
 import { createBtcMode } from "../modes/btc";
@@ -176,14 +177,19 @@ export async function runGateway(): Promise<void> {
     return spec.label;
   };
 
-  const commandHelp = [
-    "可用命令：",
-    "/btc        BTC 量化交易模式（只读行情 + 交易工具）",
-    "/btc moni   BTC 模拟盘",
-    "/a          A 股分析模式",
-    "/xzh        回到普通模式（gateway 工作目录）",
-    "/help       显示本帮助",
-  ].join("\n");
+  // 微信里的 /help 与 xzh 界面完全一致（ANSI 转义对纯文本渠道无意义，strip 掉）
+  const commandHelp = (): string => {
+    const plain = commandHelpLines().map((line) =>
+      line.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, ""),
+    );
+    return [
+      "玄猪命令帮助（与 xzh 内一致）：",
+      ...plain,
+      "",
+      "微信内说明：/btc、/btc moni、/a、/xzh 会切换模式并自动拉起对应后台；",
+      "鼠标 / 快捷键 / 右侧终端等条目仅适用于 xzh 界面。",
+    ].join("\n");
+  };
 
   /** 切模式后拉起对应后台（btc 的 live/paper 后端、A 股巡检）；已在运行时是「复用」 */
   const ensureBackend = async (mode: AgentMode): Promise<string | undefined> => {
@@ -199,7 +205,7 @@ export async function runGateway(): Promise<void> {
   const handleCommand = async (text: string): Promise<string | null> => {
     const command = parseGatewayCommand(text);
     if (!command) return null;
-    if (command.kind === "help") return commandHelp;
+    if (command.kind === "help") return commandHelp();
     if (command.kind === "usage") return command.message;
 
     if (command.kind === "xzh") {

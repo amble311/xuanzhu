@@ -352,8 +352,10 @@ export type GatewayCommand =
  */
 export function parseGatewayCommand(text: string): GatewayCommand | null {
   const trimmed = text.trim();
-  if (!trimmed.startsWith("/")) return null;
-  const parts = trimmed.slice(1).trim().split(/\s+/);
+  // 全角斜杠（中文输入法常见）也认作命令
+  if (!/^[／/]/.test(trimmed)) return null;
+  const body = trimmed.replace(/^／/, "/").slice(1).trim();
+  const parts = body.length > 0 ? body.split(/\s+/) : [];
   const name = (parts.shift() ?? "").toLowerCase();
   const arg = (parts.shift() ?? "").toLowerCase();
 
