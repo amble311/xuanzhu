@@ -17,3 +17,5 @@ export * from "./paper";
 export * from "./watchlist";
 export * from "./score";
 export * from "./monitor";
+export * from "./regime";
+export * from "./backtest";

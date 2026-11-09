@@ -252,7 +252,7 @@ xzh
 | `/model [编号\|id]` | 查看 / 切换当前模型 |
 | `/auto [on\|off]` | 自动批准（**不带参数 = 开**，`/auto off` 才关；写入配置） |
 | `/autonomy [ask\|observe\|auto]` | 自治等级：逐项确认 / 只观察 / 全自动 |
-| `/monitor` | 查看全部叫醒条件（完整阈值 / 公式 / 链式进度）；面板只显示前 2 条 |
+| `/wakeup` | 查看监控内容：btc 叫醒条件（完整阈值 / 公式 / 链式进度）/ A 股监控池（别名 `/monitor`） |
 | `/compact` / `/context` / `/usage` | 压缩历史 / 看上下文预算 / 看 token 用量 |
 | `/tools` | 列出本轮发给模型的工具（排查「某个工具没被调用」） |
 | `/memory` | 查看项目记忆（`show`、`global`、`clear`） |

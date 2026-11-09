@@ -89,14 +89,48 @@ export function startWeixinChannel(options: WeixinChannelOptions): WeixinChannel
     return true;
   };
 
+  /**
+   * 所有出站消息串行化：回复、巡检推送可能同时发生，iLink 对并发发送不稳定
+   * （后一条偶发丢失）。这里用一条 Promise 链保证「一条发完再发下一条」。
+   */
+  let sendChain: Promise<void> = Promise.resolve();
+  const enqueueSend = (task: () => Promise<void>): Promise<void> => {
+    const run = sendChain.then(task, task);
+    sendChain = run.catch(() => undefined);
+    return run;
+  };
+
+  const sleep = (ms: number): Promise<void> =>
+    new Promise((resolve) => setTimeout(resolve, ms));
+
   const sendChunks = async (to: string, reply: string): Promise<void> => {
-    for (const chunk of splitChunks(reply)) {
-      await sendText({
-        baseUrl: account.baseUrl,
-        token: account.token,
-        to,
-        text: chunk,
-        contextToken: tokens[to],
+    const chunks = splitChunks(reply);
+    for (let index = 0; index < chunks.length; index += 1) {
+      // 多条气泡之间留间隔：连续 send 太快时 iLink 会丢后一条
+      if (index > 0) await sleep(450);
+      const chunk = chunks[index];
+      await enqueueSend(async () => {
+        let lastError: unknown;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            await sendText({
+              baseUrl: account.baseUrl,
+              token: account.token,
+              to,
+              text: chunk,
+              contextToken: tokens[to],
+            });
+            return;
+          } catch (err) {
+            lastError = err;
+            await sleep(600 * (attempt + 1));
+          }
+        }
+        log(
+          `微信：分块发送失败（${index + 1}/${chunks.length}）：${
+            lastError instanceof Error ? lastError.message : String(lastError)
+          }`,
+        );
       });
     }
   };

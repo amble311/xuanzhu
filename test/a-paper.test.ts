@@ -177,6 +177,15 @@ describe("模拟盘撮合", () => {
     expect(marked.positions[0].marketValue).toBe(1200);
     expect(accountSummary(marked).totalPnl).toBeCloseTo(200 - 5.01, 2);
   });
+
+  it("移动止盈需要持仓期最高价：只升不降", () => {
+    const account = emptyPaperAccount(NOW);
+    const bought = applyPaperOrder(account, quote(), { code: "600519", side: "buy", qty: 100 }, NOW).account;
+    const peak = markPaperAccount(bought, new Map([["600519", quote({ price: 12 })]]));
+    expect(peak.positions[0].peakPrice).toBe(12);
+    const pulledBack = markPaperAccount(peak, new Map([["600519", quote({ price: 11 })]]));
+    expect(pulledBack.positions[0].peakPrice).toBe(12);
+  });
 });
 
 describe("T+1 跨日", () => {

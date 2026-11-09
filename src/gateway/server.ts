@@ -2,10 +2,18 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent, type AgentEvents } from "../core/agent";
-import { activeModelEntry, loadConfig } from "../config/store";
+import { activeModelEntry, loadConfig, saveConfig } from "../config/store";
 import { commandHelpLines } from "../core/help-text";
 import { btcInfoLines, collectBtcPanelData } from "../btc/panel-data";
 import { aInfoLines, collectASharePanelData } from "../a/info";
+import { TOOLS, toolVisibleInMode } from "../tools";
+import { describeTrigger, readTriggers } from "../btc/triggers";
+import { setPaused } from "../btc/pause";
+import { ensureBtcBackend, stopBtcBackend } from "../btc/daemon";
+import { startAService, stopAService } from "../a/monitor";
+import { resetPaperLedger } from "../btc/paper-reset";
+import { expandHome, getDataSubdir } from "../utils/paths";
+import { loadWatchlist } from "../a/watchlist";
 import { createProvider } from "../llm";
 import { createAShareMode } from "../modes/a";
 import { createBtcMode } from "../modes/btc";
@@ -189,8 +197,8 @@ export async function runGateway(): Promise<void> {
       "玄猪命令帮助（与 xzh 内一致）：",
       ...plain,
       "",
-      "微信内说明：/btc、/btc moni、/a、/xzh 会切换模式并自动拉起对应后台；",
-      "鼠标 / 快捷键 / 右侧终端等条目仅适用于 xzh 界面。",
+      "微信内说明：命令集与终端一致；/btc、/btc moni、/a、/xzh 会切换模式并自动拉起对应后台。",
+      "界面专属命令（/clear、/copy、/image、/mouse、/term、/device、/feed、/focus、/resume、/init、/undo、/exit）会说明原因，其余均可用。",
     ].join("\n");
   };
 
@@ -204,12 +212,275 @@ export async function runGateway(): Promise<void> {
     }
   };
 
+  /** 终端界面专属命令：微信里直接说明原因，而不是当成「未知命令」 */
+  const TUI_ONLY: Record<string, string> = {
+    clear: "/clear 用于清屏，微信没有界面；要清对话上下文请用 /reset。",
+    copy: "/copy 仅终端可用（复制到系统剪贴板）。",
+    image: "微信侧目前只支持文本；图片附件请在终端用 /image。",
+    mouse: "/mouse 仅终端可用（切换鼠标捕获）。",
+    term: "/term 仅终端可用（右侧终端面板）。",
+    device: "/device 手机桥仅终端可用，命令行请用 xzh device ...。",
+    feed: "/feed 过程流仅终端可用；微信已自动推送巡检结论与动作（也可用 /info）。",
+    focus: "/focus 工作集仅终端可用（终端里维护文件工作集）。",
+    resume: "/resume 会话切换仅终端可用；微信频道固定使用 gateway 自己的会话。",
+    init: "/init 需要交互确认，请在终端运行 xzh init。",
+    undo: "/undo 需要逐项确认，请在终端使用 /undo。",
+    exit: "gateway 是常驻服务，不能从对话退出；停止请用 xzh gateway stop。",
+  };
+
+  /** 与终端同一套 /help 列表的命令路由（微信侧） */
+  const runRawCommand = async (name: string, arg: string): Promise<string> => {
+    if (TUI_ONLY[name]) return TUI_ONLY[name];
+
+    switch (name) {
+      case "cwd": {
+        const runner = ensureAgent();
+        return `工作目录：${runner.getCwd()}\n模式：${modeState ? modeSpec(modeState).label : "xzh 普通模式"}`;
+      }
+      case "switch": {
+        if (!arg) return "用法：/switch <目录>";
+        if (modeState) return `当前为 ${modeSpec(modeState).label}，目录已锁定，不能 /switch；先 /xzh 退出模式。`;
+        const runner = ensureAgent();
+        try {
+          runner.setCwd(path.resolve(expandHome(arg)));
+        } catch (err) {
+          return `切换失败：${err instanceof Error ? err.message : String(err)}`;
+        }
+        state.cwd = runner.getCwd();
+        writeGatewayState(state, home);
+        return `✓ 已切换工作目录：${state.cwd}`;
+      }
+      case "reset": {
+        if (arg.trim().toLowerCase().startsWith("moni")) {
+          const capitalText = arg.trim().split(/\s+/)[1];
+          const capital = capitalText === undefined ? undefined : Number(capitalText);
+          if (capital !== undefined && (!Number.isFinite(capital) || capital <= 0)) {
+            return "用法：/reset moni [初始资金]";
+          }
+          const result = await resetPaperLedger({
+            home: getBtcHome(),
+            capital,
+            source: "command",
+          });
+          return result.ok
+            ? `✓ 模拟盘已重置，初始资金 ${result.data.capital.toLocaleString("en-US")}`
+            : `✗ 重置失败：${result.error}`;
+        }
+        ensureAgent().reset();
+        return "✓ 已重置对话上下文";
+      }
+      case "compact": {
+        const result = await ensureAgent().compactHistory();
+        return result.compacted
+          ? `✓ 已压缩上下文：${result.before} 条 → ${result.after} 条`
+          : `未压缩：${result.reason ?? "历史较短"}`;
+      }
+      case "tools": {
+        const modeName = modeState?.name;
+        const visible = TOOLS.filter((tool) => toolVisibleInMode(tool, modeName));
+        return `当前可用工具 ${visible.length} 个：\n` + visible.map((tool) => `- ${tool.name}`).join("\n");
+      }
+      case "context": {
+        const runner = ensureAgent();
+        const chars = runner.messages.reduce((sum, message) => sum + message.content.length, 0);
+        return `历史 ${runner.messages.length} 条 · 约 ${chars} 字\n工具 ${TOOLS.length} 个（当前模式可见 ${
+          TOOLS.filter((tool) => toolVisibleInMode(tool, modeState?.name)).length
+        } 个）\n（gateway 侧不做像素级预算统计，终端 /context 更完整）`;
+      }
+      case "usage":
+        return "微信频道不统计 token 用量；终端的 /usage 会显示本轮与累计真实用量。";
+      case "autonomy": {
+        const runner = ensureAgent();
+        const next = arg.trim().toLowerCase();
+        if (!next) return `当前自治等级：${runner.getAutonomyMode()}（ask / observe / auto）`;
+        if (next !== "ask" && next !== "observe" && next !== "auto") {
+          return "用法：/autonomy [ask|observe|auto]";
+        }
+        runner.setAutonomyMode(next);
+        return `✓ 自治等级已切换为 ${next}`;
+      }
+      case "auto": {
+        const next = arg.trim().toLowerCase();
+        if (next !== "on" && next !== "off") return "用法：/auto [on|off]";
+        const config = loadConfig();
+        config.autoApprove = next === "on";
+        saveConfig(config);
+        return `✓ 自动批准已${next === "on" ? "开启" : "关闭"}（写入配置，新会话生效）`;
+      }
+      case "jobs": {
+        const runner = ensureAgent();
+        const parts = arg.trim().split(/\s+/).filter(Boolean);
+        if (parts[0] === "kill" && parts[1]) {
+          const result = runner.killBackgroundJob(parts[1]);
+          return result.ok ? `✓ ${result.message}` : `✗ ${result.message}`;
+        }
+        const jobs = runner.getBackgroundJobs();
+        if (jobs.length === 0) return "没有后台任务";
+        return jobs
+          .map((job) => `${job.id} [${job.status}] ${job.command}${job.code !== null ? `（退出码 ${job.code}）` : ""}`)
+          .join("\n");
+      }
+      case "goal": {
+        const runner = ensureAgent();
+        const value = arg.trim();
+        if (!value || value === "status") {
+          const goal = runner.getGoal();
+          return goal ? `当前目标：${goal.text}` : "当前没有目标（/goal <目标> 设定）";
+        }
+        if (value === "off") {
+          runner.clearGoal();
+          return "✓ 已清除目标";
+        }
+        const goal = runner.setGoal(value);
+        return `✓ 已设定目标：${goal.text}\n发送 /goal continue 继续推进`;
+      }
+      case "stop":
+      case "start":
+      case "restart": {
+        if (!modeState) return `/${name} 仅在 btc / btc moni / a 模式下可用。`;
+        const isBtc = modeState.name === "btc";
+        const role = modeState.paper ? "paper" : "live";
+        const label = isBtc ? (role === "paper" ? "btc 模拟盘" : "btc 实盘") : "A 股巡检";
+        const messages: string[] = [];
+
+        if (name !== "start") {
+          if (isBtc) {
+            const result = await stopBtcBackend(role);
+            messages.push(
+              result.stopped
+                ? `✓ 已停止 ${label} 后端`
+                : result.error
+                  ? `✗ 停止失败：${result.error}`
+                  : `${label} 后端本来没在运行`,
+            );
+          } else {
+            const result = await stopAService();
+            messages.push(
+              result.ok
+                ? result.stopped
+                  ? "✓ 已停止 A 股巡检"
+                  : "A 股巡检本来没在运行"
+                : `✗ 停止失败：${result.error}`,
+            );
+          }
+        }
+        if (name !== "stop") {
+          if (isBtc) {
+            const result = await ensureBtcBackend({ role });
+            messages.push(
+              result.running
+                ? result.started
+                  ? `✓ 已启动 ${label} 后端`
+                  : `${label} 后端已在运行`
+                : `✗ 启动失败：${result.error ?? "未知原因"}`,
+            );
+          } else {
+            const result = await startAService();
+            messages.push(
+              result.ok
+                ? result.started
+                  ? "✓ 已启动 A 股巡检"
+                  : "A 股巡检已在运行"
+                : `✗ 启动失败：${result.error ?? "未知原因"}`,
+            );
+          }
+        }
+        return messages.join("\n");
+      }
+      case "pause": {
+        if (modeState?.name !== "btc") return "/pause 仅在 btc / btc moni 模式下有效";
+        const resume = arg.trim().toLowerCase() === "resume";
+        setPaused(getBtcHome(), !resume, "/pause");
+        return resume ? "✓ 已恢复 btc 后端巡检" : "✓ 已暂停 btc 后端巡检（/pause resume 恢复）";
+      }
+      case "wakeup":
+      case "monitor": { // 旧名保留为别名
+        if (modeState?.name === "btc") {
+          const triggers = readTriggers(
+            getBtcHome(),
+            modeState.paper ? "paper" : "live",
+          );
+          if (triggers.length === 0) return "当前没有叫醒条件（btc_trigger 可添加）";
+          return `叫醒条件 ${triggers.length} 条：\n` + triggers.map((trigger) => `- ${describeTrigger(trigger)}`).join("\n");
+        }
+        if (modeState?.name === "a") {
+          const watch = loadWatchlist();
+          if (watch.items.length === 0) return "A 股监控池为空（xzh a serve 会自动选股）";
+          return `A 股监控池 ${watch.items.length}/10：\n` + watch.items.map((item) => `- ${item.code} ${item.name} ${item.score} 分`).join("\n");
+        }
+        return "/wakeup 仅在 btc / a 模式下有效";
+      }
+      case "model": {
+        const config = loadConfig();
+        const runner = ensureAgent();
+        const models = config.models ?? [];
+        if (!arg.trim()) {
+          if (models.length === 0) return `当前模型：${runner.getActiveModel()?.id ?? "未配置"}`;
+          return (
+            "可用模型：\n" +
+            models
+              .map((entry, index) => `${index + 1}. ${entry.id}${runner.getActiveModel()?.id === entry.id ? "（当前）" : ""}`)
+              .join("\n") +
+            "\n切换：/model <序号|id>"
+          );
+        }
+        const key = arg.trim();
+        const entry =
+          models.find((item) => item.id === key) ??
+          models[Number(key) - 1] ??
+          models.find((item) => `${item.provider}/${item.model}` === key);
+        if (!entry) return `没有找到模型：${key}`;
+        try {
+          const changed = runner.switchModel(entry);
+          return changed ? `✓ 已切换到 ${entry.id}` : `当前已是 ${entry.id}`;
+        } catch (err) {
+          return `✗ 切换失败：${err instanceof Error ? err.message : String(err)}`;
+        }
+      }
+      case "memory": {
+        const runner = ensureAgent();
+        const global = arg.trim().toLowerCase() === "global";
+        const file = global
+          ? path.join(getDataSubdir(), "memory", "MEMORY.md")
+          : path.join(runner.getCwd(), ".xuanzhu", "MEMORY.md");
+        try {
+          const text = fs.readFileSync(file, "utf8").trim();
+          if (!text) return `${file}\n（空）`;
+          const lines = text.split("\n").slice(0, 25);
+          return `${file}\n${lines.join("\n")}${text.split("\n").length > 25 ? "\n…" : ""}`;
+        } catch {
+          return `没有找到${global ? "全局" : "项目"}记忆：${file}`;
+        }
+      }
+      case "prompt": {
+        const config = loadConfig();
+        const keys = Object.keys(config.promptOverrides ?? {});
+        if (keys.length === 0) return "没有提示词分段覆盖";
+        return `已覆盖的提示词段落：${keys.join("、")}\n（查看详情请在终端使用 /prompt list）`;
+      }
+      case "intent": {
+        const next = arg.trim().toLowerCase();
+        if (next !== "on" && next !== "off") return "用法：/intent [on|off]";
+        const config = loadConfig();
+        config.intent.enabled = next === "on";
+        saveConfig(config);
+        return `✓ 意图分析已${next === "on" ? "开启" : "关闭"}（写入配置，新会话生效）`;
+      }
+      default:
+        return `未知命令 /${name}；发送 /help 查看全部命令。`;
+    }
+  };
+
   /** 返回 null 表示「不是命令」，应交给模型 */
   const handleCommand = async (text: string): Promise<string | null> => {
     const command = parseGatewayCommand(text);
     if (!command) return null;
     if (command.kind === "help") return commandHelp();
     if (command.kind === "usage") return command.message;
+
+    if (command.kind === "raw") {
+      return runRawCommand(command.name, command.arg);
+    }
 
     if (command.kind === "info") {
       if (!modeState) {

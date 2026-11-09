@@ -3,7 +3,9 @@ import * as os from "os";
 import * as path from "path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { inTradingWindow, shouldSell } from "../src/a/monitor";
-import { scoreCandidate } from "../src/a/score";
+import { decideMarketRegime } from "../src/a/regime";
+import { computeIndicators } from "../src/a/indicators";
+import { scoreDailyDetailed } from "../src/a/score";
 import {
   addWatchItem,
   loadWatchlist,
@@ -13,30 +15,10 @@ import {
   type WatchItem,
 } from "../src/a/watchlist";
 import type { Quote } from "../src/exchange/ashare";
-import type { Bar } from "../src/exchange/ashare";
 import type { Indicators } from "../src/a/indicators";
 import type { SnapshotRow } from "../src/a/snapshot";
 
 /** A 股巡检：股池不变量、打分方向、T+1 卖点、盘中窗口。全部离线。 */
-
-function bar(index: number, close: number): Bar {
-  return {
-    time: `2026-09-${String((index % 28) + 1).padStart(2, "0")}`,
-    open: close,
-    high: close * 1.01,
-    low: close * 0.99,
-    close,
-    volume: 1_000_000,
-  };
-}
-
-function rising(count: number, start = 10): Bar[] {
-  return Array.from({ length: count }, (_, index) => bar(index, start + index * 0.2));
-}
-
-function falling(count: number, start = 20): Bar[] {
-  return Array.from({ length: count }, (_, index) => bar(index, start - index * 0.2));
-}
 
 function row(): SnapshotRow {
   return {
@@ -76,20 +58,27 @@ const indicators: Indicators = {
   bars: 140,
 };
 
-describe("选股打分", () => {
-  it("月/周/日/1h 同向向上时得分显著高于下跌趋势", () => {
-    const up = scoreCandidate(row(), indicators, rising(30), rising(30), rising(30));
-    const down = scoreCandidate(row(), { ...indicators, close: 8, ma5: 9, ma20: 10, ret20: -20 }, falling(30), falling(30), falling(30));
-    expect(up.score.total).toBeGreaterThanOrEqual(70);
-    expect(up.score.total).toBeGreaterThan(down.score.total);
+describe("日线详细评分", () => {
+  it("趋势向上、位置合适时高分，下跌趋势显著低", () => {
+    const up = scoreDailyDetailed(row(), indicators);
+    const down = scoreDailyDetailed(row(), {
+      ...indicators,
+      close: 8,
+      ma5: 9,
+      ma20: 10,
+      ma60: 12,
+      high20: 12,
+      ret5: -5,
+      ret20: -20,
+      ret60: -30,
+      atr20: 0.2,
+    });
+    expect(up).toBeGreaterThanOrEqual(70);
+    expect(up).toBeGreaterThan(down);
   });
 
-  it("K 线不足时不给该周期分，并标注原因", () => {
-    const result = scoreCandidate(row(), indicators, rising(5), rising(5), rising(5));
-    expect(result.score.weekly).toBe(0);
-    expect(result.score.monthly).toBe(0);
-    expect(result.score.hourly).toBe(0);
-    expect(result.reason).toContain("周线不足");
+  it("指标缺失返回 0", () => {
+    expect(scoreDailyDetailed(row(), undefined)).toBe(0);
   });
 });
 
@@ -141,6 +130,50 @@ describe("自选股不变量", () => {
   });
 });
 
+describe("市场门控与 ATR", () => {
+  it("指数在 MA20 上方且广度健康才允许开仓", () => {
+    expect(
+      decideMarketRegime(
+        { name: "沪深300", price: 100, ma20: 90 },
+        { up: 600, down: 400, flat: 0, limitDown: 5 },
+      ).riskOn,
+    ).toBe(true);
+    expect(
+      decideMarketRegime(
+        { name: "沪深300", price: 80, ma20: 90 },
+        { up: 600, down: 400, flat: 0, limitDown: 5 },
+      ).riskOn,
+    ).toBe(false);
+    expect(
+      decideMarketRegime(
+        { name: "沪深300", price: 100, ma20: 90 },
+        { up: 300, down: 700, flat: 0, limitDown: 5 },
+      ).riskOn,
+    ).toBe(false);
+    expect(
+      decideMarketRegime(
+        { name: "沪深300", price: 100, ma20: 90 },
+        { up: 600, down: 400, flat: 0, limitDown: 25 },
+      ).riskOn,
+    ).toBe(false);
+    expect(decideMarketRegime(null, null).riskOn).toBe(false);
+  });
+
+  it("ATR20 按真实波幅计算", () => {
+    const bars = Array.from({ length: 25 }, (_, index) => ({
+      time: `2026-09-${String(index + 1).padStart(2, "0")}`,
+      open: 10,
+      high: 10.5,
+      low: 9.5,
+      close: 10,
+      volume: 1_000_000,
+      amount: 10_000_000,
+    }));
+    const indicators = computeIndicators("600519", bars)!;
+    expect(indicators.atr20).toBeCloseTo(1, 5);
+  });
+});
+
 describe("卖点与窗口", () => {
   const position = {
     code: "600519",
@@ -169,11 +202,33 @@ describe("卖点与窗口", () => {
     st: false,
   } satisfies Quote;
 
-  it("T+1 当日买入不卖；止损 / 止盈 / 跌破 MA20 触发", () => {
-    expect(shouldSell({ ...position, available: 0 }, { ...quote, price: 8 })).toBeNull();
-    expect(shouldSell(position, { ...quote, price: 9 })).toContain("止损");
-    expect(shouldSell(position, { ...quote, price: 12 })).toContain("止盈");
-    expect(shouldSell(position, { ...quote, price: 9.5 }, 10)).toContain("MA20");
+  it("T+1 当日买入仍评估风控，但标记为不可卖", () => {
+    const locked = shouldSell({ ...position, available: 0 }, { ...quote, price: 8 });
+    expect(locked?.reason).toContain("止损");
+    expect(locked?.sellable).toBe(false); // 今天不能卖，待下一交易日
+
+    const stop = shouldSell(position, { ...quote, price: 9 });
+    expect(stop?.reason).toContain("止损");
+    expect(stop?.sellable).toBe(true);
+  });
+
+  it("ATR 越大止损越宽；浮盈后移动止盈", () => {
+    const wide = shouldSell(position, { ...quote, price: 9.2 }, { atr20: 0.8, close: 10 });
+    expect(wide).toBeNull(); // 8% ATR → 12% 止损，9.2 未触发
+
+    const trailing = shouldSell(
+      { ...position, peakPrice: 12, tookPartial: true },
+      { ...quote, price: 11.3 },
+    );
+    expect(trailing?.reason).toContain("移动止盈");
+    expect(trailing?.sellable).toBe(true);
+
+    const partial = shouldSell(
+      { ...position, qty: 200, available: 200, peakPrice: 11.3, tookPartial: false },
+      { ...quote, price: 11.1 },
+    );
+    expect(partial?.partial).toBe(true);
+    expect(partial?.qty).toBe(100);
   });
 
   it("只在工作日盘中窗口运行", () => {

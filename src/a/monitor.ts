@@ -9,7 +9,16 @@ import {
   mapLimit,
   type Quote,
 } from "../exchange/ashare";
-import { accountSummary, loadPaperAccount, markPaperAccount, placePaperOrder, type PaperAccount } from "./paper";
+import {
+  accountSummary,
+  loadPaperAccount,
+  markPaperAccount,
+  markPartialTaken,
+  placePaperOrder,
+  type PaperAccount,
+} from "./paper";
+import { evaluateMarketRegime } from "./regime";
+import { intradayBuyReady, intradayWeak } from "./intraday";
 import { loadIndicators } from "./indicators";
 import { selectTopWatchlist } from "./score";
 import { loadWatchlist, mergeWatchlist, monitorDir, saveWatchlist, type WatchItem } from "./watchlist";
@@ -27,12 +36,17 @@ import { VERSION } from "../utils/version";
  * 决策是**确定性规则**：月/周/日趋势 + 1h 择时打分，不每轮调用模型。
  */
 
-const MAX_POSITIONS = 3;
-const POSITION_PCT = 0.3;
-const STOP_LOSS_PCT = -7;
-const TAKE_PROFIT_PCT = 15;
+const MAX_POSITIONS = 5;
+const POSITION_PCT = 0.2;
+/** 初始止损下限 5%，并按 1.5×ATR 放大 */
+const MIN_STOP_PCT = 0.05;
+const STOP_ATR_MULTIPLE = 1.5;
+/** 浮盈超过 8% 后启动移动止盈 */
+const TRAIL_TRIGGER_PCT = 0.08;
+/** 浮盈 12% 时卖出一半，剩余继续移动止盈 */
+const PARTIAL_TAKE_PCT = 0.12;
 const BUY_SCORE = 70;
-const BUY_MAX_PCT = 7;
+const BUY_MAX_PCT = 5;
 const CYCLE_MS = 15 * 60_000;
 const TICK_MS = 30_000;
 const LOCK_FILE = "run/monitor.lock";
@@ -161,17 +175,103 @@ function equityOf(account: PaperAccount, quotes: Map<string, Quote>): number {
   return account.cash + marketValue;
 }
 
+export interface SellDecision {
+  reason: string;
+  /** T+1 当日买入为 false：风控照样触发，但今天不能卖 */
+  sellable: boolean;
+  /** 分批止盈时只卖这么多；不传 = 全部可卖数量 */
+  qty?: number;
+  /** 是否是 +12% 的分批止盈（卖完要记标记，避免反复卖一半） */
+  partial?: boolean;
+}
+
+/**
+ * 风控判定：**不因 T+1 而跳过**，止损按波动率（ATR）计算。
+ *
+ * - 初始止损：max(5%, 1.5 × ATR20%)；
+ * - 浮盈 ≥8% 后转为移动止盈：止损线跟随持仓期最高价回撤 1.5×ATR；
+ * - 浮盈 ≥12% 且尚未分批：先卖一半（落袋），剩余继续移动止盈；
+ * - T+1 当日买入仍返回信号，只是 `sellable=false`，由调用方挂待卖。
+ */
 export function shouldSell(
   position: PaperAccount["positions"][number],
   quote: Quote,
-  ma20?: number,
-): string | null {
-  if (position.available <= 0) return null; // T+1 当日买入不可卖
-  const pnlPct = position.avgCost > 0 ? ((quote.price - position.avgCost) / position.avgCost) * 100 : 0;
-  if (pnlPct <= STOP_LOSS_PCT) return `止损 ${pnlPct.toFixed(1)}%`;
-  if (pnlPct >= TAKE_PROFIT_PCT) return `止盈 ${pnlPct.toFixed(1)}%`;
-  if (ma20 && quote.price < ma20) return `跌破日线 MA20（${ma20.toFixed(2)}）`;
+  indicators?: { atr20?: number; close?: number },
+): SellDecision | null {
+  if (position.avgCost <= 0 || quote.price <= 0) return null;
+  const atrPct =
+    indicators?.atr20 && indicators.close && indicators.close > 0
+      ? (indicators.atr20 / indicators.close) * 100
+      : 3.5;
+  const stopPct = Math.max(MIN_STOP_PCT, (STOP_ATR_MULTIPLE * atrPct) / 100);
+  const peak = Math.max(position.peakPrice ?? position.avgCost, quote.price);
+  const pnlPct = ((quote.price - position.avgCost) / position.avgCost) * 100;
+  const peakPct = ((peak - position.avgCost) / position.avgCost) * 100;
+
+  // 分批止盈：只在当前仍有浮盈时执行，避免第二天回落还机械卖一半
+  if (
+    !position.tookPartial &&
+    peakPct >= PARTIAL_TAKE_PCT * 100 &&
+    pnlPct >= TRAIL_TRIGGER_PCT * 100 &&
+    position.available >= 100
+  ) {
+    const half = Math.floor(position.qty / 2 / 100) * 100;
+    if (half >= 100) {
+      return {
+        reason: `分批止盈（峰值 +${peakPct.toFixed(1)}%）`,
+        sellable: true,
+        qty: half,
+        partial: true,
+      };
+    }
+  }
+
+  let stop = position.avgCost * (1 - stopPct);
+  if (peakPct >= TRAIL_TRIGGER_PCT * 100) {
+    // 移动止盈：从最高点回撤 1.5×ATR，且不低于初始止损
+    stop = Math.max(stop, peak * (1 - stopPct));
+  }
+
+  if (quote.price <= stop) {
+    const reason =
+      stop >= position.avgCost
+        ? `移动止盈（峰值 +${peakPct.toFixed(1)}%，回撤触发）`
+        : `止损 ${pnlPct.toFixed(1)}%（ATR ${atrPct.toFixed(1)}%）`;
+    return { reason, sellable: position.available > 0, qty: position.available };
+  }
   return null;
+}
+
+// ─────────────────── T+1 锁定的待卖队列 ───────────────────
+
+const PENDING_FILE = "run/pending-sells.json";
+
+export interface PendingSell {
+  code: string;
+  name: string;
+  reason: string;
+  /** 首次触发的日期（用于面板提示“明日处理”） */
+  since: string;
+}
+
+function pendingPath(): string {
+  return path.join(monitorDir(), PENDING_FILE);
+}
+
+export function readPendingSells(): PendingSell[] {
+  try {
+    const raw = JSON.parse(fs.readFileSync(pendingPath(), "utf8")) as PendingSell[];
+    return Array.isArray(raw) ? raw.filter((item) => item && typeof item.code === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePendingSells(list: PendingSell[]): void {
+  ensureDir(path.dirname(pendingPath()));
+  const tmp = `${pendingPath()}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(list, null, 2)}\n`, "utf8");
+  fs.renameSync(tmp, pendingPath());
 }
 
 /**
@@ -201,22 +301,102 @@ export async function runMonitorCycle(now = new Date()): Promise<CycleResult> {
   }
   const canTrade = tradingDay && inTradingWindow(now);
 
-  // 1) 持仓卖点
+  // 1) 持仓卖点：T+1 锁定的股票照样评估，只是今天不执行，进入待卖队列
   let account = loadPaperAccount(now);
   const indicators = await loadIndicators();
-  for (const position of canTrade ? account.positions : []) {
+  const pending = new Map(readPendingSells().map((item) => [item.code, item]));
+  const heldCodes = new Set(account.positions.map((position) => position.code));
+  for (const code of [...pending.keys()]) {
+    if (!heldCodes.has(code)) pending.delete(code);
+  }
+
+  for (const position of account.positions) {
     const quote = quotes.get(position.code);
     if (!quote || quote.price <= 0) continue;
-    const reason = shouldSell(position, quote, indicators.get(position.code)?.ma20);
-    if (!reason) continue;
+    let decision = shouldSell(position, quote, indicators.get(position.code));
+
+    // 日内卖点：ATR 止损未触发时，再看 30m 是否走弱（数据失败不卖）
+    if (!decision && canTrade) {
+      try {
+        const bars30 = await fetchBars(position.code, {
+          period: "30m",
+          adjust: "backward",
+          limit: 80,
+        });
+        if (intradayWeak(bars30)) {
+          decision = {
+            reason: "30m 跌破 MA20 与前 10 根低点",
+            sellable: position.available > 0,
+            qty: position.available,
+          };
+        }
+      } catch {
+        // 取不到 30m 就不按日内信号卖，继续用 ATR 风控
+      }
+    }
+
+    // 风险解除：撤销待卖（例如第二天反弹回 MA20 上方）
+    if (!decision) {
+      if (pending.delete(position.code)) {
+        result.actions.push(`${position.code} 风险已解除，撤销待卖`);
+        appendAction({ kind: "risk-clear", code: position.code, ok: true });
+      }
+      continue;
+    }
+
+    // 今天不能卖（T+1 / 非交易时段）：记录待卖，下一交易日开盘处理
+    if (!decision.sellable || !canTrade) {
+      const existing = pending.get(position.code);
+      if (!existing) {
+        pending.set(position.code, {
+          code: position.code,
+          name: position.name,
+          reason: decision.reason,
+          since: dayKey(now),
+        });
+        result.actions.push(
+          `T+1 锁定 ${position.code} ${decision.reason}，下一交易日开盘处理`,
+        );
+        appendAction({
+          kind: "risk-locked",
+          code: position.code,
+          reason: decision.reason,
+          ok: true,
+        });
+      } else if (existing.reason !== decision.reason) {
+        existing.reason = decision.reason;
+      }
+      continue;
+    }
+
+    const sellQty = Math.min(decision.qty ?? position.available, position.available);
+    if (sellQty < 1) continue;
     const sold = await placePaperOrder(
-      { code: position.code, side: "sell", qty: position.available },
+      { code: position.code, side: "sell", qty: sellQty },
       now,
     );
-    result.actions.push(sold.ok ? `卖出 ${position.code} ${reason}：${sold.message}` : `卖出失败 ${position.code}：${sold.message}`);
-    if (sold.ok) result.sold.push(position.code);
-    appendAction({ kind: "sell", code: position.code, reason, ok: sold.ok, message: sold.message });
+    result.actions.push(
+      sold.ok
+        ? `卖出 ${position.code} ${decision.reason}：${sold.message}`
+        : `卖出失败 ${position.code}：${sold.message}`,
+    );
+    if (sold.ok) {
+      if (decision.partial) {
+        markPartialTaken(position.code);
+      } else {
+        result.sold.push(position.code);
+        pending.delete(position.code);
+      }
+    }
+    appendAction({
+      kind: "sell",
+      code: position.code,
+      reason: decision.reason,
+      ok: sold.ok,
+      message: sold.message,
+    });
   }
+  writePendingSells([...pending.values()]);
 
   // 2) 无持仓时全市场选股（每天一次）
   const state = readAMonitorState();
@@ -260,7 +440,19 @@ export async function runMonitorCycle(now = new Date()): Promise<CycleResult> {
       .sort((a, b) => b.score - a.score);
     const equity = equityOf(account, quotes);
 
-    for (const item of candidates) {
+    // 市场门控：弱势只卖不买，避免在下跌环境里反复试错
+    let allowBuy = true;
+    if (candidates.length > 0) {
+      const regime = await evaluateMarketRegime();
+      if (!regime.riskOn) {
+        result.actions.push(`市场门控：${regime.reason}，暂停开仓`);
+        appendAction({ kind: "regime", ok: true, message: regime.reason });
+        allowBuy = false;
+      }
+    }
+
+    if (allowBuy)
+      for (const item of candidates) {
       let quote: Quote;
       try {
         quote = await fetchQuote(item.code);
@@ -271,17 +463,17 @@ export async function runMonitorCycle(now = new Date()): Promise<CycleResult> {
       if (quote.limitUp && quote.price >= quote.limitUp - 0.001) continue;
       if (quote.changePct > BUY_MAX_PCT) continue;
 
-      // 1h 择时：必须站上 1h MA20，避免日线好但短线在下跌
+      // 日内买点：选股只看日/周/月 MACD，但成交时仍要 30m 确认
       try {
-        const hourly = await fetchBars(item.code, { period: "60m", adjust: "backward", limit: 60 });
-        if (hourly.length < 21) continue;
-        const closes = hourly.slice(-20).map((bar) => bar.close);
-        const ma20 = closes.reduce((sum, value) => sum + value, 0) / 20;
-        if (hourly[hourly.length - 1].close <= ma20) continue;
+        const bars30 = await fetchBars(item.code, {
+          period: "30m",
+          adjust: "backward",
+          limit: 80,
+        });
+        if (!intradayBuyReady(bars30)) continue;
       } catch {
         continue;
       }
-
       let qty = Math.floor((equity * POSITION_PCT) / quote.price / 100) * 100;
       const affordable = Math.floor((account.cash - 10) / quote.price / 100) * 100;
       qty = Math.min(qty, affordable);

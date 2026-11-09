@@ -343,6 +343,7 @@ export type GatewayCommand =
   | { kind: "xzh" }
   | { kind: "help" }
   | { kind: "info" }
+  | { kind: "raw"; name: string; arg: string }
   | { kind: "usage"; message: string };
 
 /**
@@ -358,29 +359,30 @@ export function parseGatewayCommand(text: string): GatewayCommand | null {
   const body = trimmed.replace(/^／/, "/").slice(1).trim();
   const parts = body.length > 0 ? body.split(/\s+/) : [];
   const name = (parts.shift() ?? "").toLowerCase();
-  const arg = (parts.shift() ?? "").toLowerCase();
+  // 参数保留原始大小写：/switch 的目录在大小写敏感文件系统上不能被 toLowerCase 破坏
+  const arg = parts.join(" ").trim();
+  const lower = arg.toLowerCase();
 
   if (!name || name === "help") return { kind: "help" };
   if (name === "xzh") return { kind: "xzh" };
   if (name === "info") return { kind: "info" };
   if (name === "a") {
     if (!arg) return { kind: "a" };
-    if (arg === "off" || arg === "exit") return { kind: "xzh" };
+    if (lower === "off" || lower === "exit") return { kind: "xzh" };
     return { kind: "usage", message: "用法：/a（进入 A 股分析）· /xzh（回到普通模式）" };
   }
   if (name === "btc") {
-    if (!arg || arg === "start" || arg === "live") return { kind: "btc", paper: false };
-    if (arg === "moni" || arg === "paper") return { kind: "btc", paper: true };
-    if (arg === "off" || arg === "exit") return { kind: "xzh" };
+    if (!arg || lower === "start" || lower === "live") return { kind: "btc", paper: false };
+    if (lower === "moni" || lower === "paper") return { kind: "btc", paper: true };
+    if (lower === "off" || lower === "exit") return { kind: "xzh" };
     return {
       kind: "usage",
       message: "用法：/btc（实盘）· /btc moni（模拟盘）· /xzh（回到普通模式）",
     };
   }
-  return {
-    kind: "usage",
-    message: `未知命令 /${name}；可用 /btc、/btc moni、/a、/xzh`,
-  };
+  // 其余命令交给 gateway 的命令路由（与终端同一套 /help 列表）；
+  // 真正不认识的由路由返回用法提示。
+  return { kind: "raw", name, arg };
 }
 
 export interface GatewayModeState {

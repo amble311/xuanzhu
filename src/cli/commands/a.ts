@@ -17,6 +17,7 @@ import {
   monitorLogPath,
   removeWatchItem,
   runAServe,
+  runBacktest,
   runMonitorCycle,
   saveWatchlist,
   screenConditionFromInput,
@@ -210,6 +211,7 @@ ${ansi.bold}监控（独立进程）${ansi.reset}
   ${ansi.green}xzh a watch add|remove <代码>${ansi.reset}   手工增删（持仓不可删除）
   ${ansi.green}xzh a watch refresh${ansi.reset}             立即全市场重选前 10
   ${ansi.green}xzh a monitor once${ansi.reset}              手动跑一轮巡检（不常驻）
+  ${ansi.green}xzh a backtest${ansi.reset}                  日线回测（默认自选股；--codes / --days / --top）
 
 ${ansi.bold}缓存${ansi.reset}
   ${ansi.green}xzh a sync${ansi.reset}                       建股票池 + 预计算全市场指标 + 交易日历（约 1-2 分钟）
@@ -670,6 +672,53 @@ async function watchCommand(parsed: ParsedArgs): Promise<void> {
   throw new Error("用法：xzh a watch [list|add <代码>|remove <代码>|refresh]");
 }
 
+async function backtestCommand(parsed: ParsedArgs): Promise<void> {
+  const rawCodes = parsed.options.get("codes");
+  const codes =
+    typeof rawCodes === "string"
+      ? rawCodes
+          .split(",")
+          .map((code) => code.trim())
+          .filter(Boolean)
+      : loadWatchlist().items.map((item) => item.code);
+  if (codes.length === 0) {
+    throw new Error("自选股为空；先运行 xzh a watch refresh，或用 --codes 600519,300750 指定");
+  }
+  const days = Number(parsed.options.get("days") ?? 250);
+  const top = Number(parsed.options.get("top") ?? 5);
+  const pct = Number(parsed.options.get("pct") ?? 0.2);
+  const result = await runBacktest({
+    codes,
+    days: Number.isFinite(days) ? days : 250,
+    maxPositions: Number.isFinite(top) ? top : 5,
+    positionPct: Number.isFinite(pct) ? pct : 0.2,
+    marketGate: parsed.options.get("no-gate") === undefined,
+    trailing: parsed.options.get("no-trail") === undefined,
+    partialTake: parsed.options.get("partial") !== undefined,
+  });
+  if (jsonMode(parsed.options)) return printJson(result);
+  process.stdout.write(
+    `${ansi.bold}A 股日线回测${ansi.reset} ${result.start} ~ ${result.end}` +
+      `${ansi.gray} · ${result.codes} 只 · ${result.days} 日${ansi.reset}\n`,
+  );
+  const pctText = (value: number): string =>
+    `${value >= 0 ? ansi.red : ansi.green}${value >= 0 ? "+" : ""}${value.toFixed(2)}%${ansi.reset}`;
+  process.stdout.write(
+    `  收益 ${pctText(result.returnPct)} · 沪深300 ${pctText(result.benchmarkPct)}` +
+      ` · 超额 ${pctText(result.returnPct - result.benchmarkPct)}\n`,
+  );
+  const closed = result.trades.filter((trade) => trade.side === "sell").length;
+  process.stdout.write(
+    `  最大回撤 ${ansi.green}${result.maxDrawdownPct.toFixed(2)}%${ansi.reset}` +
+      ` · 胜率 ${closed > 0 ? `${result.winRatePct.toFixed(1)}%` : "—（无平仓）"}` +
+      ` · 平均持有 ${result.avgHoldDays.toFixed(1)} 天` +
+      ` · 交易 ${result.trades.length} 笔\n`,
+  );
+  process.stdout.write(
+    `${ansi.gray}  说明：日线回测不含 30 分钟触发；用于比较门控 / ATR 止损 / 移动止盈 / 仓位参数。${ansi.reset}\n`,
+  );
+}
+
 async function monitorCommand(parsed: ParsedArgs): Promise<void> {
   const action = (parsed.positional[1] ?? "once").toLowerCase();
   if (action !== "once") throw new Error("用法：xzh a monitor once");
@@ -729,6 +778,9 @@ export async function aCommand(args: string[]): Promise<void> {
         return;
       case "monitor":
         await monitorCommand(parsed);
+        return;
+      case "backtest":
+        await backtestCommand(parsed);
         return;
       default:
         process.stdout.write(

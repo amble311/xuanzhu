@@ -1,7 +1,8 @@
 import { fetchQuote, sessionKind, sessionLabel, type Quote } from "../exchange/ashare";
 import { accountSummary, loadPaperAccount, markPaperAccount, type PaperAccount } from "./paper";
 import { loadWatchlist } from "./watchlist";
-import { aServiceStatus } from "./monitor";
+import { aActionsPath, aServiceStatus, readPendingSells } from "./monitor";
+import * as fs from "fs";
 
 /**
  * A 股右侧面板 / `/info` 的**数据采集与纯文本输出**。
@@ -31,7 +32,46 @@ export interface APanelData {
   indices: AIndexRow[];
   account?: PaperAccount;
   watch: AWatchRow[];
+  /** 最近几条巡检动作（选股 / 买卖 / 失败），最新在前 */
+  lastActions: string[];
+  /** T+1 锁定、已触发但今天不能卖的持仓 */
+  riskLocks: Array<{ code: string; name: string; reason: string }>;
   error?: string;
+}
+
+/** 读巡检动作账本末尾几条，给「巡检」区块展示（与微信推送同源） */
+function readRecentActions(limit = 4): string[] {
+  try {
+    const file = aActionsPath();
+    const size = fs.statSync(file).size;
+    const start = Math.max(0, size - 64 * 1024);
+    const text = fs.readFileSync(file).toString("utf8", start);
+    const lines = text.split("\n").filter(Boolean).slice(-limit).reverse();
+    const actions: string[] = [];
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line) as {
+          kind?: string;
+          ok?: boolean;
+          message?: string;
+          codes?: string[];
+        };
+        if (entry.kind === "select") {
+          const codes = entry.codes ?? [];
+          if (codes.length > 0) actions.push(`选股 ${codes.length} 只：${codes.join("、")}`);
+        } else if (entry.kind === "buy" || entry.kind === "sell") {
+          const verb = entry.kind === "buy" ? "买入" : "卖出";
+          if (entry.ok === false) actions.push(`${verb}失败：${entry.message ?? ""}`);
+          else if (entry.message) actions.push(entry.message);
+        }
+      } catch {
+        // 坏行跳过
+      }
+    }
+    return actions;
+  } catch {
+    return [];
+  }
 }
 
 const INDEX_LIST: Array<{ code: string; label: string }> = [
@@ -89,6 +129,14 @@ export async function collectASharePanelData(): Promise<APanelData> {
     indices: indexRows,
     account: markPaperAccount(account, map),
     watch: watchRows,
+    lastActions: readRecentActions(),
+    riskLocks: readPendingSells()
+      .filter((item) => heldCodes.has(item.code))
+      .map((item) => ({
+        code: item.code,
+        name: item.name,
+        reason: item.reason,
+      })),
   };
 }
 
@@ -113,7 +161,10 @@ export function aInfoLines(data: APanelData): string[] {
       data.indices.map((item) => `${item.name} ${fmt(item.price)}（${signed(item.pct)}%）`).join(" · "),
     );
   }
+  lines.push("");
 
+  // 账户（与 btc 面板的「账户 / 模拟盘」对应）
+  lines.push("【账户】");
   const summary = data.account ? accountSummary(data.account) : undefined;
   if (!data.account || !summary) {
     lines.push("模拟盘 未开始（初始 1,000,000 · T+1 · 100 股整手）");
@@ -126,7 +177,6 @@ export function aInfoLines(data: APanelData): string[] {
     if (positions.length === 0) {
       lines.push("持仓 无");
     } else {
-      lines.push("持仓：");
       for (const position of positions) {
         lines.push(
           `  ${position.code} ${position.name} ${position.qty} 股（可卖 ${position.available}）` +
@@ -146,26 +196,49 @@ export function aInfoLines(data: APanelData): string[] {
       }
     }
   }
+  lines.push("");
 
+  // 风控（对应 btc 的「风控」区块；A 股是固定规则）
+  lines.push(
+    "【风控】ATR 止损（1.5×ATR，下限 5%）· 浮盈 +8% 移动止盈 · +12% 分批止盈 · 最多 5 仓 × 20% · T+1",
+  );
+  if (data.riskLocks.length > 0) {
+    lines.push(
+      `  T+1 锁定 ${data.riskLocks.length} 只（今日不可卖，下一交易日处理）：` +
+        data.riskLocks.map((item) => `${item.code} ${item.reason}`).join("、"),
+    );
+  }
+  lines.push("");
+
+  // 巡检（独立进程）
   const service = aServiceStatus();
   lines.push(
-    `巡检 ${service.running ? "运行中" : "未运行"}` +
-      (service.running && service.state
-        ? `（pid ${service.state.pid} · 自选 ${service.state.watchlist}/10 · 下一轮 ${service.state.nextRunAt}）`
-        : "（xzh a serve）"),
+    "【巡检】" +
+      (service.running
+        ? `运行中（pid ${service.state?.pid} · 上一轮 ${service.state?.lastRunAt?.slice(11, 16) ?? "—"} · 下一轮 ${service.state?.nextRunAt?.slice(11, 16) ?? "—"}）`
+        : "未运行（/start 或 xzh a serve）"),
   );
+  if (service.state?.lastSelectDay) lines.push(`  上次全市场选股：${service.state.lastSelectDay}`);
+  if (service.state?.lastError) lines.push(`  最近错误：${service.state.lastError}`);
+  for (const action of data.lastActions.slice(0, 3)) {
+    lines.push(`  ${action}`);
+  }
+  lines.push("");
+
+  // 监控（自选股池，每 15 分钟）
   const watch = loadWatchlist();
-  if (watch.items.length > 0) {
-    lines.push(
-      "监控池：" +
-        watch.items
-          .slice(0, 10)
-          .map((item) => `${item.code}(${item.score})`)
-          .join("、"),
-    );
+  lines.push(`【监控】自选 ${watch.items.length}/10 · 每 15 分钟 · ★=持仓`);
+  if (watch.items.length === 0) {
+    lines.push("  监控池为空（xzh a serve 会自动选股）");
+  }
+  for (const row of data.watch) {
+    const star = row.held ? "★ " : "  ";
+    const price = row.price > 0 ? `${fmt(row.price)}（${signed(row.pct)}%）` : "—";
+    lines.push(`  ${star}${row.code} ${row.name} ${row.score}分 ${price}`);
   }
 
   // 与 a_order / a_account 的口径一致，防止模型把模拟盘说成实盘
+  lines.push("");
   lines.push("以上为模拟盘数据，不涉及真钱。");
   return lines;
 }

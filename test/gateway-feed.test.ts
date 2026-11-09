@@ -29,7 +29,7 @@ describe("btc 事件筛选", () => {
     expect(kept.map((event) => event.kind)).toEqual(["text", "error", "notice"]);
   });
 
-  it("批量格式化：超过 5 条折叠为条数说明", () => {
+  it("批量格式化：超过 4 条折叠为条数说明", () => {
     const events = Array.from({ length: 7 }, (_, index) => ({
       ts: "t",
       round: "r",
@@ -39,7 +39,18 @@ describe("btc 事件筛选", () => {
     const message = formatBtcBatch("BTC 实盘巡检", events)!;
     expect(message).toContain("[BTC 实盘巡检]");
     expect(message).toContain("结论6");
-    expect(message).toContain("…（本轮还有 2 条）");
+    expect(message).toContain("…（本轮还有 3 条）");
+  });
+
+  it("单条推送压进一个微信气泡（≤900 字）", () => {
+    const events = Array.from({ length: 4 }, () => ({
+      ts: "t",
+      round: "r",
+      kind: "text" as const,
+      text: "长".repeat(1000),
+    }));
+    const message = formatBtcBatch("BTC 实盘巡检", events)!;
+    expect(message.length).toBeLessThanOrEqual(900);
   });
 });
 

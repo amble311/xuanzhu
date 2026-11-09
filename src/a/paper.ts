@@ -35,6 +35,10 @@ export interface PaperPosition {
   marketValue: number;
   pnl: number;
   pnlPct: number;
+  /** 持仓期间最高价（移动止盈用） */
+  peakPrice?: number;
+  /** 是否已经执行过 +12% 的分批止盈 */
+  tookPartial?: boolean;
 }
 
 export interface PaperTrade {
@@ -132,6 +136,8 @@ function normalizeAccount(raw: Partial<PaperAccount>, now: Date): PaperAccount {
           marketValue: Number(item.marketValue) || 0,
           pnl: Number(item.pnl) || 0,
           pnlPct: Number(item.pnlPct) || 0,
+          peakPrice: Number(item.peakPrice) || Number(item.avgCost) || 0,
+          tookPartial: item.tookPartial === true,
         }))
     : [];
   const account: PaperAccount = {
@@ -217,6 +223,8 @@ export function markPaperAccount(
       lastPrice,
       marketValue,
       pnl,
+      // 移动止盈需要跟踪持仓期最高价；只升不降
+      peakPrice: Math.max(position.peakPrice ?? position.avgCost, lastPrice),
       pnlPct:
         position.avgCost > 0 ? round2(((lastPrice - position.avgCost) / position.avgCost) * 100) : 0,
     };
@@ -302,6 +310,8 @@ export function applyPaperOrder(
       existing.qty += qty;
       existing.lastPrice = fillPrice;
       existing.marketValue = round2(fillPrice * existing.qty);
+      existing.peakPrice = Math.max(existing.peakPrice ?? fillPrice, fillPrice);
+      existing.tookPartial = false;
     } else {
       next.positions.push({
         code: quote.code,
@@ -313,6 +323,8 @@ export function applyPaperOrder(
         marketValue: amount,
         pnl: 0,
         pnlPct: 0,
+        peakPrice: fillPrice,
+        tookPartial: false,
       });
     }
   } else {
@@ -354,6 +366,16 @@ export function applyPaperOrder(
     account: next,
     trade,
   };
+}
+
+/** 记录「已执行过分批止盈」，避免同一波上涨反复卖一半 */
+export function markPartialTaken(code: string): void {
+  const account = loadPaperAccount();
+  const position = account.positions.find((item) => item.code === code);
+  if (!position) return;
+  position.tookPartial = true;
+  account.updatedAt = new Date().toISOString();
+  savePaperAccount(account);
 }
 
 /** 拉取最新价并落盘（工具与面板共用） */

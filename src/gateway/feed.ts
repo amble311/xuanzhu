@@ -18,7 +18,9 @@ import { getAShareHome, getBtcHome } from "../utils/paths";
  */
 
 /** 单次推送里最多带几条事件，多的折叠成条数说明 */
-const MAX_EVENTS_PER_PUSH = 5;
+const MAX_EVENTS_PER_PUSH = 4;
+/** 单条推送的字符上限：尽量压进一个微信气泡，避免多块发送时丢后一条 */
+const MAX_PUSH_CHARS = 900;
 
 export type FeedOffsets = Record<string, number>;
 
@@ -54,11 +56,15 @@ export function pickBtcImportant(events: InspectEvent[]): InspectEvent[] {
 export function formatBtcBatch(label: string, events: InspectEvent[]): string | null {
   if (events.length === 0) return null;
   const shown = events.slice(-MAX_EVENTS_PER_PUSH);
-  const lines = shown.map((event) => `- ${event.text.trim().slice(0, 300)}`);
+  const lines = shown.map((event) => `- ${event.text.trim().slice(0, 180)}`);
   if (events.length > shown.length) {
     lines.push(`…（本轮还有 ${events.length - shown.length} 条）`);
   }
-  return `[${label}]\n${lines.join("\n")}`;
+  let message = `[${label}]\n${lines.join("\n")}`;
+  if (message.length > MAX_PUSH_CHARS) {
+    message = `${message.slice(0, MAX_PUSH_CHARS - 1)}…`;
+  }
+  return message;
 }
 
 export interface AActionEntry {

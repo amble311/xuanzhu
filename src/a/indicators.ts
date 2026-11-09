@@ -1,3 +1,4 @@
+import { macdSeries } from "./macd";
 import {
   readCache,
   writeCache,
@@ -17,7 +18,7 @@ import {
  * 口径：后复权（`02`）。前复权在高分红股上早年为负，无法参与均线/涨幅计算。
  */
 
-export const INDICATORS_CACHE = "indicators.json";
+export const INDICATORS_CACHE = "indicators-v2.json";
 // 36 小时：收盘后算一次，足够覆盖**下一个交易日全天**而不在盘中突然过期重算；
 // 需要日内最新口径时显式 `xzh a sync`（指标本身按收盘价计算，盘中重算意义不大）。
 const CACHE_TTL_MS = 36 * 60 * 60 * 1000;
@@ -42,6 +43,17 @@ export interface Indicators {
   /** 近 N 日平均成交额（元） */
   avgAmount5?: number;
   avgAmount20?: number;
+  /**
+   * 20 日平均真实波幅（后复权价格单位）。
+   *
+   * 止损 / 仓位按 `atr20 / close` 的比例使用，因此后复权的绝对价格不影响结论。
+   */
+  atr20?: number;
+  /** 日线 MACD 柱体（2×(DIF-DEA)），选股漏斗用它比较「今天是否比昨天高」 */
+  macdHist?: number;
+  macdHistPrev?: number;
+  macdDif?: number;
+  macdDea?: number;
   /** 参与计算的日线根数 */
   bars: number;
 }
@@ -71,6 +83,36 @@ export function computeIndicators(code: string, bars: Bar[]): Indicators | null 
   const amounts5 = bars.slice(-5).map((bar) => bar.amount);
   const amounts20 = bars.slice(-20).map((bar) => bar.amount);
 
+  // 真实波幅：max(高-低, |高-昨收|, |低-昨收|)，取最近 20 根的均值
+  const trueRanges: number[] = [];
+  for (let index = 1; index < bars.length; index += 1) {
+    const bar = bars[index];
+    const prevClose = bars[index - 1].close;
+    trueRanges.push(
+      Math.max(
+        bar.high - bar.low,
+        Math.abs(bar.high - prevClose),
+        Math.abs(bar.low - prevClose),
+      ),
+    );
+  }
+  const atr20 = trueRanges.length >= 20 ? average(trueRanges.slice(-20)) : undefined;
+
+  // MACD 需要足够长的 EMA 预热；不足时留空，选股时会自然排除
+  let macdHist: number | undefined;
+  let macdHistPrev: number | undefined;
+  let macdDif: number | undefined;
+  let macdDea: number | undefined;
+  if (bars.length >= 37) {
+    const series = macdSeries(bars);
+    const last = series[series.length - 1];
+    const prev = series[series.length - 2];
+    macdHist = last?.hist;
+    macdHistPrev = prev?.hist;
+    macdDif = last?.dif;
+    macdDea = last?.dea;
+  }
+
   return {
     code,
     asOf: last.time.slice(0, 10),
@@ -87,6 +129,11 @@ export function computeIndicators(code: string, bars: Bar[]): Indicators | null 
     ret60: bars.length > 60 ? percentChange(last.close, closes[closes.length - 61]) : undefined,
     avgAmount5: average(amounts5.filter((value): value is number => Number.isFinite(value))),
     avgAmount20: average(amounts20.filter((value): value is number => Number.isFinite(value))),
+    atr20,
+    macdHist,
+    macdHistPrev,
+    macdDif,
+    macdDea,
     bars: bars.length,
   };
 }

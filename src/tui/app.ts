@@ -30,6 +30,9 @@ import {
   loadPaperAccount,
   loadWatchlist,
   markPaperAccount,
+  readPendingSells,
+  startAService,
+  stopAService,
   type PaperAccount,
 } from "../a";
 import { fetchQuote, sessionKind, sessionLabel, type Quote } from "../exchange/ashare";
@@ -37,7 +40,7 @@ import type { AgentMode } from "../modes";
 import { createAShareMode } from "../modes/a";
 import { createBtcMode } from "../modes/btc";
 import { activeExchange } from "../exchange";
-import { liveBackend } from "../btc/daemon";
+import { ensureBtcBackend, liveBackend, stopBtcBackend } from "../btc/daemon";
 import {
   describeStep,
   describeTrigger,
@@ -1753,9 +1756,41 @@ export class TuiApp {
    * 直接读 `~/.xzh_btc/run/triggers*.json`，看到的就是后端要评估的那份配置。
    */
   private showMonitor(): void {
+    if (this.mode?.name === "a") {
+      const service = aServiceStatus();
+      const watch = loadWatchlist();
+      const account = loadPaperAccount();
+      const held = new Set(account.positions.map((position) => position.code));
+      const pending = readPendingSells().filter((item) => held.has(item.code));
+      const out: string[] = [
+        `A 股监控池 ${watch.items.length}/10 · 巡检${
+          service.running
+            ? `运行中（pid ${service.state?.pid}${service.state?.nextRunAt ? `，下一轮 ${service.state.nextRunAt.slice(11, 16)}` : ""}）`
+            : "未运行（/start 或 xzh a serve）"
+        }`,
+        "",
+      ];
+      if (watch.items.length === 0) {
+        out.push("监控池为空；无持仓时巡检会自动全市场选股前 10。");
+      }
+      watch.items.forEach((item, index) => {
+        out.push(
+          `${index + 1}. ${item.code} ${item.name} ${item.score} 分` +
+            `${held.has(item.code) ? "（持仓·强制保留）" : ""}`,
+        );
+      });
+      if (pending.length > 0) {
+        out.push("", "T+1 锁定（今日不可卖，下一交易日处理）：");
+        for (const item of pending) out.push(`- ${item.code} ${item.reason}`);
+      }
+      out.push("", "监控池由 xzh 全权管理；已持仓股票必须在池中并持续监控。");
+      this.lines.push(`${ansi.gray}${out.join("\n")}${ansi.reset}`);
+      this.scheduleRender();
+      return;
+    }
     if (this.mode?.name !== "btc") {
       this.lines.push(
-        `${ansi.gray}/monitor 只在 xzh btc 模式下有意义（监控条件属于 btc 后端）。${ansi.reset}`,
+        `${ansi.gray}/wakeup 在 btc 模式显示叫醒条件，在 a 模式显示监控池。${ansi.reset}`,
       );
       this.scheduleRender();
       return;
@@ -2833,7 +2868,8 @@ export class TuiApp {
       case "jobs":
         this.handleJobsCommand(arg);
         break;
-      case "monitor":
+      case "wakeup":
+      case "monitor": // 旧名保留为别名
         this.showMonitor();
         break;
       case "autonomy":
@@ -2875,11 +2911,20 @@ export class TuiApp {
         );
         break;
       }
-      case "stop": {
-        // 只影响 btc 后端（进程仍在），与 `xzh btc stop`（杀进程）区分开
+      case "stop":
+        void this.controlBackend("stop");
+        break;
+      case "start":
+        void this.controlBackend("start");
+        break;
+      case "restart":
+        void this.controlBackend("restart");
+        break;
+      case "pause": {
+        // 暂停巡检（进程仍在），与 /stop（杀进程）区分
         if (this.mode?.name !== "btc") {
           this.lines.push(
-            `${ansi.gray}/stop 仅在 btc 模式下可用（暂停后端巡检与自动交易）。${ansi.reset}`,
+            `${ansi.gray}/pause 仅在 btc 模式下可用（暂停巡检与自动交易，进程仍在）。${ansi.reset}`,
           );
           break;
         }
@@ -2893,14 +2938,14 @@ export class TuiApp {
           const pause = readPause(this.cwd);
           this.lines.push(
             pause.paused
-              ? `${ansi.yellow}后端已暂停${ansi.reset}${ansi.gray}（${pause.at ?? "?"}，/stop resume 恢复）${ansi.reset}`
-              : `${ansi.green}后端运行中${ansi.reset}${ansi.gray}（/stop 可暂停巡检与自动交易）${ansi.reset}`,
+              ? `${ansi.yellow}后端已暂停${ansi.reset}${ansi.gray}（${pause.at ?? "?"}，/pause resume 恢复）${ansi.reset}`
+              : `${ansi.green}后端运行中${ansi.reset}${ansi.gray}（/pause 可暂停巡检与自动交易）${ansi.reset}`,
           );
         } else {
-          const pause = setPaused(this.cwd, true, "/stop");
+          const pause = setPaused(this.cwd, true, "/pause");
           this.lines.push(
             `${ansi.yellow}⏸${ansi.reset} 已暂停后端巡检与自动交易${ansi.gray}（${pause.at}）${ansi.reset}`,
-            `${ansi.gray}  恢复：/stop resume · 彻底停止进程：xzh btc stop${ansi.reset}`,
+            `${ansi.gray}  恢复：/pause resume · 彻底停止进程：/stop${ansi.reset}`,
           );
         }
         void this.refreshBtcPanel();
@@ -3898,6 +3943,79 @@ export class TuiApp {
         );
         this.scheduleRender();
       });
+  }
+
+  /** `/stop`、`/start`、`/restart`：控制当前模式的后台进程（btc 按当前角色，A 股巡检） */
+  private async controlBackend(action: "start" | "stop" | "restart"): Promise<void> {
+    const mode = this.mode;
+    if (!mode || (mode.name !== "btc" && mode.name !== "a")) {
+      this.lines.push(
+        `${ansi.gray}/stop、/start、/restart 仅在 btc / btc moni / a 模式下可用。${ansi.reset}`,
+      );
+      this.scheduleRender();
+      return;
+    }
+
+    const isBtc = mode.name === "btc";
+    const role = process.env.XZH_BTC_ROLE === "paper" ? "paper" : "live";
+    const label = isBtc ? (role === "paper" ? "btc 模拟盘" : "btc 实盘") : "A 股巡检";
+    const messages: string[] = [];
+
+    if (action !== "start") {
+      if (isBtc) {
+        const result = await stopBtcBackend(role);
+        messages.push(
+          result.stopped
+            ? `✓ 已停止 ${label} 后端`
+            : result.error
+              ? `✗ 停止失败：${result.error}`
+              : `${label} 后端本来没在运行`,
+        );
+      } else {
+        const result = await stopAService();
+        messages.push(
+          result.ok
+            ? result.stopped
+              ? "✓ 已停止 A 股巡检"
+              : "A 股巡检本来没在运行"
+            : `✗ 停止失败：${result.error}`,
+        );
+      }
+    }
+
+    if (action !== "stop") {
+      if (isBtc) {
+        const result = await ensureBtcBackend({ role });
+        messages.push(
+          result.running
+            ? result.started
+              ? `✓ 已启动 ${label} 后端`
+              : `${label} 后端已在运行`
+            : `✗ 启动失败：${result.error ?? "未知原因"}`,
+        );
+      } else {
+        const result = await startAService();
+        messages.push(
+          result.ok
+            ? result.started
+              ? "✓ 已启动 A 股巡检"
+              : "A 股巡检已在运行"
+            : `✗ 启动失败：${result.error ?? "未知原因"}`,
+        );
+      }
+    }
+
+    for (const message of messages) {
+      const color = message.startsWith("✓")
+        ? ansi.green
+        : message.startsWith("✗")
+          ? ansi.red
+          : ansi.gray;
+      this.lines.push(`${color}${message}${ansi.reset}`);
+    }
+    if (isBtc) void this.refreshBtcPanel();
+    else void this.refreshASharePanel();
+    this.scheduleRender();
   }
 
   private switchToBtc(paper: boolean): void {
@@ -5440,6 +5558,7 @@ export class TuiApp {
       push(`${ansi.yellow}  行情异常：${truncate(data.error, Math.max(8, width - 12))}${ansi.reset}`);
     }
     divider();
+    push(` ${ansi.bold}账户${ansi.reset}${ansi.gray}（模拟盘）${ansi.reset}`);
 
     const account = data.account;
     if (!account) {
@@ -5459,7 +5578,7 @@ export class TuiApp {
       if (account.positions.length === 0) {
         push(` ${ansi.gray}持仓${ansi.reset} 无`);
       } else {
-        for (const position of account.positions.slice(0, 3)) {
+        for (const position of account.positions.slice(0, 2)) {
           push(
             ` ${position.code} ${truncate(position.name, 6)} ${position.qty}股` +
               `(${position.available}) ${amount(position.avgCost)}→${amount(position.lastPrice)}`,
@@ -5480,32 +5599,55 @@ export class TuiApp {
         }
       }
     }
+
+    divider();
+    push(
+      ` ${ansi.bold}风控${ansi.reset}${ansi.gray} ATR 止损 · +8% 移动止盈 · +12% 分批 · 5 仓×20%${ansi.reset}`,
+    );
+    if (data.riskLocks.length > 0) {
+      push(
+        `${ansi.yellow}   T+1 锁定 ${data.riskLocks.length} 只（今日不可卖，下一交易日处理）：` +
+          `${data.riskLocks.map((item) => `${item.code} ${item.reason}`).join("、")}${ansi.reset}`,
+      );
+    }
+
     divider();
     const service = aServiceStatus();
     const watch = loadWatchlist();
     push(
-      ` ${ansi.gray}巡检${ansi.reset} ` +
+      ` ${ansi.bold}巡检${ansi.reset} ` +
         (service.running
           ? `${ansi.green}运行中${ansi.reset}${ansi.gray} pid ${service.state?.pid}`
-          : `${ansi.yellow}未运行${ansi.reset}${ansi.gray}（xzh a serve）`) +
-        `${ansi.gray} · 自选 ${watch.items.length}/10${ansi.reset}`,
+          : `${ansi.yellow}未运行${ansi.reset}${ansi.gray}（/start 或 xzh a serve）`),
     );
     if (service.running && service.state?.nextRunAt) {
-      push(`${ansi.gray}   下一轮 ${service.state.nextRunAt.slice(11, 16)}${ansi.reset}`);
+      push(
+        `${ansi.gray}   上一轮 ${service.state.lastRunAt?.slice(11, 16) ?? "—"}` +
+          ` · 下一轮 ${service.state.nextRunAt.slice(11, 16)}${ansi.reset}`,
+      );
     }
-    if (watch.items.length > 0) {
-      push(` ${ansi.gray}监控（${watch.items.length}/10 · ★=持仓）${ansi.reset}`);
-      for (const item of data.watch.slice(0, 4)) {
-        const star = item.held ? `${ansi.red}★ ${ansi.reset}` : "";
-        const price =
-          item.price > 0
-            ? `${amount(item.price)} ${pct(item.pct)}`
-            : `${ansi.gray}—${ansi.reset}`;
-        push(`  ${star}${item.code} ${truncate(item.name, 6)} ${item.score}分 ${price}`);
-      }
-      if (watch.items.length > 4) {
-        push(`${ansi.gray}   … 共 ${watch.items.length} 只${ansi.reset}`);
-      }
+    if (service.state?.lastSelectDay) {
+      push(`${ansi.gray}   上次选股 ${service.state.lastSelectDay}${ansi.reset}`);
+    }
+    for (const action of data.lastActions.slice(0, 2)) {
+      push(`${ansi.gray}   ${truncate(action, Math.max(10, width - 4))}${ansi.reset}`);
+    }
+
+    divider();
+    push(` ${ansi.bold}监控${ansi.reset}${ansi.gray}（每 15 分钟 · ${watch.items.length}/10 · ★=持仓）${ansi.reset}`);
+    if (watch.items.length === 0) {
+      push(`${ansi.gray}   监控池为空（xzh a serve 会自动选股）${ansi.reset}`);
+    }
+    for (const item of data.watch.slice(0, 4)) {
+      const star = item.held ? `${ansi.red}★ ${ansi.reset}` : "  ";
+      const price =
+        item.price > 0
+          ? `${amount(item.price)} ${pct(item.pct)}`
+          : `${ansi.gray}—${ansi.reset}`;
+      push(` ${star}${item.code} ${truncate(item.name, 6)} ${item.score}分 ${price}`);
+    }
+    if (watch.items.length > 4) {
+      push(`${ansi.gray}   … 共 ${watch.items.length} 只${ansi.reset}`);
     }
     push(`${ansi.gray} 模拟盘 · T+1 · 100 股整手 · 费用已计${ansi.reset}`);
     if (data.updatedAt > 0) {
@@ -5729,7 +5871,7 @@ export class TuiApp {
       }
       if (data.triggers.length > 2) {
         push(
-          `${ansi.gray}  …还有 ${data.triggers.length - 2} 条，/monitor 看全部${ansi.reset}`,
+          `${ansi.gray}  …还有 ${data.triggers.length - 2} 条，/wakeup 看全部${ansi.reset}`,
         );
       }
     }

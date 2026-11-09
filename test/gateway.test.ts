@@ -93,7 +93,14 @@ describe("gateway", () => {
     expect(parseGatewayCommand("/a off")).toEqual({ kind: "xzh" });
     expect(parseGatewayCommand("/help")).toEqual({ kind: "help" });
     expect(parseGatewayCommand("/info")).toEqual({ kind: "info" });
-    expect(parseGatewayCommand("/nope")).toMatchObject({ kind: "usage" });
+    // 其余命令统一交给 gateway 的命令路由（与终端 /help 列表一致）
+    expect(parseGatewayCommand("/reset")).toEqual({ kind: "raw", name: "reset", arg: "" });
+    expect(parseGatewayCommand("/reset moni 200000")).toEqual({
+      kind: "raw",
+      name: "reset",
+      arg: "moni 200000",
+    });
+    expect(parseGatewayCommand("/nope")).toEqual({ kind: "raw", name: "nope", arg: "" });
     // 中文输入法的全角斜杠也认作命令
     expect(parseGatewayCommand("／btc moni")).toEqual({ kind: "btc", paper: true });
     expect(parseGatewayCommand("／help")).toEqual({ kind: "help" });
