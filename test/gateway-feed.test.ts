@@ -4,7 +4,7 @@ import * as path from "path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { appendInspectEvent } from "../src/btc/inspect-stream";
 import {
-  formatBtcBatch,
+  formatBtcBatches,
   pickBtcImportant,
   readFeedOffsets,
   runFeedTick,
@@ -29,17 +29,20 @@ describe("btc 事件筛选", () => {
     expect(kept.map((event) => event.kind)).toEqual(["text", "error", "notice"]);
   });
 
-  it("批量格式化：超过 4 条折叠为条数说明", () => {
+  it("超过 4 条拆成多条消息，剩余内容不会被丢弃", () => {
     const events = Array.from({ length: 7 }, (_, index) => ({
       ts: "t",
       round: "r",
       kind: "text" as const,
       text: `结论${index}`,
     }));
-    const message = formatBtcBatch("BTC 实盘巡检", events)!;
-    expect(message).toContain("[BTC 实盘巡检]");
-    expect(message).toContain("结论6");
-    expect(message).toContain("…（本轮还有 3 条）");
+    const batches = formatBtcBatches("BTC 实盘巡检", events);
+    expect(batches).toHaveLength(2);
+    expect(batches[0]).toContain("[BTC 实盘巡检 1/2]");
+    expect(batches[0]).toContain("结论0");
+    expect(batches[1]).toContain("[BTC 实盘巡检 2/2]");
+    expect(batches[1]).toContain("结论6");
+    expect(batches.join("\n")).not.toContain("本轮还有");
   });
 
   it("单条推送压进一个微信气泡（≤900 字）", () => {
@@ -49,8 +52,8 @@ describe("btc 事件筛选", () => {
       kind: "text" as const,
       text: "长".repeat(1000),
     }));
-    const message = formatBtcBatch("BTC 实盘巡检", events)!;
-    expect(message.length).toBeLessThanOrEqual(900);
+    const batches = formatBtcBatches("BTC 实盘巡检", events);
+    expect(batches[0].length).toBeLessThanOrEqual(900);
   });
 });
 

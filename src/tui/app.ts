@@ -31,6 +31,10 @@ import {
   loadWatchlist,
   markPaperAccount,
   readPendingSells,
+  readPause as readAPause,
+  readRules,
+  readScheduleQueue as readAScheduleQueue,
+  setPaused as setAPaused,
   startAService,
   stopAService,
   type PaperAccount,
@@ -53,6 +57,10 @@ import {
   currentInspectOffset,
   readInspectEvents,
 } from "../btc/inspect-stream";
+import {
+  currentAInspectOffset,
+  readAInspectEvents,
+} from "../a/inspect-stream";
 import {
   currentScheduleRole,
   readScheduleQueue,
@@ -344,6 +352,7 @@ export class TuiApp {
    * 首次接入定位到**末尾**，否则界面会被几百行历史事件刷屏。
    */
   private feedOffset = -1;
+  private feedAOffset = -1;
   private feedTimer?: NodeJS.Timeout;
   private feedEnabled = true;
   /** 面板里显示的「最近一条后台活动」 */
@@ -1762,8 +1771,10 @@ export class TuiApp {
       const account = loadPaperAccount();
       const held = new Set(account.positions.map((position) => position.code));
       const pending = readPendingSells().filter((item) => held.has(item.code));
+      const rules = readRules();
+      const queue = readAScheduleQueue();
       const out: string[] = [
-        `A 股监控池 ${watch.items.length}/10 · 巡检${
+        `A 股监控池 ${watch.items.length}/10 · 规则 ${rules.length} 条 · 排期 ${queue.length} 条 · 巡检${
           service.running
             ? `运行中（pid ${service.state?.pid}${service.state?.nextRunAt ? `，下一轮 ${service.state.nextRunAt.slice(11, 16)}` : ""}）`
             : "未运行（/start 或 xzh a serve）"
@@ -1779,6 +1790,16 @@ export class TuiApp {
             `${held.has(item.code) ? "（持仓·强制保留）" : ""}`,
         );
       });
+      if (queue.length > 0) {
+        out.push("", "下一轮巡检：");
+        for (const entry of queue.slice(0, 3)) {
+          out.push(`- ${entry.at.slice(5, 16).replace("T", " ")} ${entry.reason}`);
+        }
+      }
+      if (rules.length > 0) {
+        out.push("", "监控规则（命中只唤醒巡检）：");
+        for (const rule of rules.slice(0, 5)) out.push(`- ${rule.code} ${rule.note}`);
+      }
       if (pending.length > 0) {
         out.push("", "T+1 锁定（今日不可卖，下一交易日处理）：");
         for (const item of pending) out.push(`- ${item.code} ${item.reason}`);
@@ -2897,9 +2918,9 @@ export class TuiApp {
         break;
       case "feed": {
         // 后台巡检的思考/工具调用实时显示在输出区，刷屏时可关掉
-        if (this.mode?.name !== "btc") {
+        if (this.mode?.name !== "btc" && this.mode?.name !== "a") {
           this.lines.push(
-            `${ansi.gray}/feed 只在 btc 模式下有意义（后台巡检过程流）。${ansi.reset}`,
+            `${ansi.gray}/feed 只在 btc / a 模式下有意义（后台巡检过程流）。${ansi.reset}`,
           );
           break;
         }
@@ -2922,9 +2943,31 @@ export class TuiApp {
         break;
       case "pause": {
         // 暂停巡检（进程仍在），与 /stop（杀进程）区分
+        if (this.mode?.name === "a") {
+          const wanted = arg.trim().toLowerCase();
+          if (wanted === "resume" || wanted === "on") {
+            setAPaused(false, "/pause");
+            this.lines.push(`${ansi.green}✓${ansi.reset} 已恢复 A 股巡检与交易。`);
+          } else if (wanted === "status") {
+            const pause = readAPause();
+            this.lines.push(
+              pause.paused
+                ? `${ansi.yellow}A 股巡检已暂停${ansi.reset}（${pause.at ?? "?"}，/pause resume 恢复）`
+                : `${ansi.green}A 股巡检运行中${ansi.reset}（/pause 可暂停，进程仍在）`,
+            );
+          } else {
+            const pause = setAPaused(true, "/pause");
+            this.lines.push(
+              `${ansi.yellow}⏸${ansi.reset} 已暂停 A 股巡检与交易（${pause.at}）`,
+              `${ansi.gray}  恢复：/pause resume · 彻底停止：/stop${ansi.reset}`,
+            );
+          }
+          void this.refreshASharePanel();
+          break;
+        }
         if (this.mode?.name !== "btc") {
           this.lines.push(
-            `${ansi.gray}/pause 仅在 btc 模式下可用（暂停巡检与自动交易，进程仍在）。${ansi.reset}`,
+            `${ansi.gray}/pause 仅在 btc / a 模式下可用（暂停巡检与自动交易，进程仍在）。${ansi.reset}`,
           );
           break;
         }
@@ -3976,8 +4019,8 @@ export class TuiApp {
         messages.push(
           result.ok
             ? result.stopped
-              ? "✓ 已停止 A 股巡检"
-              : "A 股巡检本来没在运行"
+              ? "✓ 已停止 A 股巡检与监控"
+              : "A 股巡检与监控本来没在运行"
             : `✗ 停止失败：${result.error}`,
         );
       }
@@ -3998,8 +4041,8 @@ export class TuiApp {
         messages.push(
           result.ok
             ? result.started
-              ? "✓ 已启动 A 股巡检"
-              : "A 股巡检已在运行"
+              ? "✓ 已启动 A 股巡检与监控"
+              : "A 股巡检与监控已在运行"
             : `✗ 启动失败：${result.error ?? "未知原因"}`,
         );
       }
@@ -4534,9 +4577,9 @@ export class TuiApp {
 
       case "feed": {
         // 后台巡检的思考/工具调用实时显示在输出区，刷屏时可关掉
-        if (this.mode?.name !== "btc") {
+        if (this.mode?.name !== "btc" && this.mode?.name !== "a") {
           this.lines.push(
-            `${ansi.gray}/feed 只在 btc 模式下有意义（后台巡检过程流）。${ansi.reset}`,
+            `${ansi.gray}/feed 只在 btc / a 模式下有意义（后台巡检过程流）。${ansi.reset}`,
           );
           break;
         }
@@ -5375,7 +5418,36 @@ export class TuiApp {
    * 关闭（`/feed`）时仍然推进偏移：重新开启只显示之后发生的事，
    * 不会把关闭期间攒的几百行一次性倒出来。
    */
+  /** A 股巡检过程流：结论 / 工具 / 错误写进输出区 */
+  private refreshAFeed(): void {
+    if (this.feedAOffset < 0) {
+      this.feedAOffset = currentAInspectOffset();
+      return;
+    }
+    const { events, offset } = readAInspectEvents(this.feedAOffset);
+    this.feedAOffset = offset;
+    if (events.length === 0 || !this.feedEnabled) return;
+    for (const event of events) {
+      if (event.kind === "start" || event.kind === "end") continue;
+      const body = event.text.replace(/\s+/g, " ").trim().slice(0, 240);
+      if (!body) continue;
+      const clock = new Date(event.ts).toLocaleTimeString("zh-CN", {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
+      const label =
+        event.kind === "text" ? "结论" : event.kind === "tool" ? "工具" : event.kind === "error" ? "错误" : "提示";
+      this.lines.push(`${ansi.gray}[A 股巡检 ${clock}]${ansi.reset} ${label}：${body}`);
+    }
+    this.scheduleRender();
+  }
+
   private refreshFeed(): void {
+    if (this.mode?.name === "a") {
+      this.refreshAFeed();
+      return;
+    }
     if (this.feedOffset < 0) {
       this.feedOffset = currentInspectOffset(this.cwd);
       return;
@@ -5623,7 +5695,9 @@ export class TuiApp {
     if (service.running && service.state?.nextRunAt) {
       push(
         `${ansi.gray}   上一轮 ${service.state.lastRunAt?.slice(11, 16) ?? "—"}` +
-          ` · 下一轮 ${service.state.nextRunAt.slice(11, 16)}${ansi.reset}`,
+          ` · 下一轮 ${service.state.nextCheckAt?.slice(11, 16) ?? "未排期"}` +
+          ` · 规则 ${service.state.rules ?? 0} 条` +
+          `${service.state.paused ? " · 已暂停" : ""}${ansi.reset}`,
       );
     }
     if (service.state?.lastSelectDay) {

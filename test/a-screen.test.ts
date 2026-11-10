@@ -99,10 +99,17 @@ describe("模式与工具注册", () => {
     expect(names.sort()).toEqual([
       "a_account",
       "a_bars",
+      "a_cancel_order",
+      "a_clear_risk",
       "a_order",
+      "a_orders",
       "a_quote",
+      "a_remove_trigger",
+      "a_schedule",
       "a_screen",
       "a_snapshot",
+      "a_trigger",
+      "a_unschedule",
     ]);
     const screen = TOOLS.find((tool) => tool.name === "a_screen")!;
     expect(toolVisibleInMode(screen, "a")).toBe(true);

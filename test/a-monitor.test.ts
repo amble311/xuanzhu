@@ -231,10 +231,12 @@ describe("卖点与窗口", () => {
     expect(partial?.qty).toBe(100);
   });
 
-  it("只在工作日盘中窗口运行", () => {
+  it("只在工作日 09:00–15:30 运行", () => {
     expect(inTradingWindow(new Date("2026-11-09T10:00:00+08:00"))).toBe(true);
-    expect(inTradingWindow(new Date("2026-11-09T12:00:00+08:00"))).toBe(false);
+    expect(inTradingWindow(new Date("2026-11-09T12:00:00+08:00"))).toBe(true);
     expect(inTradingWindow(new Date("2026-11-09T14:00:00+08:00"))).toBe(true);
+    expect(inTradingWindow(new Date("2026-11-09T08:59:00+08:00"))).toBe(false);
+    expect(inTradingWindow(new Date("2026-11-09T15:31:00+08:00"))).toBe(false);
     expect(inTradingWindow(new Date("2026-11-08T10:00:00+08:00"))).toBe(false);
   });
 });

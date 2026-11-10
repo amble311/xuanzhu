@@ -4,6 +4,57 @@
 
 ## [未发布]
 
+## [0.15.8] — 2026-11-10
+
+### 新增
+
+- **TS 实时 + Python 离线**：新增 `xzh a research` 与 `assets/a/research.py`，用
+  pandas/numpy 对自选股做 ATR 止损/移动止盈参数扫描，输出收益、回撤、胜率与报告
+  （`~/.xzh_a/reports/`）。Python 只做离线研究，不改变盘中巡检参数与实时链路。
+  需要环境有 pandas/numpy；缺失时命令会明确提示。
+
+### 变更
+
+- **A 股复刻 btc 的巡检 / 监控架构**：监控循环每 60 秒只评估规则并唤醒，巡检由排期队列、
+  规则命中、市场事件（开盘 / 午间 / 尾盘 / 收盘）或兜底 60 分钟触发；Agent 拥有下单与排期权，
+  结束前用 `a_schedule` 决定下一轮；优先级为持仓 > 自选 > 综合选股；硬风控
+  （ATR / 移动止盈 / 分批 / T+1 待卖）仍由代码每轮强制执行。
+- **只在工作日 09:00–15:30 工作**：窗口外只保持进程与状态心跳，不拉行情、不巡检、不交易；
+  排期时间会被夹到该窗口，越界顺延到下一个工作日。
+- **新增 A 股模块**：`schedule.ts`（next/extra 排期）、`rules.ts`（只叫醒的监控规则）、
+  `pause.ts`（进程保留的暂停）、`events.ts`（市场时点事件）、`inspect.ts`（Agent 巡检，
+  工具白名单 + 预检 + 失败退避）。
+- **新增工具**：`a_schedule` / `a_trigger` / `a_unschedule` / `a_remove_trigger`；
+  `xzh a pause [resume|status]`、TUI / 微信 `/pause` 支持 A 股。
+
+### 新增
+
+- **A 股账户级硬风控**：`risk.ts` 检查当日亏损、单票亏损、连亏；触发后写
+  `run/risk-state.json`，巡检注入“禁止开新仓”，`a_order` 拒绝买入，减仓后可用
+  `a_clear_risk` 解除。
+- **A 股巡检过程流**：`inspect-stream.ts` 写 JSONL；gateway 增量读取结论 / 错误并
+  推送到微信（工具调用仍不推）。
+- **监控规则扩展**：新增 `ma20_above`、`ret20_above`，加上原有价格 / 涨跌幅 / 跌破
+  MA20，共 7 种；支持 UTC+8 时间窗口、冷却、一次性、72 小时过期。
+- **`xzh a fk`**：查看 / 修改硬风控阈值（当日亏损 / 单票亏损 / 连亏），`fk reset` 解除当日触发。
+- **TUI `/feed` 支持 A 股**：读取 `inspect-stream.jsonl`，实时显示 A 股巡检的结论 / 工具 / 错误。
+- **链式监控规则（chain）**：先用 `a_trigger steps=[...]` 定义多步条件，只有最后一步满足才唤醒；
+  中间步骤只推进进度，超过 `chainExpireMin` 自动重置。
+- **动作账本补齐**：Agent 通过 `a_order` 成交/拒单也会写 `actions.jsonl`，带
+  `status: filled|rejected` 与 `origin: inspect|manual`，预检和微信推送都能看到。
+- **formula 触发器**：`a_trigger` 支持 `expression`（如 `price > ma20 && pct > 2`），
+  只允许白名单变量，禁止任意代码。
+- **挂单状态机**：`a_order pending=true` 可挂限价单，tick 按价格穿越成交，
+  收盘前未成交自动过期；`a_orders` / `a_cancel_order` 查询与撤单，状态
+  `open → filled / cancelled / expired`。
+- **巡检过程流 1.5 秒合并刷写**；旧确定性 `runMonitorCycle` 已删除。
+
+### 修复
+
+- 微信出站消息串行发送、分块间隔 + 重试；巡检推送超量时拆成多条消息（1/2、2/2），
+  不再只提示“还有 N 条”；新增 `run/outbox.json` 磁盘队列，失败退避、重启续发。
+- `/info` 补齐巡检内容：btc 增加排期；A 股增加下一轮、监控规则数、最近一轮动作。
+
 ## [0.15.7] — 2026-11-09
 
 ### 新增

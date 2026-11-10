@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { currentInspectOffset, readInspectEvents, type InspectEvent } from "../btc/inspect-stream";
 import { aActionsPath } from "../a/monitor";
+import { currentAInspectOffset, readAInspectEvents } from "../a/inspect-stream";
 import { getAShareHome, getBtcHome } from "../utils/paths";
 
 /**
@@ -53,18 +54,27 @@ export function pickBtcImportant(events: InspectEvent[]): InspectEvent[] {
   );
 }
 
-export function formatBtcBatch(label: string, events: InspectEvent[]): string | null {
-  if (events.length === 0) return null;
-  const shown = events.slice(-MAX_EVENTS_PER_PUSH);
-  const lines = shown.map((event) => `- ${event.text.trim().slice(0, 180)}`);
-  if (events.length > shown.length) {
-    lines.push(`…（本轮还有 ${events.length - shown.length} 条）`);
+/**
+ * 把重要事件拆成多条消息（每条 ≤4 条事件 / ≤900 字），**不丢剩余内容**。
+ *
+ * 之前超过 4 条只写「本轮还有 N 条」然后丢掉，用户看到提示却永远等不到后续；
+ * 现在剩余的会作为下一条消息排进出站队列。
+ */
+export function formatBtcBatches(label: string, events: InspectEvent[]): string[] {
+  if (events.length === 0) return [];
+  const total = Math.ceil(events.length / MAX_EVENTS_PER_PUSH);
+  const batches: string[] = [];
+  for (let index = 0; index < total; index += 1) {
+    const chunk = events.slice(index * MAX_EVENTS_PER_PUSH, (index + 1) * MAX_EVENTS_PER_PUSH);
+    const title = total > 1 ? `${label} ${index + 1}/${total}` : label;
+    const lines = chunk.map((event) => `- ${event.text.trim().slice(0, 180)}`);
+    let message = `[${title}]\n${lines.join("\n")}`;
+    if (message.length > MAX_PUSH_CHARS) {
+      message = `${message.slice(0, MAX_PUSH_CHARS - 1)}…`;
+    }
+    batches.push(message);
   }
-  let message = `[${label}]\n${lines.join("\n")}`;
-  if (message.length > MAX_PUSH_CHARS) {
-    message = `${message.slice(0, MAX_PUSH_CHARS - 1)}…`;
-  }
-  return message;
+  return batches;
 }
 
 export interface AActionEntry {
@@ -159,14 +169,13 @@ export async function runFeedTick(deps: FeedTickDeps): Promise<void> {
       if (important.length === 0) {
         updates[key] = offset;
       } else {
-        const message = formatBtcBatch(label, important);
-        if (message) {
-          const ok = await deps.send(message);
-          if (ok) updates[key] = offset;
-          else failed = true;
-        } else {
-          updates[key] = offset;
+        const batches = formatBtcBatches(label, important);
+        let ok = true;
+        for (const message of batches) {
+          ok = (await deps.send(message)) && ok;
         }
+        if (ok) updates[key] = offset;
+        else failed = true;
       }
     }
   }
@@ -187,13 +196,41 @@ export async function runFeedTick(deps: FeedTickDeps): Promise<void> {
     if (formatted.length === 0) {
       updates[aKey] = offset;
     } else {
-      const shown = formatted.slice(-MAX_EVENTS_PER_PUSH);
-      const lines = shown.map((line) => `- ${line.slice(0, 300)}`);
-      if (formatted.length > shown.length) {
-        lines.push(`…（本轮还有 ${formatted.length - shown.length} 条）`);
+      const total = Math.ceil(formatted.length / MAX_EVENTS_PER_PUSH);
+      let ok = true;
+      for (let index = 0; index < total; index += 1) {
+        const chunk = formatted.slice(
+          index * MAX_EVENTS_PER_PUSH,
+          (index + 1) * MAX_EVENTS_PER_PUSH,
+        );
+        const title = total > 1 ? `A 股巡检 ${index + 1}/${total}` : "A 股巡检";
+        ok = (await deps.send(`[${title}]\n${chunk.map((line) => `- ${line.slice(0, 300)}`).join("\n")}`)) && ok;
       }
-      const ok = await deps.send(`[A 股巡检]\n${lines.join("\n")}`);
       if (ok) updates[aKey] = offset;
+      else failed = true;
+    }
+  }
+
+  // A 股巡检结论（过程流里的 text / error；工具调用不推）
+  const aStreamKey = "a-stream";
+  if (!(aStreamKey in offsets)) {
+    updates[aStreamKey] = currentAInspectOffset();
+  } else {
+    const { events, offset } = readAInspectEvents(offsets[aStreamKey]);
+    const important = events
+      .filter((event) => event.kind === "text" || event.kind === "error")
+      .map((event) => `- ${event.text.trim().slice(0, 300)}`);
+    if (important.length === 0) {
+      updates[aStreamKey] = offset;
+    } else {
+      const total = Math.ceil(important.length / MAX_EVENTS_PER_PUSH);
+      let ok = true;
+      for (let index = 0; index < total; index += 1) {
+        const chunk = important.slice(index * MAX_EVENTS_PER_PUSH, (index + 1) * MAX_EVENTS_PER_PUSH);
+        const title = total > 1 ? `A 股巡检结论 ${index + 1}/${total}` : "A 股巡检结论";
+        ok = (await deps.send(`[${title}]\n${chunk.join("\n")}`)) && ok;
+      }
+      if (ok) updates[aStreamKey] = offset;
       else failed = true;
     }
   }

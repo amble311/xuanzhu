@@ -3,6 +3,7 @@ import { loadIndicators, type Indicators } from "./indicators";
 import { dropIncompleteWeek, macdRising } from "./macd";
 import { loadSnapshot, type SnapshotRow } from "./snapshot";
 import { applyNewsAdjustments } from "./news";
+import { reviewWithAgent } from "./agent-review";
 import type { WatchItem } from "./watchlist";
 
 /**
@@ -169,8 +170,12 @@ export async function selectTopWatchlist(
   onProgress?.(`选股完成 ${scored.length} 只，开始消息面检查…`);
   const withNews = await applyNewsAdjustments(scored, { onProgress });
 
+  // 每日一次的 Agent 复核：只能剔除/重排，失败回退规则结果
+  const reviewed = await reviewWithAgent(withNews, onProgress);
+  if (reviewed.error) onProgress?.(`Agent 复核跳过：${reviewed.error}`);
+
   onProgress?.(
-    `最终入选 ${withNews.length} 只${withNews.length < limit ? "（不足 10 只，不补）" : ""}`,
+    `最终入选 ${reviewed.items.length} 只${reviewed.items.length < limit ? "（不足 10 只，不补）" : ""}`,
   );
-  return withNews;
+  return reviewed.items;
 }

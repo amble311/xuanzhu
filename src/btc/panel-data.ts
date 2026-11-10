@@ -176,6 +176,7 @@ function signed(value: number, digits = 2): string {
  */
 export function btcInfoLines(data: BtcPanelData): string[] {
   const lines: string[] = [];
+  const divider = "─".repeat(28);
   const roleLabel = data.role === "paper" ? "BTC 模拟盘" : "BTC 量化交易（实盘）";
   lines.push(
     `${roleLabel}${data.paused ? " · 已暂停" : ""} · 后端${data.backendRunning ? "运行中" : "未运行"}` +
@@ -188,10 +189,13 @@ export function btcInfoLines(data: BtcPanelData): string[] {
     lines.push(`价格 —（行情接口不可用${data.tickerError ? `：${data.tickerError}` : ""}）`);
   }
 
+  lines.push(divider);
+  lines.push(data.role === "paper" ? "模拟盘" : "账户");
+
   if (data.role === "paper") {
     const paper = data.paper;
     if (!paper) {
-      lines.push(`模拟盘 ${data.paperError ?? "未就绪"}`);
+      lines.push(`未就绪：${data.paperError ?? "未知原因"}`);
     } else {
       lines.push(
         `权益 ${fmt(paper.equity)}（${signed(paper.return_pct)}%）· 可用 ${fmt(paper.available ?? paper.cash)}` +
@@ -224,7 +228,7 @@ export function btcInfoLines(data: BtcPanelData): string[] {
       );
     }
   } else if (!data.account || !data.account.ok) {
-    lines.push(`账户 ${data.account?.error ?? "未连接"}`);
+    lines.push(`未连接：${data.account?.error ?? "未知原因"}`);
   } else {
     const account = data.account;
     if (account.wallet) {
@@ -251,24 +255,36 @@ export function btcInfoLines(data: BtcPanelData): string[] {
     if (data.liqGapPct !== undefined) lines.push(`距强平最小 ${fmt(data.liqGapPct)}%`);
   }
 
+  lines.push(divider);
+  lines.push("风控");
   lines.push(
-    `风控 ${data.riskState.triggered ? "已触发" : "正常"}` +
+    `${data.riskState.triggered ? "已触发" : "正常"}` +
       ` · 单仓亏损 ${data.riskSettings.maxPositionLossPct}% · 当日 ${data.riskSettings.maxDailyLossPct}%`,
   );
 
-  lines.push(`监控 ${data.triggers.length} 条`);
-  if (data.nextTriggerEvalAt) lines.push(`下次评估 ${data.nextTriggerEvalAt}`);
+  lines.push(divider);
+  lines.push(`监控（叫醒条件 ${data.triggers.length} 条）`);
   for (const trigger of data.triggers.slice(0, 5)) {
-    lines.push(`  - ${describeTrigger(trigger)}`);
+    lines.push(`- ${describeTrigger(trigger)}`);
   }
   if (data.marketFailures) {
     lines.push(`行情连续失败 ${data.marketFailures} 次${data.lastMarketError ? `：${data.lastMarketError}` : ""}`);
   }
 
+  lines.push(divider);
+  lines.push(`巡检（排期 ${data.queue.length} 条）`);
+  if (data.nextTriggerEvalAt) lines.push(`下次叫醒评估 ${data.nextTriggerEvalAt}`);
+  for (const entry of data.queue.slice(0, 3)) {
+    lines.push(`- ${entry.at.slice(5, 16).replace("T", " ")} ${entry.reason}`);
+  }
+
   if (data.role === "live" && data.actions.length > 0) {
-    lines.push("最近动作：");
+    lines.push(divider);
+    lines.push("最近动作");
     for (const action of data.actions) {
-      lines.push(`  - ${action.ts.slice(0, 16).replace("T", " ")} ${action.kind} ${action.symbol} ${action.status}（${action.reason}）`);
+      lines.push(
+        `- ${action.ts.slice(0, 16).replace("T", " ")} ${action.kind} ${action.symbol} ${action.status}（${action.reason}）`,
+      );
     }
   }
 

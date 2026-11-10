@@ -15,8 +15,21 @@ import {
   screenNeedsIndicators,
   screenStocks,
   summarizeSnapshot,
+  addRule,
+  appendAAction,
+  cancelOrder,
+  clearRiskTrigger,
+  createOrder,
+  describeOrder,
+  listOrders,
+  readRiskState,
+  describeRule,
+  pushSchedule,
+  removeRules,
+  removeSchedules,
   type Indicators,
   type PaperAccount,
+  type RuleKind,
 } from "../a";
 import {
   fetchBars,
@@ -388,6 +401,9 @@ const orderTool: ToolDefinition = {
       side: { type: "string", enum: ["buy", "sell"], description: "买入 / 卖出" },
       qty: { type: "number", description: "股数（买入需 100 的整数倍）" },
       price: { type: "number", description: "限价；不传 = 按现价成交" },
+      pending: { type: "boolean", description: "true = 挂单等待价格穿越（需要 price），默认立即成交" },
+      reason: { type: "string", description: "挂单原因（可选）" },
+      ttlMinutes: { type: "number", description: "挂单有效期分钟，默认 120 且不超过当日 15:00" },
     },
     required: ["code", "side", "qty"],
   },
@@ -402,8 +418,55 @@ const orderTool: ToolDefinition = {
     if (price !== undefined && !Number.isFinite(price)) {
       return { ok: false, content: "✗ price 必须是数字" };
     }
+    if (args.pending === true) {
+      if (price === undefined || price <= 0) {
+        return { ok: false, content: "✗ 挂单需要 price（限价）" };
+      }
+      try {
+        const quote = await fetchQuote(code);
+        const created = createOrder({
+          code: quote.code,
+          name: quote.name,
+          side,
+          qty,
+          limitPrice: price,
+          reason: typeof args.reason === "string" ? args.reason : undefined,
+          ttlMinutes: args.ttlMinutes === undefined ? undefined : Number(args.ttlMinutes),
+        });
+        if (!created.ok) return { ok: false, content: `✗ ${created.error}` };
+        appendAAction({
+          kind: side,
+          code,
+          ok: true,
+          status: "open",
+          message: `挂单 ${describeOrder(created.order)}`,
+          origin: process.env.XZH_A_INSPECT === "1" ? "inspect" : "manual",
+        });
+        return {
+          ok: true,
+          content: `✓ 已挂单：${describeOrder(created.order)}（${created.order.expiresAt} 前有效）`,
+          summary: `挂单 ${code}`,
+        };
+      } catch (err) {
+        return { ok: false, content: `✗ 挂单失败：${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+    if (side === "buy" && readRiskState()?.triggered) {
+      return {
+        ok: false,
+        content: `✗ 硬风控已触发，禁止开新仓：${readRiskState()?.reasons.join("；") ?? ""}`,
+      };
+    }
     try {
       const result = await placePaperOrder({ code, side, qty, price });
+      appendAAction({
+        kind: side,
+        code,
+        ok: result.ok,
+        status: result.ok ? "filled" : "rejected",
+        message: result.message,
+        origin: process.env.XZH_A_INSPECT === "1" ? "inspect" : "manual",
+      });
       if (!result.ok) return { ok: false, content: `✗ ${result.message}` };
       return {
         ok: true,
@@ -419,6 +482,206 @@ const orderTool: ToolDefinition = {
   },
 };
 
+// ─────────────────────────── 巡检闭环工具 ───────────────────────────
+
+const scheduleTool: ToolDefinition = {
+  name: "a_schedule",
+  modes: A_MODES,
+  description:
+    "安排下一次 A 股巡检时间（巡检结束前必须调用）。分钟数 5–720，或直接给 at（ISO/本地时间）。" +
+    "非工作时间会被自动夹到下一个工作日 09:00–15:30。slot=next 会顶掉旧的 next；extra 是额外检查点。",
+  parameters: {
+    type: "object",
+    properties: {
+      minutes: { type: "number", description: "多少分钟后巡检" },
+      at: { type: "string", description: "指定时间（ISO 或 YYYY-MM-DD HH:mm）" },
+      reason: { type: "string", description: "为什么这个时间再来看" },
+      slot: { type: "string", enum: ["next", "extra"], description: "默认 next" },
+    },
+    required: ["reason"],
+  },
+  async execute(args): Promise<ToolResult> {
+    const minutes = args.minutes === undefined ? undefined : Number(args.minutes);
+    const at = typeof args.at === "string" ? args.at : undefined;
+    const reason = typeof args.reason === "string" ? args.reason : "";
+    if (!reason) return { ok: false, content: "✗ 需要 reason" };
+    if (minutes !== undefined && !Number.isFinite(minutes)) {
+      return { ok: false, content: "✗ minutes 必须是数字" };
+    }
+    const slot = args.slot === "extra" ? "extra" : "next";
+    const entry = pushSchedule({ minutes, at, reason, slot });
+    return {
+      ok: true,
+      content: `✓ 已排期 ${entry.at}（${entry.slot}）：${entry.reason}${entry.clamped ? "（已夹到交易时段）" : ""}`,
+      summary: `巡检排期 ${entry.at}`,
+    };
+  },
+};
+
+const triggerTool: ToolDefinition = {
+  name: "a_trigger",
+  modes: A_MODES,
+  description:
+    "给持仓/自选股设置监控规则（只叫醒，不下单）。kind: price_above / price_below / pct_above / pct_below / ma20_break / ma20_above / ret20_above。" +
+    "命中后监控会唤醒巡检并说明原因；最多 20 条，默认 72 小时过期、30 分钟冷却。",
+  parameters: {
+    type: "object",
+    properties: {
+      code: { type: "string", description: "6 位股票代码" },
+      kind: {
+        type: "string",
+        enum: [
+          "price_above",
+          "price_below",
+          "pct_above",
+          "pct_below",
+          "ma20_break",
+          "ma20_above",
+          "ret20_above",
+          "chain",
+          "formula",
+        ],
+      },
+      value: { type: "number", description: "price/pct 的目标值；ma20_break 不需要" },
+      note: { type: "string", description: "命中时给巡检看的原因" },
+      once: { type: "boolean", description: "命中一次后删除" },
+      cooldownMin: { type: "number", description: "冷却分钟，默认 30" },
+      ttlHours: { type: "number", description: "有效期小时，默认 72" },
+      startHour: { type: "number", description: "只在几点后评估（UTC+8，0–23）" },
+      endHour: { type: "number", description: "只在几点前评估（UTC+8，0–23）" },
+      steps: {
+        type: "array",
+        description: "chain 专用：步骤数组，如 [{kind:'pct_above',value:3},{kind:'ma20_break'}]；只有最后一步满足才唤醒",
+        items: { type: "object" },
+      },
+      chainExpireMin: { type: "number", description: "链式中间步骤有效期分钟，默认 240" },
+      expression: {
+        type: "string",
+        description: "formula 专用，如 price > ma20 && pct > 2；变量 price/pct/ma5/ma20/ma60/ret5/ret20/ret60/atr_pct/amount",
+      },
+    },
+    required: ["code", "kind", "note"],
+  },
+  async execute(args): Promise<ToolResult> {
+    const code = typeof args.code === "string" ? args.code : "";
+    const kind = args.kind as RuleKind;
+    const value = args.value === undefined ? undefined : Number(args.value);
+    const note = typeof args.note === "string" ? args.note : "";
+    if (!note) return { ok: false, content: "✗ 需要 note（命中原因）" };
+    const result = addRule({
+      code,
+      kind,
+      value,
+      note,
+      once: args.once === true,
+      cooldownMin: args.cooldownMin === undefined ? undefined : Number(args.cooldownMin),
+      ttlHours: args.ttlHours === undefined ? undefined : Number(args.ttlHours),
+      windowStartHour: args.startHour === undefined ? undefined : Number(args.startHour),
+      windowEndHour: args.endHour === undefined ? undefined : Number(args.endHour),
+      steps: Array.isArray(args.steps) ? (args.steps as Array<{ kind: never; value?: number }>) : undefined,
+      chainExpireMin: args.chainExpireMin === undefined ? undefined : Number(args.chainExpireMin),
+      expression: typeof args.expression === "string" ? args.expression : undefined,
+    });
+    if (!result.ok) return { ok: false, content: `✗ ${result.error}` };
+    return {
+      ok: true,
+      content: `✓ 已添加监控：${describeRule(result.rule)}（${result.rule.note}）`,
+      summary: `监控 ${result.rule.code} ${result.rule.kind}`,
+    };
+  },
+};
+
+const unscheduleTool: ToolDefinition = {
+  name: "a_unschedule",
+  modes: A_MODES,
+  description: "撤销排期：给 id 撤销一条，不给 id 清空全部。",
+  parameters: {
+    type: "object",
+    properties: { id: { type: "string", description: "排期 id；不传 = 清空" } },
+    required: [],
+  },
+  async execute(args): Promise<ToolResult> {
+    const removed = removeSchedules(typeof args.id === "string" ? args.id : undefined);
+    return { ok: true, content: `✓ 已撤销 ${removed} 条排期`, summary: `撤销排期 ${removed}` };
+  },
+};
+
+const clearRiskTool: ToolDefinition = {
+  name: "a_clear_risk",
+  modes: A_MODES,
+  description:
+    "解除当日硬风控（仅在已减仓/风险消失后使用）。解除后 a_order 才能重新买入；不要用它绕过风控。",
+  parameters: { type: "object", properties: {}, required: [] },
+  async execute(): Promise<ToolResult> {
+    const state = readRiskState();
+    if (!state?.triggered) return { ok: true, content: "当前没有触发的硬风控" };
+    clearRiskTrigger();
+    return { ok: true, content: "✓ 已解除当日硬风控（请确认已减仓）", summary: "解除硬风控" };
+  },
+};
+
+const ordersTool: ToolDefinition = {
+  name: "a_orders",
+  modes: A_MODES,
+  description: "查看当前挂单（open / filled / cancelled / expired）。",
+  parameters: { type: "object", properties: {}, required: [] },
+  async execute(): Promise<ToolResult> {
+    const orders = listOrders().filter((order) => order.status === "open");
+    if (orders.length === 0) return { ok: true, content: "当前没有挂单" };
+    return {
+      ok: true,
+      content: orders.map((order) => `- ${order.id} ${describeOrder(order)} ${order.reason}`).join("\n"),
+      summary: `挂单 ${orders.length} 条`,
+    };
+  },
+};
+
+const cancelOrderTool: ToolDefinition = {
+  name: "a_cancel_order",
+  modes: A_MODES,
+  description: "撤销一条挂单：需要 a_orders 返回的 id。",
+  parameters: {
+    type: "object",
+    properties: { id: { type: "string", description: "挂单 id" } },
+    required: ["id"],
+  },
+  async execute(args): Promise<ToolResult> {
+    const id = typeof args.id === "string" ? args.id : "";
+    const result = cancelOrder(id);
+    if (!result.ok) return { ok: false, content: `✗ ${result.error}` };
+    appendAAction({
+      kind: "cancel",
+      code: result.order?.code,
+      ok: true,
+      status: "cancelled",
+      message: `撤销挂单 ${id}`,
+      origin: process.env.XZH_A_INSPECT === "1" ? "inspect" : "manual",
+    });
+    return { ok: true, content: `✓ 已撤销挂单 ${id}`, summary: `撤销 ${id}` };
+  },
+};
+
+const removeTriggerTool: ToolDefinition = {
+  name: "a_remove_trigger",
+  modes: A_MODES,
+  description: "删除监控规则：给 id 删一条，给 code 删该股票全部，都不给则清空。",
+  parameters: {
+    type: "object",
+    properties: {
+      id: { type: "string" },
+      code: { type: "string" },
+    },
+    required: [],
+  },
+  async execute(args): Promise<ToolResult> {
+    const removed = removeRules({
+      id: typeof args.id === "string" ? args.id : undefined,
+      code: typeof args.code === "string" ? args.code : undefined,
+    });
+    return { ok: true, content: `✓ 已删除 ${removed} 条监控规则`, summary: `删除规则 ${removed}` };
+  },
+};
+
 export const aShareTools: ToolDefinition[] = [
   snapshotTool,
   screenTool,
@@ -426,4 +689,11 @@ export const aShareTools: ToolDefinition[] = [
   barsTool,
   accountTool,
   orderTool,
+  scheduleTool,
+  triggerTool,
+  unscheduleTool,
+  removeTriggerTool,
+  clearRiskTool,
+  ordersTool,
+  cancelOrderTool,
 ];

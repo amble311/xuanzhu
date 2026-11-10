@@ -51,6 +51,8 @@ export interface PaperTrade {
   amount: number;
   fees: number;
   time: string;
+  /** 卖出时的已实现盈亏（买为 undefined） */
+  pnl?: number;
 }
 
 export interface PaperAccount {
@@ -356,6 +358,15 @@ export function applyPaperOrder(
     amount,
     fees: fees.total,
     time: now.toISOString(),
+    ...(side === "sell"
+      ? {
+          pnl: round2(
+            (fillPrice - (account.positions.find((item) => item.code === quote.code)?.avgCost ?? fillPrice)) *
+              qty -
+              fees.total,
+          ),
+        }
+      : {}),
   };
   next.trades = [...next.trades, trade].slice(-MAX_TRADES);
   return {

@@ -14,11 +14,21 @@ import {
   loadSnapshot,
   loadWatchlist,
   mergeWatchlist,
+  readPause,
+  readRiskSettings,
+  readRiskState,
+  writeRiskSettings,
+  clearRiskTrigger,
+  readRules,
+  readScheduleQueue,
+  setPaused,
   monitorLogPath,
   removeWatchItem,
   runAServe,
+  defaultResearchCodes,
   runBacktest,
-  runMonitorCycle,
+  runResearch,
+  runManualInspection,
   saveWatchlist,
   screenConditionFromInput,
   selectTopWatchlist,
@@ -205,13 +215,17 @@ ${ansi.bold}横截面（全市场）${ansi.reset}
       ${ansi.gray}--where '{"boards":["sh-main"],"pctMin":3}' 直接给完整 JSON 条件${ansi.reset}
 
 ${ansi.bold}监控（独立进程）${ansi.reset}
-  ${ansi.green}xzh a serve${ansi.reset}                     启动 A 股巡检（盘中每 15 分钟一轮）
+  ${ansi.green}xzh a serve${ansi.reset}                     启动 A 股巡检与监控（工作日 09:00–15:30）
   ${ansi.green}xzh a serve status|stop${ansi.reset}         查看 / 停止巡检进程
+  ${ansi.green}xzh a start|stop${ansi.reset}                 启停巡检（与 btc 的 xzh btc serve|stop 对齐）
+  ${ansi.green}xzh a pause [resume|status]${ansi.reset}       暂停/恢复巡检（进程仍在）
+  ${ansi.green}xzh a fk [当日% 单票% 连亏]${ansi.reset}        查看 / 修改硬风控（fk reset 解除）
   ${ansi.green}xzh a watch${ansi.reset}                     查看自选股（监控池）
   ${ansi.green}xzh a watch add|remove <代码>${ansi.reset}   手工增删（持仓不可删除）
   ${ansi.green}xzh a watch refresh${ansi.reset}             立即全市场重选前 10
   ${ansi.green}xzh a monitor once${ansi.reset}              手动跑一轮巡检（不常驻）
   ${ansi.green}xzh a backtest${ansi.reset}                  日线回测（默认自选股；--codes / --days / --top）
+  ${ansi.green}xzh a research${ansi.reset}                  Python 离线参数扫描（--stop / --trail / --days）
 
 ${ansi.bold}缓存${ansi.reset}
   ${ansi.green}xzh a sync${ansi.reset}                       建股票池 + 预计算全市场指标 + 交易日历（约 1-2 分钟）
@@ -499,7 +513,14 @@ async function statusCommand(parsed: ParsedArgs): Promise<void> {
     service: {
       running: service.running,
       pid: service.state?.pid ?? null,
+      paused: readPause().paused,
       nextRunAt: service.state?.nextRunAt ?? null,
+      nextCheckAt: service.state?.nextCheckAt ?? null,
+      queueSize: readScheduleQueue().length,
+      rules: readRules().length,
+      riskTriggered: readRiskState()?.triggered === true,
+      lastInspectAt: service.state?.lastInspectAt ?? null,
+      lastInspectSummary: service.state?.lastInspectSummary ?? null,
       lastAction: service.state?.lastAction ?? null,
     },
     watchlist: watch.items.map((item) => ({
@@ -541,9 +562,17 @@ async function statusCommand(parsed: ParsedArgs): Promise<void> {
   process.stdout.write(
     `  ${padEnd("巡检", 10)}${
       service.running
-        ? `${ansi.green}运行中${ansi.reset}${ansi.gray} pid ${service.state?.pid} · 下一轮 ${service.state?.nextRunAt ?? "—"}${ansi.reset}`
+        ? `${ansi.green}运行中${ansi.reset}${ansi.gray} pid ${service.state?.pid} · 下一轮 ${service.state?.nextCheckAt ?? "未排期"}${ansi.reset}`
         : `${ansi.yellow}未运行${ansi.reset}${ansi.gray}（xzh a serve）${ansi.reset}`
     }\n`,
+  );
+  process.stdout.write(
+    `  ${padEnd("监控规则", 10)}${readRules().length} 条` +
+      `${ansi.gray} · 排期 ${readScheduleQueue().length} 条` +
+      `${readPause().paused ? " · 已暂停" : ""}${ansi.reset}\n`,
+  );
+  process.stdout.write(
+    `  ${padEnd("硬风控", 10)}${readRiskState()?.triggered ? "已触发（禁止买入）" : "正常"}\n`,
   );
   process.stdout.write(
     `  ${padEnd("自选股", 10)}${watch.items.length}/10` +
@@ -552,6 +581,90 @@ async function statusCommand(parsed: ParsedArgs): Promise<void> {
   if (!universe.exists || !indicators.exists || !calendar.exists) {
     process.stdout.write(`${ansi.gray}缺失的缓存可运行 xzh a sync 建立。${ansi.reset}\n`);
   }
+}
+
+async function fkCommand(parsed: ParsedArgs): Promise<void> {
+  const action = (parsed.positional[1] ?? "").toLowerCase();
+  if (action === "reset") {
+    clearRiskTrigger();
+    process.stdout.write(`${ansi.green}✓ 已解除当日硬风控${ansi.reset}\n`);
+    return;
+  }
+  const settings = readRiskSettings();
+  if (action === "") {
+    const state = readRiskState();
+    process.stdout.write(
+      `${ansi.bold}A 股硬风控${ansi.reset}\n` +
+        `  当日亏损上限 ${settings.maxDailyLossPct}%\n` +
+        `  单票亏损上限 ${settings.maxPositionLossPct}%\n` +
+        `  连亏上限 ${settings.maxConsecutiveLosses} 笔\n` +
+        `  状态：${state?.triggered ? `${ansi.red}已触发${ansi.reset}（${state.reasons.join("；")}）` : `${ansi.green}正常${ansi.reset}`}\n` +
+        `${ansi.gray}修改：xzh a fk <当日> <单票> <连亏>；解除：xzh a fk reset${ansi.reset}\n`,
+    );
+    return;
+  }
+  const values = parsed.positional.slice(1).map(Number);
+  if (values.length !== 3 || values.some((value) => !Number.isFinite(value) || value <= 0)) {
+    throw new Error("用法：xzh a fk <当日亏损%> <单票亏损%> <连亏笔数>，或 xzh a fk reset");
+  }
+  writeRiskSettings({
+    maxDailyLossPct: values[0],
+    maxPositionLossPct: values[1],
+    maxConsecutiveLosses: Math.round(values[2]),
+  });
+  process.stdout.write(
+    `${ansi.green}✓ 已更新硬风控${ansi.reset}：当日 ${values[0]}% · 单票 ${values[1]}% · 连亏 ${Math.round(values[2])} 笔\n`,
+  );
+}
+
+async function researchCommand(parsed: ParsedArgs): Promise<void> {
+  const rawCodes = parsed.options.get("codes");
+  const codes =
+    typeof rawCodes === "string"
+      ? rawCodes.split(",").map((code) => code.trim()).filter(Boolean)
+      : defaultResearchCodes();
+  const days = Number(parsed.options.get("days") ?? 120);
+  const stop = String(parsed.options.get("stop") ?? "1.0,1.5,2.0")
+    .split(",")
+    .map(Number)
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const trail = String(parsed.options.get("trail") ?? "0.06,0.08,0.10")
+    .split(",")
+    .map(Number)
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const top = Number(parsed.options.get("top") ?? 5);
+  const result = await runResearch({
+    codes,
+    days: Number.isFinite(days) ? days : 250,
+    stopAtr: stop.length > 0 ? stop : [1.5],
+    trail: trail.length > 0 ? trail : [0.08],
+    maxPositions: Number.isFinite(top) ? top : 5,
+  });
+  if (jsonMode(parsed.options)) return printJson(result);
+  if (!result.ok) {
+    process.stdout.write(`${ansi.red}✗ 研究失败：${result.error}${ansi.reset}\n`);
+    return;
+  }
+  process.stdout.write(
+    `${ansi.bold}A 股离线研究${ansi.reset}${ansi.gray} 参数扫描 ${result.results?.length ?? 0} 组${ansi.reset}\n`,
+  );
+  for (const row of result.results ?? []) {
+    process.stdout.write(
+      `  ATR×${row.params.stop_atr} · 移动止盈 ${(row.params.trail_trigger * 100).toFixed(0)}%` +
+        ` → 收益 ${row.returnPct >= 0 ? "+" : ""}${row.returnPct}% · 回撤 ${row.maxDrawdownPct}%` +
+        ` · 胜率 ${row.winRatePct}% · ${row.trades} 笔\n`,
+    );
+  }
+  if (result.best) {
+    process.stdout.write(
+      `${ansi.green}最佳：ATR×${result.best.params.stop_atr} / 移动止盈 ${(result.best.params.trail_trigger * 100).toFixed(0)}%` +
+        ` → ${result.best.returnPct >= 0 ? "+" : ""}${result.best.returnPct}%${ansi.reset}\n`,
+    );
+  }
+  if (result.report) process.stdout.write(`${ansi.gray}报告：${result.report}${ansi.reset}\n`);
+  process.stdout.write(
+    `${ansi.gray}说明：Python 离线回测只用于研究，不改变盘中巡检参数。${ansi.reset}\n`,
+  );
 }
 
 async function serveCommand(parsed: ParsedArgs): Promise<void> {
@@ -564,7 +677,7 @@ async function serveCommand(parsed: ParsedArgs): Promise<void> {
     const result = await stopAService();
     process.stdout.write(
       result.ok
-        ? `${ansi.green}✓ ${result.stopped ? "A 股巡检已停止" : "巡检本来就没在运行"}${ansi.reset}\n`
+        ? `${ansi.green}✓ ${result.stopped ? "A 股巡检与监控已停止" : "A 股巡检与监控本来就没在运行"}${ansi.reset}\n`
         : `${ansi.red}✗ 停止失败：${result.error}${ansi.reset}\n`,
     );
     return;
@@ -573,13 +686,13 @@ async function serveCommand(parsed: ParsedArgs): Promise<void> {
   const status = aServiceStatus();
   if (action === "status") {
     if (!status.running) {
-      process.stdout.write(`${ansi.yellow}A 股巡检未运行${ansi.reset}\n`);
+      process.stdout.write(`${ansi.yellow}A 股巡检与监控未运行${ansi.reset}\n`);
       if (status.stale) process.stdout.write(`${ansi.gray}  有残留状态，下次启动会清理${ansi.reset}\n`);
       return;
     }
     const state = status.state!;
     process.stdout.write(
-      `${ansi.green}A 股巡检运行中${ansi.reset}${ansi.gray} pid ${state.pid} · ${state.version}` +
+      `${ansi.green}A 股巡检与监控运行中${ansi.reset}${ansi.gray} pid ${state.pid} · ${state.version}` +
         ` · 自选 ${state.watchlist} 只 · 持仓 ${state.holdings} 只${ansi.reset}\n` +
         `${ansi.gray}  下一轮 ${state.nextRunAt}${state.lastAction ? ` · 最近：${state.lastAction}` : ""}${ansi.reset}\n` +
         `${ansi.gray}  日志 ${monitorLogPath()}${ansi.reset}\n`,
@@ -595,14 +708,14 @@ async function serveCommand(parsed: ParsedArgs): Promise<void> {
   }
   if (status.running) {
     process.stdout.write(
-      `${ansi.gray}A 股巡检已在运行（pid ${status.state?.pid}）${ansi.reset}\n`,
+      `${ansi.gray}A 股巡检与监控已在运行（pid ${status.state?.pid}）${ansi.reset}\n`,
     );
     return;
   }
   const result = await startAService();
   process.stdout.write(
     result.ok
-      ? `${ansi.green}✓ A 股巡检已启动${ansi.reset}${ansi.gray} pid ${result.state?.pid} · 盘中每 15 分钟一轮${ansi.reset}\n`
+      ? `${ansi.green}✓ A 股巡检与监控已启动${ansi.reset}${ansi.gray} pid ${result.state?.pid} · 工作日 09:00–15:30 · 监控每 60 秒 / 巡检按排期${ansi.reset}\n`
       : `${ansi.red}✗ 启动失败：${result.error}${ansi.reset}\n`,
   );
 }
@@ -722,7 +835,7 @@ async function backtestCommand(parsed: ParsedArgs): Promise<void> {
 async function monitorCommand(parsed: ParsedArgs): Promise<void> {
   const action = (parsed.positional[1] ?? "once").toLowerCase();
   if (action !== "once") throw new Error("用法：xzh a monitor once");
-  const result = await runMonitorCycle();
+  const result = await runManualInspection();
   if (result.actions.length === 0) {
     process.stdout.write(`${ansi.gray}巡检完成：无动作${ansi.reset}\n`);
     return;
@@ -773,6 +886,38 @@ export async function aCommand(args: string[]): Promise<void> {
       case "serve":
         await serveCommand(parsed);
         return;
+      // 与 btc 对齐的简写：xzh a stop / xzh a start
+      case "stop":
+        await serveCommand({ ...parsed, positional: ["a", "stop"] });
+        return;
+      case "start":
+        await serveCommand({ ...parsed, positional: ["a", "start"] });
+        return;
+      case "pause": {
+        const action = (parsed.positional[1] ?? "").toLowerCase();
+        if (action === "status") {
+          const pause = readPause();
+          process.stdout.write(
+            pause.paused
+              ? `${ansi.yellow}⏸ A 股巡检已暂停${ansi.reset}（${pause.at ?? "?"}，/pause resume 恢复；进程仍在）\n`
+              : `${ansi.green}A 股巡检运行中${ansi.reset}（/pause 暂停巡检与交易，进程仍在）\n`,
+          );
+          return;
+        }
+        if (action === "resume" || action === "on") {
+          setPaused(false, "cli");
+          process.stdout.write(`${ansi.green}✓ 已恢复 A 股巡检${ansi.reset}\n`);
+          return;
+        }
+        setPaused(true, "cli");
+        process.stdout.write(
+          `${ansi.yellow}⏸ 已暂停 A 股巡检与交易${ansi.reset}${ansi.gray}（进程仍在；xzh a pause resume 恢复）${ansi.reset}\n`,
+        );
+        return;
+      }
+      case "fk":
+        await fkCommand(parsed);
+        return;
       case "watch":
         await watchCommand(parsed);
         return;
@@ -781,6 +926,9 @@ export async function aCommand(args: string[]): Promise<void> {
         return;
       case "backtest":
         await backtestCommand(parsed);
+        return;
+      case "research":
+        await researchCommand(parsed);
         return;
       default:
         process.stdout.write(

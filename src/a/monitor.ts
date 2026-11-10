@@ -17,8 +17,14 @@ import {
   placePaperOrder,
   type PaperAccount,
 } from "./paper";
-import { evaluateMarketRegime } from "./regime";
-import { intradayBuyReady, intradayWeak } from "./intraday";
+import { runAInspect } from "./inspect";
+import { commitRuleHit, evaluateRules, readRules } from "./rules";
+import { pushSchedule, readScheduleQueue, takeDueSchedule } from "./schedule";
+import { isPaused, readPause } from "./pause";
+import { takeMarketEvent } from "./events";
+import { describeOrder, listOrders, matchOrders } from "./orders";
+import { checkAccountRisk, markRiskDelivered } from "./risk";
+import { intradayWeak } from "./intraday";
 import { loadIndicators } from "./indicators";
 import { selectTopWatchlist } from "./score";
 import { loadWatchlist, mergeWatchlist, monitorDir, saveWatchlist, type WatchItem } from "./watchlist";
@@ -36,8 +42,6 @@ import { VERSION } from "../utils/version";
  * 决策是**确定性规则**：月/周/日趋势 + 1h 择时打分，不每轮调用模型。
  */
 
-const MAX_POSITIONS = 5;
-const POSITION_PCT = 0.2;
 /** 初始止损下限 5%，并按 1.5×ATR 放大 */
 const MIN_STOP_PCT = 0.05;
 const STOP_ATR_MULTIPLE = 1.5;
@@ -45,8 +49,6 @@ const STOP_ATR_MULTIPLE = 1.5;
 const TRAIL_TRIGGER_PCT = 0.08;
 /** 浮盈 12% 时卖出一半，剩余继续移动止盈 */
 const PARTIAL_TAKE_PCT = 0.12;
-const BUY_SCORE = 70;
-const BUY_MAX_PCT = 5;
 const CYCLE_MS = 15 * 60_000;
 const TICK_MS = 30_000;
 const LOCK_FILE = "run/monitor.lock";
@@ -66,6 +68,19 @@ export interface AMonitorState {
   holdings: number;
   lastAction?: string;
   lastError?: string;
+  /** 暂停标记（进程仍在） */
+  paused?: boolean;
+  /** 排期队列长度 / 下一条 */
+  queueSize?: number;
+  nextCheckAt?: string;
+  nextCheckReason?: string;
+  /** 监控规则条数 */
+  rules?: number;
+  /** 最近一次巡检 */
+  lastInspectAt?: string;
+  lastInspectReason?: string;
+  lastInspectSummary?: string;
+  lastInspectTools?: number;
 }
 
 export interface CycleResult {
@@ -130,7 +145,7 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-function appendAction(entry: Record<string, unknown>): void {
+export function appendAAction(entry: Record<string, unknown>): void {
   try {
     ensureDir(monitorDir());
     fs.appendFileSync(actionsPath(), `${JSON.stringify({ time: new Date().toISOString(), ...entry })}\n`, "utf8");
@@ -150,15 +165,12 @@ function log(message: string): void {
   }
 }
 
-/** 盘中窗口（含集合竞价/尾盘缓冲），周末不算 */
+/** 工作窗口：工作日 09:00–15:30（监控与巡检都只在这段时间工作） */
 export function inTradingWindow(now = new Date()): boolean {
   const weekday = now.getDay();
   if (weekday === 0 || weekday === 6) return false;
   const minutes = now.getHours() * 60 + now.getMinutes();
-  return (
-    (minutes >= 9 * 60 + 25 && minutes <= 11 * 60 + 35) ||
-    (minutes >= 12 * 60 + 55 && minutes <= 15 * 60 + 5)
-  );
+  return minutes >= 9 * 60 && minutes <= 15 * 60 + 30;
 }
 
 function quoteMap(quotes: Array<Quote | null>): Map<string, Quote> {
@@ -277,237 +289,6 @@ function writePendingSells(list: PendingSell[]): void {
 /**
  * 一轮巡检。可被 `<MODE> serve` 调用，也可由 `xzh a monitor once` 手动触发。
  */
-export async function runMonitorCycle(now = new Date()): Promise<CycleResult> {
-  const result: CycleResult = { actions: [], sold: [], bought: [], selected: [] };
-  const before = loadPaperAccount(now);
-  const watchBefore = loadWatchlist();
-  const codes = [
-    ...new Set([
-      ...before.positions.map((position) => position.code),
-      ...watchBefore.items.map((item) => item.code),
-    ]),
-  ];
-  const quotes = quoteMap(
-    await mapLimit(codes, async (code) => fetchQuote(code).catch(() => null), 6),
-  );
-
-  // 只有「交易日 + 盘中窗口」才允许成交；非交易时段只做选股/复盘，避免周末按收盘价下单
-  let tradingDay = false;
-  try {
-    const calendar = await loadTradingCalendar();
-    tradingDay = isTradingDay(calendar, dayKey(now));
-  } catch {
-    tradingDay = false;
-  }
-  const canTrade = tradingDay && inTradingWindow(now);
-
-  // 1) 持仓卖点：T+1 锁定的股票照样评估，只是今天不执行，进入待卖队列
-  let account = loadPaperAccount(now);
-  const indicators = await loadIndicators();
-  const pending = new Map(readPendingSells().map((item) => [item.code, item]));
-  const heldCodes = new Set(account.positions.map((position) => position.code));
-  for (const code of [...pending.keys()]) {
-    if (!heldCodes.has(code)) pending.delete(code);
-  }
-
-  for (const position of account.positions) {
-    const quote = quotes.get(position.code);
-    if (!quote || quote.price <= 0) continue;
-    let decision = shouldSell(position, quote, indicators.get(position.code));
-
-    // 日内卖点：ATR 止损未触发时，再看 30m 是否走弱（数据失败不卖）
-    if (!decision && canTrade) {
-      try {
-        const bars30 = await fetchBars(position.code, {
-          period: "30m",
-          adjust: "backward",
-          limit: 80,
-        });
-        if (intradayWeak(bars30)) {
-          decision = {
-            reason: "30m 跌破 MA20 与前 10 根低点",
-            sellable: position.available > 0,
-            qty: position.available,
-          };
-        }
-      } catch {
-        // 取不到 30m 就不按日内信号卖，继续用 ATR 风控
-      }
-    }
-
-    // 风险解除：撤销待卖（例如第二天反弹回 MA20 上方）
-    if (!decision) {
-      if (pending.delete(position.code)) {
-        result.actions.push(`${position.code} 风险已解除，撤销待卖`);
-        appendAction({ kind: "risk-clear", code: position.code, ok: true });
-      }
-      continue;
-    }
-
-    // 今天不能卖（T+1 / 非交易时段）：记录待卖，下一交易日开盘处理
-    if (!decision.sellable || !canTrade) {
-      const existing = pending.get(position.code);
-      if (!existing) {
-        pending.set(position.code, {
-          code: position.code,
-          name: position.name,
-          reason: decision.reason,
-          since: dayKey(now),
-        });
-        result.actions.push(
-          `T+1 锁定 ${position.code} ${decision.reason}，下一交易日开盘处理`,
-        );
-        appendAction({
-          kind: "risk-locked",
-          code: position.code,
-          reason: decision.reason,
-          ok: true,
-        });
-      } else if (existing.reason !== decision.reason) {
-        existing.reason = decision.reason;
-      }
-      continue;
-    }
-
-    const sellQty = Math.min(decision.qty ?? position.available, position.available);
-    if (sellQty < 1) continue;
-    const sold = await placePaperOrder(
-      { code: position.code, side: "sell", qty: sellQty },
-      now,
-    );
-    result.actions.push(
-      sold.ok
-        ? `卖出 ${position.code} ${decision.reason}：${sold.message}`
-        : `卖出失败 ${position.code}：${sold.message}`,
-    );
-    if (sold.ok) {
-      if (decision.partial) {
-        markPartialTaken(position.code);
-      } else {
-        result.sold.push(position.code);
-        pending.delete(position.code);
-      }
-    }
-    appendAction({
-      kind: "sell",
-      code: position.code,
-      reason: decision.reason,
-      ok: sold.ok,
-      message: sold.message,
-    });
-  }
-  writePendingSells([...pending.values()]);
-
-  // 2) 无持仓时全市场选股（每天一次）
-  const state = readAMonitorState();
-  account = loadPaperAccount(now);
-  const watch = loadWatchlist();
-  const today = dayKey(now);
-  // 手动 `monitor once` 没有 daemon state，用 watchlist 的更新时间当作「今天已选过」
-  const lastSelectDay =
-    state?.lastSelectDay ??
-    (Number.isNaN(Date.parse(watch.updatedAt)) ? "" : dayKey(new Date(watch.updatedAt)));
-  if (watch.items.length === 0 || lastSelectDay !== today) {
-    log("开始全市场选股（持仓会强制保留）…");
-    try {
-      const picks = await selectTopWatchlist(10, log);
-      const heldForSelect = account.positions.map((position) => ({
-        code: position.code,
-        name: position.name,
-      }));
-      const merged = mergeWatchlist(picks, heldForSelect);
-      saveWatchlist(merged);
-      if (state) {
-        state.lastSelectDay = today;
-        state.watchlist = merged.items.length;
-        writeState(state);
-      }
-      result.selected = merged.items.map((item) => item.code);
-      result.actions.push(`选股 ${merged.items.length} 只：${merged.items.map((item) => `${item.code}(${item.score})`).join("、")}`);
-      appendAction({ kind: "select", ok: true, codes: result.selected });
-    } catch (err) {
-      result.actions.push(`选股失败：${err instanceof Error ? err.message : String(err)}`);
-      appendAction({ kind: "select", ok: false, message: String(err) });
-    }
-  }
-
-  // 3) 自选股买点（持仓未满时；非交易时段不下单）
-  account = loadPaperAccount(now);
-  if (canTrade && account.positions.length < MAX_POSITIONS) {
-    const held = new Set(account.positions.map((position) => position.code));
-    const candidates = loadWatchlist()
-      .items.filter((item) => !held.has(item.code) && item.score >= BUY_SCORE)
-      .sort((a, b) => b.score - a.score);
-    const equity = equityOf(account, quotes);
-
-    // 市场门控：弱势只卖不买，避免在下跌环境里反复试错
-    let allowBuy = true;
-    if (candidates.length > 0) {
-      const regime = await evaluateMarketRegime();
-      if (!regime.riskOn) {
-        result.actions.push(`市场门控：${regime.reason}，暂停开仓`);
-        appendAction({ kind: "regime", ok: true, message: regime.reason });
-        allowBuy = false;
-      }
-    }
-
-    if (allowBuy)
-      for (const item of candidates) {
-      let quote: Quote;
-      try {
-        quote = await fetchQuote(item.code);
-      } catch {
-        continue;
-      }
-      if (quote.price <= 0 || quote.stockStatus?.includes("停")) continue;
-      if (quote.limitUp && quote.price >= quote.limitUp - 0.001) continue;
-      if (quote.changePct > BUY_MAX_PCT) continue;
-
-      // 日内买点：选股只看日/周/月 MACD，但成交时仍要 30m 确认
-      try {
-        const bars30 = await fetchBars(item.code, {
-          period: "30m",
-          adjust: "backward",
-          limit: 80,
-        });
-        if (!intradayBuyReady(bars30)) continue;
-      } catch {
-        continue;
-      }
-      let qty = Math.floor((equity * POSITION_PCT) / quote.price / 100) * 100;
-      const affordable = Math.floor((account.cash - 10) / quote.price / 100) * 100;
-      qty = Math.min(qty, affordable);
-      if (qty < 100) continue;
-      const bought = await placePaperOrder({ code: item.code, side: "buy", qty }, now);
-      result.actions.push(bought.ok ? `买入 ${item.code}：${bought.message}` : `买入失败 ${item.code}：${bought.message}`);
-      appendAction({ kind: "buy", code: item.code, score: item.score, ok: bought.ok, message: bought.message });
-      if (bought.ok) {
-        result.bought.push(item.code);
-        break; // 每轮最多建一个仓，避免同一分钟把现金打满
-      }
-    }
-  }
-
-  // 4) 确保持仓仍在自选股中（用户手工改过也要纠正）
-  account = loadPaperAccount(now);
-  const held = account.positions.map((position) => ({ code: position.code, name: position.name }));
-  saveWatchlist(mergeWatchlist(loadWatchlist().items, held, now));
-
-  const latestState = readAMonitorState();
-  if (latestState) {
-    latestState.updatedAt = iso(now);
-    latestState.lastRunAt = iso(now);
-    latestState.lastAction = result.actions[0];
-    latestState.watchlist = loadWatchlist().items.length;
-    latestState.holdings = account.positions.length;
-    writeState(latestState);
-  }
-  log(`巡检完成：${result.actions.length > 0 ? result.actions.join("；") : "无动作"}`);
-  return result;
-}
-
-// ─────────────────────────── 常驻进程 ───────────────────────────
-
 function cliEntry(): string {
   return process.argv[1] ?? path.join(__dirname, "cli.js");
 }
@@ -547,10 +328,11 @@ function releaseLock(): void {
   }
 }
 
+
 export async function runAServe(): Promise<void> {
   ensureDir(monitorDir());
   if (!acquireLock()) {
-    process.stderr.write("A 股巡检已在运行（锁被占用），本次退出。\n");
+    process.stderr.write("A 股巡检与监控已在运行（锁被占用），本次退出。\n");
     process.exit(1);
   }
 
@@ -560,43 +342,104 @@ export async function runAServe(): Promise<void> {
     startedAt: iso(now),
     updatedAt: iso(now),
     version: VERSION,
-    nextRunAt: iso(new Date(now.getTime() + CYCLE_MS)),
+    nextRunAt: iso(now),
     watchlist: loadWatchlist().items.length,
     holdings: loadPaperAccount(now).positions.length,
   };
   writeState(state);
-  log(`A 股巡检启动 pid=${process.pid}，窗口 09:25–11:35 / 12:55–15:05，每 15 分钟`);
+  log(`A 股巡检启动 pid=${process.pid}，工作日 09:00–15:30 工作`);
 
-  let nextRun = Date.now();
   let stopped = false;
+  let running = false;
 
-  const tick = async (): Promise<void> => {
-    if (stopped) return;
-    const at = new Date();
+  const refresh = (at: Date): void => {
+    const pause = readPause();
+    const queue = readScheduleQueue();
+    const rules = readRules();
+    const next = queue[0];
     state.updatedAt = iso(at);
+    state.paused = pause.paused;
+    state.queueSize = queue.length;
+    state.nextCheckAt = next?.at;
+    state.nextCheckReason = next?.reason;
+    state.rules = rules.length;
     state.watchlist = loadWatchlist().items.length;
     state.holdings = loadPaperAccount(at).positions.length;
-    writeState(state);
-
-    // 首次启动且从未选股：即使不在窗口也先选一次，否则面板与监控是空的
-    const needsFirstSelect = loadWatchlist().items.length === 0 && !state.lastSelectDay;
-    if (Date.now() < nextRun) return;
-    if (!inTradingWindow(at) && !needsFirstSelect) return;
-
-    nextRun = Date.now() + CYCLE_MS;
-    state.nextRunAt = iso(new Date(nextRun));
-    try {
-      const result = await runMonitorCycle(at);
-      state.lastAction = result.actions[0] ?? "无动作";
-      state.lastError = undefined;
-    } catch (err) {
-      state.lastError = err instanceof Error ? err.message : String(err);
-      log(`巡检失败：${state.lastError}`);
-    }
+    state.nextRunAt = next?.at ?? iso(at);
     writeState(state);
   };
 
-  // 不能 unref：这是常驻进程，定时器是唯一让它保持活着的句柄
+  const tick = async (): Promise<void> => {
+    if (stopped || running) return;
+    const at = new Date();
+    refresh(at);
+
+    if (isPaused()) return;
+    if (!inTradingWindow(at)) return;
+
+    running = true;
+    try {
+      const account = loadPaperAccount(at);
+      const codes = account.positions.map((position) => position.code);
+      const heldQuotes = quoteMap(
+        await mapLimit(codes, async (code) => fetchQuote(code).catch(() => null), 6),
+      );
+      const orderActions = await processPendingOrders(at);
+      const actions = [...orderActions, ...(await enforceStops(at, heldQuotes))];
+      const risk = checkAccountRisk(account, heldQuotes, at);
+
+      await ensureDailySelection(at, state);
+
+      const hit = await checkMonitorRules(at);
+      const due = takeDueSchedule(at);
+      const event = takeMarketEvent(at);
+      const lastInspect = state.lastInspectAt ? Date.parse(state.lastInspectAt) : 0;
+      const fallback = Date.now() - lastInspect >= 60 * 60_000;
+
+      if (!hit && !due && !event && !risk.triggered && !fallback) {
+        if (actions.length > 0) {
+          state.lastAction = actions[0];
+          log(actions.join("；"));
+        }
+        return;
+      }
+
+      const reason =
+        (risk.triggered ? `硬风控：${risk.reasons.join("；")}` : undefined) ??
+        hit?.reason ??
+        due?.reason ??
+        event?.reason ??
+        "兜底巡检";
+      state.lastInspectReason = reason;
+      log(`唤醒巡检：${reason}`);
+      const result = await runAInspect(reason, { origin: "inspect" });
+      if (hit) commitRuleHit(hit.rule);
+      if (risk.triggered && !result.error) markRiskDelivered();
+      state.lastInspectAt = iso(new Date());
+      state.lastInspectSummary = result.summary;
+      state.lastInspectTools = result.toolCalls;
+      state.lastAction = result.summary || actions[0];
+      state.lastError = result.error;
+
+      if (result.error) {
+        const entry = pushSchedule({
+          minutes: 15,
+          reason: `巡检失败退避：${result.error}`,
+          slot: "next",
+          origin: "inspect",
+        });
+        state.nextCheckAt = entry.at;
+      }
+    } catch (err) {
+      state.lastError = err instanceof Error ? err.message : String(err);
+      log(`巡检失败：${state.lastError}`);
+      pushSchedule({ minutes: 15, reason: "巡检异常退避", slot: "next", origin: "inspect" });
+    } finally {
+      running = false;
+      refresh(new Date());
+    }
+  };
+
   const timer = setInterval(() => void tick(), TICK_MS);
   void tick();
 
@@ -618,10 +461,201 @@ export async function runAServe(): Promise<void> {
   });
 }
 
+/** 手动巡检：不发指令、不自动买；走同一套 Agent 巡检与排期 */
+export async function runManualInspection(): Promise<CycleResult> {
+  const at = new Date();
+  const actions: string[] = [];
+  const account = loadPaperAccount(at);
+  const quotes = quoteMap(
+    await mapLimit(
+      account.positions.map((position) => position.code),
+      async (code) => fetchQuote(code).catch(() => null),
+      6,
+    ),
+  );
+  actions.push(...(await enforceStops(at, quotes)));
+  const state = readAMonitorState();
+  if (state) await ensureDailySelection(at, state);
+  const result = await runAInspect("手动巡检", { origin: "manual" });
+  actions.push(`巡检：${result.summary}`);
+  if (result.error) actions.push(`巡检失败：${result.error}`);
+  return { actions, sold: [], bought: [], selected: [] };
+}
+
+/** 挂单撮合：价格穿越则成交，收盘前未成交则过期 */
+async function processPendingOrders(now: Date): Promise<string[]> {
+  const open = listOrders().filter((order) => order.status === "open");
+  if (open.length === 0) return [];
+  const quotes = quoteMap(
+    await mapLimit(
+      [...new Set(open.map((order) => order.code))],
+      async (code) => fetchQuote(code).catch(() => null),
+      6,
+    ),
+  );
+  const { fills, expired } = matchOrders(quotes, now);
+  const actions: string[] = [];
+  for (const order of fills) {
+    const result = await placePaperOrder(
+      { code: order.code, side: order.side, qty: order.qty, price: order.limitPrice },
+      now,
+    );
+    actions.push(
+      result.ok ? `挂单成交 ${describeOrder(order)}` : `挂单成交失败 ${order.id}：${result.message}`,
+    );
+    appendAAction({
+      kind: order.side,
+      code: order.code,
+      ok: result.ok,
+      status: result.ok ? "filled" : "rejected",
+      message: result.message,
+      origin: order.origin,
+    });
+  }
+  for (const order of expired) {
+    actions.push(`挂单过期 ${describeOrder(order)}`);
+    appendAAction({
+      kind: "expire",
+      code: order.code,
+      ok: true,
+      status: "expired",
+      message: `挂单过期 ${order.id}`,
+      origin: order.origin,
+    });
+  }
+  return actions;
+}
+
+/** 硬风控（代码强制执行，不依赖 Agent）：ATR 止损 / 移动止盈 / 分批 + T+1 待卖 */
+async function enforceStops(now: Date, quotes: Map<string, Quote>): Promise<string[]> {
+  const actions: string[] = [];
+  const account = loadPaperAccount(now);
+  if (account.positions.length === 0) return actions;
+  const indicators = await loadIndicators();
+  const pending = new Map(readPendingSells().map((item) => [item.code, item]));
+  const held = new Set(account.positions.map((position) => position.code));
+  for (const code of [...pending.keys()]) if (!held.has(code)) pending.delete(code);
+
+  for (const position of account.positions) {
+    const quote = quotes.get(position.code);
+    if (!quote || quote.price <= 0) continue;
+    let decision = shouldSell(position, quote, indicators.get(position.code));
+    if (!decision) {
+      try {
+        const bars30 = await fetchBars(position.code, {
+          period: "30m",
+          adjust: "backward",
+          limit: 80,
+        });
+        if (intradayWeak(bars30)) {
+          decision = {
+            reason: "30m 跌破 MA20 与前 10 根低点",
+            sellable: position.available > 0,
+            qty: position.available,
+          };
+        }
+      } catch {
+        // 取不到 30m 继续用 ATR
+      }
+    }
+    if (!decision) {
+      if (pending.delete(position.code)) {
+        actions.push(`${position.code} 风险已解除，撤销待卖`);
+        appendAAction({ kind: "risk-clear", code: position.code, ok: true });
+      }
+      continue;
+    }
+    if (!decision.sellable) {
+      if (!pending.has(position.code)) {
+        pending.set(position.code, {
+          code: position.code,
+          name: position.name,
+          reason: decision.reason,
+          since: dayKey(now),
+        });
+        actions.push(`T+1 锁定 ${position.code} ${decision.reason}，下一交易日处理`);
+        appendAAction({ kind: "risk-locked", code: position.code, reason: decision.reason, ok: true });
+      }
+      continue;
+    }
+    const qty = Math.min(decision.qty ?? position.available, position.available);
+    if (qty < 1) continue;
+    const sold = await placePaperOrder({ code: position.code, side: "sell", qty }, now);
+    actions.push(
+      sold.ok
+        ? `卖出 ${position.code} ${decision.reason}：${sold.message}`
+        : `卖出失败 ${position.code}：${sold.message}`,
+    );
+    if (sold.ok) {
+      if (decision.partial) markPartialTaken(position.code);
+      else pending.delete(position.code);
+    }
+    appendAAction({
+      kind: "sell",
+      code: position.code,
+      reason: decision.reason,
+      ok: sold.ok,
+      message: sold.message,
+    });
+  }
+  writePendingSells([...pending.values()]);
+  return actions;
+}
+
+/** 无持仓时每天重选一次（选股属于巡检的“综合选股”层，不是交易） */
+async function ensureDailySelection(now: Date, state: AMonitorState): Promise<void> {
+  const account = loadPaperAccount(now);
+  const watch = loadWatchlist();
+  const today = dayKey(now);
+  const lastSelectDay =
+    state.lastSelectDay ??
+    (Number.isNaN(Date.parse(watch.updatedAt)) ? "" : dayKey(new Date(watch.updatedAt)));
+  if (watch.items.length > 0 && lastSelectDay === today) return;
+  log("开始全市场选股（持仓强制保留）…");
+  try {
+    const picks = await selectTopWatchlist(10, log);
+    const merged = mergeWatchlist(
+      picks,
+      account.positions.map((position) => ({ code: position.code, name: position.name })),
+    );
+    saveWatchlist(merged);
+    state.lastSelectDay = today;
+    appendAAction({ kind: "select", ok: true, codes: merged.items.map((item) => item.code) });
+  } catch (err) {
+    state.lastError = err instanceof Error ? err.message : String(err);
+    appendAAction({ kind: "select", ok: false, message: state.lastError });
+  }
+}
+
+/** 监控规则评估：持仓优先，再自选 */
+async function checkMonitorRules(
+  now: Date,
+): Promise<{ rule: import("./rules").MonitorRule; reason: string } | null> {
+  const rules = readRules();
+  if (rules.length === 0) return null;
+  const held = heldCodes();
+  const sorted = [...rules].sort(
+    (a, b) => Number(held.has(b.code)) - Number(held.has(a.code)),
+  );
+  const codes = [...new Set(sorted.map((rule) => rule.code))];
+  const quotes = quoteMap(
+    await mapLimit(codes, async (code) => fetchQuote(code).catch(() => null), 6),
+  );
+  const indicators = await loadIndicators();
+  return evaluateRules(sorted, quotes, indicators, now);
+}
+
 export interface AServiceStatus {
   running: boolean;
   state: AMonitorState | null;
   stale: boolean;
+}
+
+export interface StartAServiceResult {
+  ok: boolean;
+  started: boolean;
+  state?: AMonitorState;
+  error?: string;
 }
 
 export function aServiceStatus(): AServiceStatus {
@@ -715,6 +749,7 @@ export async function stopAService(): Promise<{ ok: boolean; stopped: boolean; e
 }
 
 /** 手工维护自选股时，把当前持仓带进来做“不可删除”校验 */
+
 export function heldCodes(): Set<string> {
   return new Set(loadPaperAccount().positions.map((position) => position.code));
 }

@@ -154,6 +154,7 @@ function signed(value: number, digits = 2): string {
 /** `/info` 的纯文本输出（无 ANSI），TUI 对话框与微信共用 */
 export function aInfoLines(data: APanelData): string[] {
   const lines: string[] = [];
+  const divider = "─".repeat(28);
   lines.push(`A 股分析 · ${sessionLabel(sessionKind())}`);
 
   if (data.indices.length > 0) {
@@ -161,13 +162,13 @@ export function aInfoLines(data: APanelData): string[] {
       data.indices.map((item) => `${item.name} ${fmt(item.price)}（${signed(item.pct)}%）`).join(" · "),
     );
   }
-  lines.push("");
 
   // 账户（与 btc 面板的「账户 / 模拟盘」对应）
-  lines.push("【账户】");
+  lines.push(divider);
+  lines.push("账户（模拟盘）");
   const summary = data.account ? accountSummary(data.account) : undefined;
   if (!data.account || !summary) {
-    lines.push("模拟盘 未开始（初始 1,000,000 · T+1 · 100 股整手）");
+    lines.push("未开始（初始 1,000,000 · T+1 · 100 股整手）");
   } else {
     lines.push(
       `总资产 ${fmt(summary.equity)}（${signed(summary.totalPnlPct)}%）· 可用 ${fmt(summary.cash)}` +
@@ -196,11 +197,12 @@ export function aInfoLines(data: APanelData): string[] {
       }
     }
   }
-  lines.push("");
 
   // 风控（对应 btc 的「风控」区块；A 股是固定规则）
+  lines.push(divider);
+  lines.push("风控");
   lines.push(
-    "【风控】ATR 止损（1.5×ATR，下限 5%）· 浮盈 +8% 移动止盈 · +12% 分批止盈 · 最多 5 仓 × 20% · T+1",
+    "ATR 止损（1.5×ATR，下限 5%）· 浮盈 +8% 移动止盈 · +12% 分批止盈 · 最多 5 仓 × 20% · T+1",
   );
   if (data.riskLocks.length > 0) {
     lines.push(
@@ -208,26 +210,32 @@ export function aInfoLines(data: APanelData): string[] {
         data.riskLocks.map((item) => `${item.code} ${item.reason}`).join("、"),
     );
   }
-  lines.push("");
 
   // 巡检（独立进程）
+  lines.push(divider);
+  lines.push("巡检");
   const service = aServiceStatus();
   lines.push(
-    "【巡检】" +
-      (service.running
-        ? `运行中（pid ${service.state?.pid} · 上一轮 ${service.state?.lastRunAt?.slice(11, 16) ?? "—"} · 下一轮 ${service.state?.nextRunAt?.slice(11, 16) ?? "—"}）`
-        : "未运行（/start 或 xzh a serve）"),
+    service.running
+      ? `运行中（pid ${service.state?.pid} · 上一轮 ${service.state?.lastRunAt?.slice(11, 16) ?? "—"} · 下一轮 ${service.state?.nextCheckAt?.slice(11, 16) ?? "未排期"}）`
+      : "未运行（/start 或 xzh a serve）",
   );
+  if (service.state?.paused) lines.push("  已暂停（进程仍在，/pause resume 恢复）");
+  if (service.state?.nextCheckAt) {
+    lines.push(`  下一轮排期：${service.state.nextCheckAt}${service.state.nextCheckReason ? `（${service.state.nextCheckReason}）` : ""}`);
+  }
+  lines.push(`  监控规则 ${service.state?.rules ?? 0} 条 · 排期 ${service.state?.queueSize ?? 0} 条`);
   if (service.state?.lastSelectDay) lines.push(`  上次全市场选股：${service.state.lastSelectDay}`);
+  if (service.state?.lastAction) lines.push(`  最近一轮：${service.state.lastAction}`);
   if (service.state?.lastError) lines.push(`  最近错误：${service.state.lastError}`);
-  for (const action of data.lastActions.slice(0, 3)) {
+  for (const action of data.lastActions.slice(0, 5)) {
     lines.push(`  ${action}`);
   }
-  lines.push("");
 
   // 监控（自选股池，每 15 分钟）
+  lines.push(divider);
   const watch = loadWatchlist();
-  lines.push(`【监控】自选 ${watch.items.length}/10 · 每 15 分钟 · ★=持仓`);
+  lines.push(`监控（自选 ${watch.items.length}/10 · 每 15 分钟 · ★=持仓）`);
   if (watch.items.length === 0) {
     lines.push("  监控池为空（xzh a serve 会自动选股）");
   }
@@ -238,7 +246,7 @@ export function aInfoLines(data: APanelData): string[] {
   }
 
   // 与 a_order / a_account 的口径一致，防止模型把模拟盘说成实盘
-  lines.push("");
+  lines.push(divider);
   lines.push("以上为模拟盘数据，不涉及真钱。");
   return lines;
 }

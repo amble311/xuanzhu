@@ -552,7 +552,8 @@ ${ansi.bold}用法${ansi.reset}
   ${ansi.green}xzh btc stop${ansi.reset}           停止 btc 常驻后端（退出界面不会停它；${ansi.gray}--paper${ansi.reset} 只停模拟盘）
   ${ansi.green}xzh btc status${ansi.reset}         查看观察 / 模拟盘两个后端与排期队列
   ${ansi.green}xzh a${ansi.reset}                   进入 A 股分析模式：工作目录固定为 ${ansi.gray}${getAShareHome()}${ansi.reset}（不可 /switch）
-  ${ansi.green}xzh a serve [status|stop]${ansi.reset} A 股独立巡检：盘中每 15 分钟选股 / 监控 / 模拟买卖
+  ${ansi.green}xzh a serve [status|stop]${ansi.reset} A 股独立巡检与监控：盘中每 15 分钟选股 / 监控 / 模拟买卖
+  ${ansi.green}xzh a start|stop${ansi.reset}         启动 / 停止 A 股巡检（简写）
   ${ansi.green}xzh a watch [add|remove]${ansi.reset}  自选股（≤10，持仓强制保留）
   ${ansi.green}xzh a quote <代码...>${ansi.reset}    实时快照；指数写 1A0001
   ${ansi.green}xzh a bars <代码>${ansi.reset}        K 线（--period / --adjust / --limit / --from）

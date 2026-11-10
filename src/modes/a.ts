@@ -27,8 +27,8 @@ export function createAShareMode(): AgentMode {
       return {
         ok: service.ok,
         message: service.ok
-          ? `A 股巡检${service.started ? "已启动" : "已在运行"}（pid ${service.state?.pid}，盘中每 15 分钟）`
-          : `A 股巡检未启动：${service.error ?? "未知原因"}`,
+          ? `A 股巡检与监控${service.started ? "已启动" : "已在运行"}（pid ${service.state?.pid}，工作日 09:00–15:30）`
+          : `A 股巡检与监控未启动：${service.error ?? "未知原因"}`,
       };
     },
     promptSection: `## 当前模式：A 股分析

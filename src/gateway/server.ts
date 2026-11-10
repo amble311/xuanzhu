@@ -11,8 +11,11 @@ import { describeTrigger, readTriggers } from "../btc/triggers";
 import { setPaused } from "../btc/pause";
 import { ensureBtcBackend, stopBtcBackend } from "../btc/daemon";
 import { startAService, stopAService } from "../a/monitor";
+import { readPause as readAPause, setPaused as setAPaused } from "../a/pause";
 import { resetPaperLedger } from "../btc/paper-reset";
 import { expandHome, getDataSubdir } from "../utils/paths";
+import { readRules, describeRule } from "../a/rules";
+import { readScheduleQueue } from "../a/schedule";
 import { loadWatchlist } from "../a/watchlist";
 import { createProvider } from "../llm";
 import { createAShareMode } from "../modes/a";
@@ -35,6 +38,7 @@ import {
 import { loadAccount } from "./weixin/paths";
 import { startWeixinChannel, type WeixinChannel } from "./weixin/channel";
 import { startFeedForwarder, type FeedForwarder } from "./feed";
+import { startOutbox, type Outbox } from "./outbox";
 
 /**
  * `xzh gateway run`：常驻后台进程。
@@ -358,8 +362,8 @@ export async function runGateway(): Promise<void> {
             messages.push(
               result.ok
                 ? result.stopped
-                  ? "✓ 已停止 A 股巡检"
-                  : "A 股巡检本来没在运行"
+                  ? "✓ 已停止 A 股巡检与监控"
+                  : "A 股巡检与监控本来没在运行"
                 : `✗ 停止失败：${result.error}`,
             );
           }
@@ -379,8 +383,8 @@ export async function runGateway(): Promise<void> {
             messages.push(
               result.ok
                 ? result.started
-                  ? "✓ 已启动 A 股巡检"
-                  : "A 股巡检已在运行"
+                  ? "✓ 已启动 A 股巡检与监控"
+                  : "A 股巡检与监控已在运行"
                 : `✗ 启动失败：${result.error ?? "未知原因"}`,
             );
           }
@@ -388,8 +392,18 @@ export async function runGateway(): Promise<void> {
         return messages.join("\n");
       }
       case "pause": {
-        if (modeState?.name !== "btc") return "/pause 仅在 btc / btc moni 模式下有效";
         const resume = arg.trim().toLowerCase() === "resume";
+        if (modeState?.name === "a") {
+          if (arg.trim().toLowerCase() === "status") {
+            const pause = readAPause();
+            return pause.paused
+              ? `A 股巡检已暂停（${pause.at ?? "?"}，/pause resume 恢复）`
+              : "A 股巡检运行中（/pause 可暂停，进程仍在）";
+          }
+          setAPaused(!resume, "/pause");
+          return resume ? "✓ 已恢复 A 股巡检与交易" : "✓ 已暂停 A 股巡检与交易（/pause resume 恢复）";
+        }
+        if (modeState?.name !== "btc") return "/pause 仅在 btc / btc moni / a 模式下有效";
         setPaused(getBtcHome(), !resume, "/pause");
         return resume ? "✓ 已恢复 btc 后端巡检" : "✓ 已暂停 btc 后端巡检（/pause resume 恢复）";
       }
@@ -405,8 +419,20 @@ export async function runGateway(): Promise<void> {
         }
         if (modeState?.name === "a") {
           const watch = loadWatchlist();
-          if (watch.items.length === 0) return "A 股监控池为空（xzh a serve 会自动选股）";
-          return `A 股监控池 ${watch.items.length}/10：\n` + watch.items.map((item) => `- ${item.code} ${item.name} ${item.score} 分`).join("\n");
+          const rules = readRules();
+          const queue = readScheduleQueue();
+          const lines: string[] = [];
+          lines.push(
+            `A 股监控池 ${watch.items.length}/10 · 规则 ${rules.length} 条 · 排期 ${queue.length} 条`,
+          );
+          if (queue[0]) lines.push(`下一轮巡检：${queue[0].at} ${queue[0].reason}`);
+          for (const item of watch.items) {
+            lines.push(`- ${item.code} ${item.name} ${item.score} 分`);
+          }
+          for (const rule of rules.slice(0, 10)) {
+            lines.push(`规则：${describeRule(rule)}（${rule.note}）`);
+          }
+          return lines.join("\n");
         }
         return "/wakeup 仅在 btc / a 模式下有效";
       }
@@ -491,10 +517,10 @@ export async function runGateway(): Promise<void> {
           getBtcHome(),
           modeState.paper ? "paper" : "live",
         );
-        return btcInfoLines(data).join("\n");
+        return btcInfoLines(data).join("\n").replace(/^\n+/, "");
       }
       const data = await collectASharePanelData();
-      return aInfoLines(data).join("\n");
+      return aInfoLines(data).join("\n").replace(/^\n+/, "");
     }
 
     if (command.kind === "xzh") {
@@ -669,6 +695,7 @@ export async function runGateway(): Promise<void> {
 
   let weixin: WeixinChannel | null = null;
   let feed: FeedForwarder | null = null;
+  let outbox: Outbox | null = null;
 
   server.listen(port, "127.0.0.1", () => {
     log(`gateway 已启动 pid=${process.pid} port=${port} cwd=${home}`);
@@ -691,11 +718,20 @@ export async function runGateway(): Promise<void> {
         onMessage: (text) => handleMessage(text),
       });
       log(`微信频道已启动 account=${account.accountId}`);
+      // 出站队列：先落盘再串行发送，失败退避重试，gateway 重启不丢
+      outbox = startOutbox({
+        gatewayHome: home,
+        log,
+        send: (text) => (weixin ? weixin.sendToLastPeer(text) : Promise.resolve(false)),
+      });
       // 巡检内容转发：btc 后端结论 / 错误、A 股选股 / 买卖，推给最近对话的对端
       feed = startFeedForwarder({
         gatewayHome: home,
         log,
-        send: (text) => (weixin ? weixin.sendToLastPeer(text) : Promise.resolve(false)),
+        send: async (text) => {
+          outbox?.enqueue(text);
+          return true;
+        },
       });
     } else {
       log("微信未登录（要接微信请运行 xzh gateway weixin login）");
@@ -735,6 +771,7 @@ export async function runGateway(): Promise<void> {
     closing = true;
     log("gateway 正在退出");
     feed?.stop();
+    outbox?.stop();
     weixin?.stop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     cleanup();
