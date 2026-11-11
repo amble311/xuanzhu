@@ -199,13 +199,16 @@ export async function runAInspect(reason: string, options: { origin?: "inspect" 
   }
   const provider = createProvider(config, active);
   let text = "";
+  let reasoning = "";
   let toolCalls = 0;
 
   const events: AgentEvents = {
     onText: (delta) => {
       text += delta;
     },
-    onReasoning: () => undefined,
+    onReasoning: (delta) => {
+      reasoning += delta;
+    },
     onToolStart: (call) => {
       toolCalls += 1;
       appendLog(`工具 ${call.name}`);
@@ -267,7 +270,48 @@ export async function runAInspect(reason: string, options: { origin?: "inspect" 
     appendLog(`未发现有效排期，兜底 ${entry.at}`);
   }
 
-  const summary = text.trim().slice(0, SUMMARY_LIMIT) || "巡检完成（无文本结论）";
+  let summary = text.trim().slice(0, SUMMARY_LIMIT);
+
+  // 模型有时只输出思考、正文为空；用一次短调用把思考与最近动作压成结论，
+  // 避免微信/TUI 只看到“没有输出”。
+  if (!summary) {
+    try {
+      let fallback = "";
+      const controller2 = new AbortController();
+      const timer2 = setTimeout(() => controller2.abort(), 30_000);
+      try {
+        for await (const chunk of provider.chat({
+          messages: [
+            {
+              role: "system",
+              content:
+                "你是 A 股巡检总结器。根据思考片段与最近动作，输出一句可执行的中文结论（持仓/买卖/观望 + 下一步），不要复述思考，不要调用工具。",
+            },
+            {
+              role: "user",
+              content:
+                `思考片段：\n${reasoning.slice(-4_000) || "（无）"}\n\n` +
+                "最近动作：见上一轮上下文。请直接输出一句结论。",
+            },
+          ],
+          tools: [],
+          temperature: 0.2,
+          maxTokens: 300,
+          signal: controller2.signal,
+        })) {
+          if (chunk.type === "text") fallback += chunk.text;
+        }
+      } finally {
+        clearTimeout(timer2);
+      }
+      summary = fallback.trim().slice(0, SUMMARY_LIMIT);
+    } catch {
+      const lines = reasoning.trim().split(/\n+/).filter(Boolean);
+      summary = lines.length > 0 ? `（自动摘要）${lines[lines.length - 1].slice(-300)}` : "";
+    }
+  }
+
+  summary ||= "巡检完成（模型未生成正文结论，也未产生动作）";
   appendLog(`巡检结论：${summary}`);
   appendAInspectEvent("text", summary);
   appendAInspectEvent("end", `工具 ${toolCalls} 次`);

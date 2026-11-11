@@ -33,6 +33,7 @@ export const SUMMARY_LIMIT = 600;
 
 const INSPECT_PROMPT = `你现在处于**后台巡检 / 无人值守**：没有用户在终端前，也没有人会回答你的提问。
 这一轮你必须**自主决策到底** —— 该开就开、该平就平、该撤就撤，直接调用工具执行；
+最终回复必须包含一段**正文结论**（不能只把内容留在思考/reasoning 里）；即使选择观望，也要写“结论：…”。
 不要写「请确认」「等你回复」（没有人会回），也不要只给方案不执行。
 
 任务：判断当前是否有值得执行的 BTC 交易机会，并决定下次巡检时间。
@@ -154,6 +155,7 @@ export async function runInspectCycle(
   }
 
   let text = "";
+  let reasoning = "";
   let toolCalls = 0;
 
   // ── 过程流：前端据此实时展示「后台在想什么」 ──
@@ -195,6 +197,7 @@ export async function runInspectCycle(
       flush();
     },
     onReasoning: (delta) => {
+      reasoning += delta;
       reasoningBuf += delta;
       flush();
     },
@@ -324,7 +327,52 @@ export async function runInspectCycle(
   }
 
   flush(true);
-  const summary = text.trim().slice(-SUMMARY_LIMIT);
+  let summary = text.trim().slice(-SUMMARY_LIMIT);
+
+  // 有些模型会把整轮内容全放在 reasoning 里，正文为空；直接显示“没有结论”
+  // 等于让后台巡检静默。这里用一次短调用把「思考 + 最近动作」压成结论。
+  if (!summary) {
+    const actions = readActions(home)
+      .slice(0, 6)
+      .map((action) => `${action.ts} ${action.kind} ${action.symbol ?? ""} ${action.status} ${action.reason ?? ""}`)
+      .join("\n");
+    try {
+      const controller2 = new AbortController();
+      const timer2 = setTimeout(() => controller2.abort(), 30_000);
+      let fallback = "";
+      try {
+        for await (const chunk of provider.chat({
+          messages: [
+            {
+              role: "system",
+              content:
+                "你是巡检总结器。根据给定的思考片段与最近动作，写一句可执行的中文结论（持仓/下单/观望 + 下一步），不要复述思考过程，不要调用工具。",
+            },
+            {
+              role: "user",
+              content:
+                `思考片段：\n${reasoning.slice(-4_000) || "（无）"}\n\n` +
+                `最近动作：\n${actions || "（无）"}\n\n` +
+                "请直接输出一句结论。",
+            },
+          ],
+          tools: [],
+          temperature: 0.2,
+          maxTokens: 300,
+          signal: controller2.signal,
+        })) {
+          if (chunk.type === "text") fallback += chunk.text;
+        }
+      } finally {
+        clearTimeout(timer2);
+      }
+      summary = fallback.trim().slice(-SUMMARY_LIMIT);
+    } catch {
+      // 总结调用失败就退回最后一句思考
+      const lines = reasoning.trim().split(/\n+/).filter(Boolean);
+      summary = lines.length > 0 ? `（自动摘要）${lines[lines.length - 1].slice(-300)}` : "";
+    }
+  }
   emit("round-end", summary || "（本轮没有输出结论）");
 
   // 计划不在这一层读：它是「队列」，由后端定时器按到期时间消费
