@@ -5700,9 +5700,10 @@ export class TuiApp {
           `${service.state.paused ? " · 已暂停" : ""}${ansi.reset}`,
       );
     }
-    if (service.state?.lastSelectDay) {
-      push(`${ansi.gray}   上次选股 ${service.state.lastSelectDay}${ansi.reset}`);
-    }
+    push(
+      `${ansi.gray}   收盘选股 每个交易日 16:00` +
+        `${service.state?.lastSelectDay ? ` · 上次 ${service.state.lastSelectDay}` : ""}${ansi.reset}`,
+    );
     for (const action of data.lastActions.slice(0, 2)) {
       push(`${ansi.gray}   ${truncate(action, Math.max(10, width - 4))}${ansi.reset}`);
     }

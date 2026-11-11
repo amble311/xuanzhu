@@ -31,6 +31,8 @@ import {
   type PaperAccount,
   type RuleKind,
 } from "../a";
+import { selectTopWatchlist } from "../a/score";
+import { mergeWatchlist, saveWatchlist } from "../a/watchlist";
 import {
   fetchBars,
   fetchQuote,
@@ -482,6 +484,42 @@ const orderTool: ToolDefinition = {
   },
 };
 
+const selectTool: ToolDefinition = {
+  name: "a_select",
+  modes: A_MODES,
+  description:
+    "重新跑一次完整 A 股选股：全市场日线 MACD 回升 → 周线 MACD 回升 → 月线 MACD 回升 → 日线详细评分取前 10，" +
+    "并把结果写入自选股（持仓强制保留）。**用户说“重新选股”时直接调这个**，不要用 a_screen + a_bars 手动模拟；" +
+    "全流程约 1–2 分钟，可用 emit 看进度。",
+  parameters: {
+    type: "object",
+    properties: {
+      limit: { type: "number", description: "保留只数，默认 10（上限 10）" },
+    },
+    required: [],
+  },
+  async execute(args, ctx): Promise<ToolResult> {
+    const limit = Math.max(1, Math.min(10, Number(args.limit) || 10));
+    const picks = await selectTopWatchlist(limit, (message) => ctx.emit?.(message));
+    const account = loadPaperAccount();
+    const merged = mergeWatchlist(
+      picks,
+      account.positions.map((position) => ({ code: position.code, name: position.name })),
+    );
+    saveWatchlist(merged);
+    const lines = merged.items.map(
+      (item, index) => `${index + 1}. ${item.code} ${item.name} ${item.score} 分`,
+    );
+    return {
+      ok: true,
+      content:
+        `✓ 选股完成：${picks.length}/10 只（不足不补），已写入自选股\n` +
+        (lines.length > 0 ? lines.join("\n") : "（本次没有符合条件的股票）"),
+      summary: `重新选股 ${picks.length} 只`,
+    };
+  },
+};
+
 // ─────────────────────────── 巡检闭环工具 ───────────────────────────
 
 const scheduleTool: ToolDefinition = {
@@ -685,6 +723,7 @@ const removeTriggerTool: ToolDefinition = {
 export const aShareTools: ToolDefinition[] = [
   snapshotTool,
   screenTool,
+  selectTool,
   quoteTool,
   barsTool,
   accountTool,

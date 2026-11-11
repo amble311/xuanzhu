@@ -141,6 +141,7 @@ export async function runGateway(): Promise<void> {
   let replyBuffer = "";
   /** 需要确认的工具：无人在场时拒绝，并把原因带回给调用方 */
   let deniedNote = "";
+  let lastToolNote = "";
 
   /** 当前模式（持久化在 run/mode.json，重启后仍是同一个频道模式） */
   let modeState = readGatewayMode(home);
@@ -565,7 +566,10 @@ export async function runGateway(): Promise<void> {
       },
       onReasoning: () => undefined,
       onToolStart: (call) => log(`工具 ${call.name}`),
-      onToolEnd: () => undefined,
+      onToolEnd: (call, result) => {
+        const brief = (result.content ?? "").replace(/\s+/g, " ").trim().slice(0, 120);
+        if (brief) lastToolNote = `${call.name} → ${brief}`;
+      },
       onStatus: () => undefined,
       onNotice: (message) => log(`提示 ${message}`),
       // gateway 目前没有交互式确认通道；未来接微信时可以把这里换成「发消息问用户」
@@ -621,7 +625,11 @@ export async function runGateway(): Promise<void> {
       } finally {
         clearTimeout(timer);
       }
-      const reply = replyBuffer.trim() || "（本轮没有文本输出）";
+      const reply =
+        replyBuffer.trim() ||
+        (lastToolNote
+          ? `（本轮没有文本输出，但工具已执行：${lastToolNote}）`
+          : "（本轮没有文本输出；可能是模型超时或工具轮数用尽，请重试一次）");
       return deniedNote ? `${reply}\n\n[${deniedNote}]` : reply;
     });
     // 无论成败都要让队列继续，否则一条失败的消息会把后续全部堵死

@@ -567,6 +567,9 @@ async function statusCommand(parsed: ParsedArgs): Promise<void> {
     }\n`,
   );
   process.stdout.write(
+    `  ${padEnd("收盘选股", 10)}每交易日 16:00${service.state?.lastSelectDay ? ` · 上次 ${service.state.lastSelectDay}` : ""}\n`,
+  );
+  process.stdout.write(
     `  ${padEnd("监控规则", 10)}${readRules().length} 条` +
       `${ansi.gray} · 排期 ${readScheduleQueue().length} 条` +
       `${readPause().paused ? " · 已暂停" : ""}${ansi.reset}\n`,
@@ -715,7 +718,7 @@ async function serveCommand(parsed: ParsedArgs): Promise<void> {
   const result = await startAService();
   process.stdout.write(
     result.ok
-      ? `${ansi.green}✓ A 股巡检与监控已启动${ansi.reset}${ansi.gray} pid ${result.state?.pid} · 工作日 09:00–15:30 · 监控每 60 秒 / 巡检按排期${ansi.reset}\n`
+      ? `${ansi.green}✓ A 股巡检与监控已启动${ansi.reset}${ansi.gray} pid ${result.state?.pid} · 工作日 09:00–15:30 · 监控 60 秒 / 巡检按排期 / 16:00 选股${ansi.reset}\n`
       : `${ansi.red}✗ 启动失败：${result.error}${ansi.reset}\n`,
   );
 }

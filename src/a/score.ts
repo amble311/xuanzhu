@@ -81,9 +81,22 @@ function baseUniverse(rows: SnapshotRow[]): SnapshotRow[] {
 export async function selectTopWatchlist(
   limit = 10,
   onProgress?: (message: string) => void,
+  options: { refresh?: boolean } = {},
 ): Promise<WatchItem[]> {
-  onProgress?.("读取全市场快照与日线指标…");
-  const [loaded, indicators] = await Promise.all([loadSnapshot(), loadIndicators()]);
+  onProgress?.(
+    options.refresh ? "刷新全市场快照与日线指标（收盘后选股）…" : "读取全市场快照与日线指标…",
+  );
+  const [loaded, indicators] = await Promise.all([
+    loadSnapshot({ refresh: options.refresh }),
+    loadIndicators({
+      refresh: options.refresh,
+      onProgress: (done, total) => {
+        if (done === total || done % 1000 === 0) {
+          onProgress?.(`重算日线指标 ${done}/${total}…`);
+        }
+      },
+    }),
+  ]);
   const universe = baseUniverse(loaded.snapshot.rows);
 
   // 1) 日线 MACD 柱体回升（缓存指标，零额外请求）

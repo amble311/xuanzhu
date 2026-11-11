@@ -225,7 +225,9 @@ export function aInfoLines(data: APanelData): string[] {
     lines.push(`  下一轮排期：${service.state.nextCheckAt}${service.state.nextCheckReason ? `（${service.state.nextCheckReason}）` : ""}`);
   }
   lines.push(`  监控规则 ${service.state?.rules ?? 0} 条 · 排期 ${service.state?.queueSize ?? 0} 条`);
-  if (service.state?.lastSelectDay) lines.push(`  上次全市场选股：${service.state.lastSelectDay}`);
+  lines.push(
+    `  收盘选股：每个交易日 16:00${service.state?.lastSelectDay ? ` · 上次 ${service.state.lastSelectDay}` : ""}`,
+  );
   if (service.state?.lastAction) lines.push(`  最近一轮：${service.state.lastAction}`);
   if (service.state?.lastError) lines.push(`  最近错误：${service.state.lastError}`);
   for (const action of data.lastActions.slice(0, 5)) {

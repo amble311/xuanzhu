@@ -81,6 +81,8 @@ export interface AMonitorState {
   lastInspectReason?: string;
   lastInspectSummary?: string;
   lastInspectTools?: number;
+  /** 收盘后固定选股：最近一次尝试（防止失败后每 60 秒重试） */
+  lastSelectAttemptAt?: string;
 }
 
 export interface CycleResult {
@@ -347,10 +349,11 @@ export async function runAServe(): Promise<void> {
     holdings: loadPaperAccount(now).positions.length,
   };
   writeState(state);
-  log(`A 股巡检启动 pid=${process.pid}，工作日 09:00–15:30 工作`);
+  log(`A 股巡检启动 pid=${process.pid}，工作日 09:00–15:30 巡检；收盘后 16:00 固定选股`);
 
   let stopped = false;
   let running = false;
+  let selecting = false;
 
   const refresh = (at: Date): void => {
     const pause = readPause();
@@ -374,6 +377,19 @@ export async function runAServe(): Promise<void> {
     const at = new Date();
     refresh(at);
 
+    // 固定任务：收盘后 1 小时重新选股（只更新自选股，持仓强制保留）。
+    // 它不交易，因此暂停巡检时也照常执行；放在交易窗口判断之前，因为 16:00 已收盘。
+    if (shouldRunAfterCloseSelection(at, state.lastSelectDay, state.lastSelectAttemptAt)) {
+      if (selecting) return;
+      selecting = true;
+      try {
+        const selected = await maybeRunAfterCloseSelection(at, state);
+        if (selected) refresh(new Date());
+      } finally {
+        selecting = false;
+      }
+    }
+
     if (isPaused()) return;
     if (!inTradingWindow(at)) return;
 
@@ -387,8 +403,6 @@ export async function runAServe(): Promise<void> {
       const orderActions = await processPendingOrders(at);
       const actions = [...orderActions, ...(await enforceStops(at, heldQuotes))];
       const risk = checkAccountRisk(account, heldQuotes, at);
-
-      await ensureDailySelection(at, state);
 
       const hit = await checkMonitorRules(at);
       const due = takeDueSchedule(at);
@@ -474,8 +488,6 @@ export async function runManualInspection(): Promise<CycleResult> {
     ),
   );
   actions.push(...(await enforceStops(at, quotes)));
-  const state = readAMonitorState();
-  if (state) await ensureDailySelection(at, state);
   const result = await runAInspect("手动巡检", { origin: "manual" });
   actions.push(`巡检：${result.summary}`);
   if (result.error) actions.push(`巡检失败：${result.error}`);
@@ -602,28 +614,67 @@ async function enforceStops(now: Date, quotes: Map<string, Quote>): Promise<stri
   return actions;
 }
 
-/** 无持仓时每天重选一次（选股属于巡检的“综合选股”层，不是交易） */
-async function ensureDailySelection(now: Date, state: AMonitorState): Promise<void> {
-  const account = loadPaperAccount(now);
-  const watch = loadWatchlist();
+/**
+ * 收盘后固定选股（工作日 16:00 后，每天一次）：
+ * - 强制刷新快照与日线指标，确保用的是当天收盘数据；
+ * - 完整三周期 MACD 漏斗 + 日线评分；
+ * - 只替换非持仓自选股，持仓强制保留；
+ * - 不触发巡检，不交易。
+ */
+export function shouldRunAfterCloseSelection(
+  now: Date,
+  lastSelectDay?: string,
+  lastSelectAttemptAt?: string,
+): boolean {
+  if (now.getDay() === 0 || now.getDay() === 6) return false;
+  if (now.getHours() < 16) return false;
   const today = dayKey(now);
-  const lastSelectDay =
-    state.lastSelectDay ??
-    (Number.isNaN(Date.parse(watch.updatedAt)) ? "" : dayKey(new Date(watch.updatedAt)));
-  if (watch.items.length > 0 && lastSelectDay === today) return;
-  log("开始全市场选股（持仓强制保留）…");
+  if (lastSelectDay === today) return false;
+  if (lastSelectAttemptAt) {
+    const elapsed = now.getTime() - Date.parse(lastSelectAttemptAt);
+    if (Number.isFinite(elapsed) && elapsed < 30 * 60_000) return false;
+  }
+  return true;
+}
+
+async function maybeRunAfterCloseSelection(now: Date, state: AMonitorState): Promise<boolean> {
+  if (!shouldRunAfterCloseSelection(now, state.lastSelectDay, state.lastSelectAttemptAt)) {
+    return false;
+  }
+  const today = dayKey(now);
+
   try {
-    const picks = await selectTopWatchlist(10, log);
+    const calendar = await loadTradingCalendar();
+    if (!isTradingDay(calendar, today)) return false;
+  } catch {
+    // 日历不可用时按工作日处理，避免错过选股
+  }
+
+  state.lastSelectAttemptAt = iso(now);
+  log("收盘后固定选股开始（强制刷新当日指标）…");
+  try {
+    const picks = await selectTopWatchlist(10, log, { refresh: true });
+    const account = loadPaperAccount(now);
     const merged = mergeWatchlist(
       picks,
       account.positions.map((position) => ({ code: position.code, name: position.name })),
     );
     saveWatchlist(merged);
     state.lastSelectDay = today;
-    appendAAction({ kind: "select", ok: true, codes: merged.items.map((item) => item.code) });
+    state.lastAction = `收盘后选股 ${picks.length} 只`;
+    appendAAction({
+      kind: "select",
+      ok: true,
+      codes: merged.items.map((item) => item.code),
+      message: `收盘后选股 ${picks.length} 只（持仓保留）`,
+    });
+    log(`收盘后选股完成：${picks.length} 只，自选 ${merged.items.length}/10`);
+    return true;
   } catch (err) {
     state.lastError = err instanceof Error ? err.message : String(err);
     appendAAction({ kind: "select", ok: false, message: state.lastError });
+    log(`收盘后选股失败：${state.lastError}`);
+    return false;
   }
 }
 

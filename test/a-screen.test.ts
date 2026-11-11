@@ -107,6 +107,7 @@ describe("模式与工具注册", () => {
       "a_remove_trigger",
       "a_schedule",
       "a_screen",
+      "a_select",
       "a_snapshot",
       "a_trigger",
       "a_unschedule",

@@ -6,6 +6,7 @@ import { clampToWorkTime, pushSchedule, readScheduleQueue, takeDueSchedule } fro
 import { addRule, commitRuleHit, evaluateRules, readRules, removeRules } from "../src/a/rules";
 import { isPaused, readPause, setPaused } from "../src/a/pause";
 import { takeMarketEvent } from "../src/a/events";
+import { shouldRunAfterCloseSelection } from "../src/a/monitor";
 import { checkAccountRisk, clearRiskTrigger, readRiskState } from "../src/a/risk";
 import { appendAInspectEvent, currentAInspectOffset, readAInspectEvents } from "../src/a/inspect-stream";
 import { cancelOrder, createOrder, listOrders, matchOrders } from "../src/a/orders";
@@ -225,5 +226,18 @@ describe("挂单状态机", () => {
       expect(cancelOrder(cancel.order.id).ok).toBe(true);
       expect(listOrders().find((order) => order.id === cancel.order.id)?.status).toBe("cancelled");
     }
+  });
+});
+
+describe("收盘后固定选股", () => {
+  it("工作日 16:00 后每天一次，周末与已选过不跑", () => {
+    const wed = new Date("2026-11-11T16:00:00+08:00");
+    expect(shouldRunAfterCloseSelection(wed)).toBe(true);
+    expect(shouldRunAfterCloseSelection(new Date("2026-11-11T15:59:00+08:00"))).toBe(false);
+    expect(shouldRunAfterCloseSelection(new Date("2026-11-14T16:00:00+08:00"))).toBe(false);
+    expect(shouldRunAfterCloseSelection(wed, "2026-11-11")).toBe(false);
+    expect(
+      shouldRunAfterCloseSelection(wed, undefined, "2026-11-11T15:50:00+08:00"),
+    ).toBe(false);
   });
 });
