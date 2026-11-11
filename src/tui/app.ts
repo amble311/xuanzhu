@@ -43,6 +43,7 @@ import { fetchQuote, sessionKind, sessionLabel, type Quote } from "../exchange/a
 import type { AgentMode } from "../modes";
 import { createAShareMode } from "../modes/a";
 import { createBtcMode } from "../modes/btc";
+import { formatLocalTime } from "../utils/time";
 import { activeExchange } from "../exchange";
 import { ensureBtcBackend, liveBackend, stopBtcBackend } from "../btc/daemon";
 import {
@@ -1793,7 +1794,7 @@ export class TuiApp {
       if (queue.length > 0) {
         out.push("", "下一轮巡检：");
         for (const entry of queue.slice(0, 3)) {
-          out.push(`- ${entry.at.slice(5, 16).replace("T", " ")} ${entry.reason}`);
+          out.push(`- ${formatLocalTime(entry.at, "monthday")} ${entry.reason}`);
         }
       }
       if (rules.length > 0) {
@@ -5694,8 +5695,8 @@ export class TuiApp {
     );
     if (service.running && service.state?.nextRunAt) {
       push(
-        `${ansi.gray}   上一轮 ${service.state.lastRunAt?.slice(11, 16) ?? "—"}` +
-          ` · 下一轮 ${service.state.nextCheckAt?.slice(11, 16) ?? "未排期"}` +
+        `${ansi.gray}   上一轮 ${formatLocalTime(service.state.lastRunAt, "time")}` +
+          ` · 下一轮 ${formatLocalTime(service.state.nextCheckAt, "time") !== "—" ? formatLocalTime(service.state.nextCheckAt, "time") : "未排期"}` +
           ` · 规则 ${service.state.rules ?? 0} 条` +
           `${service.state.paused ? " · 已暂停" : ""}${ansi.reset}`,
       );

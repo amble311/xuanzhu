@@ -30,6 +30,8 @@ import {
   parseGatewayCommand,
   readGatewayMode,
   readGatewayState,
+  readPeerModes,
+  writePeerMode,
   writeGatewayMode,
   writeGatewayState,
   type GatewayModeState,
@@ -143,8 +145,13 @@ export async function runGateway(): Promise<void> {
   let deniedNote = "";
   let lastToolNote = "";
 
-  /** 当前模式（持久化在 run/mode.json，重启后仍是同一个频道模式） */
-  let modeState = readGatewayMode(home);
+  /** 当前模式（按微信对端持久化；重启后恢复最后一次对话的模式） */
+  const peerModes = readPeerModes(home);
+  const restoredPeerMode =
+    peerModes.lastPeer && peerModes.modes[peerModes.lastPeer]
+      ? peerModes.modes[peerModes.lastPeer]
+      : null;
+  let modeState = restoredPeerMode ?? readGatewayMode(home);
   if (modeState?.name === "btc") {
     process.env.XZH_BTC_ROLE = modeState.paper ? "paper" : "live";
   }
@@ -167,7 +174,7 @@ export async function runGateway(): Promise<void> {
    * 切换模式：先清旧模式再切目录（否则 cwdLocked 会拒绝），然后重新注入提示词/工具。
    * 不启动 btc 常驻后端 —— 与 TUI 的 `/btc` 语义一致，避免切个模式就触发自主巡检。
    */
-  const applyGatewayMode = (next: GatewayModeState | null): string => {
+  const applyGatewayMode = (next: GatewayModeState | null, peer?: string): string => {
     const spec = modeSpec(next);
     process.env.XZH_BTC_ROLE =
       next?.name === "btc" ? (next.paper ? "paper" : "live") : "live";
@@ -187,6 +194,7 @@ export async function runGateway(): Promise<void> {
 
     modeState = next;
     writeGatewayMode(next, home);
+    if (peer) writePeerMode(peer, next, home);
     state.cwd = spec.cwd;
     writeGatewayState(state, home);
     log(`模式切换：${spec.label}（cwd=${spec.cwd}）`);
@@ -499,7 +507,7 @@ export async function runGateway(): Promise<void> {
   };
 
   /** 返回 null 表示「不是命令」，应交给模型 */
-  const handleCommand = async (text: string): Promise<string | null> => {
+  const handleCommand = async (text: string, peer?: string): Promise<string | null> => {
     const command = parseGatewayCommand(text);
     if (!command) return null;
     if (command.kind === "help") return commandHelp();
@@ -527,7 +535,7 @@ export async function runGateway(): Promise<void> {
     if (command.kind === "xzh") {
       if (!modeState) return `当前已是 xzh 普通模式（${home}）。`;
       const previous = modeSpec(modeState).label;
-      applyGatewayMode(null);
+      applyGatewayMode(null, peer);
       return `✓ 已退出 ${previous}，回到 ${home}。`;
     }
 
@@ -536,7 +544,7 @@ export async function runGateway(): Promise<void> {
         const serviceMessage = await ensureBackend(createBtcMode({ paper: command.paper }));
         return `已在 ${modeSpec(modeState).label}。${serviceMessage ? `\n${serviceMessage}` : ""}`;
       }
-      const label = applyGatewayMode({ name: "btc", paper: command.paper });
+      const label = applyGatewayMode({ name: "btc", paper: command.paper }, peer);
       const serviceMessage = await ensureBackend(createBtcMode({ paper: command.paper }));
       return `✓ 已切换到 ${label}（工作目录 ${getBtcHome()}）。${serviceMessage ? `\n${serviceMessage}` : ""}`;
     }
@@ -545,7 +553,7 @@ export async function runGateway(): Promise<void> {
       const serviceMessage = await ensureBackend(createAShareMode());
       return `已在 A 股分析模式。${serviceMessage ? `\n${serviceMessage}` : ""}`;
     }
-    const label = applyGatewayMode({ name: "a" });
+    const label = applyGatewayMode({ name: "a" }, peer);
     const serviceMessage = await ensureBackend(createAShareMode());
     return `✓ 已切换到 ${label}（工作目录 ${getAShareHome()}）。${serviceMessage ? `\n${serviceMessage}` : ""}`;
   };
@@ -609,10 +617,23 @@ export async function runGateway(): Promise<void> {
 
   /** 串行处理：Agent 实例不是并发安全的，同时两条消息会把上下文搅在一起 */
   let queue: Promise<unknown> = Promise.resolve();
-  const handleMessage = (text: string): Promise<string> => {
+  const handleMessage = (text: string, peer?: string): Promise<string> => {
     const task = queue.then(async () => {
+      // 微信：恢复该对端上次使用的模式；没有记录时沿用当前模式并记住
+      if (peer) {
+        const store = readPeerModes(home);
+        const saved = store.modes[peer];
+        const current = modeState;
+        const same = saved
+          ? saved.name === current?.name &&
+            (saved.name !== "btc" || saved.paper === current?.paper)
+          : false;
+        if (saved && !same) applyGatewayMode(saved, peer);
+        else writePeerMode(peer, current, home);
+      }
+
       // `/btc` / `/a` / `/xzh` 这类命令不进入对话历史，也不调用模型
-      const commandReply = await handleCommand(text);
+      const commandReply = await handleCommand(text, peer);
       if (commandReply !== null) return commandReply;
 
       const runner = ensureAgent();
@@ -723,7 +744,7 @@ export async function runGateway(): Promise<void> {
         log,
         allowedUsers: allowed,
         // 与 HTTP /message 共用同一条串行队列：同一个 Agent 实例不能并发
-        onMessage: (text) => handleMessage(text),
+        onMessage: (text, peer) => handleMessage(text, peer),
       });
       log(`微信频道已启动 account=${account.accountId}`);
       // 出站队列：先落盘再串行发送，失败退避重试，gateway 重启不丢

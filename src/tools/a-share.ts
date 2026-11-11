@@ -550,7 +550,7 @@ const scheduleTool: ToolDefinition = {
     const entry = pushSchedule({ minutes, at, reason, slot });
     return {
       ok: true,
-      content: `✓ 已排期 ${entry.at}（${entry.slot}）：${entry.reason}${entry.clamped ? "（已夹到交易时段）" : ""}`,
+      content: `✓ 已排期 ${entry.at}（${entry.slot}）：${entry.reason}${entry.clamped ? "（当前非工作时段，已顺延到下一个工作日 09:00–15:30）" : ""}`,
       summary: `巡检排期 ${entry.at}`,
     };
   },

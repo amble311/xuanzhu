@@ -41,6 +41,7 @@ import {
   type RankField,
   type ScreenCondition,
 } from "../../a";
+import { formatLocalTime } from "../../utils/time";
 import {
   BOARDS_CACHE,
   CALENDAR_CACHE,
@@ -562,7 +563,7 @@ async function statusCommand(parsed: ParsedArgs): Promise<void> {
   process.stdout.write(
     `  ${padEnd("巡检", 10)}${
       service.running
-        ? `${ansi.green}运行中${ansi.reset}${ansi.gray} pid ${service.state?.pid} · 下一轮 ${service.state?.nextCheckAt ?? "未排期"}${ansi.reset}`
+        ? `${ansi.green}运行中${ansi.reset}${ansi.gray} pid ${service.state?.pid} · 下一轮 ${formatLocalTime(service.state?.nextCheckAt, "monthday") !== "—" ? formatLocalTime(service.state?.nextCheckAt, "monthday") : "未排期"}${ansi.reset}`
         : `${ansi.yellow}未运行${ansi.reset}${ansi.gray}（xzh a serve）${ansi.reset}`
     }\n`,
   );
@@ -697,7 +698,7 @@ async function serveCommand(parsed: ParsedArgs): Promise<void> {
     process.stdout.write(
       `${ansi.green}A 股巡检与监控运行中${ansi.reset}${ansi.gray} pid ${state.pid} · ${state.version}` +
         ` · 自选 ${state.watchlist} 只 · 持仓 ${state.holdings} 只${ansi.reset}\n` +
-        `${ansi.gray}  下一轮 ${state.nextRunAt}${state.lastAction ? ` · 最近：${state.lastAction}` : ""}${ansi.reset}\n` +
+        `${ansi.gray}  下一轮 ${formatLocalTime(state.nextRunAt, "monthday")}${state.lastAction ? ` · 最近：${state.lastAction}` : ""}${ansi.reset}\n` +
         `${ansi.gray}  日志 ${monitorLogPath()}${ansi.reset}\n`,
     );
     if (state.lastError) process.stdout.write(`${ansi.yellow}  最近错误：${state.lastError}${ansi.reset}\n`);

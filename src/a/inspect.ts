@@ -73,6 +73,12 @@ function fmt(value: number | undefined, digits = 2): string {
   });
 }
 
+function inAWorkWindow(now = new Date()): boolean {
+  if (now.getDay() === 0 || now.getDay() === 6) return false;
+  const minutes = now.getHours() * 60 + now.getMinutes();
+  return minutes >= 9 * 60 && minutes <= 15 * 60 + 30;
+}
+
 function contextSection(): string {
   const account = loadPaperAccount();
   const summary = accountSummary(account);
@@ -81,6 +87,12 @@ function contextSection(): string {
   const queue = readScheduleQueue();
 
   const lines: string[] = [];
+  if (!inAWorkWindow()) {
+    lines.push(
+      "注意：当前不在 A 股工作时段（工作日 09:00–15:30）。本轮是手动触发，不要安排夜间巡检；" +
+        "下一轮请排到下一个工作日 09:05 之后（a_schedule 会自动顺延）。",
+    );
+  }
   lines.push(
     `账户：总资产 ${fmt(summary.equity)} · 可用 ${fmt(summary.cash)} · 市值 ${fmt(summary.marketValue)}` +
       ` · 总盈亏 ${fmt(summary.totalPnl)}（${fmt(summary.totalPnlPct)}%）`,
@@ -169,7 +181,7 @@ const INSPECT_PROMPT = `你现在处于 A 股**后台巡检**：没有用户在�
   不会自动交易；规则要具体、可执行。
 - 用 a_schedule 决定**下一次巡检时间**（分钟或 at），这是本轮必须完成的事：
   有持仓/临近收盘时看紧一点（5–15 分钟），无持仓/平静时 30–60 分钟；
-  非工作时间会被自动夹到下一个工作日 09:00–15:30。
+  **如果当前不在工作日 09:00–15:30，不要排夜间巡检**，交给 a_schedule 顺延到下一个工作日。
 - 不允许写文件、执行 shell、修改环境、重置账本；不要声称真钱交易（这是模拟盘）。
 - 若上下文提示“硬风控已触发”，本轮禁止买入/加仓，只能减仓或观望；减仓后可用 a_clear_risk 解除。
 

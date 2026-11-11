@@ -7,6 +7,7 @@ import { addRule, commitRuleHit, evaluateRules, readRules, removeRules } from ".
 import { isPaused, readPause, setPaused } from "../src/a/pause";
 import { takeMarketEvent } from "../src/a/events";
 import { shouldRunAfterCloseSelection } from "../src/a/monitor";
+import { formatLocalTime } from "../src/utils/time";
 import { checkAccountRisk, clearRiskTrigger, readRiskState } from "../src/a/risk";
 import { appendAInspectEvent, currentAInspectOffset, readAInspectEvents } from "../src/a/inspect-stream";
 import { cancelOrder, createOrder, listOrders, matchOrders } from "../src/a/orders";
@@ -239,5 +240,14 @@ describe("收盘后固定选股", () => {
     expect(
       shouldRunAfterCloseSelection(wed, undefined, "2026-11-11T15:50:00+08:00"),
     ).toBe(false);
+  });
+});
+
+describe("本地时间展示", () => {
+  it("ISO UTC 转成本机时区，而不是直接截字符串", () => {
+    const date = new Date(2026, 0, 2, 3, 4, 0);
+    expect(formatLocalTime(date.toISOString(), "time")).toBe("03:04");
+    expect(formatLocalTime(date.toISOString(), "monthday")).toBe("01-02 03:04");
+    expect(formatLocalTime("bad", "time")).toBe("—");
   });
 });

@@ -1,4 +1,5 @@
 import { btcVenvReady } from "../../btc/bootstrap";
+import { formatLocalTime } from "../../utils/time";
 import {
   credentialManager,
   credentialStatusLine,
@@ -443,7 +444,7 @@ function printQueue(
     const tag = entry.slot === "next" ? "下一跳" : "额外";
     const who = entry.origin === "manual" ? "前台" : "巡检";
     process.stdout.write(
-      `${indent}#${entry.id.slice(-6)} ${entry.at}（约 ${waitMin} 分钟后）` +
+      `${indent}#${entry.id.slice(-6)} ${formatLocalTime(entry.at, "monthday")}（约 ${waitMin} 分钟后）` +
         `[${tag}/${who}] ${entry.reason}\n`,
     );
   }

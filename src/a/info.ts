@@ -3,6 +3,7 @@ import { accountSummary, loadPaperAccount, markPaperAccount, type PaperAccount }
 import { loadWatchlist } from "./watchlist";
 import { aActionsPath, aServiceStatus, readPendingSells } from "./monitor";
 import * as fs from "fs";
+import { formatLocalTime } from "../utils/time";
 
 /**
  * A 股右侧面板 / `/info` 的**数据采集与纯文本输出**。
@@ -217,12 +218,12 @@ export function aInfoLines(data: APanelData): string[] {
   const service = aServiceStatus();
   lines.push(
     service.running
-      ? `运行中（pid ${service.state?.pid} · 上一轮 ${service.state?.lastRunAt?.slice(11, 16) ?? "—"} · 下一轮 ${service.state?.nextCheckAt?.slice(11, 16) ?? "未排期"}）`
+      ? `运行中（pid ${service.state?.pid} · 上一轮 ${formatLocalTime(service.state?.lastRunAt, "time")} · 下一轮 ${formatLocalTime(service.state?.nextCheckAt, "time") !== "—" ? formatLocalTime(service.state?.nextCheckAt, "time") : "未排期"}）`
       : "未运行（/start 或 xzh a serve）",
   );
   if (service.state?.paused) lines.push("  已暂停（进程仍在，/pause resume 恢复）");
   if (service.state?.nextCheckAt) {
-    lines.push(`  下一轮排期：${service.state.nextCheckAt}${service.state.nextCheckReason ? `（${service.state.nextCheckReason}）` : ""}`);
+    lines.push(`  下一轮排期：${formatLocalTime(service.state.nextCheckAt, "monthday")}${service.state.nextCheckReason ? `（${service.state.nextCheckReason}）` : ""}`);
   }
   lines.push(`  监控规则 ${service.state?.rules ?? 0} 条 · 排期 ${service.state?.queueSize ?? 0} 条`);
   lines.push(

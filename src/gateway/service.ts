@@ -426,6 +426,53 @@ export function writeGatewayMode(
   }
 }
 
+export interface PeerModeState {
+  lastPeer?: string;
+  modes: Record<string, GatewayModeState>;
+}
+
+export function peerModeFile(home = gatewayHome()): string {
+  return path.join(gatewayPaths(home).run, "peer-modes.json");
+}
+
+export function readPeerModes(home = gatewayHome()): PeerModeState {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(peerModeFile(home), "utf8")) as Partial<PeerModeState>;
+    const modes: Record<string, GatewayModeState> = {};
+    for (const [peer, value] of Object.entries(parsed.modes ?? {})) {
+      if (value?.name === "btc") modes[peer] = { name: "btc", paper: value.paper === true };
+      else if (value?.name === "a") modes[peer] = { name: "a" };
+    }
+    return { lastPeer: typeof parsed.lastPeer === "string" ? parsed.lastPeer : undefined, modes };
+  } catch {
+    return { modes: {} };
+  }
+}
+
+export function writePeerMode(
+  peer: string,
+  mode: GatewayModeState | null,
+  home = gatewayHome(),
+): void {
+  const state = readPeerModes(home);
+  state.lastPeer = peer;
+  if (mode) {
+    state.modes[peer] = {
+      name: mode.name,
+      ...(mode.name === "btc" ? { paper: mode.paper === true } : {}),
+    };
+  } else {
+    delete state.modes[peer];
+  }
+  const file = peerModeFile(home);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  } catch {
+    // 写不了只影响重启恢复
+  }
+}
+
 // ─────────────────────────── 开机自启 ───────────────────────────
 
 export interface AutostartStatus {

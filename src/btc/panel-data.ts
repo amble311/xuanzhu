@@ -8,6 +8,7 @@ import { readPause } from "./pause";
 import { readScheduleQueue, type ScheduleEntry } from "./schedule";
 import { readRiskSettings, readRiskState, type HardRiskSettings, type HardRiskState } from "./risk";
 import { buildPreflight, liquidationGapPct } from "./preflight";
+import { formatLocalTime } from "../utils/time";
 
 /**
  * btc 右侧面板 / `/info` 的**数据采集**（渲染在 TUI 与纯文本两个渠道各自做）。
@@ -273,9 +274,11 @@ export function btcInfoLines(data: BtcPanelData): string[] {
 
   lines.push(divider);
   lines.push(`巡检（排期 ${data.queue.length} 条）`);
-  if (data.nextTriggerEvalAt) lines.push(`下次叫醒评估 ${data.nextTriggerEvalAt}`);
+  if (data.nextTriggerEvalAt) {
+    lines.push(`下次叫醒评估 ${formatLocalTime(data.nextTriggerEvalAt, "monthday")}`);
+  }
   for (const entry of data.queue.slice(0, 3)) {
-    lines.push(`- ${entry.at.slice(5, 16).replace("T", " ")} ${entry.reason}`);
+    lines.push(`- ${formatLocalTime(entry.at, "monthday")} ${entry.reason}`);
   }
 
   if (data.role === "live" && data.actions.length > 0) {
@@ -283,7 +286,7 @@ export function btcInfoLines(data: BtcPanelData): string[] {
     lines.push("最近动作");
     for (const action of data.actions) {
       lines.push(
-        `- ${action.ts.slice(0, 16).replace("T", " ")} ${action.kind} ${action.symbol} ${action.status}（${action.reason}）`,
+        `- ${formatLocalTime(action.ts, "monthday")} ${action.kind} ${action.symbol} ${action.status}（${action.reason}）`,
       );
     }
   }
