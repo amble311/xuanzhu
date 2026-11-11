@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { Agent, type AgentEvents } from "../core/agent";
 import { activeModelEntry, loadConfig, saveConfig } from "../config/store";
 import { commandHelpLines } from "../core/help-text";
+import { formatLocalTime } from "../utils/time";
 import { btcInfoLines, collectBtcPanelData } from "../btc/panel-data";
 import { aInfoLines, collectASharePanelData } from "../a/info";
 import { TOOLS, toolVisibleInMode } from "../tools";
@@ -416,6 +417,21 @@ export async function runGateway(): Promise<void> {
         setPaused(getBtcHome(), !resume, "/pause");
         return resume ? "✓ 已恢复 btc 后端巡检" : "✓ 已暂停 btc 后端巡检（/pause resume 恢复）";
       }
+      case "watch":
+      case "watchlist": {
+        if (modeState?.name !== "a") return "/watch 仅在 a 模式下显示自选股；btc 叫醒条件请用 /wakeup。";
+        const data = await collectASharePanelData();
+        const lines = [`A 股自选股 ${data.watch.length}/10（★=持仓）`];
+        if (data.watch.length === 0) lines.push("为空；收盘后 16:00 自动选股。");
+        for (const row of data.watch) {
+          lines.push(
+            `${row.held ? "★ " : "  "}- ${row.code} ${row.name} ${row.score} 分` +
+              (row.price > 0 ? ` ${row.price.toFixed(2)}（${row.pct >= 0 ? "+" : ""}${row.pct.toFixed(2)}%）` : ""),
+          );
+        }
+        lines.push("", "监控规则请用 /wakeup；完整详情用 /info。");
+        return lines.join("\n");
+      }
       case "wakeup":
       case "monitor": { // 旧名保留为别名
         if (modeState?.name === "btc") {
@@ -427,20 +443,19 @@ export async function runGateway(): Promise<void> {
           return `叫醒条件 ${triggers.length} 条：\n` + triggers.map((trigger) => `- ${describeTrigger(trigger)}`).join("\n");
         }
         if (modeState?.name === "a") {
-          const watch = loadWatchlist();
           const rules = readRules();
           const queue = readScheduleQueue();
-          const lines: string[] = [];
-          lines.push(
-            `A 股监控池 ${watch.items.length}/10 · 规则 ${rules.length} 条 · 排期 ${queue.length} 条`,
-          );
-          if (queue[0]) lines.push(`下一轮巡检：${queue[0].at} ${queue[0].reason}`);
-          for (const item of watch.items) {
-            lines.push(`- ${item.code} ${item.name} ${item.score} 分`);
+          const lines: string[] = [`A 股监控规则 ${rules.length} 条（命中只唤醒巡检）`];
+          if (queue[0]) {
+            lines.push(`下一轮巡检：${formatLocalTime(queue[0].at, "monthday")} ${queue[0].reason}`);
           }
-          for (const rule of rules.slice(0, 10)) {
-            lines.push(`规则：${describeRule(rule)}（${rule.note}）`);
+          if (rules.length === 0) {
+            lines.push("暂无规则；可用 a_trigger 添加价格 / 涨跌幅 / MA20 / 链式 / formula 条件。");
           }
+          for (const rule of rules) {
+            lines.push(`- ${describeRule(rule)}${rule.note ? ` — ${rule.note}` : ""}`);
+          }
+          lines.push("", "自选股列表请用 /watch（或 /watchlist）。");
           return lines.join("\n");
         }
         return "/wakeup 仅在 btc / a 模式下有效";

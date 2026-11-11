@@ -1,6 +1,7 @@
 import { fetchQuote, sessionKind, sessionLabel, type Quote } from "../exchange/ashare";
 import { accountSummary, loadPaperAccount, markPaperAccount, type PaperAccount } from "./paper";
 import { loadWatchlist } from "./watchlist";
+import { describeRule, readRules } from "./rules";
 import { aActionsPath, aServiceStatus, readPendingSells } from "./monitor";
 import * as fs from "fs";
 import { formatLocalTime } from "../utils/time";
@@ -235,12 +236,22 @@ export function aInfoLines(data: APanelData): string[] {
     lines.push(`  ${action}`);
   }
 
-  // 监控（自选股池，每 15 分钟）
+  // 监控：规则才是唤醒源；自选股单独展示，避免把“股票名称”误当成监控内容
+  lines.push(divider);
+  const rules = readRules();
+  lines.push(`监控规则 ${rules.length} 条（命中只唤醒巡检，不直接下单）`);
+  if (rules.length === 0) {
+    lines.push("  暂无规则；巡检会按排期 / 风控 / 市场事件唤醒，可用 a_trigger 添加条件");
+  }
+  for (const rule of rules) {
+    lines.push(`  ${describeRule(rule)}${rule.note ? ` — ${rule.note}` : ""}`);
+  }
+
   lines.push(divider);
   const watch = loadWatchlist();
-  lines.push(`监控（自选 ${watch.items.length}/10 · 每 15 分钟 · ★=持仓）`);
+  lines.push(`自选股 ${watch.items.length}/10 · ★=持仓`);
   if (watch.items.length === 0) {
-    lines.push("  监控池为空（xzh a serve 会自动选股）");
+    lines.push("  为空；收盘后 16:00 自动选股");
   }
   for (const row of data.watch) {
     const star = row.held ? "★ " : "  ";

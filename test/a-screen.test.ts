@@ -246,3 +246,22 @@ describe("筛选器", () => {
     expect(() => screenConditionFromInput({ boards: ["nasdaq"] })).toThrow(/未知板块/);
   });
 });
+
+describe("巡检不选股", () => {
+  it("XZH_A_INSPECT=1 时 a_select / a_screen 直接拒绝", async () => {
+    const original = process.env.XZH_A_INSPECT;
+    process.env.XZH_A_INSPECT = "1";
+    try {
+      const ctx = { cwd: process.cwd(), mode: "a", autoApprove: true } as never;
+      for (const name of ["a_select", "a_screen"]) {
+        const tool = TOOLS.find((item) => item.name === name)!;
+        const result = await tool.execute({}, ctx);
+        expect(result.ok).toBe(false);
+        expect(result.content).toContain("巡检");
+      }
+    } finally {
+      if (original === undefined) delete process.env.XZH_A_INSPECT;
+      else process.env.XZH_A_INSPECT = original;
+    }
+  });
+});

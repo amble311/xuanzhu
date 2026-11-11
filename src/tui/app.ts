@@ -33,6 +33,7 @@ import {
   readPendingSells,
   readPause as readAPause,
   readRules,
+  describeRule,
   readScheduleQueue as readAScheduleQueue,
   setPaused as setAPaused,
   startAService,
@@ -1765,51 +1766,67 @@ export class TuiApp {
    * 右侧面板只有几十列，公式/链式条件折行后仍会被截；这里不经过模型，
    * 直接读 `~/.xzh_btc/run/triggers*.json`，看到的就是后端要评估的那份配置。
    */
+  /** A 股自选股列表：与「监控规则」分开，/wakeup 只看规则 */
+  private showWatchlist(): void {
+    if (this.mode?.name !== "a") {
+      this.lines.push(`${ansi.gray}/watch 仅在 a 模式下显示自选股；btc 的叫醒条件请用 /wakeup。${ansi.reset}`);
+      this.scheduleRender();
+      return;
+    }
+    const watch = loadWatchlist();
+    const account = loadPaperAccount();
+    const held = new Set(account.positions.map((position) => position.code));
+    const quotes = new Map((this.aPanel?.watch ?? []).map((row) => [row.code, row]));
+    const out: string[] = [`A 股自选股 ${watch.items.length}/10（★=持仓）`, ""];
+    if (watch.items.length === 0) {
+      out.push("为空；收盘后 16:00 自动选股，或让 xzh 用 a_select 手动选股。");
+    }
+    watch.items.forEach((item, index) => {
+      const quote = quotes.get(item.code);
+      const price =
+        quote && quote.price > 0
+          ? ` ${quote.price.toFixed(2)} ${quote.pct >= 0 ? "+" : ""}${quote.pct.toFixed(2)}%`
+          : "";
+      out.push(
+        `${index + 1}. ${held.has(item.code) ? "★ " : "  "}${item.code} ${item.name} ${item.score} 分${price}`,
+      );
+    });
+    out.push("", "监控规则请用 /wakeup；完整详情用 /info。");
+    this.lines.push(`${ansi.gray}${out.join("\n")}${ansi.reset}`);
+    this.scheduleRender();
+  }
+
   private showMonitor(): void {
     if (this.mode?.name === "a") {
       const service = aServiceStatus();
-      const watch = loadWatchlist();
-      const account = loadPaperAccount();
-      const held = new Set(account.positions.map((position) => position.code));
-      const pending = readPendingSells().filter((item) => held.has(item.code));
       const rules = readRules();
       const queue = readAScheduleQueue();
       const out: string[] = [
-        `A 股监控池 ${watch.items.length}/10 · 规则 ${rules.length} 条 · 排期 ${queue.length} 条 · 巡检${
+        `A 股监控规则 ${rules.length} 条 · 巡检${
           service.running
-            ? `运行中（pid ${service.state?.pid}${service.state?.nextRunAt ? `，下一轮 ${service.state.nextRunAt.slice(11, 16)}` : ""}）`
+            ? `运行中（pid ${service.state?.pid}${service.state?.nextCheckAt ? `，下一轮 ${formatLocalTime(service.state.nextCheckAt, "time")}` : ""}）`
             : "未运行（/start 或 xzh a serve）"
         }`,
         "",
       ];
-      if (watch.items.length === 0) {
-        out.push("监控池为空；无持仓时巡检会自动全市场选股前 10。");
-      }
-      watch.items.forEach((item, index) => {
-        out.push(
-          `${index + 1}. ${item.code} ${item.name} ${item.score} 分` +
-            `${held.has(item.code) ? "（持仓·强制保留）" : ""}`,
-        );
-      });
-      if (queue.length > 0) {
-        out.push("", "下一轮巡检：");
-        for (const entry of queue.slice(0, 3)) {
-          out.push(`- ${formatLocalTime(entry.at, "monthday")} ${entry.reason}`);
+      if (rules.length === 0) {
+        out.push("暂无监控规则。");
+        out.push("监控只负责在条件满足时唤醒巡检；可用 a_trigger 添加价格/涨跌幅/MA20/链式/formula 条件。");
+      } else {
+        out.push("监控规则（命中只唤醒巡检，不直接下单）：");
+        for (const rule of rules) {
+          out.push(`- ${describeRule(rule)}${rule.note ? ` — ${rule.note}` : ""}`);
         }
       }
-      if (rules.length > 0) {
-        out.push("", "监控规则（命中只唤醒巡检）：");
-        for (const rule of rules.slice(0, 5)) out.push(`- ${rule.code} ${rule.note}`);
+      if (queue[0]) {
+        out.push("", `下一轮巡检：${formatLocalTime(queue[0].at, "monthday")} ${queue[0].reason}`);
       }
-      if (pending.length > 0) {
-        out.push("", "T+1 锁定（今日不可卖，下一交易日处理）：");
-        for (const item of pending) out.push(`- ${item.code} ${item.reason}`);
-      }
-      out.push("", "监控池由 xzh 全权管理；已持仓股票必须在池中并持续监控。");
+      out.push("", "自选股列表请用 /watch（或 /watchlist）。");
       this.lines.push(`${ansi.gray}${out.join("\n")}${ansi.reset}`);
       this.scheduleRender();
       return;
     }
+
     if (this.mode?.name !== "btc") {
       this.lines.push(
         `${ansi.gray}/wakeup 在 btc 模式显示叫醒条件，在 a 模式显示监控池。${ansi.reset}`,
@@ -2893,6 +2910,10 @@ export class TuiApp {
       case "wakeup":
       case "monitor": // 旧名保留为别名
         this.showMonitor();
+        break;
+      case "watch":
+      case "watchlist":
+        this.showWatchlist();
         break;
       case "autonomy":
         this.handleAutonomyCommand(arg);
@@ -5710,9 +5731,22 @@ export class TuiApp {
     }
 
     divider();
-    push(` ${ansi.bold}监控${ansi.reset}${ansi.gray}（每 15 分钟 · ${watch.items.length}/10 · ★=持仓）${ansi.reset}`);
+    const rules = readRules();
+    push(` ${ansi.bold}监控${ansi.reset}${ansi.gray}（规则 ${rules.length} 条 · 命中只唤醒巡检）${ansi.reset}`);
+    if (rules.length === 0) {
+      push(`${ansi.gray}   暂无规则；巡检会按排期/风控/事件唤醒${ansi.reset}`);
+    }
+    for (const rule of rules.slice(0, 4)) {
+      push(`${ansi.gray}   ${truncate(describeRule(rule), Math.max(12, width - 4))}${ansi.reset}`);
+    }
+    if (rules.length > 4) {
+      push(`${ansi.gray}   … 共 ${rules.length} 条规则${ansi.reset}`);
+    }
+
+    divider();
+    push(` ${ansi.bold}自选${ansi.reset}${ansi.gray}（${watch.items.length}/10 · ★=持仓）${ansi.reset}`);
     if (watch.items.length === 0) {
-      push(`${ansi.gray}   监控池为空（xzh a serve 会自动选股）${ansi.reset}`);
+      push(`${ansi.gray}   为空；收盘后 16:00 自动选股${ansi.reset}`);
     }
     for (const item of data.watch.slice(0, 4)) {
       const star = item.held ? `${ansi.red}★ ${ansi.reset}` : "  ";

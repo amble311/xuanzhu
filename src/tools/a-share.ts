@@ -32,7 +32,7 @@ import {
   type RuleKind,
 } from "../a";
 import { selectTopWatchlist } from "../a/score";
-import { mergeWatchlist, saveWatchlist } from "../a/watchlist";
+import { loadWatchlist, mergeWatchlist, saveWatchlist } from "../a/watchlist";
 import {
   fetchBars,
   fetchQuote,
@@ -175,6 +175,12 @@ const screenTool: ToolDefinition = {
     required: [],
   },
   async execute(args, ctx): Promise<ToolResult> {
+    if (process.env.XZH_A_INSPECT === "1") {
+      return {
+        ok: false,
+        content: "✗ 巡检只分析持仓与自选股，不做选股；选股由收盘后 16:00 固定任务负责。",
+      };
+    }
     try {
       const condition = screenConditionFromInput(args as Record<string, unknown>);
       const loaded = await loadSnapshot({
@@ -453,6 +459,16 @@ const orderTool: ToolDefinition = {
         return { ok: false, content: `✗ 挂单失败：${err instanceof Error ? err.message : String(err)}` };
       }
     }
+    if (
+      process.env.XZH_A_INSPECT === "1" &&
+      side === "buy" &&
+      !loadWatchlist().items.some((item) => item.code === code)
+    ) {
+      return {
+        ok: false,
+        content: `✗ 巡检只能买入自选股；${code} 不在当前自选池。选股请交给收盘后 16:00 的固定任务。`,
+      };
+    }
     if (side === "buy" && readRiskState()?.triggered) {
       return {
         ok: false,
@@ -499,6 +515,12 @@ const selectTool: ToolDefinition = {
     required: [],
   },
   async execute(args, ctx): Promise<ToolResult> {
+    if (process.env.XZH_A_INSPECT === "1") {
+      return {
+        ok: false,
+        content: "✗ 巡检只分析持仓与自选股，不做选股；选股由收盘后 16:00 固定任务负责。",
+      };
+    }
     const limit = Math.max(1, Math.min(10, Number(args.limit) || 10));
     const picks = await selectTopWatchlist(limit, (message) => ctx.emit?.(message));
     const account = loadPaperAccount();
