@@ -132,11 +132,16 @@ describe("gateway", () => {
 
 describe("微信对端模式", () => {
   it("按 peer 保存最后对话模式，重启可恢复", () => {
-    writePeerMode("user-a", { name: "btc", paper: true });
-    writePeerMode("user-b", { name: "a" });
-    const store = readPeerModes();
-    expect(store.lastPeer).toBe("user-b");
-    expect(store.modes["user-a"]).toEqual({ name: "btc", paper: true });
-    expect(store.modes["user-b"]).toEqual({ name: "a" });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "xzh-gw-peer-"));
+    try {
+      writePeerMode("user-a", { name: "btc", paper: true }, dir);
+      writePeerMode("user-b", { name: "a" }, dir);
+      const store = readPeerModes(dir);
+      expect(store.lastPeer).toBe("user-b");
+      expect(store.modes["user-a"]).toEqual({ name: "btc", paper: true });
+      expect(store.modes["user-b"]).toEqual({ name: "a" });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
