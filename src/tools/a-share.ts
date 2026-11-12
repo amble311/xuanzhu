@@ -17,12 +17,14 @@ import {
   summarizeSnapshot,
   addRule,
   appendAAction,
+  appendRuleAudit,
   cancelOrder,
   clearRiskTrigger,
   createOrder,
   describeOrder,
   listOrders,
   readRiskState,
+  readRules,
   describeRule,
   pushSchedule,
   removeRules,
@@ -33,6 +35,7 @@ import {
 } from "../a";
 import { selectTopWatchlist } from "../a/score";
 import { loadWatchlist, mergeWatchlist, saveWatchlist } from "../a/watchlist";
+import { adjustByNews } from "../a/news";
 import {
   fetchBars,
   fetchQuote,
@@ -57,7 +60,18 @@ import type { ToolContext, ToolDefinition, ToolResult } from "./types";
 const A_MODES = ["a"];
 const MAX_QUOTE_CODES = 10;
 
-const PERIODS: BarPeriod[] = ["1m", "5m", "30m", "60m", "day", "week", "month", "quarter", "year"];
+const PERIODS: BarPeriod[] = [
+  "1m",
+  "5m",
+  "15m",
+  "30m",
+  "60m",
+  "day",
+  "week",
+  "month",
+  "quarter",
+  "year",
+];
 const ADJUSTS: Adjust[] = ["none", "forward", "backward"];
 
 function emitProgress(
@@ -266,7 +280,7 @@ const barsTool: ToolDefinition = {
   name: "a_bars",
   modes: A_MODES,
   description:
-    "查单只 A 股的 K 线（周期 1m/5m/30m/60m/day/week/month/quarter/year，可复权）。" +
+    "查单只 A 股的 K 线（周期 1m/5m/15m/30m/60m/day/week/month/quarter/year，可复权）。" +
     "默认日线 / 后复权 / 最近 120 根。指标用后复权（前复权在高分红股上早年为负）；" +
     "看真实价格用 adjust=none。返回里会附上该股的预计算指标摘要（若有缓存）。",
   parameters: {
@@ -500,6 +514,35 @@ const orderTool: ToolDefinition = {
   },
 };
 
+const newsTool: ToolDefinition = {
+  name: "a_news",
+  modes: A_MODES,
+  description:
+    "查单只 A 股近 180 天公告并给出消息面判断：硬风险否决、近 5 日利空/利好按价格反应 ±10、老利空 +2、无公告 +2。巡检分析持仓/自选股时必须先看这个消息。",
+  parameters: {
+    type: "object",
+    properties: { code: { type: "string", description: "6 位股票代码" } },
+    required: ["code"],
+  },
+  async execute(args): Promise<ToolResult> {
+    const code = typeof args.code === "string" ? args.code : "";
+    if (!/^\d{6}$/.test(code)) return { ok: false, content: "✗ 需要 6 位股票代码" };
+    try {
+      const result = await adjustByNews(code);
+      const delta = result.delta > 0 ? `+${result.delta}` : `${result.delta}`;
+      return {
+        ok: true,
+        content:
+          `${code} 消息面：${result.reason}` +
+          (result.veto ? "（硬风险，禁止买入）" : `（调整 ${delta}）`),
+        summary: `消息 ${code} ${result.veto ? "硬风险" : delta}`,
+      };
+    } catch (err) {
+      return { ok: false, content: `✗ 公告查询失败：${err instanceof Error ? err.message : String(err)}` };
+    }
+  },
+};
+
 const selectTool: ToolDefinition = {
   name: "a_select",
   modes: A_MODES,
@@ -582,7 +625,7 @@ const triggerTool: ToolDefinition = {
   name: "a_trigger",
   modes: A_MODES,
   description:
-    "给持仓/自选股设置监控规则（只叫醒，不下单）。kind: price_above / price_below / pct_above / pct_below / ma20_break / ma20_above / ret20_above。" +
+    "给持仓/自选股设置监控规则（只叫醒，不下单）。kind: price_above / price_below / pct_above / pct_below / ma20_break / ma20_above / ret20_above / chain / formula / script。" +
     "命中后监控会唤醒巡检并说明原因；最多 20 条，默认 72 小时过期、30 分钟冷却。",
   parameters: {
     type: "object",
@@ -600,6 +643,7 @@ const triggerTool: ToolDefinition = {
           "ret20_above",
           "chain",
           "formula",
+          "script",
         ],
       },
       value: { type: "number", description: "price/pct 的目标值；ma20_break 不需要" },
@@ -617,7 +661,7 @@ const triggerTool: ToolDefinition = {
       chainExpireMin: { type: "number", description: "链式中间步骤有效期分钟，默认 240" },
       expression: {
         type: "string",
-        description: "formula 专用，如 price > ma20 && pct > 2；变量 price/pct/ma5/ma20/ma60/ret5/ret20/ret60/atr_pct/amount",
+        description: "formula / script 专用，如 price > ma20 && pct > 2；变量 price/pct/ma5/ma20/ma60/ret5/ret20/ret60/atr_pct/amount",
       },
     },
     required: ["code", "kind", "note"],
@@ -628,6 +672,44 @@ const triggerTool: ToolDefinition = {
     const value = args.value === undefined ? undefined : Number(args.value);
     const note = typeof args.note === "string" ? args.note : "";
     if (!note) return { ok: false, content: "✗ 需要 note（命中原因）" };
+    const actor = process.env.XZH_A_INSPECT === "1" ? "inspect" : "manual";
+    // 监控规则只允许覆盖持仓/自选；公式/脚本在写入时做白名单与长度审计
+    const inScope =
+      loadWatchlist().items.some((item) => item.code === code) ||
+      loadPaperAccount().positions.some((position) => position.code === code);
+    if (!inScope) {
+      appendRuleAudit({
+        actor,
+        action: "reject",
+        ok: false,
+        code,
+        kind,
+        error: "不在持仓/自选股范围",
+      });
+      return { ok: false, content: `✗ ${code} 不在当前持仓/自选股，不能写监控规则` };
+    }
+    if ((kind === "formula" || kind === "script") && (args.expression ?? "").toString().length > 200) {
+      appendRuleAudit({
+        actor,
+        action: "reject",
+        ok: false,
+        code,
+        kind,
+        error: "表达式超过 200 字符",
+      });
+      return { ok: false, content: "✗ 公式/脚本最长 200 字符" };
+    }
+    if (readRules().filter((rule) => rule.code === code).length >= 5) {
+      appendRuleAudit({
+        actor,
+        action: "reject",
+        ok: false,
+        code,
+        kind,
+        error: "单只股票规则超过 5 条",
+      });
+      return { ok: false, content: `✗ ${code} 已有 5 条监控规则，请先清理` };
+    }
     const result = addRule({
       code,
       kind,
@@ -642,7 +724,26 @@ const triggerTool: ToolDefinition = {
       chainExpireMin: args.chainExpireMin === undefined ? undefined : Number(args.chainExpireMin),
       expression: typeof args.expression === "string" ? args.expression : undefined,
     });
-    if (!result.ok) return { ok: false, content: `✗ ${result.error}` };
+    if (!result.ok) {
+      appendRuleAudit({
+        actor,
+        action: "reject",
+        ok: false,
+        code,
+        kind,
+        error: result.error,
+      });
+      return { ok: false, content: `✗ ${result.error}` };
+    }
+    appendRuleAudit({
+      actor,
+      action: "add",
+      ok: true,
+      code: result.rule.code,
+      kind: result.rule.kind,
+      ruleId: result.rule.id,
+      detail: result.rule.expression ?? result.rule.note,
+    });
     return {
       ok: true,
       content: `✓ 已添加监控：${describeRule(result.rule)}（${result.rule.note}）`,
@@ -734,9 +835,17 @@ const removeTriggerTool: ToolDefinition = {
     required: [],
   },
   async execute(args): Promise<ToolResult> {
+    const code = typeof args.code === "string" ? args.code : undefined;
     const removed = removeRules({
       id: typeof args.id === "string" ? args.id : undefined,
-      code: typeof args.code === "string" ? args.code : undefined,
+      code,
+    });
+    appendRuleAudit({
+      actor: process.env.XZH_A_INSPECT === "1" ? "inspect" : "manual",
+      action: "remove",
+      ok: true,
+      code,
+      detail: `删除 ${removed} 条`,
     });
     return { ok: true, content: `✓ 已删除 ${removed} 条监控规则`, summary: `删除规则 ${removed}` };
   },
@@ -746,6 +855,7 @@ export const aShareTools: ToolDefinition[] = [
   snapshotTool,
   screenTool,
   selectTool,
+  newsTool,
   quoteTool,
   barsTool,
   accountTool,

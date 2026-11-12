@@ -9,7 +9,17 @@
 export type BoardKind = "sh-main" | "sz-main" | "gem" | "star" | "bse" | "index" | "board" | "unknown";
 
 /** K 线周期（同花顺只提供这些，没有 15 分钟线） */
-export type BarPeriod = "1m" | "5m" | "30m" | "60m" | "day" | "week" | "month" | "quarter" | "year";
+export type BarPeriod =
+  | "1m"
+  | "5m"
+  | "15m"
+  | "30m"
+  | "60m"
+  | "day"
+  | "week"
+  | "month"
+  | "quarter"
+  | "year";
 
 /** 复权方式：none 不复权 / forward 前复权 / backward 后复权 */
 export type Adjust = "none" | "forward" | "backward";

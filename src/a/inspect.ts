@@ -12,6 +12,7 @@ import { describeRule, readRules } from "./rules";
 import { nextScheduledEntry, pushSchedule, readScheduleQueue } from "./schedule";
 import { isPaused } from "./pause";
 import { readRiskState } from "./risk";
+import { readPositionRisks } from "./risk-alerts";
 import { appendAInspectEvent } from "./inspect-stream";
 import { describeOrder, listOrders } from "./orders";
 import { monitorDir } from "./watchlist";
@@ -39,6 +40,7 @@ const UNATTENDED_TOOLS = new Set([
   "a_account",
   "a_quote",
   "a_bars",
+  "a_news",
   "a_snapshot",
 ]);
 
@@ -161,6 +163,16 @@ function contextSection(): string {
   if (risk?.triggered) {
     lines.push(`硬风控已触发（禁止开新仓）：${risk.reasons.join("；")}`);
   }
+  const positionRisks = readPositionRisks().alerts;
+  if (positionRisks.length > 0) {
+    lines.push("持仓风控告警（只告警，是否卖出由你决定）：");
+    for (const alert of positionRisks) {
+      lines.push(
+        `- ${alert.code} ${alert.name} ${alert.reason}` +
+          `（${alert.sellable ? `可卖 ${alert.qty} 股` : "T+1 当日不可卖，下一交易日处理"}）`,
+      );
+    }
+  }
 
   return lines.join("\n");
 }
@@ -171,14 +183,20 @@ const INSPECT_PROMPT = `你现在处于 A 股**后台巡检 / 无人值守**：�
 ## 本轮职责（严格按顺序）
 
 1. **持仓股（最高优先级）**
-   - 先看止损 / 移动止盈 / 分批止盈 / 跌破 MA20 / 30 分钟走弱 / T+1 可卖数量；
+   - 先用 a_bars(period=15m) 看 15 分钟技术面（MA20、前 10 根高低点、量能、MACD），
+     再用 a_news 查公告消息面，最后结合 ATR 止损 / 移动止盈 / 分批 / T+1 可卖数量；
    - 需要减仓或清仓时，直接 a_order；T+1 当日买入不可卖，只能记录。
 2. **自选股（唯一可选池）**
    - 只允许从当前自选股里找买点；**不得买入池外股票**；
-   - 买点：日线评分 ≥70、30 分钟站上 MA20 + 突破前 10 根高点 + 放量、非涨停、当日涨幅 ≤5%；
+   - 每只候选先 a_bars(period=15m) + a_news，再判断；
+   - 买点：日线评分 ≥70、15 分钟站上 MA20 + 突破前 10 根高点 + 放量、非涨停、当日涨幅 ≤5%；
+   - 消息面硬风险（立案/退市/暴雷等）禁止买入；
    - 最多 5 仓、每仓 20% 权益、100 股整手。
 3. **监控规则**
-   - 用 a_trigger 给持仓 / 自选股设置具体、可执行的条件（价格、涨跌幅、跌破/站上 MA20）；
+   - 用 a_trigger 给持仓 / 自选股设置具体、可执行的条件：
+     价格、涨跌幅、跌破/站上 MA20、链式（steps）、公式/受限脚本（expression）；
+   - 公式/脚本只允许 price/pct/ma5/ma20/ma60/ret5/ret20/ret60/atr_pct/amount 与运算符，
+     不执行任意代码；
    - 过时或已无意义的规则用 a_remove_trigger 删除；
    - 监控命中只会唤醒下一轮巡检，不会自动交易。
 4. **下一轮巡检**
@@ -192,6 +210,7 @@ const INSPECT_PROMPT = `你现在处于 A 股**后台巡检 / 无人值守**：�
   收盘后 16:00 有独立的固定选股任务，本轮只做“已有持仓 + 已有自选”的实时分析。
 - 不允许写文件、执行 shell、修改环境、重置账本；不要声称真钱交易（这是模拟盘）。
 - 若上下文提示“硬风控已触发”，本轮禁止买入/加仓，只能减仓或观望；减仓后可用 a_clear_risk 解除。
+- 若上下文提示“持仓风控告警”，监控只是告警，**不会自动卖**；是否卖、卖多少由你判断并 a_order。
 - 行情不可用 / 数据缺失时不要猜价格，明确说明并排下一次。
 
 ## 输出要求

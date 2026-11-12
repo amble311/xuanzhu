@@ -28,3 +28,8 @@ export * from "./events";
 export * from "./risk";
 export * from "./orders";
 export * from "./research";
+export * from "./trend";
+export * from "./deep15";
+export * from "./ta";
+export * from "./rule-audit";
+export * from "./risk-alerts";

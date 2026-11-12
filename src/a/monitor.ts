@@ -23,7 +23,13 @@ import { pushSchedule, readScheduleQueue, takeDueSchedule } from "./schedule";
 import { isPaused, readPause } from "./pause";
 import { takeMarketEvent } from "./events";
 import { describeOrder, listOrders, matchOrders } from "./orders";
-import { checkAccountRisk, markRiskDelivered } from "./risk";
+import { checkAccountRisk, markRiskDelivered, readRiskState } from "./risk";
+import {
+  markPositionRisksDelivered,
+  readPositionRisks,
+  writePositionRisks,
+  type PositionRiskAlert,
+} from "./risk-alerts";
 import { intradayWeak } from "./intraday";
 import { loadIndicators } from "./indicators";
 import { selectTopWatchlist } from "./score";
@@ -390,19 +396,32 @@ export async function runAServe(): Promise<void> {
       }
     }
 
+    // 硬风控与 btc 对齐：只落盘 + 告警，不自动交易；暂停/非交易时段也检查
+    const account = loadPaperAccount(at);
+    const codes = account.positions.map((position) => position.code);
+    const heldQuotes = quoteMap(
+      await mapLimit(codes, async (code) => fetchQuote(code).catch(() => null), 6),
+    );
+    const accountRisk = checkAccountRisk(account, heldQuotes, at);
+    await detectPositionRisks(at, heldQuotes);
+    const riskAlerts = readPositionRisks();
+
     if (isPaused()) return;
     if (!inTradingWindow(at)) return;
 
     running = true;
     try {
-      const account = loadPaperAccount(at);
-      const codes = account.positions.map((position) => position.code);
-      const heldQuotes = quoteMap(
-        await mapLimit(codes, async (code) => fetchQuote(code).catch(() => null), 6),
-      );
       const orderActions = await processPendingOrders(at);
-      const actions = [...orderActions, ...(await enforceStops(at, heldQuotes))];
-      const risk = checkAccountRisk(account, heldQuotes, at);
+      if (orderActions.length > 0) {
+        state.lastAction = orderActions[0];
+        log(orderActions.join("；"));
+      }
+      const riskState = readRiskState();
+      const risk =
+        accountRisk.triggered && !(riskState?.delivered ?? false)
+          ? accountRisk
+          : { ...accountRisk, triggered: false, reasons: [] };
+      const positionRiskPending = riskAlerts.alerts.length > 0 && !riskAlerts.delivered;
 
       const hit = await checkMonitorRules(at);
       const due = takeDueSchedule(at);
@@ -410,16 +429,19 @@ export async function runAServe(): Promise<void> {
       const lastInspect = state.lastInspectAt ? Date.parse(state.lastInspectAt) : 0;
       const fallback = Date.now() - lastInspect >= 60 * 60_000;
 
-      if (!hit && !due && !event && !risk.triggered && !fallback) {
-        if (actions.length > 0) {
-          state.lastAction = actions[0];
-          log(actions.join("；"));
-        }
+      if (!hit && !due && !event && !risk.triggered && !positionRiskPending && !fallback) {
         return;
       }
 
+      const positionReason =
+        positionRiskPending
+          ? `持仓风控：${riskAlerts.alerts
+              .map((item) => `${item.code} ${item.reason}${item.sellable ? "" : "（T+1 不可卖）"}`)
+              .join("；")}`
+          : undefined;
       const reason =
-        (risk.triggered ? `硬风控：${risk.reasons.join("；")}` : undefined) ??
+        (positionReason ??
+          (risk.triggered ? `硬风控：${risk.reasons.join("；")}` : undefined)) ??
         hit?.reason ??
         due?.reason ??
         event?.reason ??
@@ -428,11 +450,14 @@ export async function runAServe(): Promise<void> {
       log(`唤醒巡检：${reason}`);
       const result = await runAInspect(reason, { origin: "inspect" });
       if (hit) commitRuleHit(hit.rule);
-      if (risk.triggered && !result.error) markRiskDelivered();
+      if (!result.error) {
+        if (accountRisk.triggered) markRiskDelivered();
+        if (riskAlerts.alerts.length > 0) markPositionRisksDelivered();
+      }
       state.lastInspectAt = iso(new Date());
       state.lastInspectSummary = result.summary;
       state.lastInspectTools = result.toolCalls;
-      state.lastAction = result.summary || actions[0];
+      state.lastAction = result.summary;
       state.lastError = result.error;
 
       if (result.error) {
@@ -487,7 +512,8 @@ export async function runManualInspection(): Promise<CycleResult> {
       6,
     ),
   );
-  actions.push(...(await enforceStops(at, quotes)));
+  const alerts = await detectPositionRisks(at, quotes);
+  actions.push(...alerts.map((item) => `${item.code} ${item.reason}`));
   const result = await runAInspect("手动巡检", { origin: "manual" });
   actions.push(`巡检：${result.summary}`);
   if (result.error) actions.push(`巡检失败：${result.error}`);
@@ -538,16 +564,25 @@ async function processPendingOrders(now: Date): Promise<string[]> {
   return actions;
 }
 
-/** 硬风控（代码强制执行，不依赖 Agent）：ATR 止损 / 移动止盈 / 分批 + T+1 待卖 */
-async function enforceStops(now: Date, quotes: Map<string, Quote>): Promise<string[]> {
-  const actions: string[] = [];
+/**
+ * 持仓级硬风控：只检测、落盘、告警；**不自动卖出**。
+ * 与 btc 的 checkRisk 对齐 —— 交易由巡检 Agent 决定。
+ */
+async function detectPositionRisks(
+  now: Date,
+  quotes: Map<string, Quote>,
+): Promise<PositionRiskAlert[]> {
   const account = loadPaperAccount(now);
-  if (account.positions.length === 0) return actions;
+  if (account.positions.length === 0) {
+    writePositionRisks([]);
+    return [];
+  }
   const indicators = await loadIndicators();
   const pending = new Map(readPendingSells().map((item) => [item.code, item]));
   const held = new Set(account.positions.map((position) => position.code));
   for (const code of [...pending.keys()]) if (!held.has(code)) pending.delete(code);
 
+  const alerts: PositionRiskAlert[] = [];
   for (const position of account.positions) {
     const quote = quotes.get(position.code);
     if (!quote || quote.price <= 0) continue;
@@ -571,47 +606,44 @@ async function enforceStops(now: Date, quotes: Map<string, Quote>): Promise<stri
       }
     }
     if (!decision) {
-      if (pending.delete(position.code)) {
-        actions.push(`${position.code} 风险已解除，撤销待卖`);
-        appendAAction({ kind: "risk-clear", code: position.code, ok: true });
-      }
+      pending.delete(position.code);
       continue;
     }
     if (!decision.sellable) {
-      if (!pending.has(position.code)) {
-        pending.set(position.code, {
-          code: position.code,
-          name: position.name,
-          reason: decision.reason,
-          since: dayKey(now),
-        });
-        actions.push(`T+1 锁定 ${position.code} ${decision.reason}，下一交易日处理`);
-        appendAAction({ kind: "risk-locked", code: position.code, reason: decision.reason, ok: true });
-      }
-      continue;
+      pending.set(position.code, {
+        code: position.code,
+        name: position.name,
+        reason: decision.reason,
+        since: dayKey(now),
+      });
     }
-    const qty = Math.min(decision.qty ?? position.available, position.available);
-    if (qty < 1) continue;
-    const sold = await placePaperOrder({ code: position.code, side: "sell", qty }, now);
-    actions.push(
-      sold.ok
-        ? `卖出 ${position.code} ${decision.reason}：${sold.message}`
-        : `卖出失败 ${position.code}：${sold.message}`,
-    );
-    if (sold.ok) {
-      if (decision.partial) markPartialTaken(position.code);
-      else pending.delete(position.code);
-    }
-    appendAAction({
-      kind: "sell",
+    alerts.push({
       code: position.code,
+      name: position.name,
       reason: decision.reason,
-      ok: sold.ok,
-      message: sold.message,
+      sellable: decision.sellable,
+      qty: Math.min(decision.qty ?? position.available, position.available),
+      at: iso(now),
     });
   }
+
   writePendingSells([...pending.values()]);
-  return actions;
+  const previous = readPositionRisks();
+  const previousSignature = previous.alerts
+    .map((item) => `${item.code}:${item.reason}:${item.sellable}`)
+    .join("|");
+  const signature = alerts
+    .map((item) => `${item.code}:${item.reason}:${item.sellable}`)
+    .join("|");
+  writePositionRisks(alerts);
+  if (alerts.length > 0 && signature !== previousSignature) {
+    appendAAction({
+      kind: "risk-alert",
+      ok: true,
+      message: alerts.map((item) => `${item.code} ${item.reason}`).join("；"),
+    });
+  }
+  return alerts;
 }
 
 /**

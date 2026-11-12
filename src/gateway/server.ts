@@ -16,6 +16,7 @@ import { readPause as readAPause, setPaused as setAPaused } from "../a/pause";
 import { resetPaperLedger } from "../btc/paper-reset";
 import { expandHome, getDataSubdir } from "../utils/paths";
 import { readRules, describeRule } from "../a/rules";
+import { readRuleAudits } from "../a/rule-audit";
 import { readScheduleQueue } from "../a/schedule";
 import { loadWatchlist } from "../a/watchlist";
 import { createProvider } from "../llm";
@@ -454,6 +455,16 @@ export async function runGateway(): Promise<void> {
           }
           for (const rule of rules) {
             lines.push(`- ${describeRule(rule)}${rule.note ? ` — ${rule.note}` : ""}`);
+          }
+          const audits = readRuleAudits(3);
+          if (audits.length > 0) {
+            lines.push("", "最近规则审计：");
+            for (const audit of audits) {
+              lines.push(
+                `- ${formatLocalTime(audit.ts, "monthday")} ${audit.actor} ${audit.action} ` +
+                  `${audit.code ?? ""} ${audit.kind ?? ""} ${audit.ok ? "通过" : `拒绝：${audit.error ?? ""}`}`,
+              );
+            }
           }
           lines.push("", "自选股列表请用 /watch（或 /watchlist）。");
           return lines.join("\n");

@@ -1,4 +1,5 @@
 import { macdSeries } from "./macd";
+import { adx, rsi } from "./ta";
 import {
   readCache,
   writeCache,
@@ -18,7 +19,7 @@ import {
  * 口径：后复权（`02`）。前复权在高分红股上早年为负，无法参与均线/涨幅计算。
  */
 
-export const INDICATORS_CACHE = "indicators-v2.json";
+export const INDICATORS_CACHE = "indicators-v3.json";
 // 36 小时：收盘后算一次，足够覆盖**下一个交易日全天**而不在盘中突然过期重算；
 // 需要日内最新口径时显式 `xzh a sync`（指标本身按收盘价计算，盘中重算意义不大）。
 const CACHE_TTL_MS = 36 * 60 * 60 * 1000;
@@ -32,6 +33,7 @@ export interface Indicators {
   ma5?: number;
   ma10?: number;
   ma20?: number;
+  ma50?: number;
   ma60?: number;
   high20?: number;
   high60?: number;
@@ -54,6 +56,9 @@ export interface Indicators {
   macdHistPrev?: number;
   macdDif?: number;
   macdDea?: number;
+  /** 日线 RSI14 / ADX14，用于三周期趋势打分 */
+  rsi14?: number;
+  adx14?: number;
   /** 参与计算的日线根数 */
   bars: number;
 }
@@ -120,6 +125,7 @@ export function computeIndicators(code: string, bars: Bar[]): Indicators | null 
     ma5: ma(5),
     ma10: ma(10),
     ma20: ma(20),
+    ma50: ma(50),
     ma60: ma(60),
     high20: recent.length > 0 ? Math.max(...recent.map((bar) => bar.high)) : undefined,
     high60: recent60.length > 0 ? Math.max(...recent60.map((bar) => bar.high)) : undefined,
@@ -134,6 +140,8 @@ export function computeIndicators(code: string, bars: Bar[]): Indicators | null 
     macdHistPrev,
     macdDif,
     macdDea,
+    rsi14: rsi(bars),
+    adx14: adx(bars),
     bars: bars.length,
   };
 }

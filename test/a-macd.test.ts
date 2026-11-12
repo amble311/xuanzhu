@@ -3,6 +3,8 @@ import { dropIncompleteWeek, macdRising, macdSeries } from "../src/a/macd";
 import { intradayBuyReady, intradayWeak } from "../src/a/intraday";
 import { computeIndicators } from "../src/a/indicators";
 import { scoreDailyDetailed } from "../src/a/score";
+import { combineTrend, dailyTrend, monthlyTrend, weeklyTrend } from "../src/a/trend";
+import { score15m } from "../src/a/deep15";
 import { newsTone } from "../src/a/news";
 import type { Bar } from "../src/exchange/ashare";
 
@@ -110,5 +112,49 @@ describe("消息面分类", () => {
     expect(newsTone("关于召开第三季度业绩说明会的公告")).toBe("neutral");
     expect(newsTone("非经营性资金占用及其他关联资金往来情况汇总表")).toBe("neutral");
     expect(newsTone("防范大股东及关联方资金占用专项制度")).toBe("neutral");
+  });
+});
+
+describe("三周期趋势与 15m 评分", () => {
+  const rising = (count: number, start = 100) =>
+    bars(Array.from({ length: count }, (_, index) => start * (1 + index * 0.01)));
+
+  it("月/周线单边上涨判为 +1，反向判为 -1 或 0", () => {
+    expect(monthlyTrend(rising(30)).score).toBe(1);
+    expect(weeklyTrend(rising(80)).score).toBe(1);
+    const falling = bars(Array.from({ length: 30 }, (_, index) => 200 - index * 2));
+    expect(monthlyTrend(falling).score).not.toBe(1);
+  });
+
+  it("任一周期向下、全 0 或没有 +1 都不通过", () => {
+    const up = { score: 1 as const, reason: "" };
+    const flat = { score: 0 as const, reason: "" };
+    const down = { score: -1 as const, reason: "" };
+    expect(combineTrend(up, up, up).pass).toBe(true);
+    expect(combineTrend(up, flat, up).pass).toBe(true);
+    expect(combineTrend(up, down, up).pass).toBe(false);
+    expect(combineTrend(flat, flat, flat).pass).toBe(false);
+  });
+
+  it("日线 4 项检查多数向上判为 +1", () => {
+    const result = dailyTrend({
+      code: "600519",
+      asOf: "2026-11-11",
+      close: 12,
+      ma20: 11,
+      ma50: 10,
+      high20: 12,
+      low20: 8,
+      rsi14: 55,
+      macdHist: 0.2,
+      macdHistPrev: 0.1,
+      bars: 140,
+    } as never);
+    expect(result.score).toBe(1);
+  });
+
+  it("15 分钟结构/动量向上时得分为正", () => {
+    const result = score15m(rising(80));
+    expect(result?.score).toBeGreaterThan(0);
   });
 });

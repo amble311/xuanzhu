@@ -101,6 +101,7 @@ describe("模式与工具注册", () => {
       "a_bars",
       "a_cancel_order",
       "a_clear_risk",
+      "a_news",
       "a_order",
       "a_orders",
       "a_quote",

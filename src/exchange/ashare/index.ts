@@ -10,3 +10,4 @@ export * from "./cache";
 export * from "./calendar";
 export * from "./boards";
 export * from "./universe";
+export * from "./fifteen";

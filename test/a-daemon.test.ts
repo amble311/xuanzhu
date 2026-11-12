@@ -6,6 +6,8 @@ import { clampToWorkTime, pushSchedule, readScheduleQueue, takeDueSchedule } fro
 import { addRule, commitRuleHit, evaluateRules, readRules, removeRules } from "../src/a/rules";
 import { isPaused, readPause, setPaused } from "../src/a/pause";
 import { takeMarketEvent } from "../src/a/events";
+import { appendRuleAudit, readRuleAudits } from "../src/a/rule-audit";
+import { markPositionRisksDelivered, readPositionRisks, writePositionRisks } from "../src/a/risk-alerts";
 import { shouldRunAfterCloseSelection } from "../src/a/monitor";
 import { formatLocalTime } from "../src/utils/time";
 import { checkAccountRisk, clearRiskTrigger, readRiskState } from "../src/a/risk";
@@ -67,6 +69,20 @@ describe("监控规则", () => {
     if (!hit) return;
     commitRuleHit(hit.rule);
     expect(readRules()).toHaveLength(0);
+  });
+
+  it("script 规则使用受限表达式", () => {
+    removeRules({});
+    const added = addRule({
+      code: "600519",
+      kind: "script",
+      note: "均线多头且上涨",
+      expression: "price > ma20 && pct > 2",
+    });
+    expect(added.ok).toBe(true);
+    const quotes = new Map([["600519", { code: "600519", price: 11, changePct: 3 } as never]]);
+    const indicators = new Map([["600519", { ma20: 10 } as never]]);
+    expect(evaluateRules(readRules(), quotes, indicators)?.reason).toContain("脚本");
   });
 
   it("ma20_break 用指标判断", () => {
@@ -249,5 +265,37 @@ describe("本地时间展示", () => {
     expect(formatLocalTime(date.toISOString(), "time")).toBe("03:04");
     expect(formatLocalTime(date.toISOString(), "monthday")).toBe("01-02 03:04");
     expect(formatLocalTime("bad", "time")).toBe("—");
+  });
+});
+
+describe("规则写入审计", () => {
+  it("记录写入/拒绝，可按时间读取", () => {
+    appendRuleAudit({ actor: "inspect", action: "add", ok: true, code: "600519", kind: "script", detail: "price > ma20" });
+    appendRuleAudit({ actor: "manual", action: "reject", ok: false, code: "999999", error: "不在持仓/自选股范围" });
+    const audits = readRuleAudits(2);
+    expect(audits).toHaveLength(2);
+    expect(audits[0].action).toBe("add");
+    expect(audits[1].error).toContain("范围");
+  });
+});
+
+describe("持仓风控告警", () => {
+  it("只落盘不交易；已送达的同一批不重复唤醒，内容变化重新置为未送达", () => {
+    writePositionRisks([
+      { code: "600519", name: "贵州茅台", reason: "止损 -8%", sellable: true, qty: 100, at: "t" },
+    ]);
+    let state = readPositionRisks();
+    expect(state.alerts).toHaveLength(1);
+    expect(state.delivered).toBe(false);
+    markPositionRisksDelivered();
+    expect(readPositionRisks().delivered).toBe(true);
+    writePositionRisks([
+      { code: "600519", name: "贵州茅台", reason: "止损 -8%", sellable: true, qty: 100, at: "t" },
+    ]);
+    expect(readPositionRisks().delivered).toBe(true);
+    writePositionRisks([
+      { code: "300750", name: "宁德时代", reason: "移动止盈", sellable: true, qty: 100, at: "t" },
+    ]);
+    expect(readPositionRisks().delivered).toBe(false);
   });
 });

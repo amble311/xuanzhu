@@ -1,22 +1,21 @@
-import { fetchBars, mapLimit } from "../exchange/ashare";
+import { fetch15mBars, fetchBars, mapLimit } from "../exchange/ashare";
 import { loadIndicators, type Indicators } from "./indicators";
-import { dropIncompleteWeek, macdRising } from "./macd";
+import { dropIncompleteWeek } from "./macd";
 import { loadSnapshot, type SnapshotRow } from "./snapshot";
 import { applyNewsAdjustments } from "./news";
-import { reviewWithAgent } from "./agent-review";
+import { score15m } from "./deep15";
+import { combineTrend, dailyTrend, monthlyTrend, weeklyTrend, type CycleTrend } from "./trend";
 import type { WatchItem } from "./watchlist";
 
 /**
- * A 股选股：三周期 MACD 漏斗 + 日线详细评分。
+ * A 股选股：三周期趋势过滤 + 15 分钟深度技术分析 + 消息面打分。
  *
- * 与用户确认的规则一致：
- * 1. 日线 MACD 柱体高于昨天（全市场缓存指标，零额外请求）；
- * 2. 周线 MACD 柱体高于上一周（只取截止最近一次周末的完整周）；
- * 3. 月线 MACD 柱体高于上一月（当月未走完，按当前月线比较）；
- * 4. 对最后剩下的做日线详细评分，取前 10；**不足 10 只不补**。
+ * 1. 月/周/日各算 -1 / 0 / +1；任一周期 -1、数据不足、三周期全 0、没有 +1 都丢弃；
+ * 2. 非涨停，按趋势强度和成交额取前 20；
+ * 3. 对 20 只拉 15 分钟 K 线，做结构/位置/动量/量能/形态评分（0–100）；
+ * 4. 消息面硬否决 + ±10 微调，按最终得分取前 10，不足不补。
  *
- * 刻意不使用 1h / 30m：A 股 T+1 + 4 小时交易，日内触发容易追涨杀跌；
- * 进场由日线信号决定，盘中只负责卖出风控。
+ * 选股不看 MACD 单指标，也不在盘中执行；固定由收盘后 16:00 任务调用。
  */
 
 /**
@@ -99,96 +98,121 @@ export async function selectTopWatchlist(
   ]);
   const universe = baseUniverse(loaded.snapshot.rows);
 
-  // 1) 日线 MACD 柱体回升（缓存指标，零额外请求）
-  const daily = universe.filter((row) => {
-    const ind = indicators.get(row.code);
-    return (
-      ind?.macdHist !== undefined &&
-      ind.macdHistPrev !== undefined &&
-      ind.macdHist > ind.macdHistPrev
-    );
-  });
-  onProgress?.(`日线 MACD 回升 ${daily.length}/${universe.length}`);
+  // 1) 日线趋势：缓存指标计算，-1 / 数据不足直接丢弃
+  const dailyPass: Array<{ row: SnapshotRow; daily: CycleTrend }> = [];
+  for (const row of universe) {
+    const daily = dailyTrend(indicators.get(row.code));
+    if (daily.score === null || daily.score === -1) continue;
+    dailyPass.push({ row, daily });
+  }
+  onProgress?.(`日线趋势通过 ${dailyPass.length}/${universe.length}`);
 
-  // 2) 周线 MACD 柱体回升（截止最近一次周末）
+  // 2) 周线趋势（截止最近一次完整周末）
   let done = 0;
-  const weekly = (
+  const weeklyPass = (
     await mapLimit(
-      daily,
-      async (row) => {
+      dailyPass,
+      async (item) => {
         try {
           const bars = dropIncompleteWeek(
-            await fetchBars(row.code, { period: "week", adjust: "backward", limit: 80 }),
+            await fetchBars(item.row.code, { period: "week", adjust: "backward", limit: 80 }),
           );
-          return macdRising(bars) ? row : null;
+          const weekly = weeklyTrend(bars);
+          if (weekly.score === null || weekly.score === -1) return null;
+          return { ...item, weekly };
         } catch {
           return null;
         } finally {
           done += 1;
-          if (done % 200 === 0) onProgress?.(`周线 MACD 检查 ${done}/${daily.length}…`);
+          if (done % 200 === 0) onProgress?.(`周线趋势检查 ${done}/${dailyPass.length}…`);
         }
       },
       6,
     )
-  ).filter((row): row is SnapshotRow => row !== null);
-  onProgress?.(`周线 MACD 回升 ${weekly.length}`);
+  ).filter((item): item is { row: SnapshotRow; daily: CycleTrend; weekly: CycleTrend } => item !== null);
+  onProgress?.(`周线趋势通过 ${weeklyPass.length}`);
 
-  // 3) 月线 MACD 柱体回升（当月未走完，按当前月线比较）
+  // 3) 月线趋势（包含当月未走完）
   done = 0;
-  const monthly = (
+  const monthlyPass = (
     await mapLimit(
-      weekly,
-      async (row) => {
+      weeklyPass,
+      async (item) => {
         try {
-          const bars = await fetchBars(row.code, {
+          const bars = await fetchBars(item.row.code, {
             period: "month",
             adjust: "backward",
             limit: 60,
           });
-          return macdRising(bars) ? row : null;
+          const monthly = monthlyTrend(bars);
+          if (monthly.score === null || monthly.score === -1) return null;
+          return { ...item, monthly };
         } catch {
           return null;
         } finally {
           done += 1;
-          if (done % 100 === 0) onProgress?.(`月线 MACD 检查 ${done}/${weekly.length}…`);
+          if (done % 100 === 0) onProgress?.(`月线趋势检查 ${done}/${weeklyPass.length}…`);
         }
       },
       6,
     )
-  ).filter((row): row is SnapshotRow => row !== null);
-  onProgress?.(`月线 MACD 回升 ${monthly.length}`);
-
-  // 4) 日线详细评分，取前 10，不足不补；同分按成交额、20 日动量排序
-  const scored: WatchItem[] = monthly
-    .map((row) => {
-      const ind = indicators.get(row.code);
-      return {
-        row,
-        score: scoreDailyDetailed(row, ind),
-        amount: row.amount,
-        ret20: ind?.ret20 ?? 0,
-      };
-    })
-    .sort((a, b) => b.score - a.score || b.amount - a.amount || b.ret20 - a.ret20)
-    .slice(0, limit)
-    .map((item) => ({
-      code: item.row.code,
-      name: item.row.name,
-      score: item.score,
-      reason: "MACD 日/周/月回升 + 日线评分",
-      source: "select" as const,
-      addedAt: new Date().toISOString(),
-    }));
-
-  onProgress?.(`选股完成 ${scored.length} 只，开始消息面检查…`);
-  const withNews = await applyNewsAdjustments(scored, { onProgress });
-
-  // 每日一次的 Agent 复核：只能剔除/重排，失败回退规则结果
-  const reviewed = await reviewWithAgent(withNews, onProgress);
-  if (reviewed.error) onProgress?.(`Agent 复核跳过：${reviewed.error}`);
-
-  onProgress?.(
-    `最终入选 ${reviewed.items.length} 只${reviewed.items.length < limit ? "（不足 10 只，不补）" : ""}`,
+  ).filter(
+    (item): item is {
+      row: SnapshotRow;
+      daily: CycleTrend;
+      weekly: CycleTrend;
+      monthly: CycleTrend;
+    } => item !== null,
   );
-  return reviewed.items;
+
+  // 4) 三周期合成：任一向下 / 全 0 / 没有 +1 都丢弃
+  const trendPass = monthlyPass
+    .map((item) => ({ ...item, trend: combineTrend(item.monthly, item.weekly, item.daily) }))
+    .filter((item) => item.trend.pass);
+  onProgress?.(`三周期趋势通过 ${trendPass.length}`);
+
+  // 5) 非涨停，按趋势强度/成交额取前 20，做 15 分钟深度分析
+  const shortlist = trendPass
+    .filter((item) => {
+      const row = item.row;
+      return !(row.limitUp && row.price >= row.limitUp - 0.001);
+    })
+    .sort(
+      (a, b) =>
+        b.trend.sum - a.trend.sum ||
+        b.row.amount - a.row.amount,
+    )
+    .slice(0, 20);
+  onProgress?.(`非涨停趋势池 ${shortlist.length}/20，开始 15 分钟深度分析…`);
+
+  done = 0;
+  const analyzed = await mapLimit(
+    shortlist,
+    async (item) => {
+      const deep = await fetch15mBars(item.row.code, 160)
+        .then((bars) => score15m(bars))
+        .catch(() => null);
+      done += 1;
+      if (done % 5 === 0) onProgress?.(`15 分钟分析 ${done}/${shortlist.length}…`);
+      return {
+        code: item.row.code,
+        name: item.row.name,
+        score: deep?.score ?? 0,
+        reason:
+          `趋势 ${item.trend.reason} · ${deep?.reason ?? "15m 数据不足（0 分）"}`,
+        source: "select" as const,
+        addedAt: new Date().toISOString(),
+      } satisfies WatchItem;
+    },
+    4,
+  );
+
+  // 6) 消息面：硬风险否决 + ±10 微调；最后按得分取前 10（不足不补）
+  onProgress?.("15 分钟分析完成，开始消息面打分…");
+  const withNews = await applyNewsAdjustments(analyzed, { onProgress });
+  const final = withNews.sort((a, b) => b.score - a.score).slice(0, limit);
+  onProgress?.(
+    `最终入选 ${final.length} 只${final.length < limit ? "（不足 10 只，不补）" : ""}`,
+  );
+  return final;
 }

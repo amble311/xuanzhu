@@ -20,10 +20,11 @@ export type RuleKind =
   | "ma20_above"
   | "ret20_above"
   | "chain"
-  | "formula";
+  | "formula"
+  | "script";
 
 export interface RuleStep {
-  kind: Exclude<RuleKind, "chain" | "formula">;
+  kind: Exclude<RuleKind, "chain" | "formula" | "script">;
   value?: number;
 }
 
@@ -42,7 +43,7 @@ export interface MonitorRule {
   /** 只在交易日的这个小时窗口内评估（UTC+8） */
   windowStartHour?: number;
   windowEndHour?: number;
-  /** formula 规则的表达式（只允许价格/均线/涨幅变量） */
+  /** formula / script 规则的受限表达式（只允许价格/均线/涨幅变量） */
   expression?: string;
   /** 链式规则的步骤；只有最后一步满足才唤醒 */
   steps?: RuleStep[];
@@ -117,13 +118,18 @@ export function addRule(input: {
     input.kind !== "ma20_above" &&
     input.kind !== "chain" &&
     input.kind !== "formula" &&
+    input.kind !== "script" &&
     (!Number.isFinite(input.value) || (input.value ?? 0) <= 0)
   ) {
     return { ok: false, error: "price/pct/ret20 规则需要正数 value" };
   }
-  if (input.kind === "formula") {
+  if (input.kind === "formula" || input.kind === "script") {
     if (!input.expression || !validateFormula(input.expression)) {
-      return { ok: false, error: "formula 表达式非法（只允许 price/pct/ma5/ma20/ma60/ret5/ret20/ret60/atr_pct/amount 与运算符）" };
+      return {
+        ok: false,
+        error:
+          "表达式非法（只允许 price/pct/ma5/ma20/ma60/ret5/ret20/ret60/atr_pct/amount 与运算符；脚本不执行任意代码）",
+      };
     }
   }
   if (input.kind === "chain") {
@@ -145,10 +151,13 @@ export function addRule(input: {
       input.kind === "ma20_break" ||
       input.kind === "ma20_above" ||
       input.kind === "chain" ||
-      input.kind === "formula"
+      input.kind === "formula" ||
+      input.kind === "script"
         ? undefined
         : input.value,
-    ...(input.kind === "formula" ? { expression: input.expression } : {}),
+    ...(input.kind === "formula" || input.kind === "script"
+      ? { expression: input.expression }
+      : {}),
     ...(input.kind === "chain"
       ? { steps: input.steps, step: 0, chainExpireMin: Math.max(5, input.chainExpireMin ?? 240) }
       : {}),
@@ -200,6 +209,7 @@ export function removeRules(input: { id?: string; code?: string }): number {
 
 export function describeRule(rule: MonitorRule): string {
   if (rule.kind === "formula") return `${rule.code} 公式：${rule.expression ?? ""}`;
+  if (rule.kind === "script") return `${rule.code} 脚本：${rule.expression ?? ""}`;
   if (rule.kind === "chain") {
     return `${rule.code} 链式 ${rule.step ?? 0}/${rule.steps?.length ?? 0}`;
   }
@@ -376,7 +386,8 @@ export function evaluateRules(
       case "ret20_above":
         hit = (indicators.get(rule.code)?.ret20 ?? -Infinity) >= (rule.value ?? 0);
         break;
-      case "formula": {
+      case "formula":
+      case "script": {
         const ind = indicators.get(rule.code);
         hit =
           evaluateFormula(rule.expression ?? "", {

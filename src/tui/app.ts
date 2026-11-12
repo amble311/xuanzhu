@@ -33,6 +33,7 @@ import {
   readPendingSells,
   readPause as readAPause,
   readRules,
+  readRuleAudits,
   describeRule,
   readScheduleQueue as readAScheduleQueue,
   setPaused as setAPaused,
@@ -1820,6 +1821,16 @@ export class TuiApp {
       }
       if (queue[0]) {
         out.push("", `下一轮巡检：${formatLocalTime(queue[0].at, "monthday")} ${queue[0].reason}`);
+      }
+      const audits = readRuleAudits(3);
+      if (audits.length > 0) {
+        out.push("", "最近规则审计：");
+        for (const audit of audits) {
+          out.push(
+            `- ${formatLocalTime(audit.ts, "monthday")} ${audit.actor} ${audit.action} ` +
+              `${audit.code ?? ""} ${audit.kind ?? ""} ${audit.ok ? "通过" : `拒绝：${audit.error ?? ""}`}`,
+          );
+        }
       }
       out.push("", "自选股列表请用 /watch（或 /watchlist）。");
       this.lines.push(`${ansi.gray}${out.join("\n")}${ansi.reset}`);

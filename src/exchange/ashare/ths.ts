@@ -26,6 +26,7 @@ const USER_AGENT = "xzh-ashare/1.0";
 const PERIOD_CODE: Record<BarPeriod, string> = {
   "1m": "6",
   "5m": "3",
+  "15m": "",
   "30m": "4",
   "60m": "5",
   day: "0",
@@ -510,6 +511,12 @@ export interface FetchBarsOptions {
 export async function fetchBars(input: string, options: FetchBarsOptions = {}): Promise<Bar[]> {
   const symbol = toThsSymbol(input);
   const period = options.period ?? "day";
+  if (period === "15m") {
+    const { fetch15mBars } = await import("./fifteen");
+    let bars = await fetch15mBars(input, options.limit ?? 160);
+    if (options.from) bars = bars.filter((bar) => bar.time.slice(0, 10) >= options.from!);
+    return bars;
+  }
   const adjust = options.adjust ?? "backward";
   const limit = options.limit ?? 250;
   const type = barsType(period, adjust);
