@@ -48,6 +48,7 @@ import {
   TRIGGER_EVAL_INTERVAL_MS,
   type TriggerHit,
 } from "./triggers";
+import { auditTrigger } from "./trigger-audit";
 import { consecutiveLosses, dailyLossPct } from "./performance";
 import { readPause } from "./pause";
 import {
@@ -437,6 +438,12 @@ export async function runBtcBackend(
       price,
       triggerNote: hits.map((hit) => describeHit(hit)).join("\n"),
       commit: () => {
+        for (const hit of hits) {
+          auditTrigger("hit", role, hit.trigger, {
+            actor: "system",
+            observed: hit.actual,
+          });
+        }
         recordEvaluation(home, triggers, observation, hits, role, evaluation.states);
         flushFormulaErrors();
         refreshQueueState();

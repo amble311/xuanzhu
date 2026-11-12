@@ -18,6 +18,7 @@ import {
   triggerFilePath,
   type Trigger,
 } from "../src/btc/triggers";
+import { appendTriggerAudit, readTriggerAudits } from "../src/btc/trigger-audit";
 
 /**
  * 叫醒条件（触发器）。
@@ -602,5 +603,36 @@ describe("叫醒条件", () => {
       expect(removeTriggers(home, { all: true }, "live").removed).toHaveLength(1);
       expect(readTriggers(home, "live")).toHaveLength(0);
     });
+  });
+});
+
+describe("触发器审计", () => {
+  it("写入与命中审计落盘，可按时间读取", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "xzh-btc-trigger-audit-"));
+    try {
+      appendTriggerAudit(
+        {
+          action: "add",
+          actor: "inspect",
+          role: "live",
+          ok: true,
+          triggerId: "t1",
+          kind: "formula",
+          expression: "rsi_1h > 70",
+          reason: "超买",
+        },
+        dir,
+      );
+      appendTriggerAudit(
+        { action: "hit", actor: "system", role: "live", ok: true, triggerId: "t1", observed: 71.2 },
+        dir,
+      );
+      const rows = readTriggerAudits(5, dir);
+      expect(rows).toHaveLength(2);
+      expect(rows[0].action).toBe("add");
+      expect(rows[1].observed).toBe(71.2);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

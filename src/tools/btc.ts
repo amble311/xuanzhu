@@ -33,6 +33,7 @@ import {
   type TriggerKind,
   type TriggerOp,
 } from "../btc/triggers";
+import { auditTrigger } from "../btc/trigger-audit";
 import { readRiskSettings } from "../btc/risk";
 import { suggestLeverage } from "../btc/leverage";
 import { decideSideGate, evaluateSideGate } from "../btc/side-gate";
@@ -1859,6 +1860,8 @@ const triggerTool: ToolDefinition = {
 
     if (action === "clear") {
       const result = removeTriggers(home, { all: true }, role);
+      for (const removed of result.removed) auditTrigger("remove", role, removed);
+      auditTrigger("clear", role, { id: "all", kind: "all" });
       return {
         ok: true,
         content:
@@ -1881,6 +1884,7 @@ const triggerTool: ToolDefinition = {
       if (result.removed.length === 0) {
         return { ok: true, content: `没有找到 id 为 ${id} 的条件（可能已触发失效）。` };
       }
+      auditTrigger("remove", role, result.removed[0]);
       return {
         ok: true,
         content:
@@ -1953,7 +1957,11 @@ const triggerTool: ToolDefinition = {
         },
         role,
       );
-      if (!result.ok) return { ok: false, content: `错误：${result.error}` };
+      if (!result.ok) {
+        auditTrigger("reject", role, { id: "new" }, { ok: false, error: result.error });
+        return { ok: false, content: `错误：${result.error}` };
+      }
+      auditTrigger("add", role, result.trigger, { duplicate: result.duplicate === true });
 
       if (result.duplicate) {
         return {
