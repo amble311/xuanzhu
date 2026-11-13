@@ -126,26 +126,26 @@ process.on("unhandledRejection", (reason) => {
 });
 
 /**
- * 只拉起 btc 常驻后端（不进入界面），对齐 `xzh a serve`。
+ * 只拉起 btc 常驻后端（不进入界面），对齐 `xzh a start`。
  *
- * `xzh btc serve` / `xzh btc moni serve` 用它：已在跑就复用，没有就 detached 启动，
+ * `xzh btc start` / `xzh btc moni start` 用它：已在跑就复用，没有就 detached 启动，
  * 最多等 3 秒拿状态文件，然后打印结果返回。真正的常驻循环是带 `--foreground` 的内部调用。
  */
 async function startBtcService(role: "live" | "paper"): Promise<void> {
-  const label = role === "paper" ? "模拟盘" : "常驻";
+  const label = role === "paper" ? "模拟盘" : "实盘";
   const backend = await ensureBtcBackend({ role });
   if (backend.running) {
     const next = backend.state?.nextCheckAt;
     process.stdout.write(
-      `${ansi.green}✓ ${backend.started ? "已启动" : "复用"} btc ${label}后端` +
+      `${ansi.green}✓ ${backend.started ? "已启动" : "复用"} btc ${label}后台` +
         `（pid ${backend.state?.pid ?? "?"}）${next ? `，下次巡检 ${next}` : ""}${ansi.reset}\n` +
-        `${ansi.gray}  停止用 ${ansi.reset}xzh btc stop${role === "paper" ? " --paper" : ""}` +
+        `${ansi.gray}  停止用 ${ansi.reset}xzh btc ${role === "paper" ? "moni " : ""}stop` +
         `${ansi.gray}；查看见 ${ansi.reset}xzh btc status${ansi.reset}\n`,
     );
     return;
   }
   process.stdout.write(
-    `${ansi.red}✗ btc ${label}后端未启动：${backend.error ?? "未知原因"}${ansi.reset}\n` +
+    `${ansi.red}✗ btc ${label}后台未启动：${backend.error ?? "未知原因"}${ansi.reset}\n` +
       `${ansi.gray}  先运行 ${ansi.reset}xzh btc setup${ansi.gray} 准备计算环境（首次需联网）${ansi.reset}\n`,
   );
   process.exitCode = 1;
@@ -203,8 +203,19 @@ async function main(): Promise<void> {
         await btcSetupCommand(args.slice(2));
         return;
       }
+      // 只启动后台，不进入界面：`xzh btc start`（实盘）/ `xzh btc moni start`（模拟盘）
+      if (sub === "start") {
+        // 内部标记：detached 出来的常驻进程才跑前台循环（见 src/btc/daemon.ts）
+        if (args.includes("--foreground")) {
+          await runBtcBackend({ role: "live" });
+          return;
+        }
+        await startBtcService("live");
+        return;
+      }
       if (sub === "stop") {
-        await btcStopCommand();
+        // 默认只停实盘；模拟盘用 `xzh btc moni stop`
+        await btcStopCommand(args.slice(2));
         return;
       }
       if (sub === "status") {
@@ -223,22 +234,18 @@ async function main(): Promise<void> {
         await btcPlatformCommand(args.slice(2));
         return;
       }
-      // 只启动后台，不进入界面（与 `xzh a serve` 对齐）：
-      // `xzh btc serve` = 实盘后端，`xzh btc moni serve` = 模拟盘后端。
-      if (sub === "serve") {
-        const role = args.includes("--paper") ? "paper" : "live";
-        // 内部标记：detached 出来的常驻进程才跑前台循环（见 src/btc/daemon.ts）
-        if (args.includes("--foreground")) {
-          await runBtcBackend({ role });
-          return;
-        }
-        await startBtcService(role);
-        return;
-      }
       // 模拟盘：同一套模式，换成 paper 角色（独立后端 + 虚拟账本）
       if (sub === "moni") {
-        if (args[2] === "serve") {
+        if (args[2] === "start") {
+          if (args.includes("--foreground")) {
+            await runBtcBackend({ role: "paper" });
+            return;
+          }
           await startBtcService("paper");
+          return;
+        }
+        if (args[2] === "stop") {
+          await btcStopCommand(["--paper"]);
           return;
         }
         process.env.XZH_BTC_ROLE = "paper";
@@ -249,10 +256,11 @@ async function main(): Promise<void> {
         process.stdout.write(
           `${ansi.red}未知子命令：${command} ${sub}${ansi.reset}\n` +
             `${ansi.gray}${command} 模式目前支持：` +
-            `${command}${ansi.gray}（进入模式）、${command} moni（模拟盘）、${command} serve（只启动后台）、` +
-            `${command} moni serve（只启动模拟盘后台）、${command} apikey（凭据管理）、` +
-            `${command} fk（硬性风控）、${command} platform（交易平台）、${command} setup、` +
-            `${command} stop、${command} status${ansi.reset}\n`,
+            `${command}${ansi.gray}（进入实盘模式）、${command} start（只启动实盘后台）、` +
+            `${command} stop（关闭实盘后台）、${command} moni（进入模拟盘）、` +
+            `${command} moni start（只启动模拟盘后台）、${command} moni stop（关闭模拟盘后台）、` +
+            `${command} apikey（凭据管理）、${command} fk（硬性风控）、${command} platform（交易平台）、` +
+            `${command} setup、${command} status${ansi.reset}\n`,
         );
         process.exitCode = 1;
         return;
@@ -583,32 +591,33 @@ ${ansi.bold}用法${ansi.reset}（按英文字母排序）
   ${ansi.green}xzh --intent${ansi.reset}            本次启动启用意图分析（默认关闭）
   ${ansi.green}xzh --no-intent${ansi.reset}         本次启动强制关闭意图分析
   ${ansi.green}xzh --version${ansi.reset}           显示版本
-  ${ansi.green}xzh a${ansi.reset}                   进入 A 股分析模式：工作目录固定为 ${ansi.gray}${getAShareHome()}${ansi.reset}（不可 /switch）
+  ${ansi.green}xzh a${ansi.reset}                   启动 A 股模式：工作目录固定为 ${ansi.gray}${getAShareHome()}${ansi.reset}（前端 + 自动拉起后台，不可 /switch）
   ${ansi.green}xzh a bars <代码>${ansi.reset}        K 线（--period / --adjust / --limit / --from）
   ${ansi.green}xzh a fk${ansi.reset}                 硬性风控（fk reset [代码] 解除；单票锁只锁该股）
   ${ansi.green}xzh a market${ansi.reset}             主要指数一览
-  ${ansi.green}xzh a pause [resume|status]${ansi.reset}  暂停/恢复 A 股巡检（进程仍在）
+  ${ansi.green}xzh a pause [resume|status]${ansi.reset}  暂停/恢复 A 股巡检与模拟交易（进程仍在）
   ${ansi.green}xzh a quote <代码...>${ansi.reset}    实时快照；指数写 1A0001
   ${ansi.green}xzh a screen${ansi.reset}             横截面筛选（--pct-min / --amount-min / --above-ma20 …）
-  ${ansi.green}xzh a serve [status|stop]${ansi.reset} A 股独立巡检与监控：盘中每 15 分钟选股 / 监控 / 模拟买卖
   ${ansi.green}xzh a snapshot${ansi.reset}           全市场温度（涨跌家数 / 涨跌停 / 成交额 / 分布）
-  ${ansi.green}xzh a start|stop${ansi.reset}         启动 / 停止 A 股巡检（简写）
+  ${ansi.green}xzh a start${ansi.reset}              启动 A 股后台服务（巡检 / 监控 / 模拟交易）
+  ${ansi.green}xzh a stop${ansi.reset}               关闭 A 股后台服务
   ${ansi.green}xzh a sync|status${ansi.reset}        建股票池 + 预计算指标 / 查看缓存状态
   ${ansi.green}xzh a watch [add|remove]${ansi.reset}  自选股（≤10，持仓强制保留）
   ${ansi.green}xzh autonomy${ansi.reset}            查看自治等级（ask / observe / auto）与最近拦截记录
   ${ansi.green}xzh autonomy <档位>${ansi.reset}     切换自治等级；observe = 只观察、改动一律拦截并记账
   ${ansi.green}xzh autonomy log [N]${ansi.reset}    打印观察日志（.xuanzhu/state/observe.log）
-  ${ansi.green}xzh btc${ansi.reset}                 进入 BTC 量化交易模式：工作目录固定为 ${ansi.gray}${getBtcHome()}${ansi.reset}
+  ${ansi.green}xzh btc${ansi.reset}                 启动 BTC 实盘模式：工作目录固定为 ${ansi.gray}${getBtcHome()}${ansi.reset}（前端 + 自动拉起实盘后台）
                             （${ansi.gray}XZH_BTC_HOME${ansi.reset} 可重定向、不可 /switch、只加载交易相关技能）
   ${ansi.green}xzh btc apikey${ansi.reset}          管理交易所 API 凭据（录入 / 更新 / 删除 / 查看别名）
   ${ansi.green}xzh btc fk${ansi.reset}              硬性风控阈值（持仓亏损 / 当日亏损 / 连亏）
-  ${ansi.green}xzh btc moni${ansi.reset}            进入 BTC 模拟盘：虚拟账本开平仓，不涉及真钱（独立后端）
-  ${ansi.green}xzh btc moni serve${ansi.reset}      只在后台启动模拟盘后端，不进入界面
+  ${ansi.green}xzh btc moni${ansi.reset}            启动 BTC 模拟盘：虚拟账本开平仓（前端 + 自动拉起模拟盘后台）
+  ${ansi.green}xzh btc moni start${ansi.reset}      启动模拟盘后台（不进入界面）
+  ${ansi.green}xzh btc moni stop${ansi.reset}       关闭模拟盘后台
   ${ansi.green}xzh btc platform${ansi.reset}        选择交易平台（默认币安；已接入的只有币安）
-  ${ansi.green}xzh btc serve${ansi.reset}           只在后台启动实盘后端，不进入界面（已在跑则复用）
   ${ansi.green}xzh btc setup${ansi.reset}           重建 btc 计算环境（首次进入模式时自动执行；此处用于修复 / ${ansi.gray}--force${ansi.reset} 重装）
-  ${ansi.green}xzh btc status${ansi.reset}          查看观察 / 模拟盘两个后端与排期队列
-  ${ansi.green}xzh btc stop${ansi.reset}            停止 btc 常驻后端（退出界面不会停它；${ansi.gray}--paper${ansi.reset} 只停模拟盘）
+  ${ansi.green}xzh btc start${ansi.reset}           启动实盘后台（不进入界面；已在跑则复用）
+  ${ansi.green}xzh btc status${ansi.reset}          查看实盘 / 模拟盘两个后台与排期队列
+  ${ansi.green}xzh btc stop${ansi.reset}            关闭实盘后台（退出界面不会停它；模拟盘用 ${ansi.gray}xzh btc moni stop${ansi.reset}）
   ${ansi.green}xzh config${ansi.reset}              查看当前配置（API Key 脱敏）
   ${ansi.green}xzh config edit${ansi.reset}         使用 nano 编辑配置文件
   ${ansi.green}xzh config init${ansi.reset}         生成默认配置文件

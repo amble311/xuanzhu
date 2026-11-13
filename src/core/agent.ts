@@ -623,6 +623,8 @@ export class Agent {
   private finishGateUsed = false;
   /** 本轮是否已经提示过「输出被长度上限截断」（每次 run 最多一次） */
   private truncationNoticed = false;
+  /** 本轮是否已经尝试过「截断续写」（每次 run 最多一次） */
+  private continuationTried = false;
   /** 本轮是否调用过 `todo_write`（未完成门只看本轮自己列的计划，避免对旧清单唠叨） */
   private runTouchedTodos = false;
   /**
@@ -1738,6 +1740,7 @@ export class Agent {
     this.runLastVerifySeq = 0;
     this.finishGateUsed = false;
     this.truncationNoticed = false;
+    this.continuationTried = false;
     this.runTouchedTodos = false;
     this.runStatus = undefined;
     this.runToolCounts.clear();
@@ -2509,6 +2512,41 @@ export class Agent {
     return trimmed.length > 0 ? trimmed : null;
   }
 
+  /**
+   * 截断续写：把已输出正文作为 assistant 前缀，再请求一次「从中断处继续」。
+   * 只用于纯文本（没有工具调用）；任何异常都交给调用方保留原文。
+   */
+  private async continueTruncatedText(
+    messages: ChatMessage[],
+    signal?: AbortSignal,
+    systemCachePrefix?: string,
+  ): Promise<{ text: string; finishReason?: string }> {
+    let text = "";
+    let finishReason: string | undefined;
+    const stream = this.provider.chat({
+      messages,
+      tools: [],
+      temperature: this.config.temperature,
+      maxTokens: this.requestMaxTokens(),
+      systemCachePrefix,
+      signal,
+    });
+    for await (const chunk of stream) {
+      if (signal?.aborted) break;
+      if (chunk.type === "text") {
+        text += chunk.text;
+        this.events.onText(chunk.text);
+        if (text.length > MAX_RESPONSE_CHARS) break;
+      } else if (chunk.type === "reasoning") {
+        this.events.onReasoning?.(chunk.text);
+      } else if (chunk.type === "done") {
+        finishReason = chunk.finishReason;
+        if (chunk.usage) this.events.onUsage?.(chunk.usage);
+      }
+    }
+    return { text, finishReason };
+  }
+
   private async streamAssistant(
     signal?: AbortSignal,
     tried: Set<string> = new Set(),
@@ -2562,6 +2600,7 @@ export class Agent {
       (message) => (message.images?.length ?? 0) > 0,
     );
 
+    let finishReason: string | undefined;
     try {
       const stream = this.provider.chat({
         messages,
@@ -2605,15 +2644,7 @@ export class Agent {
             toolCalls.push(chunk.toolCall);
             break;
           case "done":
-            // 输出被服务端长度上限截断：正文可能只剩一半甚至为空。
-            // 不提示的话，调用方只会看到「没有文本输出」，误以为是模型或工具的问题。
-            if (chunk.finishReason === "length" && !this.truncationNoticed) {
-              this.truncationNoticed = true;
-              this.events.onNotice?.(
-                "⚠ 模型输出达到服务端长度上限被截断（finish_reason=length），" +
-                  "本轮正文可能为空或不完整；可调大输出上限，或先让它给结论、再把任务拆小。",
-              );
-            }
+            finishReason = chunk.finishReason;
             if (chunk.usage) this.events.onUsage?.(chunk.usage);
             // 真实 usage 回填：把「本次估算 vs 服务端实际计入」的偏差记进校正器，
             // 下一次组装请求时据此收紧预算（只收紧、不放宽）。
@@ -2631,6 +2662,48 @@ export class Agent {
             }
             break;
         }
+      }
+
+      // 输出被服务端长度上限截断：先尝试一次「从中断处续写」。
+      // 只有在没有工具调用、正文非空时才续写，避免把半截工具 JSON 当成文本。
+      if (
+        finishReason === "length" &&
+        text.trim().length > 0 &&
+        toolCalls.length === 0 &&
+        !this.continuationTried &&
+        !signal?.aborted
+      ) {
+        this.continuationTried = true;
+        this.events.onStatus("输出被截断", "正在从中断处续写");
+        try {
+          const continued = await this.continueTruncatedText(
+            [...messages, { role: "assistant", content: text }, {
+              role: "user",
+              content:
+                "上一条回复因长度上限被截断。请从中断处继续输出，不要重复已输出内容，" +
+                "不要重新开头；如果其实已经完整，只输出“（完）”。",
+            }],
+            signal,
+            system.static,
+          );
+          if (continued.text.length > 0) {
+            text += continued.text;
+          }
+          finishReason = continued.finishReason;
+        } catch (err) {
+          if (signal?.aborted) throw err;
+          this.events.onNotice?.(
+            `截断续写失败（${friendlyError(err).split("\n")[0]}），本轮保留已输出内容。`,
+          );
+        }
+      }
+
+      if (finishReason === "length" && !this.truncationNoticed) {
+        this.truncationNoticed = true;
+        this.events.onNotice?.(
+          "⚠ 模型输出达到服务端长度上限被截断（finish_reason=length），" +
+            "本轮正文可能为空或不完整；可调大输出上限，或先让它给结论、再把任务拆小。",
+        );
       }
 
       return { text, toolCalls };

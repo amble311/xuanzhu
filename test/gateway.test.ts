@@ -113,7 +113,9 @@ describe("gateway", () => {
     const lines = commandHelpLines();
     expect(lines.length).toBeGreaterThan(30);
     expect(lines.some((line) => line.includes("/btc [moni]"))).toBe(true);
-    expect(lines.some((line) => line.includes("xzh a serve"))).toBe(true);
+    expect(lines.some((line) => line.includes("xzh a start"))).toBe(true);
+    expect(lines.some((line) => line.includes("xzh a stop"))).toBe(true);
+    expect(lines.some((line) => line.includes("xzh a serve"))).toBe(false);
   });
 
   it("模式持久化：写读一致，坏文件 / 非法模式返回 null", () => {

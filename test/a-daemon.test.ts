@@ -2,7 +2,13 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { clampToWorkTime, pushSchedule, readScheduleQueue, takeDueSchedule } from "../src/a/schedule";
+import {
+  clampToWorkTime,
+  pushSchedule,
+  readScheduleQueue,
+  removeSchedules,
+  takeDueSchedule,
+} from "../src/a/schedule";
 import { addRule, commitRuleHit, evaluateRules, readRules, removeRules } from "../src/a/rules";
 import { isPaused, readPause, setPaused } from "../src/a/pause";
 import { takeMarketEvent } from "../src/a/events";
@@ -13,6 +19,8 @@ import { formatLocalTime } from "../src/utils/time";
 import { checkAccountRisk, clearRiskTrigger, readRiskState } from "../src/a/risk";
 import { appendAInspectEvent, currentAInspectOffset, readAInspectEvents } from "../src/a/inspect-stream";
 import { cancelOrder, createOrder, listOrders, matchOrders } from "../src/a/orders";
+import { aInfoLines } from "../src/a/info";
+import { emptyPaperAccount } from "../src/a/paper";
 
 let home: string;
 const original = process.env.XZH_A_HOME;
@@ -326,6 +334,85 @@ describe("规则写入审计", () => {
     expect(audits).toHaveLength(2);
     expect(audits[0].action).toBe("add");
     expect(audits[1].error).toContain("范围");
+  });
+});
+
+describe("A 股 /info 巡检区块", () => {
+  it("优先显示下一轮时间、倒计时与原因，而不是只有 pid", () => {
+    removeSchedules();
+    const stateFile = path.join(home, "monitor", "run", "monitor.json");
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+    fs.writeFileSync(
+      stateFile,
+      JSON.stringify({
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        version: "test",
+        nextRunAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+        watchlist: 0,
+        holdings: 0,
+        rules: 0,
+        queueSize: 1,
+      }),
+    );
+    pushSchedule({ minutes: 60, reason: "确认 MA20 是否收复" });
+
+    const lines = aInfoLines({
+      updatedAt: Date.now(),
+      indices: [],
+      account: emptyPaperAccount(),
+      watch: [],
+      lastActions: [],
+      riskLocks: [],
+    });
+    const text = lines.join("\n");
+    expect(text).toContain("分钟后");
+    expect(text).toContain("确认 MA20 是否收复");
+    expect(text).toContain("进程运行中");
+  });
+});
+
+describe("A 股 /info 成交", () => {
+  it("只展示今天的成交，旧成交交给 /tr", () => {
+    const account = emptyPaperAccount();
+    account.trades = [
+      {
+        id: "old",
+        code: "600519",
+        name: "贵州茅台",
+        side: "buy",
+        qty: 100,
+        price: 10,
+        amount: 1_000,
+        fees: 5,
+        time: new Date(Date.now() - 36 * 3600_000).toISOString(),
+      },
+      {
+        id: "new",
+        code: "601857",
+        name: "中国石油",
+        side: "buy",
+        qty: 100,
+        price: 12,
+        amount: 1_200,
+        fees: 5,
+        time: new Date().toISOString(),
+      },
+    ];
+    const lines = aInfoLines({
+      updatedAt: Date.now(),
+      indices: [],
+      account,
+      watch: [],
+      lastActions: [],
+      riskLocks: [],
+    });
+    const text = lines.join("\n");
+    expect(text).toContain("今日成交（完整记录用 /tr）");
+    expect(text).toContain("买 601857");
+    // 旧成交不应出现在「今日成交」里（600519 可能出现在别处的监控规则中）
+    expect(text).not.toContain("买 600519");
   });
 });
 

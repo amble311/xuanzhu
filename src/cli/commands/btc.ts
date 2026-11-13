@@ -11,7 +11,6 @@ import {
 import {
   BACKEND_ROLES,
   liveBackend,
-  stopAllBackends,
   stopBtcBackend,
   type BackendRole,
   type BackendState,
@@ -394,31 +393,29 @@ export async function btcPlatformCommand(args: string[] = []): Promise<void> {
 }
 
 export async function btcStopCommand(args: string[] = []): Promise<void> {
+  // 默认只停实盘；模拟盘由 `xzh btc moni stop`（内部传 --paper）单独停。
+  // 以前默认停全部，会让「关实盘」把正在跑的模拟盘一起带走。
   const paperOnly = args.includes("--paper");
-  const results = paperOnly
-    ? [await stopBtcBackend("paper")]
-    : await stopAllBackends();
+  const results = [await stopBtcBackend(paperOnly ? "paper" : "live")];
 
   const stopped = results.filter((item) => item.stopped);
   const failed = results.filter((item) => item.error);
 
   if (stopped.length === 0 && failed.length === 0) {
     process.stdout.write(
-      `${ansi.gray}btc 常驻后端未在运行${
-        paperOnly ? "（模拟盘）" : ""
-      }。${ansi.reset}\n\n`,
+      `${ansi.gray}btc ${roleLabel(paperOnly ? "paper" : "live")}后台未在运行。${ansi.reset}\n\n`,
     );
     return;
   }
 
   for (const item of stopped) {
     process.stdout.write(
-      `${ansi.green}✓${ansi.reset} btc ${roleLabel(item.role)}后端已停止（pid ${item.pid}）\n`,
+      `${ansi.green}✓${ansi.reset} btc ${roleLabel(item.role)}后台已停止（pid ${item.pid}）\n`,
     );
   }
   for (const item of failed) {
     process.stdout.write(
-      `${ansi.red}✗${ansi.reset} btc ${roleLabel(item.role)}后端停止失败：${item.error}\n`,
+      `${ansi.red}✗${ansi.reset} btc ${roleLabel(item.role)}后台停止失败：${item.error}\n`,
     );
   }
   process.stdout.write("\n");

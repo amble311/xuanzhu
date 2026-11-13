@@ -71,16 +71,16 @@ export function createBtcMode(options: BtcModeOptions = {}): AgentMode {
         return {
           ok: true,
           message:
-            `${backend.started ? "已启动" : "复用"} btc ${paper ? "模拟盘" : "常驻"}后端（pid ${
+            `${backend.started ? "已启动" : "复用"} btc ${paper ? "模拟盘" : "实盘"}后台（pid ${
               backend.state?.pid ?? "?"
             }）` +
             (next ? `，下次巡检 ${next}` : "") +
-            `；停止用 xzh btc stop`,
+            `；停止用 xzh btc ${paper ? "moni " : ""}stop`,
         };
       }
       return {
         ok: false,
-        message: `⚠ btc ${paper ? "模拟盘" : "常驻"}后端未启动：${
+        message: `⚠ btc ${paper ? "模拟盘" : "实盘"}后台未启动：${
           backend.error ?? "未知原因"
         }`,
       };

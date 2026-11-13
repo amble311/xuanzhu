@@ -378,10 +378,9 @@ export async function runGateway(): Promise<void> {
           ? `✓ 已压缩上下文：${result.before} 条 → ${result.after} 条`
           : `未压缩：${result.reason ?? "历史较短"}`;
       }
-      case "trades":
-      case "records": {
+      case "tr": {
         if (!modeState) {
-          return "当前是普通模式；发送 /btc、/btc moni 或 /a 切换模式后，/trades 才有交易记录可看。";
+          return "当前是普通模式；发送 /btc、/btc moni 或 /a 切换模式后，/tr 才有交易记录可看。";
         }
         const limit = Number(arg) || 20;
         const lines =
@@ -459,7 +458,7 @@ export async function runGateway(): Promise<void> {
         if (!modeState) return `/${name} 仅在 btc / btc moni / a 模式下可用。`;
         const isBtc = modeState.name === "btc";
         const role = modeState.paper ? "paper" : "live";
-        const label = isBtc ? (role === "paper" ? "btc 模拟盘" : "btc 实盘") : "A 股巡检";
+        const label = isBtc ? (role === "paper" ? "btc 模拟盘" : "btc 实盘") : "A 股后台服务";
         const messages: string[] = [];
 
         if (name !== "start") {
@@ -477,8 +476,8 @@ export async function runGateway(): Promise<void> {
             messages.push(
               result.ok
                 ? result.stopped
-                  ? "✓ 已停止 A 股巡检与监控"
-                  : "A 股巡检与监控本来没在运行"
+                  ? "✓ 已停止 A 股后台服务"
+                  : "A 股后台服务本来没在运行"
                 : `✗ 停止失败：${result.error}`,
             );
           }
@@ -498,8 +497,8 @@ export async function runGateway(): Promise<void> {
             messages.push(
               result.ok
                 ? result.started
-                  ? "✓ 已启动 A 股巡检与监控"
-                  : "A 股巡检与监控已在运行"
+                  ? "✓ 已启动 A 股后台服务"
+                  : "A 股后台服务已在运行"
                 : `✗ 启动失败：${result.error ?? "未知原因"}`,
             );
           }

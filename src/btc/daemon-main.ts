@@ -68,7 +68,7 @@ import {
 } from "./schedule";
 
 /**
- * btc 常驻后端（`xzh btc serve`，由 `xzh btc` 自动拉起）。
+ * btc 常驻后端（`xzh btc start` / `xzh btc moni start`，由进入模式时自动拉起）。
  *
  * 调度模型是**队列 + 定时器**：
  * - 模型每次调用 `btc_schedule` 就往 `~/.xzh_btc/run/schedules.json` 里放一条计划；

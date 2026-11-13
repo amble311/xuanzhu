@@ -8,7 +8,7 @@ import { aTradeLines } from "../src/a/info";
 import { emptyPaperAccount, savePaperAccount } from "../src/a/paper";
 
 /**
- * `/trades`：btc 实盘读本机动作账本、A 股读模拟盘账本。
+ * `/tr`：btc 实盘读本机动作账本、A 股读模拟盘账本。
  * 模拟盘的 btc 分支要跑 Python，这里只覆盖不依赖 venv 的路径。
  */
 

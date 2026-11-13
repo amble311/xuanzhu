@@ -217,10 +217,9 @@ ${ansi.bold}横截面（全市场）${ansi.reset}
       ${ansi.gray}--where '{"boards":["sh-main"],"pctMin":3}' 直接给完整 JSON 条件${ansi.reset}
 
 ${ansi.bold}监控（独立进程）${ansi.reset}
-  ${ansi.green}xzh a serve${ansi.reset}                     启动 A 股巡检与监控（工作日 09:00–15:30）
-  ${ansi.green}xzh a serve status|stop${ansi.reset}         查看 / 停止巡检进程
-  ${ansi.green}xzh a start|stop${ansi.reset}                 启停巡检（与 btc 的 xzh btc serve|stop 对齐）
-  ${ansi.green}xzh a pause [resume|status]${ansi.reset}       暂停/恢复巡检（进程仍在）
+  ${ansi.green}xzh a start${ansi.reset}                     启动后台服务（巡检 / 监控 / 模拟交易；工作日 09:00–15:30）
+  ${ansi.green}xzh a stop${ansi.reset}                      关闭后台服务（巡检 / 监控 / 模拟交易一起停）
+  ${ansi.green}xzh a pause [resume|status]${ansi.reset}       暂停/恢复巡检与模拟交易（进程仍在）
   ${ansi.green}xzh a fk [当日% 单票% 连亏]${ansi.reset}        查看 / 修改硬风控（fk reset [代码] 解除；单票锁只锁该股）
   ${ansi.green}xzh a watch${ansi.reset}                     查看自选股（监控池）
   ${ansi.green}xzh a watch add|remove <代码>${ansi.reset}   手工增删（持仓不可删除）
@@ -566,7 +565,7 @@ async function statusCommand(parsed: ParsedArgs): Promise<void> {
     `  ${padEnd("巡检", 10)}${
       service.running
         ? `${ansi.green}运行中${ansi.reset}${ansi.gray} pid ${service.state?.pid} · 下一轮 ${formatLocalTime(service.state?.nextCheckAt, "monthday") !== "—" ? formatLocalTime(service.state?.nextCheckAt, "monthday") : "未排期"}${ansi.reset}`
-        : `${ansi.yellow}未运行${ansi.reset}${ansi.gray}（xzh a serve）${ansi.reset}`
+        : `${ansi.yellow}未运行${ansi.reset}${ansi.gray}（xzh a start）${ansi.reset}`
     }\n`,
   );
   process.stdout.write(
@@ -685,56 +684,30 @@ async function researchCommand(parsed: ParsedArgs): Promise<void> {
   );
 }
 
-async function serveCommand(parsed: ParsedArgs): Promise<void> {
-  const action = (parsed.positional[1] ?? "start").toLowerCase();
-  if (action === "run") {
-    await runAServe();
-    return;
-  }
-  if (action === "stop") {
-    const result = await stopAService();
-    process.stdout.write(
-      result.ok
-        ? `${ansi.green}✓ ${result.stopped ? "A 股巡检与监控已停止" : "A 股巡检与监控本来就没在运行"}${ansi.reset}\n`
-        : `${ansi.red}✗ 停止失败：${result.error}${ansi.reset}\n`,
-    );
-    return;
-  }
-
+/** `xzh a start`：启动 A 股后台服务（巡检 / 每分钟监控 / 模拟交易） */
+async function startServiceCommand(): Promise<void> {
   const status = aServiceStatus();
-  if (action === "status") {
-    if (!status.running) {
-      process.stdout.write(`${ansi.yellow}A 股巡检与监控未运行${ansi.reset}\n`);
-      if (status.stale) process.stdout.write(`${ansi.gray}  有残留状态，下次启动会清理${ansi.reset}\n`);
-      return;
-    }
-    const state = status.state!;
-    process.stdout.write(
-      `${ansi.green}A 股巡检与监控运行中${ansi.reset}${ansi.gray} pid ${state.pid} · ${state.version}` +
-        ` · 自选 ${state.watchlist} 只 · 持仓 ${state.holdings} 只${ansi.reset}\n` +
-        `${ansi.gray}  下一轮 ${formatLocalTime(state.nextRunAt, "monthday")}${state.lastAction ? ` · 最近：${state.lastAction}` : ""}${ansi.reset}\n` +
-        `${ansi.gray}  日志 ${monitorLogPath()}${ansi.reset}\n`,
-    );
-    if (state.lastError) process.stdout.write(`${ansi.yellow}  最近错误：${state.lastError}${ansi.reset}\n`);
-    return;
-  }
-
-  if (action !== "start" && action !== "") {
-    process.stdout.write(`${ansi.red}未知操作：serve ${action}${ansi.reset}\n`);
-    process.exitCode = 1;
-    return;
-  }
   if (status.running) {
     process.stdout.write(
-      `${ansi.gray}A 股巡检与监控已在运行（pid ${status.state?.pid}）${ansi.reset}\n`,
+      `${ansi.gray}A 股后台服务已在运行（pid ${status.state?.pid}）${ansi.reset}\n`,
     );
     return;
   }
   const result = await startAService();
   process.stdout.write(
     result.ok
-      ? `${ansi.green}✓ A 股巡检与监控已启动${ansi.reset}${ansi.gray} pid ${result.state?.pid} · 工作日 09:00–15:30 · 监控 60 秒 / 巡检按排期 / 16:00 选股${ansi.reset}\n`
+      ? `${ansi.green}✓ A 股后台服务已启动${ansi.reset}${ansi.gray} pid ${result.state?.pid} · 工作日 09:00–15:30 · 监控 60 秒 / 巡检按排期 / 16:00 选股${ansi.reset}\n`
       : `${ansi.red}✗ 启动失败：${result.error}${ansi.reset}\n`,
+  );
+}
+
+/** `xzh a stop`：关闭 A 股后台服务（巡检、监控、模拟交易一起停） */
+async function stopServiceCommand(): Promise<void> {
+  const result = await stopAService();
+  process.stdout.write(
+    result.ok
+      ? `${ansi.green}✓ ${result.stopped ? "A 股后台服务已停止" : "A 股后台服务本来就没在运行"}${ansi.reset}\n`
+      : `${ansi.red}✗ 停止失败：${result.error}${ansi.reset}\n`,
   );
 }
 
@@ -744,7 +717,7 @@ function printWatchlist(): void {
     `${ansi.bold}A 股自选股${ansi.reset} ${ansi.gray}（${list.items.length}/10 · 全部纳入监控）${ansi.reset}\n`,
   );
   if (list.items.length === 0) {
-    process.stdout.write(`${ansi.gray}  空；运行 xzh a serve 或 xzh a watch refresh 选股${ansi.reset}\n`);
+    process.stdout.write(`${ansi.gray}  空；运行 xzh a start 或 xzh a watch refresh 选股${ansi.reset}\n`);
     return;
   }
   for (const item of list.items) {
@@ -901,15 +874,16 @@ export async function aCommand(args: string[]): Promise<void> {
       case "status":
         await statusCommand(parsed);
         return;
-      case "serve":
-        await serveCommand(parsed);
-        return;
-      // 与 btc 对齐的简写：xzh a stop / xzh a start
-      case "stop":
-        await serveCommand({ ...parsed, positional: ["a", "stop"] });
-        return;
+      // 启停后台服务：`--foreground` 是 startAService 拉起常驻子进程用的内部标记
       case "start":
-        await serveCommand({ ...parsed, positional: ["a", "start"] });
+        if (args.includes("--foreground")) {
+          await runAServe();
+          return;
+        }
+        await startServiceCommand();
+        return;
+      case "stop":
+        await stopServiceCommand();
         return;
       case "pause": {
         const action = (parsed.positional[1] ?? "").toLowerCase();
@@ -951,7 +925,7 @@ export async function aCommand(args: string[]): Promise<void> {
       default:
         process.stdout.write(
           `${ansi.red}未知子命令：a ${sub}${ansi.reset}\n` +
-            `${ansi.gray}可用：quote / bars / intraday / market / snapshot / screen / boards / sync / status / serve / watch / monitor${ansi.reset}\n`,
+            `${ansi.gray}可用：quote / bars / intraday / market / snapshot / screen / boards / sync / status / start / stop / watch / monitor / backtest / research${ansi.reset}\n`,
         );
         process.exitCode = 1;
     }

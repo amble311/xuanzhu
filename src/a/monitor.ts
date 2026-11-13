@@ -44,13 +44,14 @@ import { ensureDir, getAShareHome } from "../utils/paths";
 import { VERSION } from "../utils/version";
 
 /**
- * A 股独立巡检进程（`xzh a serve`）。
+ * A 股独立后台服务（`xzh a start` 拉起）—— 巡检只是其中一部分。
  *
- * 与 btc 的差别：A 股只有 4 小时交易、T+1、只能做多，因此不跑 24/7：
- * - 盘中每 15 分钟一轮：先看持仓卖点，再给自选股找买点；
- * - 无持仓时每天重选一次全市场前 10（收盘后/盘前数据即可）；
- * - 非交易时段休眠，不做全市场轮询。
+ * 一个进程同时负责：
+ * - 每分钟 tick：监控规则、挂单撮合（仅连续竞价）、持仓风控检测；
+ * - 到排期时跑完整巡检（`a_schedule` 决定下一轮；失败 15 分钟退避、队列空 60 分钟兜底）；
+ * - 收盘后 16:00 固定选股（只更新自选池）。
  *
+ * 与 btc 的差别：A 股只有 4 小时交易、T+1、只能做多，因此不跑 24/7，非交易时段休眠。
  * 决策是**确定性规则**：月/周/日趋势 + 1h 择时打分，不每轮调用模型。
  */
 
@@ -384,7 +385,7 @@ async function warmupData(at: Date): Promise<void> {
 export async function runAServe(): Promise<void> {
   ensureDir(monitorDir());
   if (!acquireLock()) {
-    process.stderr.write("A 股巡检与监控已在运行（锁被占用），本次退出。\n");
+    process.stderr.write("A 股后台服务已在运行（锁被占用），本次退出。\n");
     process.exit(1);
   }
 
@@ -885,7 +886,8 @@ export async function startAService(): Promise<StartAServiceResult> {
   ensureDir(path.dirname(logFile));
   const fd = fs.openSync(logFile, "a");
   try {
-    const child = spawn(process.execPath, [cliEntry(), "a", "serve", "run"], {
+    // `--foreground` 是内部标记：用户命令 `xzh a start` 只负责拉起后台并返回
+    const child = spawn(process.execPath, [cliEntry(), "a", "start", "--foreground"], {
       detached: true,
       stdio: ["ignore", fd, fd],
       cwd: getAShareHome(),
@@ -894,7 +896,7 @@ export async function startAService(): Promise<StartAServiceResult> {
     });
     child.unref();
   } catch (err) {
-    return { ok: false, started: false, error: `拉起 A 股巡检失败：${err instanceof Error ? err.message : String(err)}` };
+    return { ok: false, started: false, error: `拉起 A 股后台服务失败：${err instanceof Error ? err.message : String(err)}` };
   } finally {
     try {
       fs.closeSync(fd);
@@ -909,7 +911,7 @@ export async function startAService(): Promise<StartAServiceResult> {
     if (state && pidAlive(state.pid)) return { ok: true, started: true, state };
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  return { ok: false, started: true, error: "巡检进程启动后 5 秒内没有写出状态" };
+  return { ok: false, started: true, error: "A 股后台服务启动后 5 秒内没有写出状态" };
 }
 
 export async function stopAService(): Promise<{ ok: boolean; stopped: boolean; error?: string }> {

@@ -304,7 +304,7 @@ const ACTION_STATUS: Record<string, string> = {
 };
 
 /**
- * `/trades` 的纯文本输出（TUI 与微信共用，无 ANSI）。
+ * `/tr` 的纯文本输出（TUI 与微信共用，无 ANSI）。
  *
  * - **模拟盘**：读 Python 账本的已平仓记录（`paper-status` 支持 limit，无需新命令）；
  * - **实盘**：读本机动作账本（`run/actions.jsonl`）里玄猪发起的开 / 平仓。

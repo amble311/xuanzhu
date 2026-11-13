@@ -301,10 +301,12 @@ export async function ensureBtcBackend(
   }
 
   try {
-    // `--foreground` 是内部标记：`xzh btc serve` 对用户是「拉起后台并返回」，
-    // 真正的常驻循环只在带这个标记时运行（否则会变成前台阻塞）。
-    const args = [cliEntry(), "btc", "serve", "--foreground"];
-    if (role === "paper") args.push("--paper");
+    // `--foreground` 是内部标记：`xzh btc start` / `xzh btc moni start` 对用户是
+    // 「拉起后台并返回」，真正的常驻循环只在带这个标记时运行（否则会变成前台阻塞）。
+    const args =
+      role === "paper"
+        ? [cliEntry(), "btc", "moni", "start", "--foreground"]
+        : [cliEntry(), "btc", "start", "--foreground"];
     const child = spawn(process.execPath, args, {
       detached: true,
       stdio: ["ignore", logFd, logFd],
@@ -387,11 +389,3 @@ export async function stopBtcBackend(
   return { stopped: true, role, pid };
 }
 
-/** 停所有角色（`xzh btc stop` 的默认行为） */
-export async function stopAllBackends(): Promise<StopBackendResult[]> {
-  const results: StopBackendResult[] = [];
-  for (const role of BACKEND_ROLES) {
-    results.push(await stopBtcBackend(role));
-  }
-  return results;
-}

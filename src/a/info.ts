@@ -2,6 +2,7 @@ import { fetchQuote, sessionKind, sessionLabel, type Quote } from "../exchange/a
 import { accountSummary, loadPaperAccount, markPaperAccount, type PaperAccount } from "./paper";
 import { loadWatchlist } from "./watchlist";
 import { describeRule, readRules } from "./rules";
+import { readScheduleQueue } from "./schedule";
 import { aActionsPath, aServiceStatus, readPendingSells } from "./monitor";
 import * as fs from "fs";
 import { formatLocalTime } from "../utils/time";
@@ -149,6 +150,17 @@ function fmt(value: number, digits = 2): string {
   });
 }
 
+/** 面板 / `/info` 只展示今天的成交；历史用 `/tr` 查 */
+function isToday(iso: string, now = new Date()): boolean {
+  const date = new Date(iso);
+  return (
+    !Number.isNaN(date.getTime()) &&
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate()
+  );
+}
+
 function signed(value: number, digits = 2): string {
   return `${value >= 0 ? "+" : ""}${fmt(value, digits)}`;
 }
@@ -188,16 +200,18 @@ export function aInfoLines(data: APanelData): string[] {
         );
       }
     }
-    const trades = data.account.trades.slice(-5).reverse();
-    if (trades.length > 0) {
-      lines.push("最近成交（完整记录用 /trades）：");
-      for (const trade of trades) {
-        lines.push(
-          `  ${formatLocalTime(trade.time, "datetime")} ${trade.side === "buy" ? "买" : "卖"}` +
-            ` ${trade.code} ${trade.qty} @ ${fmt(trade.price)}（费用 ${fmt(trade.fees)}）` +
-            (trade.pnl !== undefined ? ` 盈亏 ${signed(trade.pnl)}` : ""),
-        );
-      }
+    // 只展示今天的成交：旧成交会让「账户」看起来像流水账，历史请用 /tr
+    const trades = data.account.trades.filter((trade) => isToday(trade.time)).slice(-5).reverse();
+    lines.push("今日成交（完整记录用 /tr）：");
+    if (trades.length === 0) {
+      lines.push("  今日无");
+    }
+    for (const trade of trades) {
+      lines.push(
+        `  ${formatLocalTime(trade.time, "datetime")} ${trade.side === "buy" ? "买" : "卖"}` +
+          ` ${trade.code} ${trade.qty} @ ${fmt(trade.price)}（费用 ${fmt(trade.fees)}）` +
+          (trade.pnl !== undefined ? ` 盈亏 ${signed(trade.pnl)}` : ""),
+      );
     }
   }
 
@@ -214,20 +228,46 @@ export function aInfoLines(data: APanelData): string[] {
     );
   }
 
-  // 巡检（独立进程）
+  // 巡检（独立进程）：与 btc 面板同款 —— 先写下一轮时间、倒计时与原因
   lines.push(divider);
   lines.push("巡检");
   const service = aServiceStatus();
-  lines.push(
-    service.running
-      ? `运行中（pid ${service.state?.pid} · 上一轮 ${formatLocalTime(service.state?.lastRunAt, "time")} · 下一轮 ${formatLocalTime(service.state?.nextCheckAt, "time") !== "—" ? formatLocalTime(service.state?.nextCheckAt, "time") : "未排期"}）`
-      : "未运行（/start 或 xzh a serve）",
-  );
-  if (service.state?.paused) lines.push("  已暂停（进程仍在，/pause resume 恢复）");
-  if (service.state?.nextCheckAt) {
-    lines.push(`  下一轮排期：${formatLocalTime(service.state.nextCheckAt, "monthday")}${service.state.nextCheckReason ? `（${service.state.nextCheckReason}）` : ""}`);
+  const queue = readScheduleQueue();
+  if (!service.running) {
+    lines.push("  未运行（/start 或 xzh a start）");
+  } else {
+    if (service.state?.paused) {
+      // 暂停时排期不会执行：只报数量，不显示倒计时
+      lines.push("  已暂停（/pause resume 恢复）");
+      lines.push(`  排期 ${queue.length} 条（恢复后继续）`);
+    } else {
+      if (queue.length === 0) {
+        lines.push("  无排期（每 30 秒检查规则/风控，兜底每小时一轮）");
+      }
+      for (const entry of queue.slice(0, 2)) {
+        const wait = Math.max(
+          0,
+          Math.round((Date.parse(entry.at) - Date.now()) / 60_000),
+        );
+        lines.push(
+          `  ${formatLocalTime(entry.at, "monthday")} · ${wait} 分钟后` +
+            `${entry.slot === "extra" ? "（额外）" : ""}` +
+            `${entry.reason ? `（${entry.reason}）` : ""}`,
+        );
+      }
+    }
+    lines.push(
+      `  进程运行中（pid ${service.state?.pid ?? "?"}）` +
+        ` · 规则 ${service.state?.rules ?? 0} 条 · 排期 ${queue.length} 条`,
+    );
+    const last = service.state?.lastInspectAt ?? service.state?.lastRunAt;
+    if (last) {
+      lines.push(
+        `  上一轮：${formatLocalTime(last, "monthday")}` +
+          `${service.state?.lastInspectReason ? `（${service.state.lastInspectReason}）` : ""}`,
+      );
+    }
   }
-  lines.push(`  监控规则 ${service.state?.rules ?? 0} 条 · 排期 ${service.state?.queueSize ?? 0} 条`);
   lines.push(
     `  收盘选股：每个交易日 16:00${service.state?.lastSelectDay ? ` · 上次 ${service.state.lastSelectDay}` : ""}`,
   );
@@ -267,7 +307,7 @@ export function aInfoLines(data: APanelData): string[] {
 }
 
 /**
- * `/trades` 的纯文本输出：最近 N 笔模拟盘成交（最新在前）。
+ * `/tr` 的纯文本输出：最近 N 笔模拟盘成交（最新在前）。
  *
  * 只读本地账本（`paper.json`），不拉行情 —— 交易记录要能离线、秒开。
  */

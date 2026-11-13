@@ -4,6 +4,25 @@
 
 ## [未发布]
 
+## [0.17.3] — 2026-11-13
+
+### 变更
+
+- **启停命令统一为 `start` / `stop`**：删除 `xzh a serve`、`xzh btc serve`、`xzh btc moni serve`。
+  `xzh a` / `xzh btc` / `xzh btc moni` 仍是「启动前端并自动拉起后台」；只操作后台用
+  `xzh a start|stop`、`xzh btc start|stop`、`xzh btc moni start|stop`。
+  `xzh btc stop` 现在**只停实盘**（以前会连模拟盘一起停）。
+- **`/trades` 改名为 `/tr`**：btc 实盘 / btc moni / A 股通用，默认 20 条、上限 100；
+  原 `/trades`、`/records` 不再保留。
+- **A 股右侧面板与 `/info` 对齐 btc**：巡检先显示下一轮时间、倒计时与原因，pid 降为明细；
+  暂停时不显示倒计时。账户里的成交只显示**今天**的记录，历史统一用 `/tr` 查看。
+
+### 新增
+
+- **模型输出被长度上限截断时自动续写一次**：`finish_reason=length` 且本轮没有工具调用、
+  正文非空时，自动把已输出正文作为 assistant 前缀，请求模型从中断处继续；
+  只续写一次，仍截断则保留原文并告警；工具调用被截断不续写，避免拼接半截 JSON。
+
 ## [0.17.2] — 2026-11-13
 
 ### 变更

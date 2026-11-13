@@ -1808,7 +1808,7 @@ export class TuiApp {
         `A 股监控规则 ${rules.length} 条 · 巡检${
           service.running
             ? `运行中（pid ${service.state?.pid}${service.state?.nextCheckAt ? `，下一轮 ${formatLocalTime(service.state.nextCheckAt, "time")}` : ""}）`
-            : "未运行（/start 或 xzh a serve）"
+            : "未运行（/start 或 xzh a start）"
         }`,
         "",
       ];
@@ -2902,8 +2902,7 @@ export class TuiApp {
           }
         })();
         break;
-      case "trades":
-      case "records":
+      case "tr":
         void (async () => {
           const limit = Number(arg) || 20;
           try {
@@ -2914,12 +2913,12 @@ export class TuiApp {
               this.lines.push(...aTradeLines(limit));
             } else {
               this.lines.push(
-                `${ansi.gray}当前是普通模式；/trades 在 btc / btc moni / a 模式下查看交易记录${ansi.reset}`,
+                `${ansi.gray}当前是普通模式；/tr 在 btc / btc moni / a 模式下查看交易记录${ansi.reset}`,
               );
             }
           } catch (err) {
             this.lines.push(
-              `${ansi.red}✗ /trades 失败：${err instanceof Error ? err.message : String(err)}${ansi.reset}`,
+              `${ansi.red}✗ /tr 失败：${err instanceof Error ? err.message : String(err)}${ansi.reset}`,
             );
           } finally {
             this.scheduleRender();
@@ -4047,7 +4046,7 @@ export class TuiApp {
       });
   }
 
-  /** `/stop`、`/start`、`/restart`：控制当前模式的后台进程（btc 按当前角色，A 股巡检） */
+  /** `/stop`、`/start`、`/restart`：控制当前模式的后台服务（btc 按当前角色，A 股为巡检/监控/模拟交易） */
   private async controlBackend(action: "start" | "stop" | "restart"): Promise<void> {
     const mode = this.mode;
     if (!mode || (mode.name !== "btc" && mode.name !== "a")) {
@@ -4060,7 +4059,7 @@ export class TuiApp {
 
     const isBtc = mode.name === "btc";
     const role = process.env.XZH_BTC_ROLE === "paper" ? "paper" : "live";
-    const label = isBtc ? (role === "paper" ? "btc 模拟盘" : "btc 实盘") : "A 股巡检";
+    const label = isBtc ? (role === "paper" ? "btc 模拟盘" : "btc 实盘") : "A 股后台服务";
     const messages: string[] = [];
 
     if (action !== "start") {
@@ -4078,8 +4077,8 @@ export class TuiApp {
         messages.push(
           result.ok
             ? result.stopped
-              ? "✓ 已停止 A 股巡检与监控"
-              : "A 股巡检与监控本来没在运行"
+              ? "✓ 已停止 A 股后台服务"
+              : "A 股后台服务本来没在运行"
             : `✗ 停止失败：${result.error}`,
         );
       }
@@ -4100,8 +4099,8 @@ export class TuiApp {
         messages.push(
           result.ok
             ? result.started
-              ? "✓ 已启动 A 股巡检与监控"
-              : "A 股巡检与监控已在运行"
+              ? "✓ 已启动 A 股后台服务"
+              : "A 股后台服务已在运行"
             : `✗ 启动失败：${result.error ?? "未知原因"}`,
         );
       }
@@ -5660,6 +5659,16 @@ export class TuiApp {
     // A 股习惯：红涨绿跌（与 btc 面板相反）
     const pct = (value: number): string =>
       `${value >= 0 ? ansi.red : ansi.green}${signed(value)}%${ansi.reset}`;
+    /** 面板只展示「今天」的成交：历史记录交给 /tr，避免几周前的旧成交挤占空间 */
+    const sameLocalDay = (iso: string, ref = new Date()): boolean => {
+      const date = new Date(iso);
+      return (
+        !Number.isNaN(date.getTime()) &&
+        date.getFullYear() === ref.getFullYear() &&
+        date.getMonth() === ref.getMonth() &&
+        date.getDate() === ref.getDate()
+      );
+    };
 
     push(
       `${ansi.bgBlue}${ansi.brightWhite} ${this.mode?.label ?? "A 股分析"} ${ansi.reset}` +
@@ -5719,15 +5728,19 @@ export class TuiApp {
           );
         }
       }
-      const trades = account.trades.slice(-2).reverse();
-      if (trades.length > 0) {
-        push(` ${ansi.gray}成交${ansi.reset}`);
-        for (const trade of trades) {
-          push(
-            `${ansi.gray}   ${trade.side === "buy" ? "买" : "卖"} ${trade.code} ` +
-              `${trade.qty}@${amount(trade.price)}${ansi.reset}`,
-          );
-        }
+      const todayTrades = account.trades
+        .filter((trade) => sameLocalDay(trade.time))
+        .slice(-2)
+        .reverse();
+      push(` ${ansi.gray}成交${ansi.reset}${ansi.gray}（今日 · /tr 看全部）${ansi.reset}`);
+      if (todayTrades.length === 0) {
+        push(`${ansi.gray}   今日无${ansi.reset}`);
+      }
+      for (const trade of todayTrades) {
+        push(
+          `${ansi.gray}   ${trade.side === "buy" ? "买" : "卖"} ${trade.code} ` +
+            `${trade.qty}@${amount(trade.price)}${ansi.reset}`,
+        );
       }
     }
 
@@ -5745,19 +5758,39 @@ export class TuiApp {
     divider();
     const service = aServiceStatus();
     const watch = loadWatchlist();
+    // 与 btc 面板一致：先回答「下一轮什么时候、为什么」，进程 pid 不是用户关心的事
+    const queue = readAScheduleQueue();
     push(
       ` ${ansi.bold}巡检${ansi.reset} ` +
         (service.running
-          ? `${ansi.green}运行中${ansi.reset}${ansi.gray} pid ${service.state?.pid}`
-          : `${ansi.yellow}未运行${ansi.reset}${ansi.gray}（/start 或 xzh a serve）`),
+          ? service.state?.paused
+            ? `${ansi.yellow}已暂停${ansi.reset}${ansi.gray}（/pause resume 恢复）${ansi.reset}`
+            : `${ansi.green}运行中${ansi.reset}`
+          : `${ansi.yellow}未运行${ansi.reset}${ansi.gray}（/start 或 xzh a start）${ansi.reset}`),
     );
-    if (service.running && service.state?.nextRunAt) {
-      push(
-        `${ansi.gray}   上一轮 ${formatLocalTime(service.state.lastRunAt, "time")}` +
-          ` · 下一轮 ${formatLocalTime(service.state.nextCheckAt, "time") !== "—" ? formatLocalTime(service.state.nextCheckAt, "time") : "未排期"}` +
-          ` · 规则 ${service.state.rules ?? 0} 条` +
-          `${service.state.paused ? " · 已暂停" : ""}${ansi.reset}`,
-      );
+    if (service.running) {
+      if (service.state?.paused) {
+        // 暂停时排期不会执行：只报还剩几条，不显示倒计时（否则会以为到点就会跑）
+        push(`${ansi.gray}   排期 ${queue.length} 条（恢复后继续）${ansi.reset}`);
+      } else {
+        const upcoming = queue.slice(0, 2);
+        if (upcoming.length === 0) {
+          push(`${ansi.gray}   无排期（每 30 秒检查规则/风控，兜底每小时一轮）${ansi.reset}`);
+        }
+        for (const entry of upcoming) {
+          const wait = Math.max(
+            0,
+            Math.round((Date.parse(entry.at) - Date.now()) / 60_000),
+          );
+          push(
+            ` ${formatLocalTime(entry.at, "time")} · ${wait} 分钟后` +
+              `${entry.slot === "extra" ? `${ansi.gray}（额外）${ansi.reset}` : ""}`,
+          );
+          push(
+            `${ansi.gray}   ${truncate(entry.reason, Math.max(10, width - 4))}${ansi.reset}`,
+          );
+        }
+      }
     }
     push(
       `${ansi.gray}   收盘选股 每个交易日 16:00` +
