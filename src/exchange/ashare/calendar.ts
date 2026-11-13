@@ -111,9 +111,66 @@ export function sessionLabel(kind: SessionKind): string {
   }
 }
 
-/** 当前是否处于连续竞价时段 */
+/**
+ * 当前是否处于连续竞价时段（09:30–11:30 / 13:00–15:00）。
+ *
+ * 只按时间判断，**不含集合竞价 09:15–09:25、盘前 09:00–09:30 与午休**；
+ * 要连节假日一起判断用 `continuousSession()`。
+ */
 export function isTradingTime(now = new Date()): boolean {
   return sessionKind(now) === "continuous";
+}
+
+export interface SessionGate {
+  /** 是否可撮合 / 成交 */
+  open: boolean;
+  /** 不可交易的原因（`open` 为 true 时缺省） */
+  reason?: string;
+}
+
+/** 当天交易日状态的内存缓存：避免每轮 tick 都读日历文件 */
+let dayStatusCache: { day: string; trading: boolean; expiresAt: number } | null = null;
+
+/** 今天是否交易日；日历不可用时按工作日放行（10 分钟后重试） */
+export async function tradingDayStatus(now = new Date()): Promise<boolean> {
+  const today = todayString(now);
+  const nowMs = now.getTime();
+  if (dayStatusCache && dayStatusCache.day === today && dayStatusCache.expiresAt > nowMs) {
+    return dayStatusCache.trading;
+  }
+  if (now.getDay() === 0 || now.getDay() === 6) {
+    dayStatusCache = { day: today, trading: false, expiresAt: nowMs + 6 * 60 * 60_000 };
+    return false;
+  }
+  try {
+    const calendar = await loadTradingCalendar();
+    const trading = isTradingDay(calendar, today);
+    dayStatusCache = { day: today, trading, expiresAt: nowMs + 6 * 60 * 60_000 };
+    return trading;
+  } catch {
+    dayStatusCache = { day: today, trading: true, expiresAt: nowMs + 10 * 60_000 };
+    return true;
+  }
+}
+
+/**
+ * 撮合 / 成交闸门：连续竞价时段 + 当天是交易日。
+ *
+ * 交易链路（挂单撮合、模拟盘立即成交）必须走这里，不能只看 09:00–15:30 的工作窗口 ——
+ * 那个窗口包含集合竞价与午休，A 股在这两段时间里不成交。
+ */
+export async function continuousSession(now = new Date()): Promise<SessionGate> {
+  const kind = sessionKind(now);
+  if (kind !== "continuous") {
+    return {
+      open: false,
+      reason: `${sessionLabel(kind)}（连续竞价 09:30–11:30 / 13:00–15:00）`,
+    };
+  }
+  if (!(await tradingDayStatus(now))) {
+    return { open: false, reason: `${todayString(now)} 非交易日，休市` };
+  }
+  return { open: true };
 }
 
 /** 本地日期 `YYYY-MM-DD` */

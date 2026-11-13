@@ -7,12 +7,14 @@ import { commandHelpLines } from "../core/help-text";
 import { readObservedActions } from "../core/autonomy";
 import {
   btcInfoLines,
+  btcTradeHistoryLines,
   collectBtcPanelData,
   type BtcPanelData,
   type PaperPanelData,
 } from "../btc/panel-data";
 import {
   aInfoLines,
+  aTradeLines,
   collectASharePanelData,
   type APanelData,
 } from "../a/info";
@@ -2894,6 +2896,30 @@ export class TuiApp {
           } catch (err) {
             this.lines.push(
               `${ansi.red}✗ /info 失败：${err instanceof Error ? err.message : String(err)}${ansi.reset}`,
+            );
+          } finally {
+            this.scheduleRender();
+          }
+        })();
+        break;
+      case "trades":
+      case "records":
+        void (async () => {
+          const limit = Number(arg) || 20;
+          try {
+            if (this.mode?.name === "btc") {
+              const role = process.env.XZH_BTC_ROLE === "paper" ? "paper" : "live";
+              this.lines.push(...(await btcTradeHistoryLines(this.cwd, role, limit)));
+            } else if (this.mode?.name === "a") {
+              this.lines.push(...aTradeLines(limit));
+            } else {
+              this.lines.push(
+                `${ansi.gray}当前是普通模式；/trades 在 btc / btc moni / a 模式下查看交易记录${ansi.reset}`,
+              );
+            }
+          } catch (err) {
+            this.lines.push(
+              `${ansi.red}✗ /trades 失败：${err instanceof Error ? err.message : String(err)}${ansi.reset}`,
             );
           } finally {
             this.scheduleRender();

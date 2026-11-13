@@ -18,6 +18,7 @@ import {
   addRule,
   appendAAction,
   appendRuleAudit,
+  buyBlockReason,
   cancelOrder,
   clearRiskTrigger,
   createOrder,
@@ -414,6 +415,8 @@ const orderTool: ToolDefinition = {
   description:
     "A 股**模拟盘**下单（立即成交，不涉及真钱）。买入必须 100 股整数倍；卖出受 T+1 可卖数量限制；" +
     "涨停不买、跌停不卖、停牌拒单；限价不穿越现价时直接拒绝（不挂单排队）。" +
+    "**只在连续竞价时段成交**（09:30–11:30 / 13:00–15:00 且当天是交易日）：集合竞价、午休、" +
+    "盘前盘后与节假日会拒单，这时只能 pending 挂单等开盘。" +
     "费用：佣金 0.025%（最低 5 元）、印花税卖出 0.05%、过户费 0.001% 双边。" +
     "下单前先看 a_account 的可用资金与可卖数量。",
   parameters: {
@@ -423,7 +426,11 @@ const orderTool: ToolDefinition = {
       side: { type: "string", enum: ["buy", "sell"], description: "买入 / 卖出" },
       qty: { type: "number", description: "股数（买入需 100 的整数倍）" },
       price: { type: "number", description: "限价；不传 = 按现价成交" },
-      pending: { type: "boolean", description: "true = 挂单等待价格穿越（需要 price），默认立即成交" },
+      pending: {
+        type: "boolean",
+        description:
+          "true = 挂单等待价格穿越（需要 price），默认立即成交；挂单不受交易时段限制，开盘后由监控撮合",
+      },
       reason: { type: "string", description: "挂单原因（可选）" },
       ttlMinutes: { type: "number", description: "挂单有效期分钟，默认 120 且不超过当日 15:00" },
     },
@@ -439,6 +446,11 @@ const orderTool: ToolDefinition = {
     if (!Number.isFinite(qty)) return { ok: false, content: "✗ qty 必须是数字" };
     if (price !== undefined && !Number.isFinite(price)) {
       return { ok: false, content: "✗ price 必须是数字" };
+    }
+    // 硬风控闸门：挂单与立即成交走同一道，卖出不受影响
+    if (side === "buy") {
+      const block = buyBlockReason(code);
+      if (block) return { ok: false, content: `✗ ${block}` };
     }
     if (args.pending === true) {
       if (price === undefined || price <= 0) {
@@ -481,12 +493,6 @@ const orderTool: ToolDefinition = {
       return {
         ok: false,
         content: `✗ 巡检只能买入自选股；${code} 不在当前自选池。选股请交给收盘后 16:00 的固定任务。`,
-      };
-    }
-    if (side === "buy" && readRiskState()?.triggered) {
-      return {
-        ok: false,
-        content: `✗ 硬风控已触发，禁止开新仓：${readRiskState()?.reasons.join("；") ?? ""}`,
       };
     }
     try {
@@ -771,11 +777,27 @@ const clearRiskTool: ToolDefinition = {
   name: "a_clear_risk",
   modes: A_MODES,
   description:
-    "解除当日硬风控（仅在已减仓/风险消失后使用）。解除后 a_order 才能重新买入；不要用它绕过风控。",
-  parameters: { type: "object", properties: {}, required: [] },
-  async execute(): Promise<ToolResult> {
+    "解除硬风控（仅在已减仓/风险消失后使用）。传 code 只解除该股票的单票锁（其他股票照常），" +
+    "不传则解除账户级与全部单票锁。不要用它绕过风控。",
+  parameters: {
+    type: "object",
+    properties: {
+      code: { type: "string", description: "只解除这只股票的单票锁；不传 = 全部解除" },
+    },
+    required: [],
+  },
+  async execute(args): Promise<ToolResult> {
     const state = readRiskState();
-    if (!state?.triggered) return { ok: true, content: "当前没有触发的硬风控" };
+    const code = typeof args.code === "string" ? args.code.trim() : "";
+    if (!state || (!state.triggered && state.locks.length === 0)) {
+      return { ok: true, content: "当前没有触发的硬风控" };
+    }
+    if (code) {
+      const cleared = clearRiskTrigger(code);
+      return cleared > 0
+        ? { ok: true, content: `✓ 已解除 ${code} 的单票硬风控（其他股票不受影响）`, summary: `解除 ${code} 单票锁` }
+        : { ok: false, content: `${code} 当前没有单票锁（可先 a_account / a_clear_risk 查看）` };
+    }
     clearRiskTrigger();
     return { ok: true, content: "✓ 已解除当日硬风控（请确认已减仓）", summary: "解除硬风控" };
   },

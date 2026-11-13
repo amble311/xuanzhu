@@ -5,8 +5,8 @@ import { Agent, type AgentEvents } from "../core/agent";
 import { activeModelEntry, loadConfig, saveConfig } from "../config/store";
 import { commandHelpLines } from "../core/help-text";
 import { formatLocalTime } from "../utils/time";
-import { btcInfoLines, collectBtcPanelData } from "../btc/panel-data";
-import { aInfoLines, collectASharePanelData } from "../a/info";
+import { btcInfoLines, btcTradeHistoryLines, collectBtcPanelData } from "../btc/panel-data";
+import { aInfoLines, aTradeLines, collectASharePanelData } from "../a/info";
 import { TOOLS, toolVisibleInMode } from "../tools";
 import { describeTrigger, readTriggers } from "../btc/triggers";
 import { setPaused } from "../btc/pause";
@@ -33,6 +33,7 @@ import {
   readGatewayMode,
   readGatewayState,
   readPeerModes,
+  sameGatewayMode,
   writePeerMode,
   writeGatewayMode,
   writeGatewayState,
@@ -138,25 +139,30 @@ export async function runGateway(): Promise<void> {
     port,
   };
 
-  let agent: Agent | null = null;
   let modelLabel = "";
   let lastError: string | undefined;
-  /** 当前这轮回复的累积文本（Agent.run 的产出通过事件回调给） */
-  let replyBuffer = "";
-  /** 需要确认的工具：无人在场时拒绝，并把原因带回给调用方 */
-  let deniedNote = "";
-  let lastToolNote = "";
 
-  /** 当前模式（按微信对端持久化；重启后恢复最后一次对话的模式） */
-  const peerModes = readPeerModes(home);
-  const restoredPeerMode =
-    peerModes.lastPeer && peerModes.modes[peerModes.lastPeer]
-      ? peerModes.modes[peerModes.lastPeer]
-      : null;
-  let modeState = restoredPeerMode ?? readGatewayMode(home);
-  if (modeState?.name === "btc") {
-    process.env.XZH_BTC_ROLE = modeState.paper ? "paper" : "live";
+  /**
+   * 单个「对话对端」的会话。
+   *
+   * **为什么必须按对端隔离**：Agent 实例自带对话历史，模式（cwd / 工具集 / 记忆）也挂在
+   * 实例上。以前全进程共用一个 Agent —— 微信里 A 股聊完再 `/btc`，旧上下文仍在，
+   * 模型会把两个账本混着答（2026-11-13 实测「btc 模拟盘里说 A 股工具已加载」）；
+   * 两个微信号同时使用时，还会互相覆盖模式与历史。
+   *
+   * 现在每个对端（HTTP `/message` 也算一个）各有一个 Agent + 模式 + 缓冲；
+   * 队列仍是串行的，同一时刻只有一个会话被「激活」（见 activateSession）。
+   */
+  interface GatewaySession {
+    key: string;
+    agent: Agent | null;
+    mode: GatewayModeState | null;
+    replyBuffer: string;
+    deniedNote: string;
+    lastToolNote: string;
   }
+
+  const HTTP_SESSION_KEY = "__http__";
 
   const modeSpec = (
     state: GatewayModeState | null,
@@ -172,16 +178,96 @@ export async function runGateway(): Promise<void> {
     return { cwd: home, label: "xzh 普通模式" };
   };
 
+  /** btc 工具靠进程环境变量区分实盘 / 模拟盘，必须按「当前会话」而不是切换时设置 */
+  const applyRoleEnv = (mode: GatewayModeState | null): void => {
+    process.env.XZH_BTC_ROLE =
+      mode?.name === "btc" ? (mode.paper ? "paper" : "live") : "live";
+  };
+
+  /** 当前模式（按微信对端持久化；重启后恢复最后一次对话的模式） */
+  const peerModes = readPeerModes(home);
+  const bootPeer = peerModes.lastPeer;
+  const bootMode =
+    (bootPeer ? peerModes.modes[bootPeer] : undefined) ?? readGatewayMode(home);
+
+  const sessions = new Map<string, GatewaySession>();
+  const initialSession: GatewaySession = {
+    key: bootPeer ?? HTTP_SESSION_KEY,
+    agent: null,
+    mode: bootMode,
+    replyBuffer: "",
+    deniedNote: "",
+    lastToolNote: "",
+  };
+  sessions.set(initialSession.key, initialSession);
+
+  /**
+   * 当前正在处理的会话（队列串行，所以同一时刻只有一个）。
+   *
+   * 下面的 `agent` / `modeState` / `replyBuffer` 都是**这个会话的视图**：
+   * 处理消息前 activateSession()，处理完 saveSession() 写回，命令与工具代码不需要
+   * 到处传对端参数，也就不会漏掉某条路径。
+   */
+  let currentSession: GatewaySession = initialSession;
+  let agent: Agent | null = null;
+  let modeState: GatewayModeState | null = bootMode;
+  /** 当前这轮回复的累积文本（Agent.run 的产出通过事件回调给） */
+  let replyBuffer = "";
+  /** 需要确认的工具：无人在场时拒绝，并把原因带回给调用方 */
+  let deniedNote = "";
+  let lastToolNote = "";
+  applyRoleEnv(bootMode);
+
+  const sessionFor = (peer?: string): GatewaySession => {
+    const key = peer?.trim() || HTTP_SESSION_KEY;
+    const existing = sessions.get(key);
+    if (existing) return existing;
+    // 新对端：优先用它上次的模式；没有记录才继承 gateway 最近一次的模式
+    const saved = peer ? readPeerModes(home).modes[peer] : undefined;
+    const session: GatewaySession = {
+      key,
+      agent: null,
+      mode: saved ?? readGatewayMode(home),
+      replyBuffer: "",
+      deniedNote: "",
+      lastToolNote: "",
+    };
+    sessions.set(key, session);
+    return session;
+  };
+
+  /** 激活某个对端的会话（只切视图，不创建 Agent） */
+  const activateSession = (session: GatewaySession): void => {
+    currentSession = session;
+    agent = session.agent;
+    modeState = session.mode;
+    replyBuffer = session.replyBuffer;
+    deniedNote = session.deniedNote;
+    lastToolNote = session.lastToolNote;
+    applyRoleEnv(session.mode);
+  };
+
+  const saveSession = (): void => {
+    currentSession.agent = agent;
+    currentSession.mode = modeState;
+    currentSession.replyBuffer = replyBuffer;
+    currentSession.deniedNote = deniedNote;
+    currentSession.lastToolNote = lastToolNote;
+  };
+
   /**
    * 切换模式：先清旧模式再切目录（否则 cwdLocked 会拒绝），然后重新注入提示词/工具。
    * 不启动 btc 常驻后端 —— 与 TUI 的 `/btc` 语义一致，避免切个模式就触发自主巡检。
+   *
+   * 必须在 activateSession() 之后调用：它只改**当前会话**的 Agent 与模式，
+   * 其他对端的历史与模式不受影响（这就是那道「墙」）。
    */
   const applyGatewayMode = (next: GatewayModeState | null, peer?: string): string => {
     const spec = modeSpec(next);
-    process.env.XZH_BTC_ROLE =
-      next?.name === "btc" ? (next.paper ? "paper" : "live") : "live";
+    applyRoleEnv(next);
 
     if (agent) {
+      // setMode 检测到模式真的变了会清空该会话历史（见 core/agent.ts）
       agent.setMode(undefined);
       if (path.resolve(agent.getCwd()) !== path.resolve(spec.cwd)) {
         agent.setCwd(spec.cwd);
@@ -195,11 +281,13 @@ export async function runGateway(): Promise<void> {
     }
 
     modeState = next;
+    currentSession.mode = next;
+    currentSession.agent = agent;
     writeGatewayMode(next, home);
     if (peer) writePeerMode(peer, next, home);
     state.cwd = spec.cwd;
     writeGatewayState(state, home);
-    log(`模式切换：${spec.label}（cwd=${spec.cwd}）`);
+    log(`模式切换：${spec.label}（cwd=${spec.cwd}，会话=${currentSession.key}）`);
     return spec.label;
   };
 
@@ -289,6 +377,22 @@ export async function runGateway(): Promise<void> {
         return result.compacted
           ? `✓ 已压缩上下文：${result.before} 条 → ${result.after} 条`
           : `未压缩：${result.reason ?? "历史较短"}`;
+      }
+      case "trades":
+      case "records": {
+        if (!modeState) {
+          return "当前是普通模式；发送 /btc、/btc moni 或 /a 切换模式后，/trades 才有交易记录可看。";
+        }
+        const limit = Number(arg) || 20;
+        const lines =
+          modeState.name === "btc"
+            ? await btcTradeHistoryLines(
+                getBtcHome(),
+                modeState.paper ? "paper" : "live",
+                limit,
+              )
+            : aTradeLines(limit);
+        return lines.join("\n");
       }
       case "tools": {
         const modeName = modeState?.name;
@@ -628,6 +732,8 @@ export async function runGateway(): Promise<void> {
       backgroundJobs: false,
       maxToolRounds: 60,
     });
+    // 每个对端各持有一个 Agent，创建后立刻记到自己名下
+    currentSession.agent = agent;
     // 重启后恢复到持久化的 btc / a 模式时，后台也要跟着拉起来
     if (spec.mode?.ensureService) {
       void spec.mode
@@ -641,43 +747,74 @@ export async function runGateway(): Promise<void> {
     return agent;
   };
 
+  /**
+   * 单条消息的墙钟上限。
+   *
+   * 以前固定 5 分钟：本地模型 + `btc_sync` 这类慢工具很容易跑过，超时后 `run` 回滚、
+   * 一个字都没留下，gateway 便输出「本轮没有文本输出，但工具已执行」——
+   * 用户看到的是「只查了个价就没了」（2026-11-13 实测）。默认放宽到 15 分钟，
+   * 并让超时明确说自己超时（可设 `XZH_GATEWAY_MESSAGE_TIMEOUT_MS` 覆盖）。
+   */
+  const MESSAGE_TIMEOUT_MS = (() => {
+    const raw = Number(process.env.XZH_GATEWAY_MESSAGE_TIMEOUT_MS);
+    return Number.isFinite(raw) && raw >= 60_000 ? Math.floor(raw) : 15 * 60_000;
+  })();
+  const timeoutMinutes = Math.max(1, Math.round(MESSAGE_TIMEOUT_MS / 60_000));
+
   /** 串行处理：Agent 实例不是并发安全的，同时两条消息会把上下文搅在一起 */
   let queue: Promise<unknown> = Promise.resolve();
   const handleMessage = (text: string, peer?: string): Promise<string> => {
     const task = queue.then(async () => {
-      // 微信：恢复该对端上次使用的模式；没有记录时沿用当前模式并记住
-      if (peer) {
-        const store = readPeerModes(home);
-        const saved = store.modes[peer];
-        const current = modeState;
-        const same = saved
-          ? saved.name === current?.name &&
-            (saved.name !== "btc" || saved.paper === current?.paper)
-          : false;
-        if (saved && !same) applyGatewayMode(saved, peer);
-        else writePeerMode(peer, current, home);
-      }
-
-      // `/btc` / `/a` / `/xzh` 这类命令不进入对话历史，也不调用模型
-      const commandReply = await handleCommand(text, peer);
-      if (commandReply !== null) return commandReply;
-
-      const runner = ensureAgent();
+      // 切到该对端自己的会话：历史、模式、Agent 全都分开（见 GatewaySession）
+      const session = sessionFor(peer);
+      activateSession(session);
+      // 每轮都从空白开始：上一轮的兜底文案（尤其 lastToolNote）不能串到这一轮
       replyBuffer = "";
       deniedNote = "";
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5 * 60_000);
+      lastToolNote = "";
       try {
-        await runner.run(text, controller.signal);
+        // 微信：恢复该对端上次使用的模式；没有记录时沿用当前模式并记住
+        if (peer) {
+          const saved = readPeerModes(home).modes[peer];
+          if (saved && !sameGatewayMode(saved, session.mode)) applyGatewayMode(saved, peer);
+          else writePeerMode(peer, session.mode, home);
+        }
+
+        // `/btc` / `/a` / `/xzh` 这类命令不进入对话历史，也不调用模型
+        const commandReply = await handleCommand(text, peer);
+        if (commandReply !== null) return commandReply;
+
+        const runner = ensureAgent();
+        let timedOut = false;
+        const controller = new AbortController();
+        const timer = setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, MESSAGE_TIMEOUT_MS);
+        try {
+          await runner.run(text, controller.signal);
+        } finally {
+          clearTimeout(timer);
+        }
+        if (timedOut) {
+          const partial = replyBuffer.trim();
+          const done = lastToolNote ? `已完成的最后一步：${lastToolNote}` : "";
+          return partial
+            ? `${partial}\n\n[⏱ 本轮超过 ${timeoutMinutes} 分钟，已中断${done ? `；${done}` : ""}]`
+            : `⏱ 本轮超过 ${timeoutMinutes} 分钟，已中断。${done ? `${done}。` : ""}` +
+                `可以让我只做其中一步（例如「只查价格」「只跑一次巡检」），或把任务拆小。`;
+        }
+        const reply =
+          replyBuffer.trim() ||
+          (lastToolNote
+            ? `（本轮没有文本输出，但工具已执行：${lastToolNote}）`
+            : "（本轮没有文本输出；可能是模型超时或工具轮数用尽，请重试一次）");
+        return deniedNote ? `${reply}\n\n[${deniedNote}]` : reply;
       } finally {
-        clearTimeout(timer);
+        // 不管成功、命令还是异常，都要把该会话的 Agent / 模式写回，
+        // 否则下一个对端会拿到上一个对端的实例（回到「串台」）
+        saveSession();
       }
-      const reply =
-        replyBuffer.trim() ||
-        (lastToolNote
-          ? `（本轮没有文本输出，但工具已执行：${lastToolNote}）`
-          : "（本轮没有文本输出；可能是模型超时或工具轮数用尽，请重试一次）");
-      return deniedNote ? `${reply}\n\n[${deniedNote}]` : reply;
     });
     // 无论成败都要让队列继续，否则一条失败的消息会把后续全部堵死
     queue = task.catch(() => undefined);

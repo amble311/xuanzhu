@@ -55,7 +55,9 @@ export interface PaperPanelData {
     entry_price: number;
     exit_price: number;
     pnl: number;
+    entry_ts?: string;
     exit_ts: string;
+    exit_reason?: string;
   }>;
 }
 
@@ -291,5 +293,85 @@ export function btcInfoLines(data: BtcPanelData): string[] {
     }
   }
 
+  return lines;
+}
+
+const ACTION_STATUS: Record<string, string> = {
+  pending: "待成交",
+  filled: "已成交",
+  cancelled: "已撤销",
+  unknown: "未知",
+};
+
+/**
+ * `/trades` 的纯文本输出（TUI 与微信共用，无 ANSI）。
+ *
+ * - **模拟盘**：读 Python 账本的已平仓记录（`paper-status` 支持 limit，无需新命令）；
+ * - **实盘**：读本机动作账本（`run/actions.jsonl`）里玄猪发起的开 / 平仓。
+ *   不镜像交易所全量历史 —— 币安 App 里的手动交易不在其中，输出里要写明，
+ *   否则用户会以为「少记了」。
+ */
+export async function btcTradeHistoryLines(
+  home: string,
+  role: "live" | "paper",
+  limit = 20,
+): Promise<string[]> {
+  const shown = Math.min(100, Math.max(1, Math.floor(limit) || 20));
+  if (role === "paper") {
+    const result = await runRunner<PaperPanelData>(
+      "paper-status",
+      { limit: shown },
+      { home },
+    );
+    if (!result.ok) {
+      return [
+        `BTC 模拟盘交易记录不可用：${result.error}`,
+        ...(result.detail ? [`  ${result.detail}`] : []),
+      ];
+    }
+    const data = result.data;
+    const rows = data.recent_trades ?? [];
+    const lines = [
+      `BTC 模拟盘交易记录（最近 ${rows.length} 笔已平仓，最新在前；累计 ${data.trades} 笔）`,
+    ];
+    if (rows.length === 0) {
+      lines.push("暂无已平仓记录。");
+      return lines;
+    }
+    for (const trade of rows) {
+      lines.push(
+        `${formatLocalTime(trade.exit_ts, "datetime")}  ${trade.side === "long" ? "多" : "空"} ${trade.qty}` +
+          `  ${fmt(trade.entry_price)} → ${fmt(trade.exit_price)}` +
+          `  盈亏 ${signed(trade.pnl)} USDT` +
+          (trade.exit_reason ? `（${trade.exit_reason}）` : ""),
+      );
+    }
+    lines.push(`胜率 ${data.win_rate}% · 已实现盈亏 ${signed(data.realized_pnl)} USDT`);
+    return lines;
+  }
+
+  const actions = readActions(home)
+    .filter((action) => action.kind === "open" || action.kind === "close")
+    .slice(-shown)
+    .reverse();
+  const lines = [
+    `BTC 交易记录（本机动作账本，最近 ${actions.length} 条，最新在前）`,
+    "仅含玄猪发起的开 / 平仓；币安 App 手动交易不在其中。",
+  ];
+  if (actions.length === 0) {
+    lines.push("暂无记录。");
+    return lines;
+  }
+  for (const action of actions) {
+    const direction = action.side === "short" ? "空" : "多";
+    const verb = action.kind === "open" ? `开${direction}` : `平${direction}`;
+    const price = action.limitPrice ? ` @ ${fmt(action.limitPrice)}` : "";
+    const pnl = action.pnl !== undefined ? `  盈亏 ${signed(action.pnl)}` : "";
+    const note = action.note ? `  ${action.note}` : "";
+    lines.push(
+      `${formatLocalTime(action.ts, "datetime")}  ${verb} ${action.qty ?? "?"}${price}` +
+        `  ${ACTION_STATUS[action.status] ?? action.status}${pnl}${note}  （${action.reason}）`,
+    );
+  }
   return lines;
 }

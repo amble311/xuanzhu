@@ -17,6 +17,7 @@ import {
   readPause,
   readRiskSettings,
   readRiskState,
+  riskSummaryLines,
   writeRiskSettings,
   clearRiskTrigger,
   readRules,
@@ -220,7 +221,7 @@ ${ansi.bold}监控（独立进程）${ansi.reset}
   ${ansi.green}xzh a serve status|stop${ansi.reset}         查看 / 停止巡检进程
   ${ansi.green}xzh a start|stop${ansi.reset}                 启停巡检（与 btc 的 xzh btc serve|stop 对齐）
   ${ansi.green}xzh a pause [resume|status]${ansi.reset}       暂停/恢复巡检（进程仍在）
-  ${ansi.green}xzh a fk [当日% 单票% 连亏]${ansi.reset}        查看 / 修改硬风控（fk reset 解除）
+  ${ansi.green}xzh a fk [当日% 单票% 连亏]${ansi.reset}        查看 / 修改硬风控（fk reset [代码] 解除；单票锁只锁该股）
   ${ansi.green}xzh a watch${ansi.reset}                     查看自选股（监控池）
   ${ansi.green}xzh a watch add|remove <代码>${ansi.reset}   手工增删（持仓不可删除）
   ${ansi.green}xzh a watch refresh${ansi.reset}             立即全市场重选前 10
@@ -520,6 +521,7 @@ async function statusCommand(parsed: ParsedArgs): Promise<void> {
       queueSize: readScheduleQueue().length,
       rules: readRules().length,
       riskTriggered: readRiskState()?.triggered === true,
+      riskLocks: readRiskState()?.locks.map((lock) => lock.code) ?? [],
       lastInspectAt: service.state?.lastInspectAt ?? null,
       lastInspectSummary: service.state?.lastInspectSummary ?? null,
       lastAction: service.state?.lastAction ?? null,
@@ -576,7 +578,7 @@ async function statusCommand(parsed: ParsedArgs): Promise<void> {
       `${readPause().paused ? " · 已暂停" : ""}${ansi.reset}\n`,
   );
   process.stdout.write(
-    `  ${padEnd("硬风控", 10)}${readRiskState()?.triggered ? "已触发（禁止买入）" : "正常"}\n`,
+    `  ${padEnd("硬风控", 10)}${riskSummaryLines().join("；")}\n`,
   );
   process.stdout.write(
     `  ${padEnd("自选股", 10)}${watch.items.length}/10` +
@@ -590,20 +592,32 @@ async function statusCommand(parsed: ParsedArgs): Promise<void> {
 async function fkCommand(parsed: ParsedArgs): Promise<void> {
   const action = (parsed.positional[1] ?? "").toLowerCase();
   if (action === "reset") {
-    clearRiskTrigger();
-    process.stdout.write(`${ansi.green}✓ 已解除当日硬风控${ansi.reset}\n`);
+    const code = parsed.positional[2];
+    const cleared = clearRiskTrigger(code);
+    process.stdout.write(
+      code
+        ? cleared > 0
+          ? `${ansi.green}✓ 已解除 ${code} 的单票硬风控${ansi.reset}（其他股票不受影响）\n`
+          : `${ansi.yellow}${code} 当前没有单票锁${ansi.reset}\n`
+        : `${ansi.green}✓ 已解除当日硬风控${ansi.reset}（账户级 + 全部单票锁）\n`,
+    );
     return;
   }
   const settings = readRiskSettings();
   if (action === "") {
     const state = readRiskState();
+    const lines = riskSummaryLines(state);
     process.stdout.write(
       `${ansi.bold}A 股硬风控${ansi.reset}\n` +
         `  当日亏损上限 ${settings.maxDailyLossPct}%\n` +
-        `  单票亏损上限 ${settings.maxPositionLossPct}%\n` +
+        `  单票亏损上限 ${settings.maxPositionLossPct}%（只锁触发的那只股票）\n` +
         `  连亏上限 ${settings.maxConsecutiveLosses} 笔\n` +
-        `  状态：${state?.triggered ? `${ansi.red}已触发${ansi.reset}（${state.reasons.join("；")}）` : `${ansi.green}正常${ansi.reset}`}\n` +
-        `${ansi.gray}修改：xzh a fk <当日> <单票> <连亏>；解除：xzh a fk reset${ansi.reset}\n`,
+        `  状态：${lines
+          .map((line) =>
+            line === "正常" ? `${ansi.green}${line}${ansi.reset}` : `${ansi.red}${line}${ansi.reset}`,
+          )
+          .join("\n        ")}\n` +
+        `${ansi.gray}修改：xzh a fk <当日> <单票> <连亏>；解除：xzh a fk reset [股票代码]${ansi.reset}\n`,
     );
     return;
   }

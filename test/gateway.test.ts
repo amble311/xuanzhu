@@ -15,6 +15,7 @@ import {
   readGatewayMode,
   readGatewayState,
   readPeerModes,
+  sameGatewayMode,
   writePeerMode,
   systemdUnitFile,
   writeGatewayMode,
@@ -131,6 +132,14 @@ describe("gateway", () => {
 });
 
 describe("微信对端模式", () => {
+  it("模式等价判断：btc 实盘 / 模拟盘不算同一个，普通模式只认 null", () => {
+    expect(sameGatewayMode(null, null)).toBe(true);
+    expect(sameGatewayMode({ name: "a" }, { name: "a" })).toBe(true);
+    expect(sameGatewayMode({ name: "a" }, { name: "btc", paper: true })).toBe(false);
+    expect(sameGatewayMode({ name: "btc", paper: true }, { name: "btc", paper: false })).toBe(false);
+    expect(sameGatewayMode({ name: "btc", paper: true }, { name: "btc", paper: true })).toBe(true);
+  });
+
   it("按 peer 保存最后对话模式，重启可恢复", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "xzh-gw-peer-"));
     try {

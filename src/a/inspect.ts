@@ -161,7 +161,13 @@ function contextSection(): string {
   if (isPaused()) lines.push("注意：当前处于暂停标记，但本轮由手动/事件触发。");
   const risk = readRiskState();
   if (risk?.triggered) {
-    lines.push(`硬风控已触发（禁止开新仓）：${risk.reasons.join("；")}`);
+    lines.push(`账户级硬风控已触发（禁止所有买入）：${risk.reasons.join("；")}`);
+  }
+  if (risk && risk.locks.length > 0) {
+    lines.push("单票硬风控（只禁止买入这些股票，其他股票可正常开仓）：");
+    for (const lock of risk.locks) {
+      lines.push(`- ${lock.code} ${lock.name} ${lock.reason}`);
+    }
   }
   const positionRisks = readPositionRisks().alerts;
   if (positionRisks.length > 0) {
@@ -209,7 +215,9 @@ const INSPECT_PROMPT = `你现在处于 A 股**后台巡检 / 无人值守**：�
 - **不做选股**：禁止调用 a_select / a_screen 重新筛选股票，禁止把池外股票加入自选；
   收盘后 16:00 有独立的固定选股任务，本轮只做“已有持仓 + 已有自选”的实时分析。
 - 不允许写文件、执行 shell、修改环境、重置账本；不要声称真钱交易（这是模拟盘）。
-- 若上下文提示“硬风控已触发”，本轮禁止买入/加仓，只能减仓或观望；减仓后可用 a_clear_risk 解除。
+- 若上下文提示“账户级硬风控已触发”，本轮禁止买入/加仓，只能减仓或观望；减仓后可用 a_clear_risk 解除。
+- 若提示“单票硬风控”，**只禁止买入被锁的那只股票**，其他自选股照常评估；该股减仓后可用
+  a_clear_risk(code=…) 单独解锁，不要因为一只票而停掉整个账户。
 - 若上下文提示“持仓风控告警”，监控只是告警，**不会自动卖**；是否卖、卖多少由你判断并 a_order。
 - 行情不可用 / 数据缺失时不要猜价格，明确说明并排下一次。
 

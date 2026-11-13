@@ -202,6 +202,11 @@ xzh
 - 工作目录 `~/.xzh_gateway`（`XZH_GATEWAY_HOME` 可改），记忆/会话独立，不混进日常项目；
 - 本地接口：`GET /health`、`POST /message`（`{"text":"..."}` → 回复文本）、`POST /shutdown`，
   默认端口 17890（`XZH_GATEWAY_PORT` 可改），只监听 127.0.0.1；
+- 每个微信对端（以及 HTTP `/message`）有**独立的对话历史与模式**，互不串台；
+  切换模式（`/btc`、`/btc moni`、`/a`、`/xzh`）会清空该对端这段对话的上下文
+  —— 不同模式的工具与账本严格隔离；
+- 单条消息最多跑 15 分钟（`XZH_GATEWAY_MESSAGE_TIMEOUT_MS` 可改），超时会明确回复
+  「本轮超时已中断」并带上最后完成的工具，不再只回一句「没有文本输出」；
 - 首次 `xzh gateway` 会顺手装好开机自启：Linux 写 **systemd user unit**（`Restart=always`），
   Windows 写 **HKCU Run + wscript 隐藏启动器**（崩溃 3 秒后自动重拉，无需管理员）；
   两者都不影响服务本体，`xzh gateway autostart off` 可关闭；

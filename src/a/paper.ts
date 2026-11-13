@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { fetchQuote, type Quote } from "../exchange/ashare";
+import { continuousSession, fetchQuote, type Quote } from "../exchange/ashare";
 import { ensureDir, getAShareHome } from "../utils/paths";
 
 /**
@@ -238,6 +238,8 @@ export function markPaperAccount(
  * 执行一笔委托（纯函数，便于测试）。
  *
  * 只处理立即成交；限价不穿越现价时直接拒绝，不生成挂单。
+ * **时段闸门不在这里**：调用方负责（`placePaperOrder` 已按 `continuousSession()`
+ * 拦掉集合竞价/午休/非交易日，回测等离线场景可直接调本函数）。
  */
 export function applyPaperOrder(
   account: PaperAccount,
@@ -389,11 +391,25 @@ export function markPartialTaken(code: string): void {
   savePaperAccount(account);
 }
 
-/** 拉取最新价并落盘（工具与面板共用） */
+/**
+ * 拉取最新价并落盘（工具与面板共用）。
+ *
+ * 只在**连续竞价时段 + 交易日**成交：集合竞价（09:15–09:25 / 09:25–09:30）、午休、
+ * 盘前盘后、节假日一律拒单 —— 否则会用「昨日收盘价 / 上午收盘价」成交，
+ * 模拟盘收益全是假的。想非交易时段下单请用挂单（`a_order pending: true`）。
+ */
 export async function placePaperOrder(
   request: OrderRequest,
   now = new Date(),
 ): Promise<OrderResult> {
+  const gate = await continuousSession(now);
+  if (!gate.open) {
+    return {
+      ok: false,
+      message: `${gate.reason ?? "当前不可交易"}，模拟盘只在连续竞价时段成交（可挂单等开盘）`,
+      account: loadPaperAccount(now),
+    };
+  }
   const quote = await fetchQuote(request.code);
   const account = loadPaperAccount(now);
   const result = applyPaperOrder(account, quote, request, now);

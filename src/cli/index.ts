@@ -58,6 +58,7 @@ import {
   btcStatusCommand,
   btcStopCommand,
 } from "./commands/btc";
+import { ensureBtcBackend } from "../btc/daemon";
 import { runBtcBackend } from "../btc/daemon-main";
 import { ensureBtcNetwork } from "../btc/network";
 
@@ -123,6 +124,32 @@ process.on("unhandledRejection", (reason) => {
   if (report) process.stderr.write(`错误报告：${report}\n`);
   process.exit(1);
 });
+
+/**
+ * 只拉起 btc 常驻后端（不进入界面），对齐 `xzh a serve`。
+ *
+ * `xzh btc serve` / `xzh btc moni serve` 用它：已在跑就复用，没有就 detached 启动，
+ * 最多等 3 秒拿状态文件，然后打印结果返回。真正的常驻循环是带 `--foreground` 的内部调用。
+ */
+async function startBtcService(role: "live" | "paper"): Promise<void> {
+  const label = role === "paper" ? "模拟盘" : "常驻";
+  const backend = await ensureBtcBackend({ role });
+  if (backend.running) {
+    const next = backend.state?.nextCheckAt;
+    process.stdout.write(
+      `${ansi.green}✓ ${backend.started ? "已启动" : "复用"} btc ${label}后端` +
+        `（pid ${backend.state?.pid ?? "?"}）${next ? `，下次巡检 ${next}` : ""}${ansi.reset}\n` +
+        `${ansi.gray}  停止用 ${ansi.reset}xzh btc stop${role === "paper" ? " --paper" : ""}` +
+        `${ansi.gray}；查看见 ${ansi.reset}xzh btc status${ansi.reset}\n`,
+    );
+    return;
+  }
+  process.stdout.write(
+    `${ansi.red}✗ btc ${label}后端未启动：${backend.error ?? "未知原因"}${ansi.reset}\n` +
+      `${ansi.gray}  先运行 ${ansi.reset}xzh btc setup${ansi.gray} 准备计算环境（首次需联网）${ansi.reset}\n`,
+  );
+  process.exitCode = 1;
+}
 
 async function main(): Promise<void> {
   // 旧全局目录一次性迁移（~/.xuanzhu → ~/.xzh）。
@@ -196,15 +223,24 @@ async function main(): Promise<void> {
         await btcPlatformCommand(args.slice(2));
         return;
       }
-      // 隐藏子命令：由 `xzh btc` / `xzh btc moni` 以 detached 方式拉起，手动运行用于前台调试
+      // 只启动后台，不进入界面（与 `xzh a serve` 对齐）：
+      // `xzh btc serve` = 实盘后端，`xzh btc moni serve` = 模拟盘后端。
       if (sub === "serve") {
-        await runBtcBackend({
-          role: args.includes("--paper") ? "paper" : "live",
-        });
+        const role = args.includes("--paper") ? "paper" : "live";
+        // 内部标记：detached 出来的常驻进程才跑前台循环（见 src/btc/daemon.ts）
+        if (args.includes("--foreground")) {
+          await runBtcBackend({ role });
+          return;
+        }
+        await startBtcService(role);
         return;
       }
       // 模拟盘：同一套模式，换成 paper 角色（独立后端 + 虚拟账本）
       if (sub === "moni") {
+        if (args[2] === "serve") {
+          await startBtcService("paper");
+          return;
+        }
         process.env.XZH_BTC_ROLE = "paper";
         await startChat(mode.home, intentOverride, createBtcMode({ paper: true }));
         return;
@@ -213,7 +249,8 @@ async function main(): Promise<void> {
         process.stdout.write(
           `${ansi.red}未知子命令：${command} ${sub}${ansi.reset}\n` +
             `${ansi.gray}${command} 模式目前支持：` +
-            `${command}${ansi.gray}（进入模式）、${command} moni（模拟盘）、${command} apikey（凭据管理）、` +
+            `${command}${ansi.gray}（进入模式）、${command} moni（模拟盘）、${command} serve（只启动后台）、` +
+            `${command} moni serve（只启动模拟盘后台）、${command} apikey（凭据管理）、` +
             `${command} fk（硬性风控）、${command} platform（交易平台）、${command} setup、` +
             `${command} stop、${command} status${ansi.reset}\n`,
         );
@@ -539,83 +576,87 @@ function printHelp(): void {
   const help = `
 ${ansi.brightMagenta}${ansi.bold}玄猪 XuanZhu${ansi.reset} ${ansi.gray}v${VERSION} —— 专为终端打造的 AI 编码 Agent${ansi.reset}
 
-${ansi.bold}用法${ansi.reset}
+${ansi.bold}用法${ansi.reset}（按英文字母排序）
   ${ansi.green}xzh${ansi.reset}                     在当前目录启动交互式终端界面
   ${ansi.green}xzh <目录>${ansi.reset}              在指定项目目录启动，例如 ${ansi.gray}xzh /home${ansi.reset}
-  ${ansi.green}xzh btc${ansi.reset}                进入 BTC 量化交易模式：工作目录固定为 ${ansi.gray}${getBtcHome()}${ansi.reset}
-                            （${ansi.gray}XZH_BTC_HOME${ansi.reset} 可重定向、不可 /switch、只加载交易相关技能）
-  ${ansi.green}xzh btc setup${ansi.reset}          重建 btc 计算环境（首次进入模式时自动执行；此处用于修复 / ${ansi.gray}--force${ansi.reset} 重装）
-  ${ansi.green}xzh btc moni${ansi.reset}           进入 BTC 模拟盘：虚拟账本开平仓，不涉及真钱（独立后端）
-  ${ansi.green}xzh btc apikey${ansi.reset}         管理交易所 API 凭据（录入 / 更新 / 删除 / 查看别名）
-  ${ansi.green}xzh btc fk${ansi.reset}             硬性风控阈值（持仓亏损 / 当日亏损 / 连亏）
-  ${ansi.green}xzh btc platform${ansi.reset}       选择交易平台（默认币安；已接入的只有币安）
-  ${ansi.green}xzh btc stop${ansi.reset}           停止 btc 常驻后端（退出界面不会停它；${ansi.gray}--paper${ansi.reset} 只停模拟盘）
-  ${ansi.green}xzh btc status${ansi.reset}         查看观察 / 模拟盘两个后端与排期队列
-  ${ansi.green}xzh a${ansi.reset}                   进入 A 股分析模式：工作目录固定为 ${ansi.gray}${getAShareHome()}${ansi.reset}（不可 /switch）
-  ${ansi.green}xzh a serve [status|stop]${ansi.reset} A 股独立巡检与监控：盘中每 15 分钟选股 / 监控 / 模拟买卖
-  ${ansi.green}xzh a start|stop${ansi.reset}         启动 / 停止 A 股巡检（简写）
-  ${ansi.green}xzh a watch [add|remove]${ansi.reset}  自选股（≤10，持仓强制保留）
-  ${ansi.green}xzh a quote <代码...>${ansi.reset}    实时快照；指数写 1A0001
-  ${ansi.green}xzh a bars <代码>${ansi.reset}        K 线（--period / --adjust / --limit / --from）
-  ${ansi.green}xzh a snapshot${ansi.reset}           全市场温度（涨跌家数 / 涨跌停 / 成交额 / 分布）
-  ${ansi.green}xzh a screen${ansi.reset}             横截面筛选（--pct-min / --amount-min / --above-ma20 …）
-  ${ansi.green}xzh a market${ansi.reset}             主要指数一览
-  ${ansi.green}xzh a sync|status${ansi.reset}        建股票池 + 预计算指标 / 查看缓存状态
+  ${ansi.green}xzh --help${ansi.reset}              显示本帮助
   ${ansi.green}xzh --intent${ansi.reset}            本次启动启用意图分析（默认关闭）
   ${ansi.green}xzh --no-intent${ansi.reset}         本次启动强制关闭意图分析
-  ${ansi.green}xzh model${ansi.reset}               交互式管理多模型（新增 / 删除 / 查看全部）
-  ${ansi.green}xzh model list${ansi.reset}          列出已配置的模型（按回退顺序）
-  ${ansi.green}xzh model all${ansi.reset}           列出所有内置可用的模型
-  ${ansi.green}xzh model add <provider> <model> [上下文窗口] [on|off]${ansi.reset}
-                            新增模型（末尾 on/off = 是否支持图片输入）
-  ${ansi.green}xzh model remove <id|序号>${ansi.reset}    删除模型
-  ${ansi.green}xzh model context <id|序号> [大小]${ansi.reset}
-                            调整上下文窗口（留空则自动推断）
-  ${ansi.green}xzh model vision <id|序号> <on|off>${ansi.reset}
-                            标注是否支持图片输入
+  ${ansi.green}xzh --version${ansi.reset}           显示版本
+  ${ansi.green}xzh a${ansi.reset}                   进入 A 股分析模式：工作目录固定为 ${ansi.gray}${getAShareHome()}${ansi.reset}（不可 /switch）
+  ${ansi.green}xzh a bars <代码>${ansi.reset}        K 线（--period / --adjust / --limit / --from）
+  ${ansi.green}xzh a fk${ansi.reset}                 硬性风控（fk reset [代码] 解除；单票锁只锁该股）
+  ${ansi.green}xzh a market${ansi.reset}             主要指数一览
+  ${ansi.green}xzh a pause [resume|status]${ansi.reset}  暂停/恢复 A 股巡检（进程仍在）
+  ${ansi.green}xzh a quote <代码...>${ansi.reset}    实时快照；指数写 1A0001
+  ${ansi.green}xzh a screen${ansi.reset}             横截面筛选（--pct-min / --amount-min / --above-ma20 …）
+  ${ansi.green}xzh a serve [status|stop]${ansi.reset} A 股独立巡检与监控：盘中每 15 分钟选股 / 监控 / 模拟买卖
+  ${ansi.green}xzh a snapshot${ansi.reset}           全市场温度（涨跌家数 / 涨跌停 / 成交额 / 分布）
+  ${ansi.green}xzh a start|stop${ansi.reset}         启动 / 停止 A 股巡检（简写）
+  ${ansi.green}xzh a sync|status${ansi.reset}        建股票池 + 预计算指标 / 查看缓存状态
+  ${ansi.green}xzh a watch [add|remove]${ansi.reset}  自选股（≤10，持仓强制保留）
+  ${ansi.green}xzh autonomy${ansi.reset}            查看自治等级（ask / observe / auto）与最近拦截记录
+  ${ansi.green}xzh autonomy <档位>${ansi.reset}     切换自治等级；observe = 只观察、改动一律拦截并记账
+  ${ansi.green}xzh autonomy log [N]${ansi.reset}    打印观察日志（.xuanzhu/state/observe.log）
+  ${ansi.green}xzh btc${ansi.reset}                 进入 BTC 量化交易模式：工作目录固定为 ${ansi.gray}${getBtcHome()}${ansi.reset}
+                            （${ansi.gray}XZH_BTC_HOME${ansi.reset} 可重定向、不可 /switch、只加载交易相关技能）
+  ${ansi.green}xzh btc apikey${ansi.reset}          管理交易所 API 凭据（录入 / 更新 / 删除 / 查看别名）
+  ${ansi.green}xzh btc fk${ansi.reset}              硬性风控阈值（持仓亏损 / 当日亏损 / 连亏）
+  ${ansi.green}xzh btc moni${ansi.reset}            进入 BTC 模拟盘：虚拟账本开平仓，不涉及真钱（独立后端）
+  ${ansi.green}xzh btc moni serve${ansi.reset}      只在后台启动模拟盘后端，不进入界面
+  ${ansi.green}xzh btc platform${ansi.reset}        选择交易平台（默认币安；已接入的只有币安）
+  ${ansi.green}xzh btc serve${ansi.reset}           只在后台启动实盘后端，不进入界面（已在跑则复用）
+  ${ansi.green}xzh btc setup${ansi.reset}           重建 btc 计算环境（首次进入模式时自动执行；此处用于修复 / ${ansi.gray}--force${ansi.reset} 重装）
+  ${ansi.green}xzh btc status${ansi.reset}          查看观察 / 模拟盘两个后端与排期队列
+  ${ansi.green}xzh btc stop${ansi.reset}            停止 btc 常驻后端（退出界面不会停它；${ansi.gray}--paper${ansi.reset} 只停模拟盘）
   ${ansi.green}xzh config${ansi.reset}              查看当前配置（API Key 脱敏）
   ${ansi.green}xzh config edit${ansi.reset}         使用 nano 编辑配置文件
-  ${ansi.green}xzh config path${ansi.reset}         打印配置文件路径
   ${ansi.green}xzh config init${ansi.reset}         生成默认配置文件
-  ${ansi.green}xzh vpn${ansi.reset}                 交互式设置 / 探测 / 测试全局 HTTP(S)/SOCKS5 代理
+  ${ansi.green}xzh config path${ansi.reset}         打印配置文件路径
+  ${ansi.green}xzh device${ansi.reset}              与手机上的 AutoJs6 / AutoX.js 通信（设备桥）
+  ${ansi.green}xzh device apk${ansi.reset}          查看/安装手机端 AutoJs6 的安装包
+  ${ansi.green}xzh device check${ansi.reset}        体检：无障碍服务是否就绪、能否操作手机
+  ${ansi.green}xzh device connect <手机IP>${ansi.reset}  反过来连手机上的 AutoJs6（服务器模式）
+  ${ansi.green}xzh device logs${ansi.reset}         查看手机上的脚本日志
+  ${ansi.green}xzh device push|run <文件>${ansi.reset}   把脚本推到手机（保存 / 保存并运行）
+  ${ansi.green}xzh device serve${ansi.reset}        等手机连过来并常驻（AutoX.js 9317 + AutoJs6 客户端模式 6347）
+  ${ansi.green}xzh device shot [输出文件]${ansi.reset}   截取手机当前屏幕并保存为 JPEG
+  ${ansi.green}xzh device status|list${ansi.reset}  查看桥与已连接设备
+  ${ansi.green}xzh device stop${ansi.reset}         停止手机上正在运行的脚本
+  ${ansi.gray}  · device 通用参数：--port <端口>（默认 9317）· --device <名称> 只对某台设备下发${ansi.reset}
+  ${ansi.green}xzh errors${ansi.reset}              查看玄猪记录的错误报告（~/.xzh/state/errors/，等价 errors list）
+  ${ansi.green}xzh errors clear [--yes]${ansi.reset} 清空错误报告
+  ${ansi.green}xzh errors list${ansi.reset}         列出全部报告（最近的在前）
+  ${ansi.green}xzh errors path${ansi.reset}         打印报告目录
+  ${ansi.green}xzh errors show <序号|签名>${ansi.reset}  查看一份报告的完整内容
   ${ansi.green}xzh gateway${ansi.reset}             启动常驻 gateway（stop / restart / status / autostart）
-  ${ansi.green}xzh setup${ansi.reset}               检查并安装依赖（剪贴板工具 + 技能 CLI）
+  ${ansi.green}xzh help${ansi.reset}                显示本帮助（同 --help）
   ${ansi.green}xzh init${ansi.reset}                搭建 AGENTS.md 与 docs/ 初始框架（确定性，不调用模型）
   ${ansi.green}xzh init --dry-run${ansi.reset}      只预览将生成的内容，不写文件
   ${ansi.green}xzh init --force${ansi.reset}        整体覆盖已有规范文件（覆盖前备份）
-  ${ansi.green}xzh skill${ansi.reset}               交互式管理技能（启用 / 禁用 / 删除，禁用的技能对模型不可见）
-  ${ansi.green}xzh skill list${ansi.reset}          列出全部技能（含来源与状态）
-  ${ansi.green}xzh skill enable/disable <名称>${ansi.reset}
-                            启用 / 禁用技能
-  ${ansi.green}xzh skill delete <名称> [--yes]${ansi.reset}
-                            删除技能（仅限用户技能；内置技能请用 disable）
+  ${ansi.green}xzh model${ansi.reset}               交互式管理多模型（新增 / 删除 / 查看全部）
+  ${ansi.green}xzh model add <provider> <model> [上下文窗口] [on|off]${ansi.reset}
+                           新增模型（末尾 on/off = 是否支持图片输入）
+  ${ansi.green}xzh model all${ansi.reset}           列出所有内置可用的模型
+  ${ansi.green}xzh model context <id|序号> [大小]${ansi.reset}
+                           调整上下文窗口（留空则自动推断）
+  ${ansi.green}xzh model list${ansi.reset}          列出已配置的模型（按回退顺序）
+  ${ansi.green}xzh model remove <id|序号>${ansi.reset}    删除模型
+  ${ansi.green}xzh model vision <id|序号> <on|off>${ansi.reset}
+                           标注是否支持图片输入
   ${ansi.green}xzh prompt${ansi.reset}              查看系统提示词的段落（可分段覆盖，不必整份重写）
-  ${ansi.green}xzh prompt show [段落]${ansi.reset}   打印当前提示词 / 某段的内置原文与生效内容
-  ${ansi.green}xzh prompt set <段落> <文件|->${ansi.reset}  用文件（或 stdin）覆盖某一段
   ${ansi.green}xzh prompt reset <段落|--all>${ansi.reset}   取消覆盖
-  ${ansi.green}xzh autonomy${ansi.reset}           查看自治等级（ask / observe / auto）与最近拦截记录
-  ${ansi.green}xzh autonomy <档位>${ansi.reset}    切换自治等级；observe = 只观察、改动一律拦截并记账
-  ${ansi.green}xzh autonomy log [N]${ansi.reset}   打印观察日志（.xuanzhu/state/observe.log）
-  ${ansi.green}xzh errors${ansi.reset}              查看玄猪记录的错误报告（~/.xzh/state/errors/，等价 errors list）
-  ${ansi.green}xzh errors list${ansi.reset}         列出全部报告（最近的在前）
-  ${ansi.green}xzh errors show <序号|签名>${ansi.reset}  查看一份报告的完整内容
-  ${ansi.green}xzh errors path${ansi.reset}         打印报告目录
-  ${ansi.green}xzh errors clear [--yes]${ansi.reset} 清空错误报告
-  ${ansi.green}xzh device${ansi.reset}              与手机上的 AutoJs6 / AutoX.js 通信（设备桥）
-  ${ansi.green}xzh device serve${ansi.reset}        等手机连过来并常驻（AutoX.js 9317 + AutoJs6 客户端模式 6347）
-  ${ansi.green}xzh device connect <手机IP>${ansi.reset}  反过来连手机上的 AutoJs6（服务器模式）
-  ${ansi.green}xzh device status|list${ansi.reset}  查看桥与已连接设备
-  ${ansi.green}xzh device push|run <文件>${ansi.reset}   把脚本推到手机（保存 / 保存并运行）
-  ${ansi.green}xzh device stop${ansi.reset}         停止手机上正在运行的脚本
-  ${ansi.green}xzh device logs${ansi.reset}         查看手机上的脚本日志
-  ${ansi.green}xzh device check${ansi.reset}        体检：无障碍服务是否就绪、能否操作手机
-  ${ansi.green}xzh device shot [输出文件]${ansi.reset}   截取手机当前屏幕并保存为 JPEG
-  ${ansi.green}xzh device apk${ansi.reset}          查看/安装手机端 AutoJs6 的安装包
-  ${ansi.gray}  · device 通用参数：--port <端口>（默认 9317）· --device <名称> 只对某台设备下发${ansi.reset}
-  ${ansi.green}xzh help${ansi.reset}                显示本帮助（同 --help）
+  ${ansi.green}xzh prompt set <段落> <文件|->${ansi.reset}  用文件（或 stdin）覆盖某一段
+  ${ansi.green}xzh prompt show [段落]${ansi.reset}   打印当前提示词 / 某段的内置原文与生效内容
+  ${ansi.green}xzh setup${ansi.reset}               检查并安装依赖（剪贴板工具 + 技能 CLI）
+  ${ansi.green}xzh skill${ansi.reset}               交互式管理技能（启用 / 禁用 / 删除，禁用的技能对模型不可见）
+  ${ansi.green}xzh skill delete <名称> [--yes]${ansi.reset}
+                           删除技能（仅限用户技能；内置技能请用 disable）
+  ${ansi.green}xzh skill enable/disable <名称>${ansi.reset}
+                           启用 / 禁用技能
+  ${ansi.green}xzh skill list${ansi.reset}          列出全部技能（含来源与状态）
   ${ansi.green}xzh version${ansi.reset}             显示版本（同 --version）
-  ${ansi.green}xzh --help${ansi.reset}              显示本帮助
-  ${ansi.green}xzh --version${ansi.reset}           显示版本
+  ${ansi.green}xzh vpn${ansi.reset}                 交互式设置 / 探测 / 测试全局 HTTP(S)/SOCKS5 代理
 
 ${ansi.bold}支持的 Provider${ansi.reset}
   deepseek · anthropic · openai · gemini · glm · qwen · groq · ollama · custom

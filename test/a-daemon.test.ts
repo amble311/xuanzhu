@@ -41,7 +41,11 @@ describe("排期队列", () => {
   it("next 唯一、extra 同分钟去重、到期即出队", () => {
     removeAll();
     const target = new Date();
-    target.setDate(target.getDate() + 1);
+    // 取「下一个工作日」：明天若是周末， clampToWorkTime 会把它推到周一 09:00，
+    // 用周末日期当 target 会让 +11 分钟根本还没到排期时间（周五跑必挂）
+    do {
+      target.setDate(target.getDate() + 1);
+    } while (target.getDay() === 0 || target.getDay() === 6);
     target.setHours(10, 0, 0, 0);
     const at = target.toISOString();
     pushSchedule({ at, reason: "第一轮" });
@@ -173,8 +177,8 @@ describe("市场事件", () => {
   });
 });
 
-describe("账户级硬风控", () => {
-  it("单票亏损超过阈值触发，解除后恢复", () => {
+describe("硬风控作用域", () => {
+  it("单票亏损只锁该股票，不触发账户级；解除后恢复", () => {
     const account = {
       cash: 500000,
       positions: [
@@ -194,10 +198,13 @@ describe("账户级硬风控", () => {
     } as never;
     const quotes = new Map([["600519", { code: "600519", price: 9, changePct: -2 } as never]]);
     const result = checkAccountRisk(account, quotes, new Date("2026-11-10T10:00:00+08:00"));
-    expect(result.triggered).toBe(true);
-    expect(readRiskState()?.triggered).toBe(true);
-    clearRiskTrigger();
+    expect(result.triggered).toBe(false);
+    expect(result.locks.map((lock) => lock.code)).toEqual(["600519"]);
     expect(readRiskState()?.triggered).toBe(false);
+    expect(readRiskState()?.locks).toHaveLength(1);
+
+    clearRiskTrigger("600519");
+    expect(readRiskState()?.locks).toHaveLength(0);
   });
 });
 
@@ -228,14 +235,21 @@ describe("挂单状态机", () => {
       if (order.id === buy.order.id) order.expiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
     }
     fs.writeFileSync(file, JSON.stringify(raw));
-    const fill = matchOrders(new Map([["600519", { code: "600519", price: 9 } as never]]), new Date());
+    // 撮合闸门由调用方按连续竞价算好传入；这里显式放行，避免用例受运行时刻影响
+    const fill = matchOrders(
+      new Map([["600519", { code: "600519", price: 9 } as never]]),
+      new Date(),
+      { sessionOpen: true },
+    );
     expect(fill.fills.map((order) => order.id)).toContain(buy.order.id);
     expect(listOrders().find((order) => order.id === buy.order.id)?.status).toBe("filled");
 
     const sell = createOrder({ code: "300750", name: "宁德时代", side: "sell", qty: 100, limitPrice: 20, ttlMinutes: 1 });
     expect(sell.ok).toBe(true);
     if (!sell.ok) return;
-    const expired = matchOrders(new Map(), new Date(Date.now() + 2 * 60_000));
+    const expired = matchOrders(new Map(), new Date(Date.now() + 2 * 60_000), {
+      sessionOpen: true,
+    });
     expect(expired.expired.map((order) => order.id)).toContain(sell.order.id);
 
     const cancel = createOrder({ code: "000001", name: "平安银行", side: "buy", qty: 100, limitPrice: 10 });
@@ -243,6 +257,42 @@ describe("挂单状态机", () => {
       expect(cancelOrder(cancel.order.id).ok).toBe(true);
       expect(listOrders().find((order) => order.id === cancel.order.id)?.status).toBe("cancelled");
     }
+  });
+
+  it("集合竞价 / 午休 / 节假日不撮合，只保留挂单", () => {
+    const file = path.join(home, "monitor", "run", "pending-orders.json");
+    fs.rmSync(file, { force: true });
+    const order = createOrder({
+      code: "600519",
+      name: "贵州茅台",
+      side: "buy",
+      qty: 100,
+      limitPrice: 12,
+    });
+    expect(order.ok).toBe(true);
+    if (!order.ok) return;
+    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as {
+      orders: Array<{ id: string; expiresAt: string }>;
+    };
+    for (const item of raw.orders) {
+      if (item.id === order.order.id) item.expiresAt = new Date(Date.now() + 6 * 60 * 60_000).toISOString();
+    }
+    fs.writeFileSync(file, JSON.stringify(raw));
+
+    // 价格已经穿越，但不在连续竞价时段（09:20 集合竞价 / 12:00 午休）
+    const quotes = new Map([["600519", { code: "600519", price: 10 } as never]]);
+    const auction = matchOrders(quotes, new Date("2026-11-09T09:20:00+08:00"));
+    expect(auction.sessionOpen).toBe(false);
+    expect(auction.fills).toHaveLength(0);
+    const lunch = matchOrders(quotes, new Date("2026-11-09T12:00:00+08:00"));
+    expect(lunch.fills).toHaveLength(0);
+    expect(listOrders().find((item) => item.id === order.order.id)?.status).toBe("open");
+
+    // 进入连续竞价才成交
+    const open = matchOrders(quotes, new Date("2026-11-09T10:00:00+08:00"));
+    expect(open.sessionOpen).toBe(true);
+    expect(open.fills.map((item) => item.id)).toContain(order.order.id);
+    expect(listOrders().find((item) => item.id === order.order.id)?.status).toBe("filled");
   });
 });
 

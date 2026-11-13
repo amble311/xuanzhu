@@ -21,6 +21,8 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const IGNORED_TOP = new Set([
   ".git",
   ".codebuddy",
+  // 并行 AI 会话的本地工作目录（与 .codebuddy 同类，不入库、不属于项目源码）
+  ".workbuddy",
   ".xuanzhu",
   "node_modules",
   "dist",

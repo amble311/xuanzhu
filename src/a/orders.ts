@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import type { Quote } from "../exchange/ashare";
+import { isTradingTime, type Quote } from "../exchange/ashare";
 import { monitorDir } from "./watchlist";
 
 /**
@@ -8,6 +8,10 @@ import { monitorDir } from "./watchlist";
  *
  * 模拟盘默认立即成交；只有用户/巡检显式要求 `pending: true` 时才会挂单。
  * 监控 tick 每轮检查一次：价格穿越则按限价成交，收盘前未成交则过期。
+ *
+ * **撮合只在连续竞价时段（09:30–11:30 / 13:00–15:00）发生**：集合竞价、午休、
+ * 盘前盘后只处理「到期」，挂单保持 open 等下一个时段；判交易日请由调用方
+ * 用 `continuousSession()` 算好再以 `sessionOpen` 传入（纯函数便于测试）。
  */
 
 export type OrderStatus = "open" | "filled" | "cancelled" | "expired";
@@ -113,11 +117,18 @@ export function cancelOrder(id: string): { ok: boolean; order?: PendingOrder; er
   return { ok: true, order };
 }
 
-/** 每轮监控调用：返回待成交 / 已过期，并把状态落盘 */
+/**
+ * 每轮监控调用：返回待成交 / 已过期，并把状态落盘。
+ *
+ * `sessionOpen=false`（集合竞价 / 午休 / 盘前盘后 / 节假日）时**只做过期**，
+ * 不做价格穿越撮合，挂单留在 open 等下一个连续竞价时段。
+ */
 export function matchOrders(
   quotes: Map<string, Quote>,
   now = new Date(),
-): { fills: PendingOrder[]; expired: PendingOrder[] } {
+  options: { sessionOpen?: boolean } = {},
+): { fills: PendingOrder[]; expired: PendingOrder[]; sessionOpen: boolean } {
+  const sessionOpen = options.sessionOpen ?? isTradingTime(now);
   const file = readFile();
   const fills: PendingOrder[] = [];
   const expired: PendingOrder[] = [];
@@ -128,6 +139,7 @@ export function matchOrders(
       expired.push(order);
       continue;
     }
+    if (!sessionOpen) continue;
     const quote = quotes.get(order.code);
     if (!quote || quote.price <= 0) continue;
     const crossed =
@@ -138,7 +150,7 @@ export function matchOrders(
     }
   }
   if (fills.length > 0 || expired.length > 0) writeFile(file);
-  return { fills, expired };
+  return { fills, expired, sessionOpen };
 }
 
 export function describeOrder(order: PendingOrder): string {

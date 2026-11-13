@@ -301,7 +301,9 @@ export async function ensureBtcBackend(
   }
 
   try {
-    const args = [cliEntry(), "btc", "serve"];
+    // `--foreground` 是内部标记：`xzh btc serve` 对用户是「拉起后台并返回」，
+    // 真正的常驻循环只在带这个标记时运行（否则会变成前台阻塞）。
+    const args = [cliEntry(), "btc", "serve", "--foreground"];
     if (role === "paper") args.push("--paper");
     const child = spawn(process.execPath, args, {
       detached: true,

@@ -190,11 +190,12 @@ export function aInfoLines(data: APanelData): string[] {
     }
     const trades = data.account.trades.slice(-5).reverse();
     if (trades.length > 0) {
-      lines.push("最近成交：");
+      lines.push("最近成交（完整记录用 /trades）：");
       for (const trade of trades) {
         lines.push(
-          `  ${trade.time.slice(0, 16).replace("T", " ")} ${trade.side === "buy" ? "买" : "卖"}` +
-            ` ${trade.code} ${trade.qty} @ ${fmt(trade.price)}（费用 ${fmt(trade.fees)}）`,
+          `  ${formatLocalTime(trade.time, "datetime")} ${trade.side === "buy" ? "买" : "卖"}` +
+            ` ${trade.code} ${trade.qty} @ ${fmt(trade.price)}（费用 ${fmt(trade.fees)}）` +
+            (trade.pnl !== undefined ? ` 盈亏 ${signed(trade.pnl)}` : ""),
         );
       }
     }
@@ -262,5 +263,34 @@ export function aInfoLines(data: APanelData): string[] {
   // 与 a_order / a_account 的口径一致，防止模型把模拟盘说成实盘
   lines.push(divider);
   lines.push("以上为模拟盘数据，不涉及真钱。");
+  return lines;
+}
+
+/**
+ * `/trades` 的纯文本输出：最近 N 笔模拟盘成交（最新在前）。
+ *
+ * 只读本地账本（`paper.json`），不拉行情 —— 交易记录要能离线、秒开。
+ */
+export function aTradeLines(limit = 20): string[] {
+  const shown = Math.min(100, Math.max(1, Math.floor(limit) || 20));
+  const account = loadPaperAccount();
+  const lines = ["A 股交易记录（模拟盘 · 最新在前）"];
+  if (account.trades.length === 0) {
+    lines.push("暂无成交记录。");
+    return lines;
+  }
+  for (const trade of account.trades.slice(-shown).reverse()) {
+    lines.push(
+      `${formatLocalTime(trade.time, "datetime")}  ${trade.side === "buy" ? "买入" : "卖出"}` +
+        ` ${trade.code} ${trade.name} ${trade.qty} 股 @ ${fmt(trade.price)}` +
+        `  金额 ${fmt(trade.amount)}（费用 ${fmt(trade.fees)}）` +
+        (trade.pnl !== undefined ? `  盈亏 ${signed(trade.pnl)}` : ""),
+    );
+  }
+  const summary = accountSummary(account);
+  lines.push(
+    `共 ${account.trades.length} 笔 · 已实现盈亏 ${signed(summary.realizedPnl)}` +
+      ` · 总资产 ${fmt(summary.equity)}（${signed(summary.totalPnlPct)}%）`,
+  );
   return lines;
 }

@@ -434,6 +434,11 @@ const SMALL_TOOL_NAMES = new Set([
  */
 const GOAL_ROUND_LIMIT_EXTENSIONS = 3;
 
+/** 模式身份：名字相同但实盘/模拟盘不同也算「换了模式」，必须清空上下文 */
+function modeIdentity(mode: AgentMode | undefined): string {
+  return mode ? `${mode.name}|${mode.label}|${mode.home}` : "";
+}
+
 /** 被跳过（并未真正执行）的工具调用，其 `tool` 结果统一以此前缀开头 */
 const SKIPPED_CALL_PREFIX = "[系统] 本次调用已跳过";
 
@@ -616,6 +621,8 @@ export class Agent {
   private runLastVerifySeq = 0;
   /** 本轮是否已经发出过收尾提醒（验证 + 未完成清单合计，每次 run 最多一次） */
   private finishGateUsed = false;
+  /** 本轮是否已经提示过「输出被长度上限截断」（每次 run 最多一次） */
+  private truncationNoticed = false;
   /** 本轮是否调用过 `todo_write`（未完成门只看本轮自己列的计划，避免对旧清单唠叨） */
   private runTouchedTodos = false;
   /**
@@ -1650,12 +1657,25 @@ export class Agent {
    *
    * 用于 `/btc`：在不重启进程的前提下进入专用模式。目录要由调用方**先切**——
    * 因为 `setCwd` 会拒绝「模式锁定目录但目标不一致」的切换，顺序反了就静默不生效。
+   *
+   * **模式之间是一道硬墙**：只要模式真的变了（含 btc 实盘 ↔ 模拟盘），就清空对话历史。
+   * 否则旧模式的工具结果、持仓讨论会留在上下文里，模型会把两个账本混着答
+   * （2026-11-13 实测：在 btc 模拟盘里回答"A 股模拟盘工具已加载"）。
    */
   setMode(mode: AgentMode | undefined): void {
+    const changed = modeIdentity(this.mode) !== modeIdentity(mode);
     this.mode = mode;
     this.systemPrompt = this.composeSystemPrompt();
     this.task = undefined;
     this.taskLoaded = false;
+    if (!changed) return;
+    if (this.history.length > 0) {
+      this.reset();
+      this.events.onNotice?.(
+        `已切换到 ${mode?.label ?? "普通模式"}，上一段对话上下文已清空` +
+          `（不同模式的工具 / 账本 / 持仓互不混用）`,
+      );
+    }
   }
 
   /** 切换工作目录：更新工具上下文、项目规则与系统提示词（保留对话历史） */
@@ -1717,6 +1737,7 @@ export class Agent {
     this.runLastChangeSeq = 0;
     this.runLastVerifySeq = 0;
     this.finishGateUsed = false;
+    this.truncationNoticed = false;
     this.runTouchedTodos = false;
     this.runStatus = undefined;
     this.runToolCounts.clear();
@@ -1966,6 +1987,11 @@ export class Agent {
     // 问题并没有被解决，重新问一次还会再来一遍。
     let selfCorrections = 0;
 
+    // 模型「只调工具、不说话」时补一次催收：本地模型（尤其 thinking 模型）偶尔会在
+    // 工具结果之后返回空正文就结束，界面上就只剩一行「工具已执行」。
+    // 每次 run 只催一次，第二次仍空就尊重它，交给调用方的兜底文案。
+    let emptyReplyNudged = false;
+
     // 轮次配额的当前上限。用尽时先询问用户是否继续，而不是硬性中断 ——
     // 真实的大型重构（读完一个模块、重写、反复跑测试）很容易超过默认轮数，
     // 直接停掉会让任务断在半路。只有用户明确不再继续才收尾。
@@ -2026,6 +2052,23 @@ export class Agent {
         });
 
         if (toolCalls.length === 0) {
+          // 空正文：只调了工具（或什么都没做）就准备收尾。
+          // 这在 gateway / 微信里表现为「本轮没有文本输出，但工具已执行」——用户拿不到结论。
+          // 催一次让它基于已有工具结果说话；不是让它重复调工具。
+          if (!text.trim() && !emptyReplyNudged) {
+            emptyReplyNudged = true;
+            // 刚推入的空 assistant 先撤掉：部分端点拒绝 content 为空的 assistant 消息
+            if (turn[turn.length - 1]?.role === "assistant") turn.pop();
+            turn.push({
+              role: "user",
+              content:
+                "[系统] 你刚才这一轮没有输出任何文字。请**用文字**给出本轮结论：" +
+                "做了什么、结果如何、下一步建议；已有的工具结果足够就直接总结，不要重复调用工具。",
+            });
+            this.events.onStatus("要求模型补充结论");
+            continue;
+          }
+
           // 后台任务的结果必须**先于收尾**处理：模型在等它时不该直接结束这一轮。
           const finishedJobs = this.jobsRef?.takeCompleted() ?? [];
           if (finishedJobs.length > 0) {
@@ -2562,6 +2605,15 @@ export class Agent {
             toolCalls.push(chunk.toolCall);
             break;
           case "done":
+            // 输出被服务端长度上限截断：正文可能只剩一半甚至为空。
+            // 不提示的话，调用方只会看到「没有文本输出」，误以为是模型或工具的问题。
+            if (chunk.finishReason === "length" && !this.truncationNoticed) {
+              this.truncationNoticed = true;
+              this.events.onNotice?.(
+                "⚠ 模型输出达到服务端长度上限被截断（finish_reason=length），" +
+                  "本轮正文可能为空或不完整；可调大输出上限，或先让它给结论、再把任务拆小。",
+              );
+            }
             if (chunk.usage) this.events.onUsage?.(chunk.usage);
             // 真实 usage 回填：把「本次估算 vs 服务端实际计入」的偏差记进校正器，
             // 下一次组装请求时据此收紧预算（只收紧、不放宽）。
@@ -2766,6 +2818,17 @@ export class Agent {
     const tool = findTool(call.name, this.tools);
     if (!tool) {
       return { ok: false, content: `错误：未知工具 "${call.name}"` };
+    }
+
+    // 模式隔离的**执行期**闸门：仅靠「不下发 schema」不够 —— 历史里残留的旧工具名
+    // 仍可能被模型原样调用。这里直接拒绝，保证 btc 会话里绝不会真的动 A 股账本。
+    if (!toolVisibleInMode(tool, this.mode?.name)) {
+      return {
+        ok: false,
+        content:
+          `✗ 工具 "${tool.name}" 不属于当前模式（${this.mode?.label ?? "普通模式"}）。` +
+          `不同模式的工具 / 账本严格隔离；要使用它请先切换到对应模式（/btc、/a）。`,
+      };
     }
 
     // 自治等级闸门（确定性）：observe 模式下「会改动环境」的操作一律不执行。

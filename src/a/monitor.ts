@@ -2,6 +2,7 @@ import { spawn } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import {
+  continuousSession,
   fetchBars,
   fetchQuote,
   isTradingDay,
@@ -22,8 +23,13 @@ import { commitRuleHit, evaluateRules, readRules } from "./rules";
 import { pushSchedule, readScheduleQueue, takeDueSchedule } from "./schedule";
 import { isPaused, readPause } from "./pause";
 import { takeMarketEvent } from "./events";
-import { describeOrder, listOrders, matchOrders } from "./orders";
-import { checkAccountRisk, markRiskDelivered, readRiskState } from "./risk";
+import { cancelOrder, describeOrder, listOrders, matchOrders } from "./orders";
+import {
+  buyBlockReason,
+  checkAccountRisk,
+  markRiskDelivered,
+  readRiskState,
+} from "./risk";
 import {
   markPositionRisksDelivered,
   readPositionRisks,
@@ -173,7 +179,13 @@ function log(message: string): void {
   }
 }
 
-/** 工作窗口：工作日 09:00–15:30（监控与巡检都只在这段时间工作） */
+/**
+ * 工作窗口：工作日 09:00–15:30。
+ *
+ * 这是**进程的工作时间**（含集合竞价、午休、收盘后的收尾），只决定「要不要拉数据 /
+ * 跑巡检」；**不能当撮合闸门** —— 撮合与成交必须用 `continuousSession()`
+ * （09:30–11:30 / 13:00–15:00 且当天是交易日）。
+ */
 export function inTradingWindow(now = new Date()): boolean {
   const weekday = now.getDay();
   if (weekday === 0 || weekday === 6) return false;
@@ -337,6 +349,38 @@ function releaseLock(): void {
 }
 
 
+/**
+ * 启动预热：**先拉数据，再开始监控**。
+ *
+ * - 交易日历：读 24h 缓存，缺失时拉一次上证指数日线（约 1 秒）；
+ * - 全市场日线指标：36h 缓存，缺失时全市场重算（5000+ 只 × 140 根日线，1–2 分钟）。
+ *
+ * 为什么要放在第一次 tick 之前：`loadIndicators()` 会在调用处**同步**重算，
+ * 放在 tick 里会把一轮巡检拖成分钟级，还可能顶到 6 分钟巡检超时。
+ * 失败只记日志，不影响进程继续跑（后续 tick 会再按需拉）。
+ */
+async function warmupData(at: Date): Promise<void> {
+  try {
+    const calendar = await loadTradingCalendar();
+    log(
+      `交易日历就绪：${calendar.days.length} 个交易日（最近 ${calendar.days[calendar.days.length - 1]}）`,
+    );
+  } catch (err) {
+    log(`交易日历加载失败，按工作日判断：${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (at.getDay() === 0 || at.getDay() === 6) return;
+  const started = Date.now();
+  log("预热日线指标（缓存缺失时全市场重算，约 1–2 分钟）…");
+  try {
+    const indicators = await loadIndicators();
+    log(
+      `日线指标就绪：${indicators.size} 只（${Math.round((Date.now() - started) / 1000)}s）`,
+    );
+  } catch (err) {
+    log(`日线指标预热失败：${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 export async function runAServe(): Promise<void> {
   ensureDir(monitorDir());
   if (!acquireLock()) {
@@ -357,8 +401,17 @@ export async function runAServe(): Promise<void> {
   writeState(state);
   log(`A 股巡检启动 pid=${process.pid}，工作日 09:00–15:30 巡检；收盘后 16:00 固定选股`);
 
+  // 先拉数据再监控：状态文件已写好（startAService 的 5 秒检查不受影响），
+  // 这里把交易日历与日线指标准备好，避免第一轮 tick 同步重算全市场指标。
+  state.lastAction = "预热数据（交易日历 / 日线指标）…";
+  writeState(state);
+  await warmupData(now);
+  state.lastAction = undefined;
+  writeState(state);
+
   let stopped = false;
-  let running = false;
+  /** tick 级重入闸门：行情拉取 / 指标重算可能超过 30 秒的 tick 间隔 */
+  let busy = false;
   let selecting = false;
 
   const refresh = (at: Date): void => {
@@ -378,8 +431,7 @@ export async function runAServe(): Promise<void> {
     writeState(state);
   };
 
-  const tick = async (): Promise<void> => {
-    if (stopped || running) return;
+  const cycle = async (): Promise<void> => {
     const at = new Date();
     refresh(at);
 
@@ -396,7 +448,11 @@ export async function runAServe(): Promise<void> {
       }
     }
 
-    // 硬风控与 btc 对齐：只落盘 + 告警，不自动交易；暂停/非交易时段也检查
+    // 非工作时段（夜间 / 周末 / 15:30 之后）完全不拉行情：收盘之后价格是冻结的，
+    // 逐 tick 重拉持仓行情与 30m K 线只是白烧请求。
+    if (!inTradingWindow(at)) return;
+
+    // 硬风控与 btc 对齐：只落盘 + 告警，不自动交易；工作时段内即使暂停也检查
     const account = loadPaperAccount(at);
     const codes = account.positions.map((position) => position.code);
     const heldQuotes = quoteMap(
@@ -407,29 +463,29 @@ export async function runAServe(): Promise<void> {
     const riskAlerts = readPositionRisks();
 
     if (isPaused()) return;
-    if (!inTradingWindow(at)) return;
 
-    running = true;
     try {
-      const orderActions = await processPendingOrders(at);
+      // 撮合闸门是**连续竞价**（09:30–11:30 / 13:00–15:00 且当天是交易日），
+      // 不是 09:00–15:30 的工作窗口：集合竞价、午休、节假日不按冻结价成交。
+      const session = await continuousSession(at);
+      const orderActions = await processPendingOrders(at, session.open);
       if (orderActions.length > 0) {
         state.lastAction = orderActions[0];
         log(orderActions.join("；"));
       }
       const riskState = readRiskState();
-      const risk =
-        accountRisk.triggered && !(riskState?.delivered ?? false)
-          ? accountRisk
-          : { ...accountRisk, triggered: false, reasons: [] };
+      // 账户级与单票级都算「有风控」，但只有账户级会禁止全账户买入
+      const riskTriggered = accountRisk.triggered || accountRisk.locks.length > 0;
+      const riskPending = riskTriggered && !(riskState?.delivered ?? false);
       const positionRiskPending = riskAlerts.alerts.length > 0 && !riskAlerts.delivered;
 
-      const hit = await checkMonitorRules(at);
+      const hit = await checkMonitorRules(at, heldQuotes);
       const due = takeDueSchedule(at);
       const event = takeMarketEvent(at);
       const lastInspect = state.lastInspectAt ? Date.parse(state.lastInspectAt) : 0;
       const fallback = Date.now() - lastInspect >= 60 * 60_000;
 
-      if (!hit && !due && !event && !risk.triggered && !positionRiskPending && !fallback) {
+      if (!hit && !due && !event && !riskPending && !positionRiskPending && !fallback) {
         return;
       }
 
@@ -439,9 +495,16 @@ export async function runAServe(): Promise<void> {
               .map((item) => `${item.code} ${item.reason}${item.sellable ? "" : "（T+1 不可卖）"}`)
               .join("；")}`
           : undefined;
+      const riskReason = accountRisk.triggered
+        ? `账户级硬风控：${accountRisk.reasons.join("；")}`
+        : accountRisk.locks.length > 0
+          ? `单票硬风控：${accountRisk.locks
+              .map((lock) => `${lock.code} ${lock.name} ${lock.reason}`)
+              .join("；")}`
+          : undefined;
       const reason =
         (positionReason ??
-          (risk.triggered ? `硬风控：${risk.reasons.join("；")}` : undefined)) ??
+          (riskPending ? riskReason : undefined)) ??
         hit?.reason ??
         due?.reason ??
         event?.reason ??
@@ -451,7 +514,7 @@ export async function runAServe(): Promise<void> {
       const result = await runAInspect(reason, { origin: "inspect" });
       if (hit) commitRuleHit(hit.rule);
       if (!result.error) {
-        if (accountRisk.triggered) markRiskDelivered();
+        if (riskTriggered) markRiskDelivered();
         if (riskAlerts.alerts.length > 0) markPositionRisksDelivered();
       }
       state.lastInspectAt = iso(new Date());
@@ -474,8 +537,27 @@ export async function runAServe(): Promise<void> {
       log(`巡检失败：${state.lastError}`);
       pushSchedule({ minutes: 15, reason: "巡检异常退避", slot: "next", origin: "inspect" });
     } finally {
-      running = false;
       refresh(new Date());
+    }
+  };
+
+  /**
+   * tick：只负责重入闸门与错误兜底，真正的一轮在 `cycle()`。
+   *
+   * `busy` 必须在**任何 I/O 之前**置位：一轮里可能拉持仓行情、拉 30m K 线、
+   * 冷启动时还要全市场重算指标，耗时远超 30 秒的 tick 间隔；旧实现把 `running`
+   * 放在这些 I/O 之后才置位，慢的时候会并发跑两轮。
+   */
+  const tick = async (): Promise<void> => {
+    if (stopped || busy) return;
+    busy = true;
+    try {
+      await cycle();
+    } catch (err) {
+      state.lastError = err instanceof Error ? err.message : String(err);
+      log(`本轮异常：${state.lastError}`);
+    } finally {
+      busy = false;
     }
   };
 
@@ -520,19 +602,45 @@ export async function runManualInspection(): Promise<CycleResult> {
   return { actions, sold: [], bought: [], selected: [] };
 }
 
-/** 挂单撮合：价格穿越则成交，收盘前未成交则过期 */
-async function processPendingOrders(now: Date): Promise<string[]> {
-  const open = listOrders().filter((order) => order.status === "open");
-  if (open.length === 0) return [];
-  const quotes = quoteMap(
-    await mapLimit(
-      [...new Set(open.map((order) => order.code))],
-      async (code) => fetchQuote(code).catch(() => null),
-      6,
-    ),
-  );
-  const { fills, expired } = matchOrders(quotes, now);
+/**
+ * 挂单撮合：价格穿越则成交，收盘前未成交则过期。
+ *
+ * `sessionOpen=false`（集合竞价 / 午休 / 盘前盘后 / 节假日）时只处理**到期**：
+ * 不拉行情、不做价格穿越撮合，挂单留在 open 等下一个连续竞价时段。
+ * 硬风控撤单不受时段限制（锁出现后随时撤掉未成交买单）。
+ */
+async function processPendingOrders(now: Date, sessionOpen: boolean): Promise<string[]> {
   const actions: string[] = [];
+  // 硬风控也要管住挂单：触发后才成交的买单同样不许开仓（卖出挂单不受影响）
+  const open = listOrders().filter((order) => {
+    if (order.status !== "open") return false;
+    if (order.side !== "buy") return true;
+    const block = buyBlockReason(order.code);
+    if (!block) return true;
+    cancelOrder(order.id);
+    actions.push(`挂单撤销 ${describeOrder(order)}：${block}`);
+    appendAAction({
+      kind: "cancel",
+      code: order.code,
+      ok: true,
+      status: "cancelled",
+      message: `硬风控撤单：${block}`,
+      origin: order.origin,
+    });
+    return false;
+  });
+  if (open.length === 0) return actions;
+  // 非连续竞价不拉行情：用空表仅走过期逻辑
+  const quotes = sessionOpen
+    ? quoteMap(
+        await mapLimit(
+          [...new Set(open.map((order) => order.code))],
+          async (code) => fetchQuote(code).catch(() => null),
+          6,
+        ),
+      )
+    : new Map<string, Quote>();
+  const { fills, expired } = matchOrders(quotes, now, { sessionOpen });
   for (const order of fills) {
     const result = await placePaperOrder(
       { code: order.code, side: order.side, qty: order.qty, price: order.limitPrice },
@@ -710,9 +818,14 @@ async function maybeRunAfterCloseSelection(now: Date, state: AMonitorState): Pro
   }
 }
 
-/** 监控规则评估：持仓优先，再自选 */
+/**
+ * 监控规则评估：持仓优先，再自选。
+ *
+ * `known` 是本轮已经拉过的行情（持仓），规则里同代码不再重复请求。
+ */
 async function checkMonitorRules(
   now: Date,
+  known: Map<string, Quote> = new Map(),
 ): Promise<{ rule: import("./rules").MonitorRule; reason: string } | null> {
   const rules = readRules();
   if (rules.length === 0) return null;
@@ -721,8 +834,17 @@ async function checkMonitorRules(
     (a, b) => Number(held.has(b.code)) - Number(held.has(a.code)),
   );
   const codes = [...new Set(sorted.map((rule) => rule.code))];
-  const quotes = quoteMap(
-    await mapLimit(codes, async (code) => fetchQuote(code).catch(() => null), 6),
+  const missing = codes.filter((code) => !known.has(code));
+  if (missing.length > 0) {
+    const fetched = quoteMap(
+      await mapLimit(missing, async (code) => fetchQuote(code).catch(() => null), 6),
+    );
+    for (const [code, quote] of fetched) known.set(code, quote);
+  }
+  const quotes = new Map(
+    codes
+      .filter((code) => known.has(code))
+      .map((code) => [code, known.get(code)!] as const),
   );
   const indicators = await loadIndicators();
   return evaluateRules(sorted, quotes, indicators, now);

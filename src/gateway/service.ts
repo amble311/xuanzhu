@@ -391,6 +391,14 @@ export interface GatewayModeState {
   paper?: boolean;
 }
 
+/** 两个模式状态是否等价（btc 还要比实盘 / 模拟盘） */
+export function sameGatewayMode(
+  a: GatewayModeState | null,
+  b: GatewayModeState | null,
+): boolean {
+  return a?.name === b?.name && (a?.name !== "btc" || a.paper === b?.paper);
+}
+
 export function gatewayModeFile(home = gatewayHome()): string {
   return path.join(gatewayPaths(home).run, "mode.json");
 }
