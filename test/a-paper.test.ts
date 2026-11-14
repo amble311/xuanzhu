@@ -66,6 +66,34 @@ describe("模拟盘撮合", () => {
     expect(result.account.trades).toHaveLength(1);
   });
 
+  it("持仓最多 3 只：第 4 只被拒，同一只可继续加仓", () => {
+    let account = emptyPaperAccount(NOW);
+    for (const code of ["600001", "600002", "600003"]) {
+      const result = applyPaperOrder(account, quote({ code, name: code }), { code, side: "buy", qty: 100 }, NOW);
+      expect(result.ok).toBe(true);
+      account = result.account;
+    }
+    expect(account.positions).toHaveLength(3);
+
+    const fourth = applyPaperOrder(
+      account,
+      quote({ code: "600004", name: "第四只" }),
+      { code: "600004", side: "buy", qty: 100 },
+      NOW,
+    );
+    expect(fourth.ok).toBe(false);
+    expect(fourth.message).toContain("持仓已达上限 3 只");
+
+    const add = applyPaperOrder(
+      account,
+      quote({ code: "600001", name: "600001" }),
+      { code: "600001", side: "buy", qty: 100 },
+      NOW,
+    );
+    expect(add.ok).toBe(true);
+    expect(add.account.positions.find((item) => item.code === "600001")?.qty).toBe(200);
+  });
+
   it("买入非 100 股整数倍直接拒绝", () => {
     const result = applyPaperOrder(
       emptyPaperAccount(NOW),

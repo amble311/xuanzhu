@@ -5,6 +5,7 @@ import { loadSnapshot, type SnapshotRow } from "./snapshot";
 import { applyNewsAdjustments } from "./news";
 import { score15m } from "./deep15";
 import { combineTrend, dailyTrend, monthlyTrend, weeklyTrend, type CycleTrend } from "./trend";
+import { poolSize } from "./settings";
 import type { WatchItem } from "./watchlist";
 
 /**
@@ -12,8 +13,8 @@ import type { WatchItem } from "./watchlist";
  *
  * 1. 月/周/日各算 -1 / 0 / +1；任一周期 -1、数据不足、三周期全 0、没有 +1 都丢弃；
  * 2. 非涨停，按趋势强度和成交额取前 20；
- * 3. 对 20 只拉 15 分钟 K 线，做结构/位置/动量/量能/形态评分（0–100）；
- * 4. 消息面硬否决 + ±10 微调，按最终得分取前 10，不足不补。
+ * 3. 对 20 只逐只拉 15 分钟 K 线，做结构/位置/动量/量能/形态评分（0–100）；
+ * 4. 消息面硬否决 + ±10 微调，按最终得分取前 `poolSize` 只（默认 5，含持仓），不足不补。
  *
  * 选股不看 MACD 单指标，也不在盘中执行；固定由收盘后 16:00 任务调用。
  */
@@ -78,7 +79,7 @@ function baseUniverse(rows: SnapshotRow[]): SnapshotRow[] {
 }
 
 export async function selectTopWatchlist(
-  limit = 10,
+  limit = poolSize(),
   onProgress?: (message: string) => void,
   options: { refresh?: boolean } = {},
 ): Promise<WatchItem[]> {
@@ -207,12 +208,12 @@ export async function selectTopWatchlist(
     4,
   );
 
-  // 6) 消息面：硬风险否决 + ±10 微调；最后按得分取前 10（不足不补）
+  // 6) 消息面：硬风险否决 + ±10 微调；最后按得分取前 5（不足不补）
   onProgress?.("15 分钟分析完成，开始消息面打分…");
   const withNews = await applyNewsAdjustments(analyzed, { onProgress });
   const final = withNews.sort((a, b) => b.score - a.score).slice(0, limit);
   onProgress?.(
-    `最终入选 ${final.length} 只${final.length < limit ? "（不足 10 只，不补）" : ""}`,
+    `最终入选 ${final.length} 只${final.length < limit ? `（不足 ${limit} 只，不补）` : ""}`,
   );
   return final;
 }

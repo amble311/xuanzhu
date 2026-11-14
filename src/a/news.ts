@@ -3,7 +3,7 @@ import { fetchBars, readCache, writeCache, type Bar } from "../exchange/ashare";
 import type { WatchItem } from "./watchlist";
 
 /**
- * 消息面微调（只作用于最终入选的 10 只，不参与选股漏斗）。
+ * 消息面微调（只作用于最终入选的 5 只，不参与选股漏斗）。
  *
  * 设计原则：
  * - **公告优先**（东财公告接口，权威、可追溯），不做泛媒体情绪；

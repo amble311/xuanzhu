@@ -38,6 +38,15 @@ import {
   screenNeedsIndicators,
   screenStocks,
   summarizeSnapshot,
+  poolSize,
+  maxPositions,
+  readSettings,
+  writeSettings,
+  settingsPath,
+  DEFAULT_MAX_POSITIONS,
+  DEFAULT_POOL_SIZE,
+  MAX_POSITIONS_LIMIT,
+  POOL_SIZE_LIMIT,
   type Indicators,
   type RankField,
   type ScreenCondition,
@@ -221,9 +230,12 @@ ${ansi.bold}监控（独立进程）${ansi.reset}
   ${ansi.green}xzh a stop${ansi.reset}                      关闭后台服务（巡检 / 监控 / 模拟交易一起停）
   ${ansi.green}xzh a pause [resume|status]${ansi.reset}       暂停/恢复巡检与模拟交易（进程仍在）
   ${ansi.green}xzh a fk [当日% 单票% 连亏]${ansi.reset}        查看 / 修改硬风控（fk reset [代码] 解除；单票锁只锁该股）
-  ${ansi.green}xzh a watch${ansi.reset}                     查看自选股（监控池）
+  ${ansi.green}xzh a watch${ansi.reset}                     查看自选池（监控池，含持仓）
   ${ansi.green}xzh a watch add|remove <代码>${ansi.reset}   手工增删（持仓不可删除）
-  ${ansi.green}xzh a watch refresh${ansi.reset}             立即全市场重选前 10
+  ${ansi.green}xzh a watch refresh${ansi.reset}             立即全市场重选（默认 ${DEFAULT_POOL_SIZE} 只）
+  ${ansi.green}xzh a settings${ansi.reset}                  查看数量参数（持仓上限 / 自选池容量）
+  ${ansi.green}xzh a settings set max-positions 4${ansi.reset}  允许同时持仓几只（默认 ${DEFAULT_MAX_POSITIONS}）
+  ${ansi.green}xzh a settings set pool-size 6${ansi.reset}      自选池容量（默认 ${DEFAULT_POOL_SIZE}）
   ${ansi.green}xzh a monitor once${ansi.reset}              手动跑一轮巡检（不常驻）
   ${ansi.green}xzh a backtest${ansi.reset}                  日线回测（默认自选股；--codes / --days / --top）
   ${ansi.green}xzh a research${ansi.reset}                  Python 离线参数扫描（--stop / --trail / --days）
@@ -580,7 +592,7 @@ async function statusCommand(parsed: ParsedArgs): Promise<void> {
     `  ${padEnd("硬风控", 10)}${riskSummaryLines().join("；")}\n`,
   );
   process.stdout.write(
-    `  ${padEnd("自选股", 10)}${watch.items.length}/10` +
+    `  ${padEnd("自选池", 10)}${watch.items.length}/${poolSize()} · 持仓上限 ${maxPositions()} 只` +
       `${ansi.gray}${watch.items.length > 0 ? `：${watch.items.slice(0, 5).map((item) => `${item.code}(${item.score})`).join("、")}${watch.items.length > 5 ? " …" : ""}` : ""}${ansi.reset}\n`,
   );
   if (!universe.exists || !indicators.exists || !calendar.exists) {
@@ -714,7 +726,7 @@ async function stopServiceCommand(): Promise<void> {
 function printWatchlist(): void {
   const list = loadWatchlist();
   process.stdout.write(
-    `${ansi.bold}A 股自选股${ansi.reset} ${ansi.gray}（${list.items.length}/10 · 全部纳入监控）${ansi.reset}\n`,
+    `${ansi.bold}A 股自选池${ansi.reset} ${ansi.gray}（${list.items.length}/${poolSize()} · 全部纳入监控；上限可在 xzh a settings 调整）${ansi.reset}\n`,
   );
   if (list.items.length === 0) {
     process.stdout.write(`${ansi.gray}  空；运行 xzh a start 或 xzh a watch refresh 选股${ansi.reset}\n`);
@@ -738,16 +750,19 @@ async function watchCommand(parsed: ParsedArgs): Promise<void> {
   if (action === "add") {
     if (!code) throw new Error("用法：xzh a watch add <代码>");
     const quote = await fetchQuote(code);
-    const result = addWatchItem({
-      code: quote.code,
-      name: quote.name,
-      score: 0,
-      reason: "手工添加",
-      source: "manual",
-      addedAt: new Date().toISOString(),
-    });
+    const result = addWatchItem(
+      {
+        code: quote.code,
+        name: quote.name,
+        score: 0,
+        reason: "手工添加",
+        source: "manual",
+        addedAt: new Date().toISOString(),
+      },
+      poolSize(),
+    );
     if (!result.ok) throw new Error(result.error);
-    process.stdout.write(`${ansi.green}✓ 已加入自选股：${quote.code} ${quote.name}${ansi.reset}\n`);
+    process.stdout.write(`${ansi.green}✓ 已加入自选池：${quote.code} ${quote.name}${ansi.reset}\n`);
     printWatchlist();
     return;
   }
@@ -760,16 +775,19 @@ async function watchCommand(parsed: ParsedArgs): Promise<void> {
     return;
   }
   if (action === "refresh") {
-    const picks = await selectTopWatchlist(10, (message) =>
+    const size = poolSize();
+    const picks = await selectTopWatchlist(size, (message) =>
       process.stdout.write(`${ansi.gray}${message}${ansi.reset}\n`),
     );
     const held = loadPaperAccount().positions.map((position) => ({
       code: position.code,
       name: position.name,
     }));
-    const merged = mergeWatchlist(picks, held);
+    const merged = mergeWatchlist(picks, held, new Date(), size);
     saveWatchlist(merged);
-    process.stdout.write(`${ansi.green}✓ 已重选自选股${ansi.reset}\n`);
+    process.stdout.write(
+      `${ansi.green}✓ 已重选自选池 ${picks.length}/${size} 只（池内 ${merged.items.length}/${size}，持仓优先保留）${ansi.reset}\n`,
+    );
     printWatchlist();
     return;
   }
@@ -834,6 +852,53 @@ async function monitorCommand(parsed: ParsedArgs): Promise<void> {
   for (const action of result.actions) {
     process.stdout.write(`  ${action}\n`);
   }
+}
+
+/**
+ * `xzh a settings [show]` / `xzh a settings set <max-positions|pool-size> <N>`
+ *
+ * 只管**数量**参数（持仓只数、池子容量）；制度性约束（T+1 / 涨跌停 / 连续竞价）
+ * 与费用不可配 —— 那些是可复现的前提，改了就无法比较回测与实盘。
+ */
+function settingsCommand(parsed: ParsedArgs): void {
+  const action = (parsed.positional[1] ?? "show").toLowerCase();
+  if (action === "show" || action === "list") {
+    const current = readSettings();
+    process.stdout.write(
+      `${ansi.bold}A 股数量参数${ansi.reset} ${ansi.gray}（${settingsPath()}）${ansi.reset}\n` +
+        `  持仓上限   max-positions  ${ansi.bold}${current.maxPositions}${ansi.reset} 只` +
+        `${ansi.gray}（默认 ${DEFAULT_MAX_POSITIONS}，1–${MAX_POSITIONS_LIMIT}）${ansi.reset}\n` +
+        `  自选池容量 pool-size      ${ansi.bold}${current.poolSize}${ansi.reset} 只` +
+        `${ansi.gray}（默认 ${DEFAULT_POOL_SIZE}，1–${POOL_SIZE_LIMIT}；必须 ≥ 持仓上限）${ansi.reset}\n` +
+        `${ansi.gray}  修改：xzh a settings set max-positions 4 / xzh a settings set pool-size 6${ansi.reset}\n`,
+    );
+    return;
+  }
+  if (action !== "set") {
+    throw new Error("用法：xzh a settings [show]｜xzh a settings set <max-positions|pool-size> <数字>");
+  }
+  const rawKey = (parsed.positional[2] ?? "").toLowerCase().replace(/_/g, "-");
+  const rawValue = Number(parsed.positional[3]);
+  if (!Number.isFinite(rawValue)) throw new Error("需要一个数字，例如：xzh a settings set pool-size 6");
+  const before = readSettings();
+  if (rawKey === "max-positions" || rawKey === "positions") {
+    const next = writeSettings({ maxPositions: Math.floor(rawValue) });
+    process.stdout.write(
+      `${ansi.green}✓ 持仓上限 ${next.maxPositions} 只${ansi.reset}` +
+        `${next.maxPositions !== Math.floor(rawValue) ? `${ansi.gray}（受池子容量 ${next.poolSize} 限制）${ansi.reset}` : ""}\n`,
+    );
+    return;
+  }
+  if (rawKey === "pool-size" || rawKey === "pool" || rawKey === "watchlist") {
+    const next = writeSettings({ poolSize: Math.floor(rawValue) });
+    process.stdout.write(
+      `${ansi.green}✓ 自选池容量 ${next.poolSize} 只${ansi.reset}` +
+        `${next.maxPositions < before.maxPositions ? `${ansi.gray}（持仓上限相应收敛为 ${next.maxPositions} 只）${ansi.reset}` : ""}\n` +
+        `${ansi.gray}  池内现有 ${loadWatchlist().items.length} 只；要立刻补齐运行 xzh a watch refresh${ansi.reset}\n`,
+    );
+    return;
+  }
+  throw new Error(`未知参数：${parsed.positional[2]}（可选 max-positions / pool-size）`);
 }
 
 export async function aCommand(args: string[]): Promise<void> {
@@ -913,6 +978,9 @@ export async function aCommand(args: string[]): Promise<void> {
       case "watch":
         await watchCommand(parsed);
         return;
+      case "settings":
+        settingsCommand(parsed);
+        return;
       case "monitor":
         await monitorCommand(parsed);
         return;
@@ -925,7 +993,7 @@ export async function aCommand(args: string[]): Promise<void> {
       default:
         process.stdout.write(
           `${ansi.red}未知子命令：a ${sub}${ansi.reset}\n` +
-            `${ansi.gray}可用：quote / bars / intraday / market / snapshot / screen / boards / sync / status / start / stop / watch / monitor / backtest / research${ansi.reset}\n`,
+            `${ansi.gray}可用：quote / bars / intraday / market / snapshot / screen / boards / sync / status / start / stop / watch / settings / monitor / backtest / research${ansi.reset}\n`,
         );
         process.exitCode = 1;
     }

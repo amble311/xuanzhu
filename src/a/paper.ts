@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { continuousSession, fetchQuote, type Quote } from "../exchange/ashare";
 import { ensureDir, getAShareHome } from "../utils/paths";
+import { DEFAULT_MAX_POSITIONS, maxPositions } from "./settings";
 
 /**
  * A 股模拟盘账本（最小可用版）。
@@ -22,6 +23,18 @@ const MIN_COMMISSION = 5;
 const STAMP_RATE = 0.0005;
 const TRANSFER_RATE = 0.00001;
 const MAX_TRADES = 100;
+
+/**
+ * 同时持有的股票**只数**上限（不含同一只股票加仓），默认 3、用户可改
+ * （`~/.xzh_a/settings.json` 的 `maxPositions`，见 `settings.ts`）。
+ *
+ * 为什么要有：A 股是 T+1，持仓一多就管不过来，风控（ATR 止损 / 移动止盈）
+ * 也会因为分母变多而失效。这条由代码强制，提示词里的数字只是同一规则的说明。
+ */
+export interface PaperOrderLimits {
+  /** 不传 = 默认值（纯函数保持可测试，运行期由 `placePaperOrder` 注入用户配置） */
+  maxPositions?: number;
+}
 
 export interface PaperPosition {
   code: string;
@@ -246,6 +259,7 @@ export function applyPaperOrder(
   quote: Quote,
   request: OrderRequest,
   now = new Date(),
+  limits: PaperOrderLimits = {},
 ): OrderResult {
   const side = request.side;
   const qty = Math.floor(request.qty);
@@ -257,6 +271,15 @@ export function applyPaperOrder(
 
   if (side === "buy") {
     if (qty % 100 !== 0) return fail("买入必须是 100 股的整数倍");
+    // 持仓只数上限：同一只加仓不受限，开新仓要求当前持仓只数 < 上限
+    const cap = limits.maxPositions ?? DEFAULT_MAX_POSITIONS;
+    const heldCodes = account.positions.filter((item) => item.qty > 0).map((item) => item.code);
+    if (!heldCodes.includes(quote.code) && heldCodes.length >= cap) {
+      return fail(
+        `持仓已达上限 ${cap} 只（当前 ${heldCodes.join("、")}），` +
+          `要买新股票请先减仓或清掉一只（上限可在 xzh a settings 调整）`,
+      );
+    }
     if (quote.limitUp && quote.price >= quote.limitUp - 0.001) {
       return fail(`${quote.name} 已涨停，模拟盘不排队买入`);
     }
@@ -412,7 +435,11 @@ export async function placePaperOrder(
   }
   const quote = await fetchQuote(request.code);
   const account = loadPaperAccount(now);
-  const result = applyPaperOrder(account, quote, request, now);
+  // 持仓只数上限取用户配置（默认 3），传给了纯函数而不是让它自己读文件 ——
+  // 这样 `applyPaperOrder` 在测试里行为稳定
+  const result = applyPaperOrder(account, quote, request, now, {
+    maxPositions: maxPositions(),
+  });
   if (result.ok) savePaperAccount(result.account);
   return result;
 }

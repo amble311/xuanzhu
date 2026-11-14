@@ -30,12 +30,24 @@ import {
   pushSchedule,
   removeRules,
   removeSchedules,
+  renewOrder,
+  appendPolicy,
+  readPolicy,
+  replacePolicy,
+  clearPolicy,
+  formatSignal,
+  scanPool,
+  scoreStock,
+  maxPositions,
+  poolSize,
+  DEFAULT_POOL_SIZE,
+  POLICY_MAX_CHARS,
   type Indicators,
   type PaperAccount,
   type RuleKind,
 } from "../a";
 import { selectTopWatchlist } from "../a/score";
-import { loadWatchlist, mergeWatchlist, saveWatchlist } from "../a/watchlist";
+import { loadWatchlist, mergeWatchlist, orderedPool, saveWatchlist } from "../a/watchlist";
 import { adjustByNews } from "../a/news";
 import {
   fetchBars,
@@ -46,6 +58,7 @@ import {
   type BarPeriod,
   type Quote,
 } from "../exchange/ashare";
+import { getAShareHome } from "../utils/paths";
 import type { ToolContext, ToolDefinition, ToolResult } from "./types";
 
 /**
@@ -331,6 +344,58 @@ const barsTool: ToolDefinition = {
   },
 };
 
+// ─────────────────────────── a_signal ───────────────────────────
+
+const signalTool: ToolDefinition = {
+  name: "a_signal",
+  modes: A_MODES,
+  description:
+    "「月/周/日三周期 + 15 分钟择时」打分（对齐 btc_signal），只分析不下单。" +
+    "不传 code 时按**持仓优先**的顺序轮询自选池（5 只，含持仓），每只给出方向闸门" +
+    "（long=可开新仓 / none=不做 / unknown=数据不足）、15 分钟评分与建议；传 code 只看这一只的明细。" +
+    "巡检和选股共用同一套评分口径：三周期只定方向，15 分钟才决定「现在有没有机会」。",
+  parameters: {
+    type: "object",
+    properties: {
+      code: { type: "string", description: "6 位股票代码；不传 = 轮询整个自选池" },
+    },
+    required: [],
+  },
+  async execute(args, ctx): Promise<ToolResult> {
+    const code = typeof args.code === "string" ? args.code.trim() : "";
+    try {
+      if (code) {
+        const signal = await scoreStock({ code });
+        return {
+          ok: true,
+          content: formatSignal(signal),
+          summary: `${code} ${signal.suggestion}`,
+        };
+      }
+      ctx.emit?.("轮询自选池（持仓优先，5 只）…");
+      const signals = await scanPool();
+      if (signals.length === 0) {
+        return {
+          ok: true,
+          content: "自选池为空：等收盘后 16:00 的固定选股，或由用户用 a_select 重新选股。",
+        };
+      }
+      const buys = signals.filter((item) => item.suggestion === "买入候选").map((item) => item.code);
+      return {
+        ok: true,
+        content: signals.map(formatSignal).join("\n\n"),
+        summary:
+          `池内 ${signals.length} 只` + (buys.length > 0 ? ` · 买入候选 ${buys.join("/")}` : ""),
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        content: `✗ 打分失败：${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  },
+};
+
 // ─────────────────────────── 模拟盘 ───────────────────────────
 
 function formatPaperAccount(account: PaperAccount, withTrades = true): string {
@@ -414,6 +479,7 @@ const orderTool: ToolDefinition = {
   modes: A_MODES,
   description:
     "A 股**模拟盘**下单（立即成交，不涉及真钱）。买入必须 100 股整数倍；卖出受 T+1 可卖数量限制；" +
+    "**持仓只数上限**默认 3 只（`xzh a settings` 可调；同一只可加仓，开新仓要求当前持仓 + 在途买单的只数 < 上限）；" +
     "涨停不买、跌停不卖、停牌拒单；限价不穿越现价时直接拒绝（不挂单排队）。" +
     "**只在连续竞价时段成交**（09:30–11:30 / 13:00–15:00 且当天是交易日）：集合竞价、午休、" +
     "盘前盘后与节假日会拒单，这时只能 pending 挂单等开盘。" +
@@ -451,6 +517,22 @@ const orderTool: ToolDefinition = {
     if (side === "buy") {
       const block = buyBlockReason(code);
       if (block) return { ok: false, content: `✗ ${block}` };
+      // 持仓只数上限（含已在排队的买单）：同一只加仓不算新开仓
+      const cap = maxPositions();
+      const account = loadPaperAccount();
+      const held = account.positions.filter((position) => position.qty > 0).map((p) => p.code);
+      const planned = new Set(held);
+      for (const order of listOrders()) {
+        if (order.status === "open" && order.side === "buy") planned.add(order.code);
+      }
+      if (!held.includes(code) && !planned.has(code) && planned.size >= cap) {
+        return {
+          ok: false,
+          content:
+            `✗ 持仓已达上限 ${cap} 只（当前 ${[...planned].join("、")}）；` +
+            `要买新股票请先减仓或清掉一只（同一只股票加仓不受限；上限可用 xzh a settings 调整）`,
+        };
+      }
     }
     if (args.pending === true) {
       if (price === undefined || price <= 0) {
@@ -488,7 +570,13 @@ const orderTool: ToolDefinition = {
     if (
       process.env.XZH_A_INSPECT === "1" &&
       side === "buy" &&
-      !loadWatchlist().items.some((item) => item.code === code)
+      // 池 = 自选 + 持仓（持仓优先），持仓股不在自选文件里也要允许加仓
+      !orderedPool(
+        loadPaperAccount().positions.map((position) => ({
+          code: position.code,
+          name: position.name,
+        })),
+      ).some((item) => item.code === code)
     ) {
       return {
         ok: false,
@@ -553,13 +641,16 @@ const selectTool: ToolDefinition = {
   name: "a_select",
   modes: A_MODES,
   description:
-    "重新跑一次完整 A 股选股：全市场日线 MACD 回升 → 周线 MACD 回升 → 月线 MACD 回升 → 日线详细评分取前 10，" +
-    "并把结果写入自选股（持仓强制保留）。**用户说“重新选股”时直接调这个**，不要用 a_screen + a_bars 手动模拟；" +
-    "全流程约 1–2 分钟，可用 emit 看进度。",
+    "重新跑一次完整 A 股选股：全市场月/周/日三周期方向过滤 → 逐只 15 分钟深度评分 → 消息面校正，取前 5，" +
+    "并写入自选股（**持仓强制保留，与自选合计 5 只**）。**用户说“重新选股”时直接调这个**，" +
+    "不要用 a_screen + a_bars 手动模拟；全流程约 1–2 分钟，可用 emit 看进度。",
   parameters: {
     type: "object",
     properties: {
-      limit: { type: "number", description: "保留只数，默认 10（上限 10）" },
+      limit: {
+        type: "number",
+        description: `保留只数，默认自选池容量 ${DEFAULT_POOL_SIZE}（可用 xzh a settings 调整，上限同池容量）`,
+      },
     },
     required: [],
   },
@@ -570,12 +661,15 @@ const selectTool: ToolDefinition = {
         content: "✗ 巡检只分析持仓与自选股，不做选股；选股由收盘后 16:00 固定任务负责。",
       };
     }
-    const limit = Math.max(1, Math.min(10, Number(args.limit) || 10));
+    const size = poolSize();
+    const limit = Math.max(1, Math.min(size, Number(args.limit) || size));
     const picks = await selectTopWatchlist(limit, (message) => ctx.emit?.(message));
     const account = loadPaperAccount();
     const merged = mergeWatchlist(
       picks,
       account.positions.map((position) => ({ code: position.code, name: position.name })),
+      new Date(),
+      size,
     );
     saveWatchlist(merged);
     const lines = merged.items.map(
@@ -584,7 +678,8 @@ const selectTool: ToolDefinition = {
     return {
       ok: true,
       content:
-        `✓ 选股完成：${picks.length}/10 只（不足不补），已写入自选股\n` +
+        `✓ 选股完成：${picks.length}/${size} 只（不足不补），已写入自选股` +
+        `（池内 ${merged.items.length}/${size}，持仓优先保留）\n` +
         (lines.length > 0 ? lines.join("\n") : "（本次没有符合条件的股票）"),
       summary: `重新选股 ${picks.length} 只`,
     };
@@ -592,6 +687,61 @@ const selectTool: ToolDefinition = {
 };
 
 // ─────────────────────────── 巡检闭环工具 ───────────────────────────
+
+const policyTool: ToolDefinition = {
+  name: "a_policy",
+  modes: A_MODES,
+  description:
+    "把用户的**长期决策要求**落盘（`policy.md`，注入此后每一轮后台巡检）。" +
+    "用户在对话里给出风控阈值、仓位上限、只做某些板块、禁止追高等长期约束时**必须用它** ——" +
+    "后台巡检是独立进程，只在对话里答应一句「记住了」传不过去。" +
+    `action：read（默认，看当前指令）/ append（追加一条）/ replace（整份替换，≤${POLICY_MAX_CHARS} 字符）/ clear。`,
+  parameters: {
+    type: "object",
+    properties: {
+      action: { type: "string", enum: ["read", "append", "replace", "clear"] },
+      content: { type: "string", description: "append / replace 的内容（一条可执行约束）" },
+    },
+    required: [],
+  },
+  async execute(args): Promise<ToolResult> {
+    const action = args.action === "append" || args.action === "replace" || args.action === "clear"
+      ? args.action
+      : "read";
+    const content = typeof args.content === "string" ? args.content.trim() : "";
+    if (action === "read") {
+      const text = readPolicy();
+      return {
+        ok: true,
+        content: text ? `当前决策指令：\n${text}` : "当前没有落盘的决策指令。",
+        summary: text ? "已读取决策指令" : "无决策指令",
+      };
+    }
+    if (action === "clear") {
+      clearPolicy();
+      return { ok: true, content: "✓ 已清空决策指令", summary: "清空决策指令" };
+    }
+    if (!content) return { ok: false, content: "✗ append / replace 需要 content" };
+    if (action === "append") {
+      const result = appendPolicy(getAShareHome(), content);
+      return {
+        ok: true,
+        content:
+          `✓ 已追加决策指令（当前共 ${result.text.split("\n").filter((line) => /^[-*]\s/.test(line.trim())).length} 条）` +
+          (result.dropped > 0 ? `；超过 ${POLICY_MAX_CHARS} 字符，已丢弃 ${result.dropped} 条最旧指令` : "") +
+          `\n${result.text}`,
+        summary: "追加决策指令",
+      };
+    }
+    const result = replacePolicy(getAShareHome(), content);
+    return {
+      ok: true,
+      content:
+        `✓ 已替换决策指令${result.truncated ? `（超过 ${POLICY_MAX_CHARS} 字符，只保留末尾）` : ""}\n${result.text}`,
+      summary: "替换决策指令",
+    };
+  },
+};
 
 const scheduleTool: ToolDefinition = {
   name: "a_schedule",
@@ -844,6 +994,43 @@ const cancelOrderTool: ToolDefinition = {
   },
 };
 
+const renewOrderTool: ToolDefinition = {
+  name: "a_renew",
+  modes: A_MODES,
+  description:
+    "续期一张未成交挂单（只改到期时间，不改价格/数量）。到期时间取 ttlMinutes 与当日 15:00 的较早者，" +
+    "收盘后下单顺延到下一个工作日。巡检有挂单时：判断继续等就续期并说明理由，不该等就 a_cancel_order。",
+  parameters: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "a_orders 返回的挂单 id" },
+      ttlMinutes: { type: "number", description: "新的有效期分钟，默认 120" },
+    },
+    required: ["id"],
+  },
+  async execute(args): Promise<ToolResult> {
+    const id = typeof args.id === "string" ? args.id : "";
+    if (!id) return { ok: false, content: "✗ 需要挂单 id" };
+    const ttl = args.ttlMinutes === undefined ? undefined : Number(args.ttlMinutes);
+    const result = renewOrder(id, Number.isFinite(ttl) ? ttl : undefined);
+    if (!result.ok) return { ok: false, content: `✗ ${result.error}` };
+    const order = result.order!;
+    appendAAction({
+      kind: "renew",
+      code: order.code,
+      ok: true,
+      status: "open",
+      message: `续期挂单 ${describeOrder(order)} 至 ${order.expiresAt}`,
+      origin: process.env.XZH_A_INSPECT === "1" ? "inspect" : "manual",
+    });
+    return {
+      ok: true,
+      content: `✓ 已续期 ${describeOrder(order)}，到期 ${order.expiresAt}`,
+      summary: `续期 ${id}`,
+    };
+  },
+};
+
 const removeTriggerTool: ToolDefinition = {
   name: "a_remove_trigger",
   modes: A_MODES,
@@ -880,13 +1067,16 @@ export const aShareTools: ToolDefinition[] = [
   newsTool,
   quoteTool,
   barsTool,
+  signalTool,
   accountTool,
   orderTool,
   scheduleTool,
   triggerTool,
   unscheduleTool,
   removeTriggerTool,
+  policyTool,
   clearRiskTool,
   ordersTool,
   cancelOrderTool,
+  renewOrderTool,
 ];

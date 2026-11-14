@@ -1,15 +1,15 @@
 import * as fs from "fs";
 import * as path from "path";
 import { ensureDir, getAShareHome } from "../utils/paths";
+import { DEFAULT_POOL_SIZE } from "./settings";
 
 /**
  * A 股自选股（监控池）。
  *
- * 由玄猪全权管理：无持仓时从全市场选前 10；有持仓时持仓**强制保留**在池中，
- * 其余名额可被替换。池子最多 10 只，全部纳入监控。
+ * 与 btc 的「单标的」不同，A 股巡检要**轮询**一小组股票：池子容量默认 5 只
+ * （`settings.json` 的 `poolSize`，用户可改），**持仓强制占名额**，
+ * 剩余名额从全市场选出来。巡检顺序是「持仓优先」，其余按评分降序 —— 见 `orderedPool()`。
  */
-
-export const WATCHLIST_MAX = 10;
 
 export interface WatchItem {
   code: string;
@@ -85,6 +85,7 @@ export function mergeWatchlist(
   candidates: WatchItem[],
   held: Array<{ code: string; name: string }>,
   now = new Date(),
+  limit = DEFAULT_POOL_SIZE,
 ): WatchlistFile {
   const byCode = new Map<string, WatchItem>();
   for (const item of candidates) byCode.set(item.code, item);
@@ -108,24 +109,75 @@ export function mergeWatchlist(
   });
   const kept = sorted.filter((item) => heldCodes.has(item.code));
   for (const item of sorted) {
-    if (kept.length >= WATCHLIST_MAX) break;
+    if (kept.length >= limit) break;
     if (!heldCodes.has(item.code)) kept.push(item);
   }
   return { version: 1, updatedAt: now.toISOString(), items: kept };
 }
 
-export function addWatchItem(item: WatchItem): { ok: boolean; error?: string; list: WatchlistFile } {
+export function addWatchItem(
+  item: WatchItem,
+  limit = DEFAULT_POOL_SIZE,
+): { ok: boolean; error?: string; list: WatchlistFile } {
   const list = loadWatchlist();
   if (list.items.some((existing) => existing.code === item.code)) {
     return { ok: false, error: `${item.code} 已在自选股中`, list };
   }
-  if (list.items.length >= WATCHLIST_MAX) {
-    return { ok: false, error: `自选股最多 ${WATCHLIST_MAX} 只，请先移除`, list };
+  if (list.items.length >= limit) {
+    return { ok: false, error: `自选池最多 ${limit} 只（xzh a settings 可调），请先移除`, list };
   }
   list.items.push(item);
   list.updatedAt = new Date().toISOString();
   saveWatchlist(list);
   return { ok: true, list };
+}
+
+export interface PoolEntry {
+  code: string;
+  name: string;
+  /** 是否持仓（巡检时排在最前） */
+  held: boolean;
+  score: number;
+  reason: string;
+}
+
+/**
+ * 巡检轮询顺序：**持仓优先**，其余按评分降序，最多 `limit` 只（默认 `poolSize`）。
+ *
+ * 持仓可能不在自选文件里（手工删过、或刚买入），这里做并集补回来 ——
+ * 「池子容量含持仓」是硬约束，不能因为文件不同步就让持仓漏出巡检视野。
+ */
+export function orderedPool(
+  held: Array<{ code: string; name?: string }> = [],
+  list: WatchlistFile = loadWatchlist(),
+  limit = DEFAULT_POOL_SIZE,
+): PoolEntry[] {
+  const heldCodes = new Map(held.map((item) => [item.code, item.name]));
+  const entries: PoolEntry[] = [];
+  for (const [code, name] of heldCodes) {
+    const existing = list.items.find((item) => item.code === code);
+    entries.push({
+      code,
+      name: existing?.name ?? name ?? code,
+      held: true,
+      score: existing?.score ?? 0,
+      reason: existing?.reason ?? "持仓（强制保留在池内）",
+    });
+  }
+  const rest = list.items
+    .filter((item) => !heldCodes.has(item.code))
+    .sort((a, b) => b.score - a.score);
+  for (const item of rest) {
+    if (entries.length >= limit) break;
+    entries.push({
+      code: item.code,
+      name: item.name,
+      held: false,
+      score: item.score,
+      reason: item.reason,
+    });
+  }
+  return entries;
 }
 
 export function removeWatchItem(

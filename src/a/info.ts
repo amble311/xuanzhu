@@ -1,6 +1,7 @@
 import { fetchQuote, sessionKind, sessionLabel, type Quote } from "../exchange/ashare";
 import { accountSummary, loadPaperAccount, markPaperAccount, type PaperAccount } from "./paper";
 import { loadWatchlist } from "./watchlist";
+import { maxPositions, poolSize } from "./settings";
 import { describeRule, readRules } from "./rules";
 import { readScheduleQueue } from "./schedule";
 import { aActionsPath, aServiceStatus, readPendingSells } from "./monitor";
@@ -290,7 +291,9 @@ export function aInfoLines(data: APanelData): string[] {
 
   lines.push(divider);
   const watch = loadWatchlist();
-  lines.push(`自选股 ${watch.items.length}/10 · ★=持仓`);
+  lines.push(
+    `自选池 ${watch.items.length}/${poolSize()} · 持仓上限 ${maxPositions()} 只 · ★=持仓`,
+  );
   if (watch.items.length === 0) {
     lines.push("  为空；收盘后 16:00 自动选股");
   }

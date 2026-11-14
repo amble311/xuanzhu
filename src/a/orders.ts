@@ -62,6 +62,25 @@ export function listOrders(): PendingOrder[] {
   return readFile().orders;
 }
 
+/**
+ * 挂单到期时间：`ttlMinutes` 与「当日 15:00 收盘」取更早的那个。
+ *
+ * 收盘后 / 盘前下单时顺延到下一个工作日 15:00 —— A 股挂单不会隔夜生效，
+ * 留到隔天等于在等一个已经变了的价格（与 btc 的挂单时效同一个道理）。
+ */
+export function computeExpiresAt(now = new Date(), ttlMinutes = 120): Date {
+  const close = new Date(now);
+  close.setHours(15, 0, 0, 0);
+  if (close.getTime() <= now.getTime()) {
+    do {
+      close.setDate(close.getDate() + 1);
+      close.setHours(15, 0, 0, 0);
+    } while (close.getDay() === 0 || close.getDay() === 6);
+  }
+  const ttl = new Date(now.getTime() + Math.max(1, ttlMinutes) * 60_000);
+  return ttl < close ? ttl : close;
+}
+
 export function createOrder(input: {
   code: string;
   name: string;
@@ -77,17 +96,7 @@ export function createOrder(input: {
   }
   if (!Number.isFinite(input.qty) || input.qty < 100) return { ok: false, error: "数量至少 100 股" };
   const now = new Date();
-  const close = new Date(now);
-  close.setHours(15, 0, 0, 0);
-  if (close.getTime() <= now.getTime()) {
-    // 收盘后/盘前：顺延到下一个工作日 15:00
-    do {
-      close.setDate(close.getDate() + 1);
-      close.setHours(15, 0, 0, 0);
-    } while (close.getDay() === 0 || close.getDay() === 6);
-  }
-  const ttl = new Date(now.getTime() + Math.max(1, input.ttlMinutes ?? 120) * 60_000);
-  const expiresAt = ttl < close ? ttl : close;
+  const expiresAt = computeExpiresAt(now, input.ttlMinutes);
   const order: PendingOrder = {
     id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
     code: input.code,
@@ -113,6 +122,27 @@ export function cancelOrder(id: string): { ok: boolean; order?: PendingOrder; er
   if (!order) return { ok: false, error: "没有找到该挂单" };
   if (order.status !== "open") return { ok: false, error: `挂单已经是 ${order.status}` };
   order.status = "cancelled";
+  writeFile(file);
+  return { ok: true, order };
+}
+
+/**
+ * 续期一张未成交挂单（对齐 btc 的 `btc_renew`）。
+ *
+ * 为什么需要：模型把巡检排到 60 分钟后，这张单可能在两轮之间就过期了；
+ * 「继续等」必须是一个**显式决定**（并给出新的时效），而不是放任它过期后
+ * 靠兜底提醒。只改到期时间，不改价格与数量。
+ */
+export function renewOrder(
+  id: string,
+  ttlMinutes = 120,
+  now = new Date(),
+): { ok: boolean; order?: PendingOrder; error?: string } {
+  const file = readFile();
+  const order = file.orders.find((item) => item.id === id);
+  if (!order) return { ok: false, error: "没有找到该挂单" };
+  if (order.status !== "open") return { ok: false, error: `挂单已经是 ${order.status}，不能续期` };
+  order.expiresAt = computeExpiresAt(now, ttlMinutes).toISOString();
   writeFile(file);
   return { ok: true, order };
 }

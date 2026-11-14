@@ -1,13 +1,13 @@
 import type { Bar } from "../exchange/ashare";
 
 /**
- * 日内择时（买卖点用，选股不用）。
+ * 日内择时（买卖点用）。
  *
- * A 股 1 小时只有 4 根/天，噪声大；统一用 30 分钟：
- * - 买点：站上 30m MA20 + 突破前 10 根高点 + 放量 1.2×；
- * - 卖点：跌破 30m MA20 + 跌破前 10 根低点（与 ATR 止损并列，谁先触发算谁）。
+ * 分析周期统一为 **15 分钟**（巡检、选股、持仓风控都用同一周期）：
+ * - 买点：站上 15m MA20 + 突破前 10 根高点 + 放量 1.2×；
+ * - 卖点：跌破 15m MA20 + 跌破前 10 根低点（与 ATR 止损并列，谁先触发算谁）。
  *
- * 选股完全不用日内数据 —— 选股是日/周/月 MACD 漏斗。
+ * 入参是已经取好的 K 线，调用方负责指定周期（现为 15m）。
  */
 
 const MA_PERIOD = 20;
@@ -39,7 +39,7 @@ export function intradayBuyReady(bars: Bar[]): boolean {
   return true;
 }
 
-/** 日内卖点（走弱）：跌破 30m MA20 且跌破前 10 根低点 */
+/** 日内卖点（走弱）：跌破 15m MA20 且跌破前 10 根低点 */
 export function intradayWeak(bars: Bar[]): boolean {
   if (bars.length < MA_PERIOD + 1) return false;
   const last = bars[bars.length - 1];

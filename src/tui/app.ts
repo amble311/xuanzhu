@@ -41,6 +41,8 @@ import {
   setPaused as setAPaused,
   startAService,
   stopAService,
+  poolSize,
+  maxPositions,
   type PaperAccount,
 } from "../a";
 import { fetchQuote, sessionKind, sessionLabel, type Quote } from "../exchange/ashare";
@@ -1780,7 +1782,7 @@ export class TuiApp {
     const account = loadPaperAccount();
     const held = new Set(account.positions.map((position) => position.code));
     const quotes = new Map((this.aPanel?.watch ?? []).map((row) => [row.code, row]));
-    const out: string[] = [`A 股自选股 ${watch.items.length}/10（★=持仓）`, ""];
+    const out: string[] = [`A 股自选池 ${watch.items.length}/${poolSize()}（★=持仓）`, ""];
     if (watch.items.length === 0) {
       out.push("为空；收盘后 16:00 自动选股，或让 xzh 用 a_select 手动选股。");
     }
@@ -5746,7 +5748,7 @@ export class TuiApp {
 
     divider();
     push(
-      ` ${ansi.bold}风控${ansi.reset}${ansi.gray} ATR 止损 · +8% 移动止盈 · +12% 分批 · 5 仓×20%${ansi.reset}`,
+      ` ${ansi.bold}风控${ansi.reset}${ansi.gray} ATR 止损 · +8% 移动止盈 · +12% 分批 · ${maxPositions()} 仓×20%${ansi.reset}`,
     );
     if (data.riskLocks.length > 0) {
       push(
@@ -5814,7 +5816,7 @@ export class TuiApp {
     }
 
     divider();
-    push(` ${ansi.bold}自选${ansi.reset}${ansi.gray}（${watch.items.length}/10 · ★=持仓）${ansi.reset}`);
+    push(` ${ansi.bold}自选${ansi.reset}${ansi.gray}（${watch.items.length}/${poolSize()} · ★=持仓）${ansi.reset}`);
     if (watch.items.length === 0) {
       push(`${ansi.gray}   为空；收盘后 16:00 自动选股${ansi.reset}`);
     }

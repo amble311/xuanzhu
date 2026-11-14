@@ -92,29 +92,42 @@ export interface ReadInspectResult {
   offset: number;
 }
 
+export interface InspectEventItem {
+  event: InspectEvent;
+  /** 读完这条事件后的文件偏移（字节），可直接当作下一次的 `sinceOffset` */
+  end: number;
+}
+
+export interface ReadInspectItemsResult {
+  items: InspectEventItem[];
+  /** 下次从这里继续读（= 最后一个完整行的末尾） */
+  offset: number;
+}
+
 /**
- * 从 `sinceOffset` 增量读取。
+ * 从 `sinceOffset` 增量读取，并给出**每条事件自己的结束偏移**。
  *
- * 只消费到**最后一个换行**为止：后端可能正写到一半，把那半行当事件解析会丢内容，
- * 也会让偏移错位。文件被轮转（变小）时退回到「最后 64KB」，避免整份重读。
+ * 为什么需要逐条偏移：转发器要「按轮聚合、这一轮结束后再推」，就必须能把读到的
+ * 偏移停在一轮中间（未结束的那轮留着下次再读）。只返回整段末尾偏移的话，
+ * 要么把未写完的结论先推出去，要么把整段丢回重读。
  */
-export function readInspectEvents(
+export function readInspectEventItems(
   sinceOffset: number,
   home = getBtcHome(),
-): ReadInspectResult {
+): ReadInspectItemsResult {
   const file = inspectStreamPath(home);
   let size: number;
   try {
     size = fs.statSync(file).size;
   } catch {
-    return { events: [], offset: sinceOffset };
+    return { items: [], offset: sinceOffset };
   }
 
   let start = sinceOffset;
   if (start < 0 || start > size) {
     start = Math.max(0, size - MAX_BACKLOG_BYTES);
   }
-  if (size <= start) return { events: [], offset: start };
+  if (size <= start) return { items: [], offset: start };
 
   const length = Math.min(size - start, MAX_FILE_BYTES);
   // 用 Uint8Array 而不是 Buffer：新版 @types/node 里 readSync 的参数是
@@ -134,22 +147,40 @@ export function readInspectEvents(
   const lastBreak = bytes.lastIndexOf(0x0a);
   if (lastBreak < 0) {
     // 一整个缓冲里没有换行：说明单行异常巨大，跳过它（下次从末尾继续）
-    return { events: [], offset: start + length };
+    return { items: [], offset: start + length };
   }
 
-  const consumed = bytes.subarray(0, lastBreak).toString("utf8");
-  const events: InspectEvent[] = [];
-  for (const line of consumed.split("\n")) {
+  const items: InspectEventItem[] = [];
+  let cursor = 0;
+  while (cursor <= lastBreak) {
+    const nl = bytes.indexOf(0x0a, cursor);
+    if (nl < 0 || nl > lastBreak) break;
+    const line = bytes.subarray(cursor, nl).toString("utf8");
+    cursor = nl + 1;
     if (!line.trim()) continue;
     try {
       const parsed = JSON.parse(line) as InspectEvent;
       if (parsed && typeof parsed.text === "string" && parsed.kind) {
-        events.push(parsed);
+        items.push({ event: parsed, end: start + nl + 1 });
       }
     } catch {
       // 坏行直接跳过：一条脏数据不该让整段展示失败
     }
   }
 
-  return { events, offset: start + lastBreak + 1 };
+  return { items, offset: start + lastBreak + 1 };
+}
+
+/**
+ * 从 `sinceOffset` 增量读取。
+ *
+ * 只消费到**最后一个换行**为止：后端可能正写到一半，把那半行当事件解析会丢内容，
+ * 也会让偏移错位。文件被轮转（变小）时退回到「最后 64KB」，避免整份重读。
+ */
+export function readInspectEvents(
+  sinceOffset: number,
+  home = getBtcHome(),
+): ReadInspectResult {
+  const { items, offset } = readInspectEventItems(sinceOffset, home);
+  return { events: items.map((item) => item.event), offset };
 }

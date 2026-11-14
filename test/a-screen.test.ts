@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   computeIndicators,
+  maxPositions,
+  poolSize,
   screenConditionFromInput,
   screenNeedsIndicators,
   screenStocks,
@@ -89,11 +91,13 @@ function indicators(code: string, overrides: Partial<Indicators> = {}): Indicato
 }
 
 describe("模式与工具注册", () => {
-  it("`xzh a` 已注册为模式，6 个工具只在 a 模式可见", () => {
+  it("`xzh a` 已注册为模式，a_* 工具只在 a 模式可见", () => {
     const mode = findMode("a");
     expect(mode?.name).toBe("a");
     expect(mode?.cwdLocked).toBe(true);
-    expect(mode?.promptSection).toContain("只分析个股");
+    // 数量参数是用户可配的，断言取当前配置而不是写死
+    expect(mode?.promptSection).toContain(`自选池 ${poolSize()} 只`);
+    expect(mode?.promptSection).toContain(`持仓最多 ${maxPositions()} 只股票`);
 
     const names = TOOLS.filter((tool) => tool.modes?.includes("a")).map((tool) => tool.name);
     expect(names.sort()).toEqual([
@@ -104,11 +108,14 @@ describe("模式与工具注册", () => {
       "a_news",
       "a_order",
       "a_orders",
+      "a_policy",
       "a_quote",
       "a_remove_trigger",
+      "a_renew",
       "a_schedule",
       "a_screen",
       "a_select",
+      "a_signal",
       "a_snapshot",
       "a_trigger",
       "a_unschedule",

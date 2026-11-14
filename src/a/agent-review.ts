@@ -5,7 +5,7 @@ import { fetchAnnouncements } from "./news";
 import type { WatchItem } from "./watchlist";
 
 /**
- * Agent 研判层（每天一次，只作用于最终 10 只）。
+ * Agent 研判层（每天一次，只作用于最终 5 只自选池）。
  *
  * 规则层负责选股与执行；这里让模型做**定性复核**：
  * 公告语义、异常走势、数据质量、题材/板块（如果输入里有）。
@@ -118,7 +118,7 @@ export function parseReviewOutput(
   }
 }
 
-/** 对最终 10 只做一次 Agent 复核；失败时原样返回 */
+/** 对最终 5 只自选池做一次 Agent 复核；失败时原样返回 */
 export async function reviewWithAgent(
   items: WatchItem[],
   onProgress?: (message: string) => void,

@@ -19,6 +19,7 @@ import { readRules, describeRule } from "../a/rules";
 import { readRuleAudits } from "../a/rule-audit";
 import { readScheduleQueue } from "../a/schedule";
 import { loadWatchlist } from "../a/watchlist";
+import { poolSize } from "../a/settings";
 import { createProvider } from "../llm";
 import { createAShareMode } from "../modes/a";
 import { createBtcMode } from "../modes/btc";
@@ -525,7 +526,7 @@ export async function runGateway(): Promise<void> {
       case "watchlist": {
         if (modeState?.name !== "a") return "/watch 仅在 a 模式下显示自选股；btc 叫醒条件请用 /wakeup。";
         const data = await collectASharePanelData();
-        const lines = [`A 股自选股 ${data.watch.length}/10（★=持仓）`];
+        const lines = [`A 股自选池 ${data.watch.length}/${poolSize()}（★=持仓）`];
         if (data.watch.length === 0) lines.push("为空；收盘后 16:00 自动选股。");
         for (const row of data.watch) {
           lines.push(

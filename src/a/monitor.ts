@@ -19,11 +19,11 @@ import {
   type PaperAccount,
 } from "./paper";
 import { runAInspect } from "./inspect";
-import { commitRuleHit, evaluateRules, readRules } from "./rules";
+import { commitRuleHit, describeRule, evaluateRules, readRules } from "./rules";
 import { pushSchedule, readScheduleQueue, takeDueSchedule } from "./schedule";
 import { isPaused, readPause } from "./pause";
 import { takeMarketEvent } from "./events";
-import { cancelOrder, describeOrder, listOrders, matchOrders } from "./orders";
+import { cancelOrder, describeOrder, listOrders, matchOrders, type PendingOrder } from "./orders";
 import {
   buyBlockReason,
   checkAccountRisk,
@@ -39,7 +39,14 @@ import {
 import { intradayWeak } from "./intraday";
 import { loadIndicators } from "./indicators";
 import { selectTopWatchlist } from "./score";
-import { loadWatchlist, mergeWatchlist, monitorDir, saveWatchlist, type WatchItem } from "./watchlist";
+import {
+  loadWatchlist,
+  mergeWatchlist,
+  monitorDir,
+  saveWatchlist,
+  type WatchItem,
+} from "./watchlist";
+import { poolSize } from "./settings";
 import { ensureDir, getAShareHome } from "../utils/paths";
 import { VERSION } from "../utils/version";
 
@@ -52,7 +59,8 @@ import { VERSION } from "../utils/version";
  * - 收盘后 16:00 固定选股（只更新自选池）。
  *
  * 与 btc 的差别：A 股只有 4 小时交易、T+1、只能做多，因此不跑 24/7，非交易时段休眠。
- * 决策是**确定性规则**：月/周/日趋势 + 1h 择时打分，不每轮调用模型。
+ * 决策是**确定性规则**：月/周/日趋势 + **15 分钟**择时打分（分析周期与巡检一致），
+ * 风控告警只叫醒、不自动交易 —— 卖不卖由巡检 Agent 决定。
  */
 
 /** 初始止损下限 5%，并按 1.5×ATR 放大 */
@@ -450,7 +458,7 @@ export async function runAServe(): Promise<void> {
     }
 
     // 非工作时段（夜间 / 周末 / 15:30 之后）完全不拉行情：收盘之后价格是冻结的，
-    // 逐 tick 重拉持仓行情与 30m K 线只是白烧请求。
+    // 逐 tick 重拉持仓行情与 15m K 线只是白烧请求。
     if (!inTradingWindow(at)) return;
 
     // 硬风控与 btc 对齐：只落盘 + 告警，不自动交易；工作时段内即使暂停也检查
@@ -469,7 +477,8 @@ export async function runAServe(): Promise<void> {
       // 撮合闸门是**连续竞价**（09:30–11:30 / 13:00–15:00 且当天是交易日），
       // 不是 09:00–15:30 的工作窗口：集合竞价、午休、节假日不按冻结价成交。
       const session = await continuousSession(at);
-      const orderActions = await processPendingOrders(at, session.open);
+      const pending = await processPendingOrders(at, session.open);
+      const orderActions = pending.actions;
       if (orderActions.length > 0) {
         state.lastAction = orderActions[0];
         log(orderActions.join("；"));
@@ -512,7 +521,22 @@ export async function runAServe(): Promise<void> {
         "兜底巡检";
       state.lastInspectReason = reason;
       log(`唤醒巡检：${reason}`);
-      const result = await runAInspect(reason, { origin: "inspect" });
+      // 叫醒来源要带进提示词：只说「巡检」会让模型当成常规轮次，回一句「无变化」
+      const triggerNote = hit
+        ? `${describeRule(hit.rule)}（${hit.reason}）`
+        : event
+          ? `市场事件：${event.reason}`
+          : undefined;
+      const orderNote =
+        pending.expired.length > 0
+          ? pending.expired
+              .map(
+                (order) =>
+                  `${describeOrder(order)} 已于 ${order.expiresAt} 过期（原因：${order.reason}）`,
+              )
+              .join("\n")
+          : undefined;
+      const result = await runAInspect(reason, { origin: "inspect", triggerNote, orderNote });
       if (hit) commitRuleHit(hit.rule);
       if (!result.error) {
         if (riskTriggered) markRiskDelivered();
@@ -545,7 +569,7 @@ export async function runAServe(): Promise<void> {
   /**
    * tick：只负责重入闸门与错误兜底，真正的一轮在 `cycle()`。
    *
-   * `busy` 必须在**任何 I/O 之前**置位：一轮里可能拉持仓行情、拉 30m K 线、
+   * `busy` 必须在**任何 I/O 之前**置位：一轮里可能拉持仓行情、拉 15m K 线、
    * 冷启动时还要全市场重算指标，耗时远超 30 秒的 tick 间隔；旧实现把 `running`
    * 放在这些 I/O 之后才置位，慢的时候会并发跑两轮。
    */
@@ -610,8 +634,12 @@ export async function runManualInspection(): Promise<CycleResult> {
  * 不拉行情、不做价格穿越撮合，挂单留在 open 等下一个连续竞价时段。
  * 硬风控撤单不受时段限制（锁出现后随时撤掉未成交买单）。
  */
-async function processPendingOrders(now: Date, sessionOpen: boolean): Promise<string[]> {
+async function processPendingOrders(
+  now: Date,
+  sessionOpen: boolean,
+): Promise<{ actions: string[]; expired: PendingOrder[] }> {
   const actions: string[] = [];
+  const expiredOrders: PendingOrder[] = [];
   // 硬风控也要管住挂单：触发后才成交的买单同样不许开仓（卖出挂单不受影响）
   const open = listOrders().filter((order) => {
     if (order.status !== "open") return false;
@@ -630,7 +658,7 @@ async function processPendingOrders(now: Date, sessionOpen: boolean): Promise<st
     });
     return false;
   });
-  if (open.length === 0) return actions;
+  if (open.length === 0) return { actions, expired: expiredOrders };
   // 非连续竞价不拉行情：用空表仅走过期逻辑
   const quotes = sessionOpen
     ? quoteMap(
@@ -661,6 +689,7 @@ async function processPendingOrders(now: Date, sessionOpen: boolean): Promise<st
   }
   for (const order of expired) {
     actions.push(`挂单过期 ${describeOrder(order)}`);
+    expiredOrders.push(order);
     appendAAction({
       kind: "expire",
       code: order.code,
@@ -670,7 +699,7 @@ async function processPendingOrders(now: Date, sessionOpen: boolean): Promise<st
       origin: order.origin,
     });
   }
-  return actions;
+  return { actions, expired: expiredOrders };
 }
 
 /**
@@ -698,20 +727,21 @@ async function detectPositionRisks(
     let decision = shouldSell(position, quote, indicators.get(position.code));
     if (!decision) {
       try {
-        const bars30 = await fetchBars(position.code, {
-          period: "30m",
+        // 分析周期统一为 15 分钟（与巡检的择时周期一致），不再用 30m
+        const bars15 = await fetchBars(position.code, {
+          period: "15m",
           adjust: "backward",
           limit: 80,
         });
-        if (intradayWeak(bars30)) {
+        if (intradayWeak(bars15)) {
           decision = {
-            reason: "30m 跌破 MA20 与前 10 根低点",
+            reason: "15m 跌破 MA20 与前 10 根低点",
             sellable: position.available > 0,
             qty: position.available,
           };
         }
       } catch {
-        // 取不到 30m 继续用 ATR
+        // 取不到 15m 继续用 ATR
       }
     }
     if (!decision) {
@@ -794,11 +824,14 @@ async function maybeRunAfterCloseSelection(now: Date, state: AMonitorState): Pro
   state.lastSelectAttemptAt = iso(now);
   log("收盘后固定选股开始（强制刷新当日指标）…");
   try {
-    const picks = await selectTopWatchlist(10, log, { refresh: true });
+    const size = poolSize();
+    const picks = await selectTopWatchlist(size, log, { refresh: true });
     const account = loadPaperAccount(now);
     const merged = mergeWatchlist(
       picks,
       account.positions.map((position) => ({ code: position.code, name: position.name })),
+      now,
+      size,
     );
     saveWatchlist(merged);
     state.lastSelectDay = today;
@@ -809,7 +842,7 @@ async function maybeRunAfterCloseSelection(now: Date, state: AMonitorState): Pro
       codes: merged.items.map((item) => item.code),
       message: `收盘后选股 ${picks.length} 只（持仓保留）`,
     });
-    log(`收盘后选股完成：${picks.length} 只，自选 ${merged.items.length}/10`);
+    log(`收盘后选股完成：${picks.length} 只，自选 ${merged.items.length}/${poolSize()}`);
     return true;
   } catch (err) {
     state.lastError = err instanceof Error ? err.message : String(err);

@@ -107,10 +107,10 @@ describe("自选股不变量", () => {
     addedAt: new Date().toISOString(),
   });
 
-  it("持仓强制保留，其余按分数取前 10", () => {
+  it("持仓强制保留，其余按分数取前 5（池内合计 5 只）", () => {
     const candidates = Array.from({ length: 12 }, (_, index) => item(`6000${index}`, 100 - index));
     const merged = mergeWatchlist(candidates, [{ code: "600010", name: "持仓" }]);
-    expect(merged.items).toHaveLength(10);
+    expect(merged.items).toHaveLength(5);
     expect(merged.items[0].code).toBe("600010");
     expect(merged.items[0].source).toBe("held");
   });
@@ -120,14 +120,14 @@ describe("自选股不变量", () => {
     expect(merged.items.map((entry) => entry.code)).toEqual(["600002", "600001"]);
   });
 
-  it("持仓不能删除；非持仓可删除；最多 10 只", () => {
+  it("持仓不能删除；非持仓可删除；最多 5 只", () => {
     saveWatchlist(mergeWatchlist([item("600001", 90), item("600002", 80)], []));
     expect(removeWatchItem("600001", new Set(["600001"])).ok).toBe(false);
     expect(removeWatchItem("600002", new Set(["600001"])).ok).toBe(true);
 
-    saveWatchlist({ version: 1, updatedAt: new Date().toISOString(), items: Array.from({ length: 10 }, (_, index) => item(`6000${index}`, 90)) });
+    saveWatchlist({ version: 1, updatedAt: new Date().toISOString(), items: Array.from({ length: 5 }, (_, index) => item(`6000${index}`, 90)) });
     expect(addWatchItem(item("600099", 70)).ok).toBe(false);
-    expect(loadWatchlist().items).toHaveLength(10);
+    expect(loadWatchlist().items).toHaveLength(5);
   });
 });
 

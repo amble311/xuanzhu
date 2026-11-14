@@ -602,7 +602,7 @@ ${ansi.bold}用法${ansi.reset}（按英文字母排序）
   ${ansi.green}xzh a start${ansi.reset}              启动 A 股后台服务（巡检 / 监控 / 模拟交易）
   ${ansi.green}xzh a stop${ansi.reset}               关闭 A 股后台服务
   ${ansi.green}xzh a sync|status${ansi.reset}        建股票池 + 预计算指标 / 查看缓存状态
-  ${ansi.green}xzh a watch [add|remove]${ansi.reset}  自选股（≤10，持仓强制保留）
+  ${ansi.green}xzh a watch [add|remove]${ansi.reset}  自选池（默认 5 只，持仓强制保留）
   ${ansi.green}xzh autonomy${ansi.reset}            查看自治等级（ask / observe / auto）与最近拦截记录
   ${ansi.green}xzh autonomy <档位>${ansi.reset}     切换自治等级；observe = 只观察、改动一律拦截并记账
   ${ansi.green}xzh autonomy log [N]${ansi.reset}    打印观察日志（.xuanzhu/state/observe.log）
