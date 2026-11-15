@@ -29,8 +29,13 @@ export interface BackendState {
   home: string;
   /** 完成过的轮次（巡检或数据同步） */
   cycles?: number;
-  /** 当前工作模式：自主巡检 / 仅数据同步 */
-  mode?: "inspect" | "sync";
+  /**
+   * 当前工作模式：启动中 / 自主巡检 / 仅数据同步。
+   *
+   * `starting` 是**先写状态、再做网络探测**的产物：探测（直连失败后找本机代理）
+   * 可能耗时 3–9 秒，若等它做完才写状态，拉起方按 3 秒判「未就绪」就会误报启动失败。
+   */
+  mode?: "starting" | "inspect" | "sync";
   /** 最近一次巡检完成时间 */
   lastInspectAt?: string;
   /** 最近一次巡检的结论（已截断） */
@@ -265,8 +270,10 @@ export interface EnsureBackendOptions {
 /**
  * 确保指定角色的后端在跑：活着就复用，没有就拉一个 detached 进程。
  *
- * 注意它**不阻塞界面启动太久**：最多等 3 秒拿状态文件，拿不到也返回（带 error），
- * 由调用方决定只提示不阻断。
+ * 注意它**不阻塞界面启动太久**：最多等 `waitMs`（默认 12 秒）拿状态文件。
+ * 后端现在**一拿到锁就先写状态**（`mode: "starting"`），所以正常路径是毫秒级返回；
+ * 12 秒主要覆盖「进程还没起来就卡在网络探测」这类慢启动 —— 早先固定 3 秒，
+ * 而直连失败后找代理的探测本身就可能超过 3 秒，于是后端其实起来了却被报「启动失败」。
  */
 export async function ensureBtcBackend(
   options: EnsureBackendOptions = {},
@@ -328,7 +335,7 @@ export async function ensureBtcBackend(
     }
   }
 
-  const waitMs = options.waitMs ?? 3_000;
+  const waitMs = options.waitMs ?? 12_000;
   const deadline = Date.now() + waitMs;
   while (Date.now() < deadline) {
     const state = liveBackend(home, role);
@@ -339,7 +346,9 @@ export async function ensureBtcBackend(
   return {
     running: false,
     started: true,
-    error: `后端未在 ${Math.round(waitMs / 1000)}s 内就绪，查看日志：${paths.logFile}`,
+    error:
+      `后端已拉起，但 ${Math.round(waitMs / 1000)}s 内没有写出状态文件（可能卡在网络探测）。` +
+      `稍后用 xzh ${role === "paper" ? "btc moni " : "btc "}status 查看；日志：${paths.logFile}`,
   };
 }
 

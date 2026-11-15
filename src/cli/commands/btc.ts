@@ -468,7 +468,11 @@ function printRoleBlock(
   }
 
   const modeText =
-    state.mode === "sync" ? "仅数据同步" : "自主巡检（队列调度）";
+    state.mode === "starting"
+      ? "启动中（网络探测）"
+      : state.mode === "sync"
+        ? "仅数据同步"
+        : "自主巡检（队列调度）";
   const pausedText = state.paused
     ? ` · ${ansi.yellow}已暂停${ansi.reset}${ansi.gray}（/stop resume 恢复）${ansi.reset}`
     : "";

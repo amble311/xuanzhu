@@ -81,7 +81,12 @@ describe("btc 事件筛选与按轮聚合", () => {
       kind: "text" as const,
       text: "结论".repeat(300),
     }));
-    const messages = formatRoundPush("BTC 实盘巡检", { round, events: long, end: 9 });
+    // 传固定的 now：轮次时间标签跨天会补 MM-DD，用例不能随运行日期变化
+    const messages = formatRoundPush(
+      "BTC 实盘巡检",
+      { round, events: long, end: 9 },
+      Date.parse("2026-11-14T12:10:00Z"),
+    );
     expect(messages.length).toBeGreaterThan(1);
     expect(messages[0]).toContain("· 1/");
     expect(messages[0]).toMatch(/\[BTC 实盘巡检 \d{2}:\d{2} · 1\/\d\]/);

@@ -138,6 +138,39 @@ export async function runBtcBackend(
     return;
   }
 
+  const inspectEnabled =
+    (process.env.BTC_INSPECT_ENABLED ?? "1").trim() !== "0";
+  // 让 btc_schedule 知道这次调用来自后台巡检（用于区分前台手动改期）
+  if (inspectEnabled) process.env.XZH_BTC_INSPECT = "1";
+
+  const syncIntervalMin = clampNumber(
+    Number(process.env.BTC_SYNC_INTERVAL_MIN ?? DEFAULT_SYNC_INTERVAL_MIN),
+    1,
+    1440,
+  );
+
+  /**
+   * **先写状态，再做网络探测**。
+   *
+   * 拉起方（TUI / 微信 `/start` / 模式 ensureService）是「状态文件出现 = 就绪」，
+   * 而 `ensureBtcNetwork()` 在直连不通时要逐条探代理，耗时 3–9 秒 —— 旧顺序
+   * （探测完才写状态）会让 3 秒的等待超时，报「启动失败」，可后端其实活得好好的。
+   * 现在锁到手就先落一份 `mode: "starting"`，探测完再改成 inspect / sync。
+   */
+  const state: BackendState = {
+    pid: process.pid,
+    role,
+    startedAt: new Date().toISOString(),
+    version: VERSION,
+    home,
+    cycles: 0,
+    consecutiveFailures: 0,
+    mode: "starting",
+    lastError: null,
+  };
+  writeBackendState(home, state);
+  log(`btc ${paper ? "模拟盘" : ""}后端启动中 pid=${process.pid}，目录 ${home}`);
+
   // 后端是独立进程，必须自己做一次网络引导：它不在 `startChat` 的调用链里，
   // 否则界面里正常、后端一直失败，这种不一致极难排查。
   // 引导策略见 src/btc/network.ts（直连优先，不通再自动找本机代理）。
@@ -150,29 +183,7 @@ export async function runBtcBackend(
         ? "网络：直连"
         : "网络：不可用（交易所接口连不上）",
   );
-
-  const inspectEnabled =
-    (process.env.BTC_INSPECT_ENABLED ?? "1").trim() !== "0";
-  // 让 btc_schedule 知道这次调用来自后台巡检（用于区分前台手动改期）
-  if (inspectEnabled) process.env.XZH_BTC_INSPECT = "1";
-
-  const syncIntervalMin = clampNumber(
-    Number(process.env.BTC_SYNC_INTERVAL_MIN ?? DEFAULT_SYNC_INTERVAL_MIN),
-    1,
-    1440,
-  );
-
-  const state: BackendState = {
-    pid: process.pid,
-    role,
-    startedAt: new Date().toISOString(),
-    version: VERSION,
-    home,
-    cycles: 0,
-    consecutiveFailures: 0,
-    mode: inspectEnabled ? "inspect" : "sync",
-    lastError: null,
-  };
+  state.mode = inspectEnabled ? "inspect" : "sync";
 
   let stopping = false;
   let running = false;
