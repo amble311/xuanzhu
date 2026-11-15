@@ -47,6 +47,7 @@ import {
   type WatchItem,
 } from "./watchlist";
 import { poolSize } from "./settings";
+import { inWorkWindow, WORK_WINDOW_LABEL } from "./window";
 import { ensureDir, getAShareHome } from "../utils/paths";
 import { VERSION } from "../utils/version";
 
@@ -189,17 +190,17 @@ function log(message: string): void {
 }
 
 /**
- * 工作窗口：工作日 09:00–15:30。
+ * 工作窗口：工作日 09:30–15:30（定义在 `window.ts`）。
  *
- * 这是**进程的工作时间**（含集合竞价、午休、收盘后的收尾），只决定「要不要拉数据 /
- * 跑巡检」；**不能当撮合闸门** —— 撮合与成交必须用 `continuousSession()`
+ * 起点从 09:00 挪到 09:30：集合竞价（09:15–09:25）与 09:25–09:30 没有连续成交，
+ * 那半小时的「最新价」是竞价参考价/昨收，巡检据此判断会误判。
+ *
+ * 这是**进程的工作时间**（含午休、收盘后的收尾），只决定「要不要拉数据 / 跑巡检」；
+ * **不能当撮合闸门** —— 撮合与成交必须用 `continuousSession()`
  * （09:30–11:30 / 13:00–15:00 且当天是交易日）。
  */
 export function inTradingWindow(now = new Date()): boolean {
-  const weekday = now.getDay();
-  if (weekday === 0 || weekday === 6) return false;
-  const minutes = now.getHours() * 60 + now.getMinutes();
-  return minutes >= 9 * 60 && minutes <= 15 * 60 + 30;
+  return inWorkWindow(now);
 }
 
 function quoteMap(quotes: Array<Quote | null>): Map<string, Quote> {
@@ -408,7 +409,7 @@ export async function runAServe(): Promise<void> {
     holdings: loadPaperAccount(now).positions.length,
   };
   writeState(state);
-  log(`A 股巡检启动 pid=${process.pid}，工作日 09:00–15:30 巡检；收盘后 16:00 固定选股`);
+  log(`A 股巡检启动 pid=${process.pid}，工作日 ${WORK_WINDOW_LABEL} 巡检；收盘后 16:00 固定选股`);
 
   // 先拉数据再监控：状态文件已写好（startAService 的 5 秒检查不受影响），
   // 这里把交易日历与日线指标准备好，避免第一轮 tick 同步重算全市场指标。
@@ -475,7 +476,7 @@ export async function runAServe(): Promise<void> {
 
     try {
       // 撮合闸门是**连续竞价**（09:30–11:30 / 13:00–15:00 且当天是交易日），
-      // 不是 09:00–15:30 的工作窗口：集合竞价、午休、节假日不按冻结价成交。
+      // 不在工作窗口（09:30–15:30）：集合竞价、午休、节假日不按冻结价成交。
       const session = await continuousSession(at);
       const pending = await processPendingOrders(at, session.open);
       const orderActions = pending.actions;

@@ -8,6 +8,7 @@ import {
   isDefaultGatewayHome,
 } from "../src/gateway/paths";
 import { commandHelpLines } from "../src/core/help-text";
+import { createDeduper, DEDUP_TTL_MS, TEXT_DEDUP_MS } from "../src/gateway/weixin/channel";
 import {
   gatewayModeFile,
   isPidAlive,
@@ -154,5 +155,30 @@ describe("微信对端模式", () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("微信消息去重", () => {
+  it("没有 msgId 时按文本去重，但 3 秒后同一条命令可以再次处理", () => {
+    let now = 1_000_000;
+    const remember = createDeduper(() => now);
+    // 同一个 /info：先处理一次
+    expect(remember("text:peer:/info", TEXT_DEDUP_MS)).toBe(true);
+    // 1 秒内再来一次 = iLink 重复投递，丢掉
+    now += 1_000;
+    expect(remember("text:peer:/info", TEXT_DEDUP_MS)).toBe(false);
+    // 6 秒后再发（切模式后重发 /info）= 新的操作，必须处理
+    now += 5_000;
+    expect(remember("text:peer:/info", TEXT_DEDUP_MS)).toBe(true);
+  });
+
+  it("有 msgId 时 5 分钟内只处理一次", () => {
+    let now = 0;
+    const remember = createDeduper(() => now);
+    expect(remember("id:42", DEDUP_TTL_MS)).toBe(true);
+    now += 60_000;
+    expect(remember("id:42", DEDUP_TTL_MS)).toBe(false);
+    now += 5 * 60_000;
+    expect(remember("id:42", DEDUP_TTL_MS)).toBe(true);
   });
 });

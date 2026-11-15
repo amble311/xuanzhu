@@ -232,29 +232,40 @@ describe("卖点与窗口", () => {
     expect(partial?.qty).toBe(100);
   });
 
-  it("只在工作日 09:00–15:30 运行", () => {
+  it("只在工作日 09:30–15:30 运行（集合竞价不算，避免拿竞价价误判）", () => {
+    expect(inTradingWindow(new Date("2026-11-09T09:30:00+08:00"))).toBe(true);
     expect(inTradingWindow(new Date("2026-11-09T10:00:00+08:00"))).toBe(true);
     expect(inTradingWindow(new Date("2026-11-09T12:00:00+08:00"))).toBe(true);
     expect(inTradingWindow(new Date("2026-11-09T14:00:00+08:00"))).toBe(true);
+    // 09:15–09:25 集合竞价、09:25–09:30 撮合间隔：一律不算工作窗口
+    expect(inTradingWindow(new Date("2026-11-09T09:00:00+08:00"))).toBe(false);
+    expect(inTradingWindow(new Date("2026-11-09T09:15:00+08:00"))).toBe(false);
+    expect(inTradingWindow(new Date("2026-11-09T09:26:00+08:00"))).toBe(false);
+    expect(inTradingWindow(new Date("2026-11-09T09:29:00+08:00"))).toBe(false);
     expect(inTradingWindow(new Date("2026-11-09T08:59:00+08:00"))).toBe(false);
     expect(inTradingWindow(new Date("2026-11-09T15:31:00+08:00"))).toBe(false);
     expect(inTradingWindow(new Date("2026-11-08T10:00:00+08:00"))).toBe(false);
   });
 
   it("工作窗口 ≠ 撮合时段：集合竞价与午休不能成交", async () => {
-    // 工作窗口包含 09:00–09:30 与 11:30–13:00，撮合闸门必须更严
+    // 工作窗口与撮合时段起点相同（09:30），但窗口含午休，撮合闸门必须更严
     expect(isTradingTime(new Date("2026-11-09T09:10:00+08:00"))).toBe(false); // 盘前
     expect(isTradingTime(new Date("2026-11-09T09:20:00+08:00"))).toBe(false); // 集合竞价
     expect(isTradingTime(new Date("2026-11-09T12:00:00+08:00"))).toBe(false); // 午休
     expect(isTradingTime(new Date("2026-11-09T09:30:00+08:00"))).toBe(true);
     expect(isTradingTime(new Date("2026-11-09T14:00:00+08:00"))).toBe(true);
 
-    // 这些时刻都在工作窗口之内，但闸门应当是关的（不需要联网判断交易日）
-    for (const at of ["2026-11-09T09:10:00+08:00", "2026-11-09T09:20:00+08:00", "2026-11-09T12:00:00+08:00"]) {
+    // 集合竞价期间：不在工作窗口、闸门也关着
+    for (const at of ["2026-11-09T09:10:00+08:00", "2026-11-09T09:20:00+08:00"]) {
       const gate = await continuousSession(new Date(at));
       expect(gate.open).toBe(false);
       expect(gate.reason).toBeTruthy();
-      expect(inTradingWindow(new Date(at))).toBe(true);
+      expect(inTradingWindow(new Date(at))).toBe(false);
     }
+    // 午休：在工作窗口之内，但闸门是关的
+    const lunch = new Date("2026-11-09T12:00:00+08:00");
+    const gate = await continuousSession(lunch);
+    expect(gate.open).toBe(false);
+    expect(inTradingWindow(lunch)).toBe(true);
   });
 });

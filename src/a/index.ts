@@ -25,6 +25,7 @@ export * from "./rules";
 export * from "./policy";
 export * from "./signal";
 export * from "./settings";
+export * from "./window";
 export * from "./pause";
 export * from "./inspect";
 export * from "./events";

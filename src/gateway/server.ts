@@ -761,6 +761,42 @@ export async function runGateway(): Promise<void> {
   })();
   const timeoutMinutes = Math.max(1, Math.round(MESSAGE_TIMEOUT_MS / 60_000));
 
+  /**
+   * 命令执行的硬上限。
+   *
+   * `/info` 要拉行情、读后台状态；接口无响应时（或模式刚切完、缓存正在重建）可能拖很久。
+   * 以前这条链没有上限也没有兜底：命令一卡，微信端就是**彻底没有回复**，
+   * 连「处理失败」都看不到。现在超时与异常都转成一条可读回复。
+   */
+  const COMMAND_TIMEOUT_MS = 25_000;
+  const runCommandGuarded = async (text: string, peer?: string): Promise<string | null> => {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const timeout = new Promise<{ timedOut: true }>((resolve) => {
+        timer = setTimeout(() => resolve({ timedOut: true }), COMMAND_TIMEOUT_MS);
+        timer.unref?.();
+      });
+      const raced = await Promise.race([
+        handleCommand(text, peer).then((reply) => ({ reply })),
+        timeout,
+      ]);
+      if ("timedOut" in raced) {
+        log(`命令超时：${text.slice(0, 40)}`);
+        return (
+          `⏱ 这条命令超过 ${Math.round(COMMAND_TIMEOUT_MS / 1000)} 秒还没完成` +
+          `（多半是行情/后台接口无响应），请稍后重试。`
+        );
+      }
+      return raced.reply;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`命令失败：${text.slice(0, 40)} → ${message}`);
+      return `命令执行失败：${message}`;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
   /** 串行处理：Agent 实例不是并发安全的，同时两条消息会把上下文搅在一起 */
   let queue: Promise<unknown> = Promise.resolve();
   const handleMessage = (text: string, peer?: string): Promise<string> => {
@@ -781,8 +817,11 @@ export async function runGateway(): Promise<void> {
         }
 
         // `/btc` / `/a` / `/xzh` 这类命令不进入对话历史，也不调用模型
-        const commandReply = await handleCommand(text, peer);
-        if (commandReply !== null) return commandReply;
+        const commandReply = await runCommandGuarded(text, peer);
+        if (commandReply !== null) {
+          log(`命令回复 ${text.slice(0, 40)}：${commandReply.length} 字`);
+          return commandReply;
+        }
 
         const runner = ensureAgent();
         let timedOut = false;

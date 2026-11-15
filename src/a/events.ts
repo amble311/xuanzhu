@@ -21,7 +21,9 @@ interface EventDef {
 }
 
 const EVENTS: EventDef[] = [
-  { id: "open", minute: 9 * 60, reason: "开盘准备：确认持仓与自选股，检查隔夜公告" },
+  // 09:15–09:30 是开盘集合竞价与撮合间隔，没有连续成交价 —— 那时叫醒巡检只会误判，
+  // 所以「开盘」事件放在 09:30 连续竞价开始之后。
+  { id: "open", minute: 9 * 60 + 30, reason: "开盘后复核：确认持仓与自选股，检查隔夜公告" },
   { id: "midday", minute: 11 * 60 + 30, reason: "午间复盘：上午走势与持仓风险" },
   { id: "tail", minute: 14 * 60 + 45, reason: "尾盘决策：持仓去留与次日计划" },
   { id: "close", minute: 15 * 60 + 25, reason: "收盘总结：更新计划与监控规则" },

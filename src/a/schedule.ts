@@ -1,11 +1,13 @@
 import * as fs from "fs";
 import * as path from "path";
 import { monitorDir } from "./watchlist";
+import { WORK_END_MIN, WORK_START_MIN } from "./window";
 
 /**
  * A 股巡检排期队列（对齐 btc 的 schedule）：
  * - `next` 唯一，新顶旧；`extra` 可并存（同一分钟去重）；
- * - 时间夹到工作日 09:00–15:30；越界顺延到下一个工作时段；
+ * - 时间夹到工作日 **09:30–15:30**；越界顺延到下一个工作时段；
+ *   起点是 09:30 而不是 09:00 —— 那半小时是集合竞价，价格不能用于判断；
  * - 巡检结束前由 Agent 调 `a_schedule` 决定下一轮；代码只消费到期条目。
  */
 
@@ -55,10 +57,15 @@ function writeQueue(queue: QueueFile): void {
   fs.renameSync(tmp, file);
 }
 
-const WORK_START = 9 * 60;
-const WORK_END = 15 * 60 + 30;
+const WORK_START = WORK_START_MIN;
+const WORK_END = WORK_END_MIN;
 
-/** 把时间夹到工作日 09:00–15:30；越界顺延到下一个工作时段 */
+/**
+ * 把时间夹到工作日 09:30–15:30；越界顺延到下一个工作时段。
+ *
+ * 顺延目标固定落在 **09:30**：09:15–09:30 是开盘集合竞价与撮合间隔，
+ * 那段时间没有连续成交价，巡检在那时开跑只会拿竞价参考价做判断。
+ */
 export function clampToWorkTime(at: Date, now = new Date()): { at: Date; clamped: boolean } {
   const result = new Date(at);
   let clamped = false;
@@ -67,18 +74,18 @@ export function clampToWorkTime(at: Date, now = new Date()): { at: Date; clamped
     const minutes = result.getHours() * 60 + result.getMinutes();
     if (day === 0 || day === 6) {
       result.setDate(result.getDate() + (day === 6 ? 2 : 1));
-      result.setHours(9, 5, 0, 0);
+      result.setHours(9, 30, 0, 0);
       clamped = true;
       continue;
     }
     if (minutes < WORK_START) {
-      result.setHours(9, 5, 0, 0);
+      result.setHours(9, 30, 0, 0);
       clamped = true;
       continue;
     }
     if (minutes > WORK_END) {
       result.setDate(result.getDate() + 1);
-      result.setHours(9, 5, 0, 0);
+      result.setHours(9, 30, 0, 0);
       clamped = true;
       continue;
     }

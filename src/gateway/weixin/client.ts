@@ -273,7 +273,7 @@ export async function sendTyping(options: {
   contextToken?: string;
   /** 1 = 开始，2 = 结束 */
   status?: 1 | 2;
-}): Promise<void> {
+}): Promise<{ ok: boolean; error?: string }> {
   try {
     await requestJson("POST", {
       baseUrl: options.baseUrl,
@@ -286,7 +286,10 @@ export async function sendTyping(options: {
       },
       timeoutMs: 8_000,
     });
-  } catch {
-    // 打字状态是锦上添花，失败不影响收发
+    return { ok: true };
+  } catch (err) {
+    // 打字状态是锦上添花，失败不影响收发；但要把原因交给调用方，
+    // 它据此决定「改用一条占位消息」而不是让手机端一片空白
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }

@@ -37,19 +37,27 @@ afterAll(() => {
 });
 
 describe("排期队列", () => {
-  it("越界时间夹到工作日 09:00–15:30", () => {
+  it("越界时间夹到工作日 09:30–15:30（集合竞价不巡检）", () => {
     const saturday = clampToWorkTime(new Date("2026-11-07T10:00:00"), new Date("2026-11-06T10:00:00"));
     expect(saturday.at.getDay()).toBe(1); // 周一
     expect(saturday.at.getHours()).toBe(9);
+    expect(saturday.at.getMinutes()).toBe(30);
     const late = clampToWorkTime(new Date("2026-11-10T16:00:00"), new Date("2026-11-10T10:00:00"));
     expect(late.at.getDate()).toBe(11);
     expect(late.at.getHours()).toBe(9);
+    expect(late.at.getMinutes()).toBe(30);
+
+    // 早于 09:30（含集合竞价）一律顺延到 09:30
+    const preOpen = clampToWorkTime(new Date("2026-11-09T09:05:00"), new Date("2026-11-09T08:00:00"));
+    expect(preOpen.at.getHours()).toBe(9);
+    expect(preOpen.at.getMinutes()).toBe(30);
+    expect(preOpen.clamped).toBe(true);
   });
 
   it("next 唯一、extra 同分钟去重、到期即出队", () => {
     removeAll();
     const target = new Date();
-    // 取「下一个工作日」：明天若是周末， clampToWorkTime 会把它推到周一 09:00，
+    // 取「下一个工作日」：明天若是周末， clampToWorkTime 会把它推到周一 09:30，
     // 用周末日期当 target 会让 +11 分钟根本还没到排期时间（周五跑必挂）
     do {
       target.setDate(target.getDate() + 1);

@@ -36,8 +36,43 @@ export interface WeixinChannel {
 
 /** 单条消息的长度上限：微信气泡太长了体验很差，按行切成多块 */
 const CHUNK = 1_500;
-const DEDUP_TTL_MS = 5 * 60_000;
+/**
+ * 去重窗口（**有 msgId 时**）：iLink 在网络抖动时会重复投递同一条消息。
+ * 同一个 msgId 5 分钟内只处理一次，安全。
+ */
+export const DEDUP_TTL_MS = 5 * 60_000;
+/**
+ * 去重窗口（**没有 msgId 时**）：只能退化成「对端 + 文本」，窗口必须很短。
+ *
+ * 用 5 分钟会误杀正常操作：先发一次 `/info`，切到另一个模式后再发 `/info`，
+ * 文本一样就被当成重复消息**静默丢弃**（日志里一行都没有）—— 用户看到的就是
+ * 「切换后 /info 没反应」。真正的重复投递发生在几百毫秒内，3 秒足够挡住。
+ */
+export const TEXT_DEDUP_MS = 3_000;
 const RETRY_DELAY_MS = 5_000;
+
+/**
+ * 消息去重器：key 已处理的返回 false，未处理的记下来并返回 true。
+ *
+ * 抽成独立函数是为了能离线测试「同一文本 5 秒后必须能再次处理」这条约束。
+ */
+export function createDeduper(now: () => number = Date.now): (
+  key: string,
+  ttlMs: number,
+) => boolean {
+  // 每条记录带自己的 ttl：msgId 键 5 分钟、文本键 3 秒，不能共用一个窗口
+  const seen = new Map<string, { at: number; ttl: number }>();
+  return (key, ttlMs) => {
+    const at = now();
+    for (const [id, item] of seen) {
+      if (at - item.at > item.ttl) seen.delete(id);
+    }
+    const hit = seen.get(key);
+    if (hit && at - hit.at <= ttlMs) return false;
+    seen.set(key, { at, ttl: ttlMs });
+    return true;
+  };
+}
 
 export function splitChunks(text: string): string[] {
   const body = text.trim();
@@ -75,19 +110,9 @@ export function startWeixinChannel(options: WeixinChannelOptions): WeixinChannel
   let stopped = false;
   let syncBuf = loadSyncBuf(home);
   const tokens = loadContextTokens(home);
-  const seen = new Map<string, number>();
+  const remember = createDeduper();
   /** 最近一次对话的对端：主动推送（巡检 / 监控）只发给 TA */
   let lastPeer: string | undefined;
-
-  const remember = (key: string): boolean => {
-    const now = Date.now();
-    for (const [id, at] of seen) {
-      if (now - at > DEDUP_TTL_MS) seen.delete(id);
-    }
-    if (seen.has(key)) return false;
-    seen.set(key, now);
-    return true;
-  };
 
   /**
    * 所有出站消息串行化：回复、巡检推送可能同时发生，iLink 对并发发送不稳定
@@ -150,13 +175,50 @@ export function startWeixinChannel(options: WeixinChannelOptions): WeixinChannel
       saveContextTokens(tokens, home);
     }
 
-    await sendTyping({
+    // 每条都记一行：出问题（比如「切模式后 /info 没回复」）时至少能确认消息到没到、
+    // 回了多长、花了多久 —— 以前这里什么都不记，只能靠猜。
+    log(
+      `微信收到 ${peer.slice(-6)}：${message.text.replace(/\s+/g, " ").slice(0, 60)}` +
+        `（${message.text.length} 字）`,
+    );
+    const startedAt = Date.now();
+
+    const typing = await sendTyping({
       baseUrl: account.baseUrl,
       token: account.token,
       to: peer,
       contextToken: tokens[peer],
       status: 1,
     });
+    if (!typing.ok) {
+      log(`微信：打字状态不可用（${typing.error ?? "未知"}），长任务改用占位提示`);
+    }
+
+    /**
+     * 微信的「正在输入」只维持几秒：Agent 跑几分钟时手机端早就看不着了，
+     * 所以处理期间每 4 秒续一次；接口本身不可用时，超过 6 秒就补一条「收到，正在处理…」，
+     * 保证用户至少知道消息没丢。
+     */
+    const typingTimer = typing.ok
+      ? setInterval(() => {
+          void sendTyping({
+            baseUrl: account.baseUrl,
+            token: account.token,
+            to: peer,
+            contextToken: tokens[peer],
+            status: 1,
+          });
+        }, 4_000)
+      : undefined;
+    typingTimer?.unref?.();
+
+    let finished = false;
+    const ackTimer = typing.ok
+      ? undefined
+      : setTimeout(() => {
+          if (!finished) void sendChunks(peer, "⏳ 收到，正在处理…");
+        }, 6_000);
+    ackTimer?.unref?.();
 
     let reply: string;
     try {
@@ -164,6 +226,9 @@ export function startWeixinChannel(options: WeixinChannelOptions): WeixinChannel
     } catch (err) {
       reply = `处理失败：${err instanceof Error ? err.message : String(err)}`;
     } finally {
+      finished = true;
+      if (typingTimer) clearInterval(typingTimer);
+      if (ackTimer) clearTimeout(ackTimer);
       await sendTyping({
         baseUrl: account.baseUrl,
         token: account.token,
@@ -172,6 +237,7 @@ export function startWeixinChannel(options: WeixinChannelOptions): WeixinChannel
         status: 2,
       });
     }
+    log(`微信回复 ${peer.slice(-6)}：${reply.length} 字，用时 ${Math.round((Date.now() - startedAt) / 1000)}s`);
     await sendChunks(peer, reply);
   };
 
@@ -198,8 +264,20 @@ export function startWeixinChannel(options: WeixinChannelOptions): WeixinChannel
 
         for (const message of result.msgs) {
           if (stopped) break;
-          const key = message.msgId ?? `${message.fromUserId}:${message.text}`;
-          if (!remember(key)) continue;
+          // 有 msgId 就按 msgId 去重（5 分钟，抗重复投递）；没有 msgId 只能按文本，
+          // 窗口压到 3 秒 —— 否则「先 /info，切模式，再 /info」会被当成重复消息吞掉。
+          const key = message.msgId
+            ? `id:${message.msgId}`
+            : `text:${message.fromUserId}:${message.text}`;
+          const ttl = message.msgId ? DEDUP_TTL_MS : TEXT_DEDUP_MS;
+          if (!remember(key, ttl)) {
+            log(
+              `微信：忽略重复投递（${
+                message.msgId ? `msgId ${message.msgId}` : `无 msgId，同文本 ${TEXT_DEDUP_MS / 1000}s 内`
+              }）：${message.text.replace(/\s+/g, " ").slice(0, 40)}`,
+            );
+            continue;
+          }
           await handle(message);
         }
 

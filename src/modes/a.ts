@@ -1,5 +1,6 @@
 import { startAService } from "../a/monitor";
 import { maxPositions, poolSize } from "../a/settings";
+import { WORK_WINDOW_LABEL } from "../a/window";
 import { getAShareHome } from "../utils/paths";
 import type { AgentMode } from "./types";
 
@@ -31,7 +32,7 @@ export function createAShareMode(): AgentMode {
       return {
         ok: service.ok,
         message: service.ok
-          ? `A 股后台服务${service.started ? "已启动" : "已在运行"}（pid ${service.state?.pid}，工作日 09:00–15:30）`
+          ? `A 股后台服务${service.started ? "已启动" : "已在运行"}（pid ${service.state?.pid}，工作日 ${WORK_WINDOW_LABEL}）`
           : `A 股后台服务未启动：${service.error ?? "未知原因"}`,
       };
     },

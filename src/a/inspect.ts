@@ -8,6 +8,7 @@ import { getAShareHome } from "../utils/paths";
 import type { ExecuteToolResult } from "../tools";
 import { accountSummary, loadPaperAccount } from "./paper";
 import { maxPositions, poolSize } from "./settings";
+import { inWorkWindow, WORK_WINDOW_LABEL } from "./window";
 import { monitorDir, orderedPool } from "./watchlist";
 import { describeRule, readRules } from "./rules";
 import { nextScheduledEntry, pushSchedule, readScheduleQueue } from "./schedule";
@@ -96,9 +97,7 @@ function fmt(value: number | undefined, digits = 2): string {
 }
 
 function inAWorkWindow(now = new Date()): boolean {
-  if (now.getDay() === 0 || now.getDay() === 6) return false;
-  const minutes = now.getHours() * 60 + now.getMinutes();
-  return minutes >= 9 * 60 && minutes <= 15 * 60 + 30;
+  return inWorkWindow(now);
 }
 
 function contextSection(): string {
@@ -117,8 +116,8 @@ function contextSection(): string {
   const lines: string[] = [];
   if (!inAWorkWindow()) {
     lines.push(
-      "注意：当前不在 A 股工作时段（工作日 09:00–15:30）。本轮是手动触发，不要安排夜间巡检；" +
-        "下一轮请排到下一个工作日 09:05 之后（a_schedule 会自动顺延）。",
+      `注意：当前不在 A 股工作时段（工作日 ${WORK_WINDOW_LABEL}）。本轮是手动触发，不要安排夜间巡检；` +
+        "下一轮请排到下一个工作日 09:30 之后（a_schedule 会自动顺延；09:15–09:30 是集合竞价，不要在那时巡检）。",
     );
   }
   lines.push(
@@ -257,7 +256,8 @@ function inspectPrompt(): string {
 4. **结束前必须把「怎么再次叫醒我」注入监控**（三件事，按需使用）：
    a. \`a_schedule\`（必须有）：自己判断下一次巡检时间并说明理由 ——
       信号刚触发 / 临近收盘 → 15–30 分钟；平静观望、无持仓 → 30–60 分钟；
-      非工作时段不要排夜间巡检（a_schedule 会自动顺延）；
+      工作时段是 ${WORK_WINDOW_LABEL}（09:15–09:30 集合竞价不算），非工作时段不要排夜间巡检
+      （a_schedule 会自动顺延）；
    b. \`a_trigger\`：本轮结论**依赖某个具体价位 / 均线 / 涨跌幅**时把阈值落盘
       （例：站上 15m MA20、跌破 12.80、涨幅回落 3%）。不要只靠「等时间」；
       每只股票最多 5 条，过时或已无意义的用 \`a_remove_trigger\` 删掉；
