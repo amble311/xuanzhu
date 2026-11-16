@@ -123,6 +123,46 @@ function statePath(): string {
   return path.join(monitorDir(), STATE_FILE);
 }
 
+/**
+ * 「今天已经选过股」的标记（独立小文件）。
+ *
+ * 为什么不能只放 `monitor.json`：`xzh a stop` 会把它删掉，下次 `start` 写的是全新状态，
+ * `lastSelectDay` 变空 —— 收盘后再重启（比如 18:41 升级完服务）就会把 16:00 的选股
+ * 重跑一遍（全市场快照 + 5000+ 只日线指标重算）。这份标记必须活过停服。
+ */
+interface SelectState {
+  /** 最近一次成功选股的日期（本地 YYYY-MM-DD） */
+  day?: string;
+  /** 最近一次尝试（成功或失败）的时间 */
+  attemptedAt?: string;
+}
+
+function selectStatePath(): string {
+  return path.join(monitorDir(), "run", "select-state.json");
+}
+
+function readSelectState(): SelectState {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(selectStatePath(), "utf8")) as SelectState;
+    return {
+      day: typeof parsed?.day === "string" ? parsed.day : undefined,
+      attemptedAt: typeof parsed?.attemptedAt === "string" ? parsed.attemptedAt : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function writeSelectState(next: SelectState): void {
+  const file = selectStatePath();
+  try {
+    ensureDir(path.dirname(file));
+    fs.writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  } catch {
+    // 标记写不进去最多重跑一次选股，不该让巡检退出
+  }
+}
+
 function lockPath(): string {
   return path.join(monitorDir(), LOCK_FILE);
 }
@@ -405,6 +445,9 @@ export async function runAServe(): Promise<void> {
   }
 
   const now = new Date();
+  // 停服会删掉 monitor.json，但「今天已经选过股」必须活过重启：
+  // 否则 16:00 之后重启（升级 / 崩溃恢复）会把收盘选股重跑一遍。
+  const selectState = readSelectState();
   const state: AMonitorState = {
     pid: process.pid,
     startedAt: iso(now),
@@ -413,6 +456,8 @@ export async function runAServe(): Promise<void> {
     nextRunAt: iso(now),
     watchlist: loadWatchlist().items.length,
     holdings: loadPaperAccount(now).positions.length,
+    lastSelectDay: selectState.day,
+    lastSelectAttemptAt: selectState.attemptedAt,
   };
   writeState(state);
   log(`A 股巡检启动 pid=${process.pid}，交易时段 ${WORK_WINDOW_LABEL} 巡检；收盘后 16:00 固定选股`);
@@ -829,10 +874,12 @@ export function shouldRunAfterCloseSelection(
 export function describeSelection(items: WatchItem[], before: WatchItem[]): string {
   const lines = [`收盘选股 ${items.length} 只（持仓保留）`];
   items.forEach((item, index) => {
-    const reason = item.reason.trim().replace(/\s+/g, " ").slice(0, 42);
-    lines.push(
-      `${index + 1}. ${item.name} ${item.code} · ${item.score} 分${reason ? ` · ${reason}` : ""}`,
-    );
+    // 括号里是分项打分明细，微信里太长 —— 只留结论部分，再按长度截断
+    const raw = item.reason.trim().replace(/\s+/g, " ");
+    const reason = (raw.includes("（") ? raw.slice(0, raw.indexOf("（")) : raw).slice(0, 36);
+    // 持仓是「强制保留」带进来的，score 恒为 0：写「0 分」会让人以为它不及格
+    const score = item.score > 0 ? ` · ${item.score} 分` : "";
+    lines.push(`${index + 1}. ${item.name} ${item.code}${score}${reason ? ` · ${reason}` : ""}`);
   });
   const codes = new Set(items.map((item) => item.code));
   const added = items.filter((item) => !before.some((old) => old.code === item.code));
@@ -860,6 +907,7 @@ async function maybeRunAfterCloseSelection(now: Date, state: AMonitorState): Pro
   }
 
   state.lastSelectAttemptAt = iso(now);
+  writeSelectState({ ...readSelectState(), attemptedAt: state.lastSelectAttemptAt });
   log("收盘后固定选股开始（强制刷新当日指标）…");
   try {
     const size = poolSize();
@@ -874,6 +922,7 @@ async function maybeRunAfterCloseSelection(now: Date, state: AMonitorState): Pro
     );
     saveWatchlist(merged);
     state.lastSelectDay = today;
+    writeSelectState({ day: today, attemptedAt: state.lastSelectAttemptAt });
     state.lastAction = `收盘后选股 ${picks.length} 只`;
     appendAAction({
       kind: "select",

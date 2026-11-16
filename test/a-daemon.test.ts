@@ -391,6 +391,16 @@ describe("收盘后固定选股", () => {
     expect(text).toContain("1. 中国石油 601857 · 86 分");
     expect(text).toContain("新进：中国石油 601857、国泰君安 600901");
     expect(text).toContain("移出：莱美药业 300006");
+
+    // 持仓是「强制保留」带进来的（score 0）：不能显示「0 分」，也不能被分项明细的括号刷屏
+    const held = describeSelection(
+      [item("601857", "中国石油", 0, "已持仓，强制保留"), item("002807", "江阴银行", 100, "趋势 M1 W1 D1 · 15m 100（结构30/位置20/动量20）")],
+      [],
+    );
+    expect(held).toContain("1. 中国石油 601857 · 已持仓，强制保留");
+    expect(held).not.toMatch(/· 0 分/);
+    expect(held).toContain("2. 江阴银行 002807 · 100 分 · 趋势 M1 W1 D1 · 15m 100");
+    expect(held).not.toContain("结构30");
   });
 });
 
