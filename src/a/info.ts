@@ -243,7 +243,7 @@ export function aInfoLines(data: APanelData): string[] {
       lines.push(`  排期 ${queue.length} 条（恢复后继续）`);
     } else {
       if (queue.length === 0) {
-        lines.push("  无排期（每 30 秒检查规则/风控，兜底每小时一轮）");
+        lines.push("  无排期（每 30 秒检查规则/风控；无排期就不唤醒，除非规则/事件触发）");
       }
       for (const entry of queue.slice(0, 2)) {
         const wait = Math.max(

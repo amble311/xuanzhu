@@ -1,13 +1,13 @@
 import * as fs from "fs";
 import * as path from "path";
 import { monitorDir } from "./watchlist";
-import { WORK_END_MIN, WORK_START_MIN } from "./window";
+import { clampToTradingSession } from "./window";
 
 /**
  * A 股巡检排期队列（对齐 btc 的 schedule）：
  * - `next` 唯一，新顶旧；`extra` 可并存（同一分钟去重）；
- * - 时间夹到工作日 **09:30–15:30**；越界顺延到下一个工作时段；
- *   起点是 09:30 而不是 09:00 —— 那半小时是集合竞价，价格不能用于判断；
+ * - 时间夹到**交易时段**（工作日 09:30–11:30 / 13:00–15:00）；越界顺延到下一个时段，
+ *   允许跨日（15:00 之后一律落到下一个工作日 09:30）；
  * - 巡检结束前由 Agent 调 `a_schedule` 决定下一轮；代码只消费到期条目。
  */
 
@@ -57,50 +57,44 @@ function writeQueue(queue: QueueFile): void {
   fs.renameSync(tmp, file);
 }
 
-const WORK_START = WORK_START_MIN;
-const WORK_END = WORK_END_MIN;
-
 /**
- * 把时间夹到工作日 09:30–15:30；越界顺延到下一个工作时段。
+ * 把时间夹进**交易时段**（工作日 09:30–11:30 / 13:00–15:00），越界顺延到下一个时段。
  *
- * 顺延目标固定落在 **09:30**：09:15–09:30 是开盘集合竞价与撮合间隔，
- * 那段时间没有连续成交价，巡检在那时开跑只会拿竞价参考价做判断。
+ * 具体规则见 `window.ts::clampToTradingSession`：午休 → 当日 13:00；收盘后 → 下一个工作日
+ * 09:30（允许跨日）；集合竞价（09:15–09:30）与夜间一律不算交易时间。
  */
 export function clampToWorkTime(at: Date, now = new Date()): { at: Date; clamped: boolean } {
-  const result = new Date(at);
-  let clamped = false;
-  for (let guard = 0; guard < 14; guard += 1) {
-    const day = result.getDay();
-    const minutes = result.getHours() * 60 + result.getMinutes();
-    if (day === 0 || day === 6) {
-      result.setDate(result.getDate() + (day === 6 ? 2 : 1));
-      result.setHours(9, 30, 0, 0);
-      clamped = true;
-      continue;
-    }
-    if (minutes < WORK_START) {
-      result.setHours(9, 30, 0, 0);
-      clamped = true;
-      continue;
-    }
-    if (minutes > WORK_END) {
-      result.setDate(result.getDate() + 1);
-      result.setHours(9, 30, 0, 0);
-      clamped = true;
-      continue;
-    }
-    break;
-  }
-  // 不允许排到过去：至少 now + 1 分钟
-  if (result.getTime() < now.getTime() + 60_000) {
-    result.setTime(now.getTime() + 60_000);
-    clamped = true;
-  }
-  return { at: result, clamped };
+  return clampToTradingSession(at, now);
 }
 
 export function readScheduleQueue(): ScheduleEntry[] {
   return readQueue().entries;
+}
+
+/**
+ * 把队列里**历史遗留**的越界时间（上一版允许 11:30–13:00、15:00–15:30）顺延进交易时段。
+ *
+ * 只在后台启动时调一次：老排期若是 12:00 或 15:20，它会一直等到下一个时段的第一个 tick
+ * 才执行，但面板会一直显示那个假时间，容易让人以为「巡检定在了收盘后」。
+ */
+export function normalizeScheduleTimes(now = new Date()): number {
+  const queue = readQueue();
+  let changed = 0;
+  for (const entry of queue.entries) {
+    const original = Date.parse(entry.at);
+    if (!Number.isFinite(original)) continue;
+    const { at } = clampToTradingSession(new Date(original), now);
+    if (at.getTime() !== original) {
+      entry.at = at.toISOString();
+      entry.clamped = true;
+      changed += 1;
+    }
+  }
+  if (changed > 0) {
+    queue.entries.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+    writeQueue(queue);
+  }
+  return changed;
 }
 
 export function pushSchedule(input: {

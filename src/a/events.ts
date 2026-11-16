@@ -20,13 +20,18 @@ interface EventDef {
   reason: string;
 }
 
+/**
+ * 事件分钟必须落在**交易时段**内（09:30–11:30 / 13:00–15:00）：
+ * 窗口外的 tick 直接 return，永远不会消费这些事件 —— 收盘总结放在 15:25 会变成死代码。
+ */
 const EVENTS: EventDef[] = [
   // 09:15–09:30 是开盘集合竞价与撮合间隔，没有连续成交价 —— 那时叫醒巡检只会误判，
   // 所以「开盘」事件放在 09:30 连续竞价开始之后。
   { id: "open", minute: 9 * 60 + 30, reason: "开盘后复核：确认持仓与自选股，检查隔夜公告" },
-  { id: "midday", minute: 11 * 60 + 30, reason: "午间复盘：上午走势与持仓风险" },
-  { id: "tail", minute: 14 * 60 + 45, reason: "尾盘决策：持仓去留与次日计划" },
-  { id: "close", minute: 15 * 60 + 25, reason: "收盘总结：更新计划与监控规则" },
+  { id: "midday", minute: 11 * 60 + 25, reason: "午间复盘：上午走势与持仓风险" },
+  { id: "tail", minute: 14 * 60 + 40, reason: "尾盘决策：持仓去留与次日计划" },
+  // 收盘前 5 分钟做「收盘总结」：15:00 之后不在交易时段，巡检不会再被叫醒
+  { id: "close", minute: 14 * 60 + 55, reason: "收盘总结：更新计划与监控规则" },
 ];
 
 function statePath(): string {

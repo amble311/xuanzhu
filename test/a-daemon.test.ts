@@ -4,6 +4,7 @@ import * as path from "path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   clampToWorkTime,
+  normalizeScheduleTimes,
   pushSchedule,
   readScheduleQueue,
   removeSchedules,
@@ -14,7 +15,7 @@ import { isPaused, readPause, setPaused } from "../src/a/pause";
 import { takeMarketEvent } from "../src/a/events";
 import { appendRuleAudit, readRuleAudits } from "../src/a/rule-audit";
 import { markPositionRisksDelivered, readPositionRisks, writePositionRisks } from "../src/a/risk-alerts";
-import { shouldRunAfterCloseSelection } from "../src/a/monitor";
+import { describeSelection, shouldRunAfterCloseSelection } from "../src/a/monitor";
 import { formatLocalTime } from "../src/utils/time";
 import { checkAccountRisk, clearRiskTrigger, readRiskState } from "../src/a/risk";
 import { appendAInspectEvent, currentAInspectOffset, readAInspectEvents } from "../src/a/inspect-stream";
@@ -37,21 +38,66 @@ afterAll(() => {
 });
 
 describe("排期队列", () => {
-  it("越界时间夹到工作日 09:30–15:30（集合竞价不巡检）", () => {
+  it("越界时间夹进交易时段（09:30–11:30 / 13:00–15:00，可跨日）", () => {
     const saturday = clampToWorkTime(new Date("2026-11-07T10:00:00"), new Date("2026-11-06T10:00:00"));
     expect(saturday.at.getDay()).toBe(1); // 周一
     expect(saturday.at.getHours()).toBe(9);
     expect(saturday.at.getMinutes()).toBe(30);
+
+    // 收盘后 → 下一个工作日开盘（跨日）
     const late = clampToWorkTime(new Date("2026-11-10T16:00:00"), new Date("2026-11-10T10:00:00"));
     expect(late.at.getDate()).toBe(11);
     expect(late.at.getHours()).toBe(9);
     expect(late.at.getMinutes()).toBe(30);
 
-    // 早于 09:30（含集合竞价）一律顺延到 09:30
+    // 早于 09:30（含集合竞价）→ 当日开盘
     const preOpen = clampToWorkTime(new Date("2026-11-09T09:05:00"), new Date("2026-11-09T08:00:00"));
     expect(preOpen.at.getHours()).toBe(9);
     expect(preOpen.at.getMinutes()).toBe(30);
     expect(preOpen.clamped).toBe(true);
+
+    // 午休 → 当日 13:00（不推到第二天）
+    const lunch = clampToWorkTime(new Date("2026-11-09T12:20:00"), new Date("2026-11-09T10:00:00"));
+    expect(lunch.at.getDate()).toBe(9);
+    expect(lunch.at.getHours()).toBe(13);
+    expect(lunch.at.getMinutes()).toBe(0);
+
+    // 下午收盘后（15:05）→ 下一个工作日 09:30
+    const afterClose = clampToWorkTime(
+      new Date("2026-11-09T15:05:00"),
+      new Date("2026-11-09T14:00:00"),
+    );
+    expect(afterClose.at.getDate()).toBe(10);
+    expect(afterClose.at.getHours()).toBe(9);
+    expect(afterClose.at.getMinutes()).toBe(30);
+  });
+
+  it("历史遗留的越界排期在启动时被顺延进交易时段", () => {
+    const file = path.join(home, "monitor", "run", "schedules.json");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const at = new Date("2026-11-10T12:20:00+08:00");
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        version: 1,
+        entries: [
+          {
+            id: "legacy",
+            at: at.toISOString(),
+            reason: "午休排期",
+            slot: "next",
+            origin: "inspect",
+            createdAt: at.toISOString(),
+          },
+        ],
+      }),
+      "utf8",
+    );
+    expect(normalizeScheduleTimes(new Date("2026-11-10T10:00:00+08:00"))).toBe(1);
+    expect(readScheduleQueue()[0].at).toBe(
+      new Date("2026-11-10T13:00:00+08:00").toISOString(),
+    );
+    expect(readScheduleQueue()[0].clamped).toBe(true);
   });
 
   it("next 唯一、extra 同分钟去重、到期即出队", () => {
@@ -322,6 +368,29 @@ describe("收盘后固定选股", () => {
     expect(
       shouldRunAfterCloseSelection(wed, undefined, "2026-11-11T15:50:00+08:00"),
     ).toBe(false);
+  });
+
+  it("选股推送带名称/分数/理由与换入换出，而不是只给一串代码", () => {
+    const item = (code: string, name: string, score: number, reason: string) => ({
+      code,
+      name,
+      score,
+      reason,
+      source: "select" as const,
+      addedAt: "2026-11-16T08:00:00.000Z",
+    });
+    const before = [item("300006", "莱美药业", 55, "趋势 -1")];
+    const text = describeSelection(
+      [
+        item("601857", "中国石油", 86, "趋势 月/周/日 全 +1 · 15m 80 分 now"),
+        item("600901", "国泰君安", 74, "趋势 月 +1 · 15m 66 分 wait"),
+      ],
+      before,
+    );
+    expect(text).toContain("收盘选股 2 只");
+    expect(text).toContain("1. 中国石油 601857 · 86 分");
+    expect(text).toContain("新进：中国石油 601857、国泰君安 600901");
+    expect(text).toContain("移出：莱美药业 300006");
   });
 });
 

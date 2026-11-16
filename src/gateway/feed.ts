@@ -258,8 +258,11 @@ export interface AActionEntry {
 
 export function formatAEntry(entry: AActionEntry): string | null {
   if (entry.kind === "select") {
+    // 新版选股会写详情（名称 / 分数 / 理由 / 换入换出）；老记录只有 codes，退回代码列表
+    const message = entry.message?.trim();
+    if (message && message.includes("\n")) return message;
     const codes = entry.codes ?? [];
-    return codes.length > 0 ? `选股 ${codes.length} 只：${codes.join("、")}` : null;
+    return codes.length > 0 ? `选股 ${codes.length} 只：${codes.join("、")}` : (message ?? null);
   }
   if (entry.kind === "buy" || entry.kind === "sell") {
     const verb = entry.kind === "buy" ? "买入" : "卖出";

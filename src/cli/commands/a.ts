@@ -226,7 +226,7 @@ ${ansi.bold}横截面（全市场）${ansi.reset}
       ${ansi.gray}--where '{"boards":["sh-main"],"pctMin":3}' 直接给完整 JSON 条件${ansi.reset}
 
 ${ansi.bold}监控（独立进程）${ansi.reset}
-  ${ansi.green}xzh a start${ansi.reset}                     启动后台服务（巡检 / 监控 / 模拟交易；工作日 09:30–15:30）
+  ${ansi.green}xzh a start${ansi.reset}                     启动后台服务（巡检 / 监控 / 模拟交易；交易日 09:30–11:30 / 13:00–15:00）
   ${ansi.green}xzh a stop${ansi.reset}                      关闭后台服务（巡检 / 监控 / 模拟交易一起停）
   ${ansi.green}xzh a pause [resume|status]${ansi.reset}       暂停/恢复巡检与模拟交易（进程仍在）
   ${ansi.green}xzh a fk [当日% 单票% 连亏]${ansi.reset}        查看 / 修改硬风控（fk reset [代码] 解除；单票锁只锁该股）
@@ -708,7 +708,7 @@ async function startServiceCommand(): Promise<void> {
   const result = await startAService();
   process.stdout.write(
     result.ok
-      ? `${ansi.green}✓ A 股后台服务已启动${ansi.reset}${ansi.gray} pid ${result.state?.pid} · 工作日 09:30–15:30 · 监控 60 秒 / 巡检按排期 / 16:00 选股${ansi.reset}\n`
+      ? `${ansi.green}✓ A 股后台服务已启动${ansi.reset}${ansi.gray} pid ${result.state?.pid} · 交易日 09:30–11:30 / 13:00–15:00 · 监控 60 秒 / 巡检按排期 / 16:00 选股${ansi.reset}\n`
       : `${ansi.red}✗ 启动失败：${result.error}${ansi.reset}\n`,
   );
 }

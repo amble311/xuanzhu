@@ -33,7 +33,16 @@ import { readPolicy } from "./policy";
  */
 
 const MAX_TOOL_ROUNDS = 12;
-const TIMEOUT_MS = 6 * 60_000;
+/**
+ * 空闲超时 / 总时长上限（两个都要）。
+ *
+ * 以前只有一个 6 分钟的总超时：一轮里工具多（13 次）时，模型刚把 `a_schedule` 排完、
+ * 正在生成结论，计时器就到点把流掐断 —— 正文一个字都没有，微信收到「模型未生成正文结论」。
+ * 现在改成「有活动就续期」：只要模型还在出思考 / 调工具 / 写正文就不打断，
+ * 真正卡死（几秒都没动静）才中止；另设 15 分钟总上限兜住极端情况。
+ */
+const IDLE_TIMEOUT_MS = 3 * 60_000;
+const TOTAL_TIMEOUT_MS = 15 * 60_000;
 const SUMMARY_LIMIT = 600;
 
 /** 无人值守放行的工具：交易、排期、规则、续期；文件/bash/环境改动一律拒绝 */
@@ -116,8 +125,9 @@ function contextSection(): string {
   const lines: string[] = [];
   if (!inAWorkWindow()) {
     lines.push(
-      `注意：当前不在 A 股工作时段（工作日 ${WORK_WINDOW_LABEL}）。本轮是手动触发，不要安排夜间巡检；` +
-        "下一轮请排到下一个工作日 09:30 之后（a_schedule 会自动顺延；09:15–09:30 是集合竞价，不要在那时巡检）。",
+      `注意：当前不在 A 股交易时段（${WORK_WINDOW_LABEL}）。本轮是手动触发，**不要安排夜间 / 午休巡检**；` +
+        "下一轮请排到下一个交易时段开始（a_schedule 会自动顺延，允许跨日 —— " +
+        "例如 15:00 之后排到下一个工作日 09:30）。",
     );
   }
   lines.push(
@@ -256,8 +266,9 @@ function inspectPrompt(): string {
 4. **结束前必须把「怎么再次叫醒我」注入监控**（三件事，按需使用）：
    a. \`a_schedule\`（必须有）：自己判断下一次巡检时间并说明理由 ——
       信号刚触发 / 临近收盘 → 15–30 分钟；平静观望、无持仓 → 30–60 分钟；
-      工作时段是 ${WORK_WINDOW_LABEL}（09:15–09:30 集合竞价不算），非工作时段不要排夜间巡检
-      （a_schedule 会自动顺延）；
+      **必须落在交易时段内**：${WORK_WINDOW_LABEL}（09:15–09:30 集合竞价、11:30–13:00 午休、
+      15:00 之后收盘都不算）。可以跨日 —— 收盘后要盯就排下一个工作日 09:30，
+      午休时想复核就排 13:00；a_schedule 也会自动把这些时间顺延到最近的交易时段；
    b. \`a_trigger\`：本轮结论**依赖某个具体价位 / 均线 / 涨跌幅**时把阈值落盘
       （例：站上 15m MA20、跌破 12.80、涨幅回落 3%）。不要只靠「等时间」；
       每只股票最多 5 条，过时或已无意义的用 \`a_remove_trigger\` 删掉；
@@ -324,21 +335,32 @@ export async function runAInspect(
   let text = "";
   let reasoning = "";
   let toolCalls = 0;
+  /** 本轮工具调用明细（`a_order ✅`）：正文丢了也能拼出「做了什么」 */
+  const toolLog: string[] = [];
+  /** 中止原因（空闲超时 / 总时长上限），落日志用 */
+  let abortReason = "";
+  /** 有活动就续期空闲计时器（下文创建计时器后填上） */
+  let touch = (): void => undefined;
 
   const events: AgentEvents = {
     onText: (delta) => {
       text += delta;
+      touch();
     },
     onReasoning: (delta) => {
       reasoning += delta;
+      touch();
     },
     onToolStart: (call) => {
       toolCalls += 1;
+      touch();
       appendLog(`工具 ${call.name}`);
       appendAInspectEvent("tool", call.name);
     },
-    onToolEnd: (_call, result: ExecuteToolResult) => {
+    onToolEnd: (call, result: ExecuteToolResult) => {
+      touch();
       appendLog(`工具结束：${result.ok ? "成功" : "失败"}`);
+      toolLog.push(`${call.name} ${result.ok ? "✅" : "❌"}`);
     },
     onStatus: () => undefined,
     onNotice: (message) => {
@@ -365,7 +387,17 @@ export async function runAInspect(
   });
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  // 空闲超时：模型停止输出（思考 / 工具 / 正文）超过 3 分钟才中止；
+  // 总超时：15 分钟的硬上限，避免工具异常轮询把后台拖死。
+  const idleTimer = setTimeout(() => {
+    abortReason = `空闲 ${Math.round(IDLE_TIMEOUT_MS / 60_000)} 分钟无输出`;
+    controller.abort();
+  }, IDLE_TIMEOUT_MS);
+  touch = () => idleTimer.refresh();
+  const totalTimer = setTimeout(() => {
+    abortReason = `总时长超过 ${Math.round(TOTAL_TIMEOUT_MS / 60_000)} 分钟`;
+    controller.abort();
+  }, TOTAL_TIMEOUT_MS);
   try {
     await agent.run(
       `巡检原因：${reason}\n\n当前上下文：\n${contextSection()}\n` +
@@ -381,8 +413,13 @@ export async function runAInspect(
     appendAInspectEvent("error", message);
     return { summary: text.slice(0, SUMMARY_LIMIT), toolCalls, error: message };
   } finally {
-    clearTimeout(timer);
+    clearTimeout(idleTimer);
+    clearTimeout(totalTimer);
+    touch = () => undefined;
     delete process.env.XZH_A_INSPECT;
+  }
+  if (abortReason) {
+    appendLog(`巡检中止：${abortReason}`);
   }
 
   // 模型必须自己排下一轮；漏了就兜底 30 分钟，避免巡检停摆
@@ -399,9 +436,11 @@ export async function runAInspect(
 
   let summary = text.trim().slice(0, SUMMARY_LIMIT);
 
-  // 模型有时只输出思考、正文为空；用一次短调用把思考与最近动作压成结论，
-  // 避免微信/TUI 只看到“没有输出”。
+  // 模型有时只输出思考、正文为空（或被超时掐断）；用一次短调用把思考与**实际动作**
+  // 压成结论，避免微信/TUI 只看到“没有输出”。动作明细一定要给全 —— 以前只写
+  // 「见上一轮上下文」，摘要器只能瞎猜，是「未产生动作」这种错误结论的来源。
   if (!summary) {
+    const actions = toolLog.length > 0 ? toolLog.join("、") : "（本轮没有工具调用）";
     try {
       let fallback = "";
       const controller2 = new AbortController();
@@ -412,18 +451,22 @@ export async function runAInspect(
             {
               role: "system",
               content:
-                "你是 A 股巡检总结器。根据思考片段与最近动作，输出一句可执行的中文结论（持仓/买卖/观望 + 下一步），不要复述思考，不要调用工具。",
+                "你是 A 股巡检总结器。根据思考片段与工具调用明细，输出一段可执行的中文结论" +
+                "（当前持仓处理 + 是否买卖 + 下一步重点），不要复述思考，不要调用工具。" +
+                "只能依据给到的明细，不要臆测没有发生过的动作。",
             },
             {
               role: "user",
               content:
+                `巡检原因：${reason}${abortReason ? `（本轮被中止：${abortReason}）` : ""}\n` +
+                `工具调用（按顺序）：${actions}\n\n` +
                 `思考片段：\n${reasoning.slice(-4_000) || "（无）"}\n\n` +
-                "最近动作：见上一轮上下文。请直接输出一句结论。",
+                "请直接输出结论。",
             },
           ],
           tools: [],
           temperature: 0.2,
-          maxTokens: 300,
+          maxTokens: 400,
           signal: controller2.signal,
         })) {
           if (chunk.type === "text") fallback += chunk.text;
@@ -438,7 +481,10 @@ export async function runAInspect(
     }
   }
 
-  summary ||= "巡检完成（模型未生成正文结论，也未产生动作）";
+  // 兜底文案必须如实反映「做了什么」：本轮可能已经下单，不能一口咬定「未产生动作」
+  summary ||=
+    `巡检结束（模型未输出正文结论${abortReason ? `，${abortReason}` : ""}；` +
+    `本轮工具 ${toolCalls} 次${toolLog.length > 0 ? `：${toolLog.slice(0, 6).join("、")}` : ""}）`; 
   appendLog(`巡检结论：${summary}`);
   appendAInspectEvent("text", summary);
   appendAInspectEvent("end", `工具 ${toolCalls} 次`);

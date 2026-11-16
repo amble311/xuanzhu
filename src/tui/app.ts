@@ -5777,7 +5777,7 @@ export class TuiApp {
       } else {
         const upcoming = queue.slice(0, 2);
         if (upcoming.length === 0) {
-          push(`${ansi.gray}   无排期（每 30 秒检查规则/风控，兜底每小时一轮）${ansi.reset}`);
+          push(`${ansi.gray}   无排期（每 30 秒检查规则/风控；无排期就不唤醒，除非规则/事件触发）${ansi.reset}`);
         }
         for (const entry of upcoming) {
           const wait = Math.max(

@@ -20,7 +20,12 @@ import {
 } from "./paper";
 import { runAInspect } from "./inspect";
 import { commitRuleHit, describeRule, evaluateRules, readRules } from "./rules";
-import { pushSchedule, readScheduleQueue, takeDueSchedule } from "./schedule";
+import {
+  normalizeScheduleTimes,
+  pushSchedule,
+  readScheduleQueue,
+  takeDueSchedule,
+} from "./schedule";
 import { isPaused, readPause } from "./pause";
 import { takeMarketEvent } from "./events";
 import { cancelOrder, describeOrder, listOrders, matchOrders, type PendingOrder } from "./orders";
@@ -56,7 +61,7 @@ import { VERSION } from "../utils/version";
  *
  * 一个进程同时负责：
  * - 每分钟 tick：监控规则、挂单撮合（仅连续竞价）、持仓风控检测；
- * - 到排期时跑完整巡检（`a_schedule` 决定下一轮；失败 15 分钟退避、队列空 60 分钟兜底）；
+ * - 到排期时跑完整巡检（`a_schedule` 决定下一轮；失败 15 分钟退避、模型漏排期由巡检结尾 30 分钟兜底）；
  * - 收盘后 16:00 固定选股（只更新自选池）。
  *
  * 与 btc 的差别：A 股只有 4 小时交易、T+1、只能做多，因此不跑 24/7，非交易时段休眠。
@@ -190,14 +195,15 @@ function log(message: string): void {
 }
 
 /**
- * 工作窗口：工作日 09:30–15:30（定义在 `window.ts`）。
+ * 工作窗口：**正常交易时段**（工作日 09:30–11:30 / 13:00–15:00，定义在 `window.ts`）。
  *
- * 起点从 09:00 挪到 09:30：集合竞价（09:15–09:25）与 09:25–09:30 没有连续成交，
- * 那半小时的「最新价」是竞价参考价/昨收，巡检据此判断会误判。
+ * 为什么严格限制在交易时段：集合竞价（09:15–09:30）、午休（11:30–13:00）与 15:00 之后
+ * 都没有连续成交，拿到的价格是竞价参考价 / 上午收盘价 / 当日收盘价。
+ * 巡检在这些时刻开跑，等于用冻结价格判断 15 分钟择时，方向必然失真。
  *
- * 这是**进程的工作时间**（含午休、收盘后的收尾），只决定「要不要拉数据 / 跑巡检」；
+ * 这是**进程的工作时间**，只决定「要不要拉数据 / 跑巡检 / 消费排期」；
  * **不能当撮合闸门** —— 撮合与成交必须用 `continuousSession()`
- * （09:30–11:30 / 13:00–15:00 且当天是交易日）。
+ * （同两个时段，且还要当天是交易日）。
  */
 export function inTradingWindow(now = new Date()): boolean {
   return inWorkWindow(now);
@@ -409,7 +415,10 @@ export async function runAServe(): Promise<void> {
     holdings: loadPaperAccount(now).positions.length,
   };
   writeState(state);
-  log(`A 股巡检启动 pid=${process.pid}，工作日 ${WORK_WINDOW_LABEL} 巡检；收盘后 16:00 固定选股`);
+  log(`A 股巡检启动 pid=${process.pid}，交易时段 ${WORK_WINDOW_LABEL} 巡检；收盘后 16:00 固定选股`);
+  // 老版本允许午休 / 15:00 之后排期，启动时把它们顺延进交易时段，避免面板显示假时间
+  const shifted = normalizeScheduleTimes(now);
+  if (shifted > 0) log(`已把 ${shifted} 条越界排期顺延进交易时段`);
 
   // 先拉数据再监控：状态文件已写好（startAService 的 5 秒检查不受影响），
   // 这里把交易日历与日线指标准备好，避免第一轮 tick 同步重算全市场指标。
@@ -458,8 +467,8 @@ export async function runAServe(): Promise<void> {
       }
     }
 
-    // 非工作时段（夜间 / 周末 / 15:30 之后）完全不拉行情：收盘之后价格是冻结的，
-    // 逐 tick 重拉持仓行情与 15m K 线只是白烧请求。
+    // 不在交易时段（集合竞价 / 午休 / 收盘后 / 周末）完全不拉行情：价格是冻结的，
+    // 逐 tick 重拉持仓行情与 15m K 线只是白烧请求，而且会让巡检拿到假价格。
     if (!inTradingWindow(at)) return;
 
     // 硬风控与 btc 对齐：只落盘 + 告警，不自动交易；工作时段内即使暂停也检查
@@ -475,8 +484,8 @@ export async function runAServe(): Promise<void> {
     if (isPaused()) return;
 
     try {
-      // 撮合闸门是**连续竞价**（09:30–11:30 / 13:00–15:00 且当天是交易日），
-      // 不在工作窗口（09:30–15:30）：集合竞价、午休、节假日不按冻结价成交。
+      // 撮合闸门是**连续竞价**（09:30–11:30 / 13:00–15:00 且当天是交易日）：
+      // 工作窗口只判时段、不判交易日，节假日靠这道闸门拦住，不按冻结价成交。
       const session = await continuousSession(at);
       const pending = await processPendingOrders(at, session.open);
       const orderActions = pending.actions;
@@ -493,10 +502,12 @@ export async function runAServe(): Promise<void> {
       const hit = await checkMonitorRules(at, heldQuotes);
       const due = takeDueSchedule(at);
       const event = takeMarketEvent(at);
-      const lastInspect = state.lastInspectAt ? Date.parse(state.lastInspectAt) : 0;
-      const fallback = Date.now() - lastInspect >= 60 * 60_000;
 
-      if (!hit && !due && !event && !riskPending && !positionRiskPending && !fallback) {
+      // 只由「规则命中 / 排期到期 / 市场事件 / 风控」叫醒巡检。
+      // 曾经还有个「距上次巡检满 60 分钟就兜底跑一轮」的固定节拍（最早那版遗留），
+      // 它会在模型已经排好下一轮的情况下凭空多跑一轮（12:32 那种「兜底巡检」），
+      // 且容易撞上午休/收盘前后，已删除；模型漏排期由 `runAInspect` 结尾的 30 分钟兜底补上。
+      if (!hit && !due && !event && !riskPending && !positionRiskPending) {
         return;
       }
 
@@ -519,7 +530,7 @@ export async function runAServe(): Promise<void> {
         hit?.reason ??
         due?.reason ??
         event?.reason ??
-        "兜底巡检";
+        "定时检查";
       state.lastInspectReason = reason;
       log(`唤醒巡检：${reason}`);
       // 叫醒来源要带进提示词：只说「巡检」会让模型当成常规轮次，回一句「无变化」
@@ -809,6 +820,32 @@ export function shouldRunAfterCloseSelection(
   return true;
 }
 
+/**
+ * 选股结果 → 微信推送正文。
+ *
+ * 以前只推「选股 5 只：601857、601939、…」——用户只看到一串代码，不知道为什么进、
+ * 为什么换，还得自己翻面板。现在带上名称、综合分、一句理由，以及本次的换入换出。
+ */
+export function describeSelection(items: WatchItem[], before: WatchItem[]): string {
+  const lines = [`收盘选股 ${items.length} 只（持仓保留）`];
+  items.forEach((item, index) => {
+    const reason = item.reason.trim().replace(/\s+/g, " ").slice(0, 42);
+    lines.push(
+      `${index + 1}. ${item.name} ${item.code} · ${item.score} 分${reason ? ` · ${reason}` : ""}`,
+    );
+  });
+  const codes = new Set(items.map((item) => item.code));
+  const added = items.filter((item) => !before.some((old) => old.code === item.code));
+  if (added.length > 0) {
+    lines.push(`新进：${added.map((item) => `${item.name} ${item.code}`).join("、")}`);
+  }
+  const removed = before.filter((item) => !codes.has(item.code));
+  if (removed.length > 0) {
+    lines.push(`移出：${removed.map((item) => `${item.name} ${item.code}`).join("、")}`);
+  }
+  return lines.join("\n");
+}
+
 async function maybeRunAfterCloseSelection(now: Date, state: AMonitorState): Promise<boolean> {
   if (!shouldRunAfterCloseSelection(now, state.lastSelectDay, state.lastSelectAttemptAt)) {
     return false;
@@ -826,6 +863,7 @@ async function maybeRunAfterCloseSelection(now: Date, state: AMonitorState): Pro
   log("收盘后固定选股开始（强制刷新当日指标）…");
   try {
     const size = poolSize();
+    const before = loadWatchlist().items;
     const picks = await selectTopWatchlist(size, log, { refresh: true });
     const account = loadPaperAccount(now);
     const merged = mergeWatchlist(
@@ -841,7 +879,7 @@ async function maybeRunAfterCloseSelection(now: Date, state: AMonitorState): Pro
       kind: "select",
       ok: true,
       codes: merged.items.map((item) => item.code),
-      message: `收盘后选股 ${picks.length} 只（持仓保留）`,
+      message: describeSelection(merged.items, before),
     });
     log(`收盘后选股完成：${picks.length} 只，自选 ${merged.items.length}/${poolSize()}`);
     return true;

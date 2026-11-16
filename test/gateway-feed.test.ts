@@ -294,5 +294,23 @@ describe("转发循环", () => {
     expect(sent[0]).toContain("选股 3 只：600519、300750、000001");
     expect(sent[0]).toContain("买入 贵州茅台 100 股 @ 10.00");
     expect(sent[0]).toContain("卖出失败：可卖不足：T+1 可卖 0 股");
+
+    // 新版选股会写详情（名称 / 分数 / 换入换出）：直接用它，不再只推一串代码
+    entry({
+      kind: "select",
+      codes: ["601857", "601939"],
+      message: [
+        "收盘选股 2 只（持仓保留）",
+        "1. 中国石油 601857 · 86 分 · 趋势 月/周/日 全 +1",
+        "2. 建设银行 601939 · 81 分 · 趋势 月/周 +1",
+        "新进：中国石油 601857",
+        "移出：莱美药业 300006",
+      ].join("\n"),
+    });
+    const sent2: string[] = [];
+    await runFeedTick({ offsetsFile, send: async (text) => (sent2.push(text), true) });
+    expect(sent2).toHaveLength(1);
+    expect(sent2[0]).toContain("1. 中国石油 601857 · 86 分");
+    expect(sent2[0]).toContain("移出：莱美药业 300006");
   });
 });

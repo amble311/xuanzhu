@@ -748,7 +748,7 @@ const scheduleTool: ToolDefinition = {
   modes: A_MODES,
   description:
     "安排下一次 A 股巡检时间（巡检结束前必须调用）。分钟数 5–720，或直接给 at（ISO/本地时间）。" +
-    "工作时段是工作日 09:30–15:30（09:15–09:30 集合竞价不在内）；越界会自动顺延。slot=next 会顶掉旧的 next；extra 是额外检查点。",
+    "只能排在**交易时段**（工作日 09:30–11:30 / 13:00–15:00）：集合竞价、午休、收盘后都没有成交，越界会自动顺延到最近的交易时段（允许跨日，收盘后顺延到下一个工作日 09:30）。slot=next 会顶掉旧的 next；extra 是额外检查点。",
   parameters: {
     type: "object",
     properties: {
@@ -771,7 +771,7 @@ const scheduleTool: ToolDefinition = {
     const entry = pushSchedule({ minutes, at, reason, slot });
     return {
       ok: true,
-      content: `✓ 已排期 ${entry.at}（${entry.slot}）：${entry.reason}${entry.clamped ? "（当前非工作时段，已顺延到下一个工作日 09:30–15:30）" : ""}`,
+      content: `✓ 已排期 ${entry.at}（${entry.slot}）：${entry.reason}${entry.clamped ? "（不在交易时段，已顺延到最近的交易时段 09:30–11:30 / 13:00–15:00）" : ""}`,
       summary: `巡检排期 ${entry.at}`,
     };
   },
