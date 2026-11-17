@@ -230,7 +230,11 @@ if [ -f "$CHANGELOG_FILE" ] && grep -q '^## \[未发布\]' "$CHANGELOG_FILE"; th
     const fs = require('fs');
     const file = process.argv[1];
     const version = process.argv[2];
-    const today = new Date().toISOString().slice(0, 10);
+    // 用**本地日期**：toISOString() 是 UTC，晚上发版（UTC+8 的 00:00–08:00）会写成前一天
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+      now.getDate(),
+    ).padStart(2, "0")}`;
     let src = fs.readFileSync(file, 'utf8');
     src = src.replace(
       /^## \[未发布\][ \t]*$/m,
