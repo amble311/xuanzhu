@@ -1,6 +1,6 @@
 import { Agent, type AgentEvents } from "../core/agent";
 import type { ExecuteToolResult } from "../tools";
-import { activeModelEntry, loadConfig } from "../config/store";
+import { activeModelEntry, inspectMaxMinutes, loadConfig } from "../config/store";
 import { createProvider } from "../llm";
 import { ensureBtcNetwork } from "./network";
 import { createBtcMode } from "../modes";
@@ -35,8 +35,11 @@ const MAX_TOOL_ROUNDS = 12;
  * 以前只有一个 8 分钟总超时：工具多（下单 + 校验 + 排期 + 触发条件）的轮次里，
  * 模型刚排完下一轮、正在写结论就被掐断，日志只留下「模型没有输出文字结论」。
  */
+/**
+ * 只有空闲超时：本地模型慢，按总时长掐断会把「正在写结论」的轮次变成空结论。
+ * 模型还在出思考 / 调工具 / 写正文就续期，3 分钟没有任何输出才算挂住。
+ */
 const IDLE_TIMEOUT_MS = 3 * 60_000;
-const TOTAL_TIMEOUT_MS = 15 * 60_000;
 /** 巡检结论写进状态/日志时截断到这个长度，避免把整段分析塞进 state */
 export const SUMMARY_LIMIT = 600;
 
@@ -99,7 +102,6 @@ const PAPER_PROMPT_SECTION = `
 export interface InspectOptions {
   log?: (line: string) => void;
   maxToolRounds?: number;
-  timeoutMs?: number;
   /** 模拟盘后端：允许提示词里放开 `btc_paper_*` 的虚拟开平仓 */
   paper?: boolean;
   /**
@@ -312,19 +314,21 @@ export async function runInspectCycle(
     : "";
 
   const controller = new AbortController();
-  // 空闲超时：模型静止 3 分钟才中止；总上限 15 分钟（调用方可用 timeoutMs 覆盖上限）。
+  // 只有空闲超时：模型静止 3 分钟才中止，不按总时长掐断（与 A 股一致）。
   const idleTimer = setTimeout(() => {
     abortReason = `空闲 ${Math.round(IDLE_TIMEOUT_MS / 60_000)} 分钟无输出`;
     controller.abort();
   }, IDLE_TIMEOUT_MS);
   touch = () => idleTimer.refresh();
-  const totalTimer = setTimeout(
-    () => {
-      abortReason = `总时长超过 ${Math.round((options.timeoutMs ?? TOTAL_TIMEOUT_MS) / 60_000)} 分钟`;
-      controller.abort();
-    },
-    options.timeoutMs ?? TOTAL_TIMEOUT_MS,
-  );
+  // 可选的总时长兜底（默认 0 = 不限，与 A 股同一份配置）
+  const maxMinutes = inspectMaxMinutes(config);
+  const totalTimer =
+    maxMinutes > 0
+      ? setTimeout(() => {
+          abortReason = `总时长超过 ${maxMinutes} 分钟（xzh config inspect 可调整）`;
+          controller.abort();
+        }, maxMinutes * 60_000)
+      : null;
 
   try {
     await agent.run(
@@ -350,7 +354,7 @@ export async function runInspectCycle(
     };
   } finally {
     clearTimeout(idleTimer);
-    clearTimeout(totalTimer);
+    if (totalTimer) clearTimeout(totalTimer);
     touch = () => undefined;
   }
 

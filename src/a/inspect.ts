@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { Agent, type AgentEvents } from "../core/agent";
-import { activeModelEntry, loadConfig } from "../config/store";
+import { activeModelEntry, inspectMaxMinutes, loadConfig } from "../config/store";
 import { createProvider } from "../llm";
 import type { AgentMode } from "../modes";
 import { getAShareHome } from "../utils/paths";
@@ -36,15 +36,16 @@ import { readPolicy } from "./policy";
 
 const MAX_TOOL_ROUNDS = 12;
 /**
- * 空闲超时 / 总时长上限（两个都要）。
+ * 空闲超时（只有这一道）。
  *
- * 以前只有一个 6 分钟的总超时：一轮里工具多（13 次）时，模型刚把 `a_schedule` 排完、
- * 正在生成结论，计时器就到点把流掐断 —— 正文一个字都没有，微信收到「模型未生成正文结论」。
- * 现在改成「有活动就续期」：只要模型还在出思考 / 调工具 / 写正文就不打断，
- * 真正卡死（几秒都没动静）才中止；另设 15 分钟总上限兜住极端情况。
+ * 以前是「空闲 3 分钟 + 总时长 15 分钟」双超时。总时长上限对**本地小模型**太苛刻：
+ * 工具多（10+ 次）+ 推理慢的一轮很容易超过 15 分钟，模型刚把 `a_schedule` 排完、
+ * 正在写结论就被掐断 —— 正文一个字都没有，微信只收到「模型未生成正文结论」。
+ *
+ * 现在只保留**空闲超时**：模型还在出思考 / 调工具 / 写正文就一直续期，多久都不打断；
+ * 真正卡死（3 分钟没有任何输出）才中止。它防的是「挂住」，不是「跑得慢」。
  */
 const IDLE_TIMEOUT_MS = 3 * 60_000;
-const TOTAL_TIMEOUT_MS = 15 * 60_000;
 const SUMMARY_LIMIT = 600;
 
 /** 无人值守放行的工具：交易、排期、规则、续期；文件/bash/环境改动一律拒绝 */
@@ -410,17 +411,23 @@ export async function runAInspect(
   });
 
   const controller = new AbortController();
-  // 空闲超时：模型停止输出（思考 / 工具 / 正文）超过 3 分钟才中止；
-  // 总超时：15 分钟的硬上限，避免工具异常轮询把后台拖死。
+  // 只有空闲超时：模型停止输出（思考 / 工具 / 正文）超过 3 分钟才中止。
+  // **不设总时长上限** —— 本地模型慢，按总时长掐断只会把「正在写结论」的轮次变成空结论。
   const idleTimer = setTimeout(() => {
     abortReason = `空闲 ${Math.round(IDLE_TIMEOUT_MS / 60_000)} 分钟无输出`;
     controller.abort();
   }, IDLE_TIMEOUT_MS);
   touch = () => idleTimer.refresh();
-  const totalTimer = setTimeout(() => {
-    abortReason = `总时长超过 ${Math.round(TOTAL_TIMEOUT_MS / 60_000)} 分钟`;
-    controller.abort();
-  }, TOTAL_TIMEOUT_MS);
+  // 可选的总时长兜底（默认关闭 = 0）：本地模型慢，默认不掐；
+  // 想防「一直有输出但永远跑不完」就 `xzh config inspect 60`（或临时设环境变量）。
+  const maxMinutes = inspectMaxMinutes(config);
+  const totalTimer =
+    maxMinutes > 0
+      ? setTimeout(() => {
+          abortReason = `总时长超过 ${maxMinutes} 分钟（xzh config inspect 可调整）`;
+          controller.abort();
+        }, maxMinutes * 60_000)
+      : null;
   try {
     await agent.run(
       `巡检原因：${reason}\n\n当前上下文：\n${await contextSection()}\n` +
@@ -437,7 +444,7 @@ export async function runAInspect(
     return { summary: text.slice(0, SUMMARY_LIMIT), toolCalls, error: message };
   } finally {
     clearTimeout(idleTimer);
-    clearTimeout(totalTimer);
+    if (totalTimer) clearTimeout(totalTimer);
     touch = () => undefined;
     delete process.env.XZH_A_INSPECT;
   }

@@ -636,6 +636,8 @@ ${ansi.bold}用法${ansi.reset}（按英文字母排序）
   ${ansi.green}xzh config edit${ansi.reset}         使用 nano 编辑配置文件
   ${ansi.green}xzh config init${ansi.reset}         生成默认配置文件
   ${ansi.green}xzh config path${ansi.reset}         打印配置文件路径
+  ${ansi.green}xzh config inspect${ansi.reset}      查看巡检总时长上限（默认不限，只受空闲 3 分钟约束）
+  ${ansi.green}xzh config inspect 60${ansi.reset}   设置巡检总时长上限（分钟）；off 取消
   ${ansi.green}xzh device${ansi.reset}              与手机上的 AutoJs6 / AutoX.js 通信（设备桥）
   ${ansi.green}xzh device apk${ansi.reset}          查看/安装手机端 AutoJs6 的安装包
   ${ansi.green}xzh device check${ansi.reset}        体检：无障碍服务是否就绪、能否操作手机

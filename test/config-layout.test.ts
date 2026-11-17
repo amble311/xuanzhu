@@ -116,3 +116,26 @@ describe("全局目录布局", () => {
     expect(fs.readFileSync(path.join(home, "config.json"), "utf8")).toBe("old");
   });
 });
+
+describe("巡检总时长上限（inspectMaxMinutes）", () => {
+  const origin = process.env.XZH_INSPECT_MAX_MINUTES;
+  afterAll(() => {
+    if (origin === undefined) delete process.env.XZH_INSPECT_MAX_MINUTES;
+    else process.env.XZH_INSPECT_MAX_MINUTES = origin;
+  });
+
+  it("默认不限（0）；配置与人环境变量都能覆盖，环境变量优先", async () => {
+    const { DEFAULT_CONFIG, inspectMaxMinutes } = await import("../src/config/store");
+    delete process.env.XZH_INSPECT_MAX_MINUTES;
+    // 默认：0 = 不限（只受空闲超时约束）
+    expect(inspectMaxMinutes({ ...DEFAULT_CONFIG })).toBe(0);
+    // 配置里设 60
+    expect(inspectMaxMinutes({ ...DEFAULT_CONFIG, inspectMaxMinutes: 60 })).toBe(60);
+    // 环境变量优先于配置（临时调试不用改文件）
+    process.env.XZH_INSPECT_MAX_MINUTES = "30";
+    expect(inspectMaxMinutes({ ...DEFAULT_CONFIG, inspectMaxMinutes: 60 })).toBe(30);
+    // 非法值忽略，回落到配置
+    process.env.XZH_INSPECT_MAX_MINUTES = "abc";
+    expect(inspectMaxMinutes({ ...DEFAULT_CONFIG, inspectMaxMinutes: 60 })).toBe(60);
+  });
+});

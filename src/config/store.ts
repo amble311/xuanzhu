@@ -150,6 +150,14 @@ export interface XuanZhuConfig {
   /** 兼容默认值迁移的标记：写过一次就不再覆写用户的自治等级选择 */
   autonomyMigrated?: boolean;
   /**
+   * 巡检**总时长上限**（分钟）：0 / 省略 = 不限（只受「空闲 3 分钟」约束）。
+   *
+   * 本地小模型推理慢，一轮巡检（10+ 次工具调用 + 长结论）可能远超 15 分钟；
+   * 默认不设上限，避免模型正在写结论时被掐断。想兜底就设成 60 之类的大值。
+   * 环境变量 `XZH_INSPECT_MAX_MINUTES` 优先级更高（临时调试用）。
+   */
+  inspectMaxMinutes?: number;
+  /**
    * 是否让玄猪接管鼠标（滚轮滚动输出区 + 拖拽选中复制）。
    *
    * true（默认）：
@@ -245,6 +253,9 @@ export const DEFAULT_CONFIG: XuanZhuConfig = {
   // （同一工具 + 同一参数连续 4 次即中止），且达到上限时还会询问是否继续，
   // 因此放宽是安全的。
   maxToolRounds: 200,
+  // 巡检总时长默认**不限制**（0）：本地模型慢，按总时长掐断只会得到空结论；
+  // 真正防挂死的是空闲 3 分钟超时。要兜底用 `xzh config inspect 60`。
+  inspectMaxMinutes: 0,
   autoApprove: true,
   // 自治等级默认 auto：与 autoApprove=true 一致，但显式写出来 ——
   // 否则读配置的人只能靠「未设置时按 autoApprove 推导」这条隐式规则去猜。
@@ -302,6 +313,24 @@ function migrateAutonomy(
 }
 
 /** 读取配置；不存在时返回默认配置（不写盘） */
+/** 巡检总时长上限的默认值：0 = 不限（只受空闲超时约束） */
+export const DEFAULT_INSPECT_MAX_MINUTES = 0;
+
+/**
+ * 巡检总时长上限（分钟），0 表示不限。
+ *
+ * 优先级：环境变量 `XZH_INSPECT_MAX_MINUTES` > 配置 `inspectMaxMinutes` > 0（不限）。
+ * 环境变量放前面是为了「临时跑一次 / 排查」不用改配置；日常用 `xzh config inspect 60` 落盘。
+ */
+export function inspectMaxMinutes(config?: XuanZhuConfig): number {
+  const env = Number(process.env.XZH_INSPECT_MAX_MINUTES);
+  if (Number.isFinite(env) && env > 0) return Math.floor(env);
+  const current = config ?? loadConfig();
+  const value = Number(current.inspectMaxMinutes);
+  if (Number.isFinite(value) && value > 0) return Math.floor(value);
+  return DEFAULT_INSPECT_MAX_MINUTES;
+}
+
 export function loadConfig(): XuanZhuConfig {
   const file = getConfigPath();
   try {
@@ -369,6 +398,10 @@ function mergeConfig(partial: Partial<XuanZhuConfig>): XuanZhuConfig {
     },
     providers: { ...DEFAULT_CONFIG.providers, ...(partial.providers ?? {}) },
     maxToolRounds: partial.maxToolRounds ?? DEFAULT_CONFIG.maxToolRounds,
+    inspectMaxMinutes:
+      Number.isFinite(partial.inspectMaxMinutes) && (partial.inspectMaxMinutes ?? 0) > 0
+        ? Math.floor(partial.inspectMaxMinutes as number)
+        : DEFAULT_CONFIG.inspectMaxMinutes,
     autoApprove: partial.autoApprove ?? DEFAULT_CONFIG.autoApprove,
     autonomy: partial.autonomy ?? DEFAULT_CONFIG.autonomy,
     autonomyMigrated: partial.autonomyMigrated,
@@ -481,6 +514,8 @@ export function redactConfig(config: XuanZhuConfig): unknown {
     temperature: config.temperature,
     promptCache: config.promptCache !== false,
     maxToolRounds: config.maxToolRounds,
+    // 0 = 不限；巡检只受「空闲 3 分钟」约束
+    inspectMaxMinutes: config.inspectMaxMinutes ?? DEFAULT_CONFIG.inspectMaxMinutes,
     autoApprove: config.autoApprove,
     memoryMaxChars: config.memoryMaxChars ?? DEFAULT_CONFIG.memoryMaxChars,
     globalMemoryMaxChars:

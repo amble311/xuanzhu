@@ -3,6 +3,7 @@ import * as fs from "fs";
 import {
   configExists,
   DEFAULT_CONFIG,
+  inspectMaxMinutes,
   loadConfig,
   redactConfig,
   saveConfig,
@@ -15,6 +16,7 @@ import { ensureDir, getConfigSubdir, getConfigPath } from "../../utils/paths";
  * `xzh config edit`   使用 nano 编辑配置文件
  * `xzh config path`   打印配置文件路径
  * `xzh config init`   生成默认配置文件
+ * `xzh config inspect [分钟|off]`  查看 / 设置巡检总时长上限（默认不限）
  */
 export async function configCommand(args: string[]): Promise<void> {
   const sub = args[0];
@@ -37,16 +39,52 @@ export async function configCommand(args: string[]): Promise<void> {
       process.stdout.write(`${ansi.green}✓ 已生成默认配置：${getConfigPath()}${ansi.reset}\n`);
       return;
     }
+    case "inspect":
+      return inspectSettings(args[1]);
     case undefined:
       return showConfig();
     default:
       process.stdout.write(
         `${ansi.red}未知子命令：${sub}${ansi.reset}\n` +
-          `${ansi.gray}用法：xzh config [edit|path|init]${ansi.reset}\n`,
+          `${ansi.gray}用法：xzh config [edit|path|init|inspect [分钟|off]]${ansi.reset}\n`,
       );
       process.exitCode = 1;
       return;
   }
+}
+
+/**
+ * `xzh config inspect [分钟|off]`：巡检**总时长上限**。
+ *
+ * 默认 0（不限）：本地模型慢，按总时长掐断只会得到「未生成正文结论」的空轮次。
+ * 真正的挂死保护是「空闲 3 分钟」；这里只给想兜底的人一个大上限（如 60）。
+ * 环境变量 `XZH_INSPECT_MAX_MINUTES` 优先级更高，临时调试不用改配置。
+ */
+function inspectSettings(raw?: string): void {
+  if (raw === undefined) {
+    const minutes = inspectMaxMinutes(loadConfig());
+    process.stdout.write(
+      minutes > 0
+        ? `${ansi.gray}巡检总时长上限：${ansi.reset}${minutes} 分钟${ansi.gray}（xzh config inspect off 取消）${ansi.reset}\n`
+        : `${ansi.gray}巡检总时长上限：${ansi.reset}不限${ansi.gray}（只受空闲 3 分钟约束；要兜底请 xzh config inspect 60）${ansi.reset}\n`,
+    );
+    return;
+  }
+  const normalized = raw.trim().toLowerCase();
+  const value = normalized === "off" || normalized === "0" ? 0 : Number(normalized);
+  if (!Number.isFinite(value) || value < 0) {
+    process.stdout.write(`${ansi.red}用法：xzh config inspect [分钟|off]${ansi.reset}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const config = loadConfig();
+  config.inspectMaxMinutes = Math.floor(value);
+  saveConfig(config);
+  process.stdout.write(
+    value > 0
+      ? `${ansi.green}✓ 巡检总时长上限已设为 ${Math.floor(value)} 分钟${ansi.reset}${ansi.gray}（超时会中止并写日志）${ansi.reset}\n`
+      : `${ansi.green}✓ 已取消巡检总时长上限${ansi.reset}${ansi.gray}（只受空闲 3 分钟约束）${ansi.reset}\n`,
+  );
 }
 
 function showConfig(): void {
