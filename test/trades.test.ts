@@ -6,6 +6,7 @@ import { appendAction } from "../src/btc/actions";
 import { btcTradeHistoryLines } from "../src/btc/panel-data";
 import { aTradeLines } from "../src/a/info";
 import { emptyPaperAccount, savePaperAccount } from "../src/a/paper";
+import { createOrder } from "../src/a/orders";
 
 /**
  * `/tr`：btc 实盘读本机动作账本、A 股读模拟盘账本。
@@ -80,6 +81,49 @@ describe("btc 交易记录", () => {
     expect(lines.join("\n")).toContain("二");
   });
 
+  it("未完结的开仓也记录：挂单标「挂单中」，开仓未平标「持仓中」，平仓后恢复普通记录", async () => {
+    const btcHome = process.env.XZH_BTC_HOME as string;
+    // 1) 已成交的开仓，后面没有平仓 → 持仓中
+    appendAction(btcHome, {
+      kind: "open",
+      symbol: "BTC/USDT",
+      side: "long",
+      qty: 0.002,
+      limitPrice: 70_000,
+      status: "filled",
+      reason: "周线转多",
+    });
+    // 2) 还没成交的挂单 → 挂单中
+    appendAction(btcHome, {
+      kind: "open",
+      symbol: "BTC/USDT",
+      side: "short",
+      qty: 0.001,
+      limitPrice: 90_000,
+      status: "pending",
+      reason: "等反弹",
+    });
+
+    let text = (await btcTradeHistoryLines(btcHome, "live", 20)).join("\n");
+    expect(text).toContain("未完结：持仓中");
+    expect(text).toContain("未完结：挂单中");
+
+    // 3) 平掉之后，那条开仓不再是「未完结」
+    appendAction(btcHome, {
+      kind: "close",
+      symbol: "BTC/USDT",
+      side: "long",
+      qty: 0.002,
+      status: "filled",
+      reason: "止盈",
+      pnl: 20,
+    });
+    text = (await btcTradeHistoryLines(btcHome, "live", 20)).join("\n");
+    expect(text).not.toContain("未完结：持仓中");
+    // 挂单还没成交，仍然标着
+    expect(text).toContain("未完结：挂单中");
+  });
+
   it("没有记录时给出明确提示", async () => {
     const lines = await btcTradeHistoryLines(process.env.XZH_BTC_HOME as string, "live", 20);
     expect(lines.join("\n")).toContain("暂无记录");
@@ -123,6 +167,38 @@ describe("A 股交易记录", () => {
     expect(lines[1]).toContain("-1,000.00");
     expect(lines[2]).toContain("买入 601857 中国石油");
     expect(lines.join("\n")).toContain("共 2 笔");
+  });
+
+  it("未完结的挂单与 T+1 待卖也要出现在 /tr 里，成交后自动变成成交记录", () => {
+    const account = emptyPaperAccount(NOW);
+    savePaperAccount(account);
+    const created = createOrder({
+      code: "600519",
+      name: "贵州茅台",
+      side: "buy",
+      qty: 100,
+      limitPrice: 1_500,
+      reason: "回踩 MA20",
+    });
+    expect(created.ok).toBe(true);
+
+    // T+1 待卖（monitor 私有写入，这里直接落盘，路径与 monitor 一致）
+    const pendingFile = path.join(process.env.XZH_A_HOME as string, "monitor", "run", "pending-sells.json");
+    fs.mkdirSync(path.dirname(pendingFile), { recursive: true });
+    fs.writeFileSync(
+      pendingFile,
+      JSON.stringify([{ code: "601857", name: "中国石油", reason: "跌破 MA20", since: "2026-11-13" }]),
+      "utf8",
+    );
+
+    const lines = aTradeLines(20);
+    const text = lines.join("\n");
+    expect(text).toContain("未完结 2 笔");
+    expect(text).toContain("买入 600519 贵州茅台 100 股");
+    expect(text).toContain("挂单中");
+    expect(text).toContain("T+1 待卖 601857 中国石油");
+    // 同时没有成交时也要说明
+    expect(text).toContain("暂无成交记录");
   });
 
   it("limit 生效，且默认最多 100 条", () => {

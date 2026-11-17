@@ -21,8 +21,8 @@ import {
 import { runAInspect } from "./inspect";
 import { commitRuleHit, describeRule, evaluateRules, readRules } from "./rules";
 import {
+  nextScheduledEntry,
   normalizeScheduleTimes,
-  pushSchedule,
   readScheduleQueue,
   takeDueSchedule,
 } from "./schedule";
@@ -77,8 +77,56 @@ const STOP_ATR_MULTIPLE = 1.5;
 const TRAIL_TRIGGER_PCT = 0.08;
 /** 浮盈 12% 时卖出一半，剩余继续移动止盈 */
 const PARTIAL_TAKE_PCT = 0.12;
-const CYCLE_MS = 15 * 60_000;
-const TICK_MS = 30_000;
+/**
+ * tick 间隔：**与 btc moni 一致，60 秒**。
+ *
+ * 以前是 30 秒。A 股行情源本身就是分钟级推送，30 秒内的第二次查询通常拿到同一笔成交价，
+ * 而每 tick 要拉持仓行情 + 跑规则 + 跑撮合，等于把请求量白白翻倍。
+ */
+const TICK_MS = 60_000;
+/** 监控规则评估节流（对齐 btc 的 `TRIGGER_EVAL_INTERVAL_MS`） */
+const RULE_EVAL_INTERVAL_MS = 5 * 60_000;
+/** 挂单时效叫醒节流（对齐 btc 的 `ORDER_TTL_CHECK_INTERVAL_MS`） */
+const ORDER_TTL_INTERVAL_MS = 5 * 60_000;
+/** 行情健康探测节流（对齐 btc 的 `MARKET_HEALTH_INTERVAL_MS`） */
+const MARKET_HEALTH_INTERVAL_MS = 5 * 60_000;
+/** 数据同步间隔（对齐 btc 的 `DEFAULT_SYNC_INTERVAL_MIN = 15`） */
+const SYNC_INTERVAL_MS = 15 * 60_000;
+/** 排期队列为空时的兜底巡检间隔（对齐 btc 的 `DEFAULT_CHECK_MINUTES = 60`） */
+const FALLBACK_CHECK_MS = 60 * 60_000;
+/** 监控叫醒限流：10 分钟内最多 2 次（btc `monitorWakeAllowed` 同款） */
+const WAKE_WINDOW_MS = 10 * 60_000;
+const WAKE_LIMIT = 2;
+/** 行情健康探测用的标的：上证指数（单只票停牌不该被当成「行情源挂了」） */
+const MARKET_PROBE_CODE = "1A0001";
+/** 连续几次探测失败才叫醒（btc 同款：连续两次） */
+const MARKET_FAILURE_THRESHOLD = 2;
+/** 拉持仓行情的并发（行情源限频，btc 侧也是 3–6） */
+const QUOTE_CONCURRENCY = 6;
+
+/**
+ * 各阶段间隔（导出给测试用：**必须与 btc moni 保持一致**）。
+ *
+ * 这些值不是随便挑的 —— btc 那边有同样的常量，改一边不改另一边就会出现
+ * 「A 股 30 秒、btc 60 秒」这种口径漂移（之前文档写 60 秒、代码是 30 秒，就是这么来的）。
+ */
+export const A_MONITOR_INTERVALS = {
+  /** tick 间隔（btc `TICK_MS`） */
+  tickMs: TICK_MS,
+  /** 监控规则评估（btc `TRIGGER_EVAL_INTERVAL_MS`） */
+  ruleMs: RULE_EVAL_INTERVAL_MS,
+  /** 挂单时效叫醒（btc `ORDER_TTL_CHECK_INTERVAL_MS`） */
+  orderTtlMs: ORDER_TTL_INTERVAL_MS,
+  /** 行情健康探测（btc `MARKET_HEALTH_INTERVAL_MS`） */
+  marketHealthMs: MARKET_HEALTH_INTERVAL_MS,
+  /** 数据同步（btc `DEFAULT_SYNC_INTERVAL_MIN`） */
+  syncMs: SYNC_INTERVAL_MS,
+  /** 队列空兜底（btc `DEFAULT_CHECK_MINUTES`） */
+  fallbackMs: FALLBACK_CHECK_MS,
+  /** 监控叫醒窗口与次数上限（btc `monitorWakeAllowed`） */
+  wakeWindowMs: WAKE_WINDOW_MS,
+  wakeLimit: WAKE_LIMIT,
+} as const;
 const LOCK_FILE = "run/monitor.lock";
 const STATE_FILE = "run/monitor.json";
 const ACTIONS_FILE = "actions.jsonl";
@@ -505,141 +553,341 @@ export async function runAServe(): Promise<void> {
   /** 非交易日只记一次日志，避免每分钟刷屏 */
   let nonTradingLoggedFor = "";
 
-  const cycle = async (): Promise<void> => {
-    const at = new Date();
-    refresh(at);
+  // ── 与 btc moni 对齐的节流状态（进程内存，重启清零无所谓）──
+  let lastRuleEvalAt = 0;
+  let lastOrderTtlAt = 0;
+  let lastSyncAt = 0;
+  let lastMarketHealthAt = 0;
+  /** 行情连续失败次数 / 最近错误 / 是否已叫醒过 */
+  let marketFailures = 0;
+  let lastMarketError = "";
+  /** 最近一次探测成功的时间（btc 的 `lastMarketOkAt`，写进 marketNote 便于排查） */
+  let lastMarketOkAt: string | undefined;
+  let marketAlerted = false;
+  let wakeWindowAt = 0;
+  let wakeCount = 0;
 
-    // 固定任务：收盘后 1 小时重新选股（只更新自选股，持仓强制保留）。
-    // 它不交易，因此暂停巡检时也照常执行；放在交易窗口判断之前，因为 16:00 已收盘。
-    if (shouldRunAfterCloseSelection(at, state.lastSelectDay, state.lastSelectAttemptAt)) {
-      if (selecting) return;
-      selecting = true;
-      try {
-        const selected = await maybeRunAfterCloseSelection(at, state);
-        if (selected) refresh(new Date());
-      } finally {
-        selecting = false;
-      }
+  /** 对齐 btc `monitorWakeAllowed()`：监控叫醒限流，10 分钟内最多 2 次 */
+  const monitorWakeAllowed = (now: number): boolean => {
+    if (now - wakeWindowAt > WAKE_WINDOW_MS) {
+      wakeWindowAt = now;
+      wakeCount = 0;
     }
+    if (wakeCount >= WAKE_LIMIT) return false;
+    wakeCount += 1;
+    return true;
+  };
 
-    // 不在交易时段（集合竞价 / 午休 / 收盘后 / 周末）完全不拉行情：价格是冻结的，
-    // 逐 tick 重拉持仓行情与 15m K 线只是白烧请求，而且会让巡检拿到假价格。
-    if (!inTradingWindow(at)) return;
+  /**
+   * 行情健康探测（对齐 btc 的 `checkMarketHealth`）。
+   *
+   * 拉不到行情时，任何「现在能不能买」的判断都建立在昨天的价格上；连续 2 次失败就立刻
+   * 叫醒一轮排查，而不是等下一次排期（可能是几小时后）。探测用上证指数：
+   * 单只股票停牌/退市不该被当成「行情源挂了」。
+   */
+  const checkMarketHealth = async (at: Date): Promise<void> => {
+    const now = at.getTime();
+    if (now - lastMarketHealthAt < MARKET_HEALTH_INTERVAL_MS) return;
+    lastMarketHealthAt = now;
+    try {
+      await fetchQuote(MARKET_PROBE_CODE);
+      if (marketFailures > 0) log(`行情已恢复（此前连续失败 ${marketFailures} 次）`);
+      marketFailures = 0;
+      lastMarketError = "";
+      lastMarketOkAt = at.toISOString();
+      marketAlerted = false;
+    } catch (err) {
+      marketFailures += 1;
+      lastMarketError = err instanceof Error ? err.message : String(err);
+      log(`行情探测失败（连续 ${marketFailures} 次）：${lastMarketError}`);
+    }
+  };
 
-    // 交易日闸门：`inTradingWindow()` 只按星期 + 时间判断，节假日落在工作日时会误判为
-    // 「可以巡检」。这里用真实日历（上证指数日线）再拦一道：非交易日直接返回，
-    // 不拉行情、不撮合、不叫模型 —— 这才是「避免空跑」的地方。
+  /** 对齐 btc `shouldAlertMarket()`：连续失败到阈值、且本轮还没叫醒过 */
+  const shouldAlertMarket = (): boolean =>
+    marketFailures >= MARKET_FAILURE_THRESHOLD && !marketAlerted;
+
+  /**
+   * 数据同步（对齐 btc 的 `runSyncIfDue`，15 分钟一次）。
+   *
+   * A 股没有本地 K 线库，这里的「同步」是确保**日线指标缓存**没过期：
+   * 过期时 `loadIndicators()` 会重算全市场（5000+ 只），宁可现在算完，
+   * 也别在模型巡检中途卡两分钟。
+   */
+  const runSyncIfDue = async (at: Date): Promise<void> => {
+    if (at.getTime() - lastSyncAt < SYNC_INTERVAL_MS) return;
+    lastSyncAt = at.getTime();
+    const started = Date.now();
+    try {
+      const indicators = await loadIndicators();
+      log(
+        `数据同步：日线指标 ${indicators.size} 只（${Math.round((Date.now() - started) / 1000)}s）`,
+      );
+    } catch (err) {
+      log(`数据同步失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  /** 对齐 btc `runInspect()`：跑一轮并把结果写回状态 / 送达标记（所有叫醒路径共用） */
+  const runInspectRound = async (
+    reason: string,
+    options: {
+      triggerNote?: string;
+      orderNote?: string;
+      ruleHit?: Parameters<typeof commitRuleHit>[0];
+      marketAlert?: boolean;
+    } = {},
+  ): Promise<void> => {
+    // 风控告警只随巡检送一次（对齐 btc `runInspect()`：`riskAlert` 由本轮带走，成功才标记送达）。
+    // tick 不再为风控单独叫醒 —— 空仓/无告警时靠规则与排期，避免「定时必须启动一轮」。
+    const riskState = readRiskState();
+    const riskTriggered = Boolean(riskState?.triggered);
+    const positionAlerts = readPositionRisks().alerts.length;
+
+    state.lastInspectReason = reason;
+    log(`唤醒巡检：${reason}`);
+    const result = await runAInspect(reason, {
+      origin: "inspect",
+      triggerNote: options.triggerNote,
+      orderNote: options.orderNote,
+    });
+    // 命中即消费的规则（`once`）只在巡检**成功**后落盘 ——
+    // 失败时保留，否则「叫醒了但模型报错」会把一次性规则直接删掉（btc `if (ok) commit()` 同款）。
+    if (!result.error) {
+      if (options.ruleHit) commitRuleHit(options.ruleHit);
+      if (riskTriggered) markRiskDelivered();
+      if (positionAlerts > 0) markPositionRisksDelivered();
+      if (options.marketAlert) marketAlerted = true;
+    }
+    state.lastInspectAt = iso(new Date());
+    state.lastInspectSummary = result.summary;
+    state.lastInspectTools = result.toolCalls;
+    state.lastAction = result.summary;
+    state.lastError = result.error;
+    // 失败**不**写退避排期：与 btc 一致，队列留空由 60 分钟兜底接手；
+    // 写一条 15 分钟排期反而会让「队列为空」不成立，兜底永远等不到。
+  };
+
+  // ── 阶段函数：命名与 btc moni 一一对应（`src/btc/daemon-main.ts` 里的同名函数）──
+  // 原则：`cycle()` 只负责**按顺序调用**这些阶段并决定要不要叫醒，具体动作都在这里。
+
+  /** 收盘后固定选股（A 股特有；与 btc 的同步一样「不交易也跑」），与 `handleMessage` 无关 */
+  const runAfterCloseSelectionIfDue = async (at: Date): Promise<void> => {
+    if (!shouldRunAfterCloseSelection(at, state.lastSelectDay, state.lastSelectAttemptAt)) return;
+    if (selecting) return;
+    selecting = true;
+    try {
+      const selected = await maybeRunAfterCloseSelection(at, state);
+      if (selected) refresh(new Date());
+    } finally {
+      selecting = false;
+    }
+  };
+
+  /**
+   * 交易时段 + 交易日闸门（A 股特有；btc 7×24 没有这一层）。
+   *
+   * `inTradingWindow()` 只按星期 + 时间判断，节假日落在工作日时会误判成「可以巡检」，
+   * 所以必须再用真实日历兜一道：非交易日不拉行情、不撮合、不叫模型。
+   */
+  const tradingGate = async (at: Date): Promise<boolean> => {
+    if (!inTradingWindow(at)) return false;
     const tradingDay = await todayTradingStatus(at);
-    if (!tradingDay.tradingDay) {
-      if (nonTradingLoggedFor !== tradingDay.today) {
-        nonTradingLoggedFor = tradingDay.today;
-        log(`今天不是交易日，跳过巡检与撮合：${describeTradingDay(tradingDay)}`);
-      }
-      return;
+    if (tradingDay.tradingDay) return true;
+    if (nonTradingLoggedFor !== tradingDay.today) {
+      nonTradingLoggedFor = tradingDay.today;
+      log(`今天不是交易日，跳过巡检与撮合：${describeTradingDay(tradingDay)}`);
     }
+    return false;
+  };
 
-    // 硬风控与 btc 对齐：只落盘 + 告警，不自动交易；工作时段内即使暂停也检查
+  /**
+   * 对齐 btc `checkRisk()`：持仓行情 + 账户级 / 单票级硬风控 + 持仓风险告警。
+   *
+   * 只读 + 落盘，不自动交易；暂停时也照跑（用户可能手动开了仓，浮亏一样要监控）。
+   */
+  const checkRisk = async (
+    at: Date,
+  ): Promise<{
+    account: PaperAccount;
+    heldQuotes: Map<string, Quote>;
+    accountRisk: ReturnType<typeof checkAccountRisk>;
+    riskAlerts: ReturnType<typeof readPositionRisks>;
+  }> => {
     const account = loadPaperAccount(at);
-    const codes = account.positions.map((position) => position.code);
     const heldQuotes = quoteMap(
-      await mapLimit(codes, async (code) => fetchQuote(code).catch(() => null), 6),
+      await mapLimit(
+        account.positions.map((position) => position.code),
+        async (code) => fetchQuote(code).catch(() => null),
+        QUOTE_CONCURRENCY,
+      ),
     );
     const accountRisk = checkAccountRisk(account, heldQuotes, at);
     await detectPositionRisks(at, heldQuotes);
-    const riskAlerts = readPositionRisks();
+    return { account, heldQuotes, accountRisk, riskAlerts: readPositionRisks() };
+  };
 
+  /**
+   * 对齐 btc 的「读账本即撮合」。
+   *
+   * btc moni 没有独立的撮合函数：撮合是 Python `paper.status()` 里的 `try_fill()` 副作用，
+   * daemon 每 tick 读一次 `paper-status` 就等于每 tick 撮合一次。A 股账本是纯读的，
+   * 所以这里显式调 `processPendingOrders()`，语义仍是「读账本 = 账本回到当前状态」。
+   */
+  const matchPendingOrders = async (
+    at: Date,
+  ): Promise<{ actions: string[]; expired: PendingOrder[] }> => {
+    const session = await continuousSession(at);
+    const pending = await processPendingOrders(at, session.open);
+    if (pending.actions.length > 0) {
+      state.lastAction = pending.actions[0];
+      log(pending.actions.join("；"));
+    }
+    return pending;
+  };
+
+  /** 对齐 btc `checkEvents(hasExposure)`：到点的市场事件（优先级高于挂单 / 规则 / 排期） */
+  const checkEvents = (at: Date, hasExposure: boolean) =>
+    takeMarketEvent(at, { hasExposure });
+
+  /**
+   * 对齐 btc `checkOrderTtl()`：挂单超时未成交 → 叫醒模型决定撤单 / 改价 / 继续等。
+   *
+   * 过期单本身在撮合阶段已经处理掉，这里只做「要不要叫醒」的 5 分钟节流。
+   */
+  const checkOrderTtl = (now: number, expired: PendingOrder[]): PendingOrder[] => {
+    if (expired.length === 0 || now - lastOrderTtlAt < ORDER_TTL_INTERVAL_MS) return [];
+    lastOrderTtlAt = now;
+    return expired;
+  };
+
+  /** 对齐 btc `checkTriggers()`：监控规则 5 分钟节流，命中就返回规则 */
+  const checkTriggers = async (
+    now: number,
+    at: Date,
+    heldQuotes: Map<string, Quote>,
+  ): Promise<Awaited<ReturnType<typeof checkMonitorRules>>> => {
+    if (now - lastRuleEvalAt < RULE_EVAL_INTERVAL_MS) return null;
+    lastRuleEvalAt = now;
+    return checkMonitorRules(at, heldQuotes);
+  };
+
+  /**
+   * 对齐 btc 的兜底判断（`DEFAULT_CHECK_MINUTES = 60`）。
+   *
+   * 只有**队列里没有任何排期**、且距上次巡检已满 60 分钟才兜底 —— 模型排好期就不会多跑一轮。
+   */
+  const fallbackDue = (now: number): boolean => {
+    if (nextScheduledEntry() !== null) return false;
+    const lastInspect = state.lastInspectAt ? Date.parse(state.lastInspectAt) : 0;
+    return lastInspect === 0 || now - lastInspect >= FALLBACK_CHECK_MS;
+  };
+
+  /**
+   * 一轮完整判断：**只负责按顺序调用阶段函数**，结构与 btc moni 的 `tick()` 一致。
+   *
+   * 优先级（btc 同序）：行情故障 → 市场事件 → 挂单时效 → 监控规则 → 风控 → 排期 → 兜底；
+   * 每命中一类就立刻跑一轮巡检并 return（不占排期队列）。
+   */
+  const cycle = async (): Promise<void> => {
+    const at = new Date();
+    const now = at.getTime();
+    refresh(at);
+
+    // 0) 收盘后固定选股（A 股特有；先于时段判断，因为 16:00 已收盘）
+    await runAfterCloseSelectionIfDue(at);
+
+    // 1) 交易时段 + 交易日闸门（A 股特有）
+    if (!(await tradingGate(at))) return;
+
+    // 2) 风控：与 btc `checkRisk()` 一样，暂停也检查（只落盘 + 告警，不单独叫醒）
+    const { account, heldQuotes } = await checkRisk(at);
+
+    // 3) 暂停：btc 在 `/stop` 下也只跑风控
     if (isPaused()) return;
 
     try {
-      // 撮合闸门是**连续竞价**（09:30–11:30 / 13:00–15:00 且当天是交易日）：
-      // 工作窗口只判时段、不判交易日，节假日靠这道闸门拦住，不按冻结价成交。
-      const session = await continuousSession(at);
-      const pending = await processPendingOrders(at, session.open);
-      const orderActions = pending.actions;
-      if (orderActions.length > 0) {
-        state.lastAction = orderActions[0];
-        log(orderActions.join("；"));
-      }
-      const riskState = readRiskState();
-      // 账户级与单票级都算「有风控」，但只有账户级会禁止全账户买入
-      const riskTriggered = accountRisk.triggered || accountRisk.locks.length > 0;
-      const riskPending = riskTriggered && !(riskState?.delivered ?? false);
-      const positionRiskPending = riskAlerts.alerts.length > 0 && !riskAlerts.delivered;
+      // 4) 数据同步（btc `runSyncIfDue()`，15 分钟）
+      await runSyncIfDue(at);
 
-      const hit = await checkMonitorRules(at, heldQuotes);
-      const due = takeDueSchedule(at);
-      const event = takeMarketEvent(at);
+      // 5) 撮合（btc 是 `paper-status` 里的 `try_fill()` 副作用，A 股显式调用）
+      const pending = await matchPendingOrders(at);
+      // 账本已变（成交 / 撤销），先把状态落盘再判断要不要叫醒（btc 每个阶段后都 refreshQueueState）
+      refresh(new Date());
 
-      // 只由「规则命中 / 排期到期 / 市场事件 / 风控」叫醒巡检。
-      // 曾经还有个「距上次巡检满 60 分钟就兜底跑一轮」的固定节拍（最早那版遗留），
-      // 它会在模型已经排好下一轮的情况下凭空多跑一轮（12:32 那种「兜底巡检」），
-      // 且容易撞上午休/收盘前后，已删除；模型漏排期由 `runAInspect` 结尾的 30 分钟兜底补上。
-      if (!hit && !due && !event && !riskPending && !positionRiskPending) {
+      // 6) 行情故障（btc `checkMarketHealth()` 只记状态 → `shouldAlertMarket()` 判定）
+      await checkMarketHealth(at);
+      if (shouldAlertMarket()) {
+        if (!monitorWakeAllowed(now)) {
+          log("行情故障叫醒已达 10 分钟上限，本轮跳过（下一轮再试）");
+          return;
+        }
+        await runInspectRound(`行情获取连续失败 ${marketFailures} 次`, {
+          triggerNote:
+            `行情故障：连续 ${marketFailures} 次拉不到上证指数` +
+            `（最近错误：${lastMarketError || "未知"}；` +
+            `最后一次成功：${lastMarketOkAt ?? "启动以来没有成功过"}）`,
+          marketAlert: true,
+        });
         return;
       }
 
-      const positionReason =
-        positionRiskPending
-          ? `持仓风控：${riskAlerts.alerts
-              .map((item) => `${item.code} ${item.reason}${item.sellable ? "" : "（T+1 不可卖）"}`)
-              .join("；")}`
-          : undefined;
-      const riskReason = accountRisk.triggered
-        ? `账户级硬风控：${accountRisk.reasons.join("；")}`
-        : accountRisk.locks.length > 0
-          ? `单票硬风控：${accountRisk.locks
-              .map((lock) => `${lock.code} ${lock.name} ${lock.reason}`)
-              .join("；")}`
-          : undefined;
-      const reason =
-        (positionReason ??
-          (riskPending ? riskReason : undefined)) ??
-        hit?.reason ??
-        due?.reason ??
-        event?.reason ??
-        "定时检查";
-      state.lastInspectReason = reason;
-      log(`唤醒巡检：${reason}`);
-      // 叫醒来源要带进提示词：只说「巡检」会让模型当成常规轮次，回一句「无变化」
-      const triggerNote = hit
-        ? `${describeRule(hit.rule)}（${hit.reason}）`
-        : event
-          ? `市场事件：${event.reason}`
-          : undefined;
-      const orderNote =
-        pending.expired.length > 0
-          ? pending.expired
-              .map(
-                (order) =>
-                  `${describeOrder(order)} 已于 ${order.expiresAt} 过期（原因：${order.reason}）`,
-              )
-              .join("\n")
-          : undefined;
-      const result = await runAInspect(reason, { origin: "inspect", triggerNote, orderNote });
-      if (hit) commitRuleHit(hit.rule);
-      if (!result.error) {
-        if (riskTriggered) markRiskDelivered();
-        if (riskAlerts.alerts.length > 0) markPositionRisksDelivered();
+      // 7) 市场事件（btc `checkEvents(hasExposure)`，优先于挂单 / 规则 / 排期）
+      // 空仓不靠定时事件叫醒：模型在巡检里用 `a_trigger` 设好条件，命中自然会唤醒。
+      const hasExposure =
+        account.positions.length > 0 || listOrders().some((order) => order.status === "open");
+      const event = checkEvents(at, hasExposure);
+      if (event) {
+        await runInspectRound(event.reason, { triggerNote: `市场事件：${event.reason}` });
+        return;
       }
-      state.lastInspectAt = iso(new Date());
-      state.lastInspectSummary = result.summary;
-      state.lastInspectTools = result.toolCalls;
-      state.lastAction = result.summary;
-      state.lastError = result.error;
 
-      if (result.error) {
-        const entry = pushSchedule({
-          minutes: 15,
-          reason: `巡检失败退避：${result.error}`,
-          slot: "next",
-          origin: "inspect",
+      // 8) 挂单时效（btc `checkOrderTtl()`，5 分钟节流）
+      const expired = checkOrderTtl(now, pending.expired);
+      if (expired.length > 0) {
+        if (!monitorWakeAllowed(now)) {
+          log("挂单时效叫醒已达 10 分钟上限，本轮跳过（过期单仍在）");
+          return;
+        }
+        const orderNote = expired
+          .map(
+            (order) =>
+              `${describeOrder(order)} 已于 ${order.expiresAt} 过期（原因：${order.reason}）`,
+          )
+          .join("\n");
+        await runInspectRound(`挂单过期：${expired.map((order) => order.code).join("、")}`, {
+          orderNote,
         });
-        state.nextCheckAt = entry.at;
+        return;
       }
+
+      // 9) 监控规则（btc `checkTriggers()`，5 分钟节流）
+      const hit = await checkTriggers(now, at, heldQuotes);
+      if (hit) {
+        if (!monitorWakeAllowed(now)) {
+          log("规则叫醒已达 10 分钟上限，本轮跳过（条件保留，下一轮再试）");
+          return;
+        }
+        await runInspectRound(hit.reason, {
+          triggerNote: `${describeRule(hit.rule)}（${hit.reason}）`,
+          ruleHit: hit.rule,
+        });
+        return;
+      }
+
+      // 10) 排期到期（tick 60 秒 = 排期精度 60 秒）
+      const due = takeDueSchedule(at);
+      if (due) {
+        await runInspectRound(due.reason);
+        return;
+      }
+
+      // 11) 队列空兜底（btc `DEFAULT_CHECK_MINUTES = 60`）
+      if (fallbackDue(now)) await runInspectRound("排期队列为空，兜底巡检");
     } catch (err) {
+      // 与 btc 一样只记日志：排期由模型决定，漏排期由第 11 步兜底接手
       state.lastError = err instanceof Error ? err.message : String(err);
       log(`巡检失败：${state.lastError}`);
-      pushSchedule({ minutes: 15, reason: "巡检异常退避", slot: "next", origin: "inspect" });
     } finally {
       refresh(new Date());
     }

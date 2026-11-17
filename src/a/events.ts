@@ -60,9 +60,20 @@ function writeState(state: EventState): void {
   fs.renameSync(tmp, file);
 }
 
-/** 取当前应触发的事件（每天一次）；返回 null 表示没有 */
-export function takeMarketEvent(now = new Date()): { id: string; reason: string } | null {
+/**
+ * 取当前应触发的事件（每天一次）；返回 null 表示没有。
+ *
+ * `hasExposure=false`（空仓且无挂单）时**不触发**：对齐 btc 的 `checkEvents(hasExposure)`。
+ * 空仓时定时叫醒模型只是白烧 token —— 需要盯的价位/形态由模型在巡检里用 `a_trigger`
+ * 设好，命中后自然会唤醒，不需要「每天固定几个时点必须跑一轮」。
+ * 注意此时**不写** `handled`：当天后来开了仓，该事件仍可正常触发。
+ */
+export function takeMarketEvent(
+  now = new Date(),
+  options: { hasExposure?: boolean } = {},
+): { id: string; reason: string } | null {
   if (now.getDay() === 0 || now.getDay() === 6) return null;
+  if (options.hasExposure === false) return null;
   const minutes = now.getHours() * 60 + now.getMinutes();
   const state = readState(now);
   const due = EVENTS.filter(

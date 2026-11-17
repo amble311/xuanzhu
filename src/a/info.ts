@@ -5,6 +5,7 @@ import { maxPositions, poolSize } from "./settings";
 import { describeRule, readRules } from "./rules";
 import { readScheduleQueue } from "./schedule";
 import { aActionsPath, aServiceStatus, readPendingSells } from "./monitor";
+import { listOrders } from "./orders";
 import * as fs from "fs";
 import { formatLocalTime } from "../utils/time";
 
@@ -310,14 +311,40 @@ export function aInfoLines(data: APanelData): string[] {
 }
 
 /**
- * `/tr` 的纯文本输出：最近 N 笔模拟盘成交（最新在前）。
+ * `/tr` 的纯文本输出：**未完结的挂单 / 待卖** + 最近 N 笔成交（最新在前）。
  *
- * 只读本地账本（`paper.json`），不拉行情 —— 交易记录要能离线、秒开。
+ * 只读本地账本（`paper.json` / `orders.json` / `pending-sells.json`），不拉行情 ——
+ * 交易记录要能离线、秒开。
+ *
+ * 为什么要列未完结：以前只列 `trades`（已成交），用户盘中挂了限价单、或 T+1 待卖时
+ * 在 `/tr` 里什么都看不到，只能去 `/info` 或翻日志。挂单成交 / 撤销后，它会自动
+ * 出现在下面的成交记录里（账本本身是追加式的，不需要改历史）。
  */
 export function aTradeLines(limit = 20): string[] {
   const shown = Math.min(100, Math.max(1, Math.floor(limit) || 20));
   const account = loadPaperAccount();
   const lines = ["A 股交易记录（模拟盘 · 最新在前）"];
+
+  const openOrders = listOrders().filter((order) => order.status === "open");
+  const pendingSells = readPendingSells();
+  if (openOrders.length > 0 || pendingSells.length > 0) {
+    lines.push(
+      `未完结 ${openOrders.length + pendingSells.length} 笔（成交 / 撤销后自动变成成交记录）：`,
+    );
+    for (const order of openOrders) {
+      lines.push(
+        `  ${order.side === "buy" ? "买入" : "卖出"} ${order.code} ${order.name} ${order.qty} 股` +
+          ` @ ${fmt(order.limitPrice)}  挂单中（有效至 ${formatLocalTime(order.expiresAt, "datetime")}）` +
+          `  ${order.reason}`,
+      );
+    }
+    for (const sell of pendingSells) {
+      lines.push(
+        `  T+1 待卖 ${sell.code} ${sell.name}  首次触发 ${sell.since}  ${sell.reason}`,
+      );
+    }
+  }
+
   if (account.trades.length === 0) {
     lines.push("暂无成交记录。");
     return lines;

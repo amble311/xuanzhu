@@ -237,6 +237,16 @@ describe("市场事件", () => {
     const close = takeMarketEvent(new Date("2026-11-10T15:26:00+08:00"));
     expect(close?.id).toBe("close");
   });
+
+  it("空仓不触发定时事件，但事件不被消费（开仓后仍能触发）", () => {
+    const file = path.join(home, "monitor", "run", "events.json");
+    fs.rmSync(file, { force: true });
+    const at = new Date("2026-11-10T09:30:00+08:00");
+    // 空仓 + 无挂单：不叫醒（对齐 btc checkEvents(hasExposure)）
+    expect(takeMarketEvent(at, { hasExposure: false })).toBeNull();
+    // 没有写 handled：随后有仓位时同一个事件仍会触发
+    expect(takeMarketEvent(at, { hasExposure: true })?.id).toBe("open");
+  });
 });
 
 describe("硬风控作用域", () => {

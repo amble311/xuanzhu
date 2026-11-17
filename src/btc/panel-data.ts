@@ -334,6 +334,30 @@ export async function btcTradeHistoryLines(
     const lines = [
       `BTC 模拟盘交易记录（最近 ${rows.length} 笔已平仓，最新在前；累计 ${data.trades} 笔）`,
     ];
+
+    // 未完结：当前持仓（开了还没平）+ 未成交挂单。
+    // 以前只列 `recent_trades`（已平仓），刚开的仓在 `/tr` 里查不到，得去看面板。
+    const unfinished: string[] = [];
+    if (data.position) {
+      const position = data.position;
+      unfinished.push(
+        `  持仓中 ${position.side === "short" ? "空" : "多"} ${position.qty}` +
+          ` 开 ${fmt(position.entry_price)}` +
+          `  浮动盈亏 ${signed(position.unrealized)} USDT（${signed(position.unrealized_pct)}%）` +
+          `${position.stop_price ? `  止损 ${fmt(position.stop_price)}` : ""}`,
+      );
+    }
+    for (const order of data.open_orders ?? []) {
+      unfinished.push(
+        `  挂单待成交 ${order.side === "short" ? "空" : "多"} ${order.qty}` +
+          ` @ ${fmt(order.limit_price)}`,
+      );
+    }
+    if (unfinished.length > 0) {
+      lines.push(`未完结 ${unfinished.length} 笔（平仓 / 成交后自动并入下面的记录）：`);
+      lines.push(...unfinished);
+    }
+
     if (rows.length === 0) {
       lines.push("暂无已平仓记录。");
       return lines;
@@ -350,10 +374,24 @@ export async function btcTradeHistoryLines(
     return lines;
   }
 
-  const actions = readActions(home)
-    .filter((action) => action.kind === "open" || action.kind === "close")
-    .slice(-shown)
-    .reverse();
+  const all = readActions(home).filter(
+    (action) => action.kind === "open" || action.kind === "close",
+  );
+  // 未完结判定（实盘账本本身是追加式的，所以按时间顺序推）：
+  // - `open` 且 status=pending → 挂单还没成交；
+  // - `open` 且 status=filled、之后没有更晚的 `close` → 持仓还没平。
+  // 平仓后自然就不再命中，记录本身不需要改 —— 就是「等完结了再更新」的语义。
+  const filledOpens = all.filter((action) => action.kind === "open" && action.status === "filled");
+  const latestOpen = filledOpens[filledOpens.length - 1];
+  const closedAfterLatest =
+    latestOpen !== undefined &&
+    all.some(
+      (action) => action.kind === "close" && Date.parse(action.ts) > Date.parse(latestOpen.ts),
+    );
+  const holding = latestOpen && !closedAfterLatest ? latestOpen : undefined;
+  const pendingOpens = all.filter((action) => action.kind === "open" && action.status === "pending");
+
+  const actions = all.slice(-shown).reverse();
   const lines = [
     `BTC 交易记录（本机动作账本，最近 ${actions.length} 条，最新在前）`,
     "仅含玄猪发起的开 / 平仓；币安 App 手动交易不在其中。",
@@ -368,9 +406,13 @@ export async function btcTradeHistoryLines(
     const price = action.limitPrice ? ` @ ${fmt(action.limitPrice)}` : "";
     const pnl = action.pnl !== undefined ? `  盈亏 ${signed(action.pnl)}` : "";
     const note = action.note ? `  ${action.note}` : "";
+    // 未完结的两类单独标注：挂单没成交、持仓没平 —— 完结后会变成普通的「已成交 / 平仓」记录
+    const openPending = action === holding ? "（未完结：持仓中）" : "";
+    const stillPending = pendingOpens.includes(action) ? "（未完结：挂单中）" : "";
     lines.push(
       `${formatLocalTime(action.ts, "datetime")}  ${verb} ${action.qty ?? "?"}${price}` +
-        `  ${ACTION_STATUS[action.status] ?? action.status}${pnl}${note}  （${action.reason}）`,
+        `  ${ACTION_STATUS[action.status] ?? action.status}${openPending}${stillPending}` +
+        `${pnl}${note}  （${action.reason}）`,
     );
   }
   return lines;

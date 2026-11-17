@@ -13,7 +13,7 @@ import { sessionKind, sessionLabel } from "../exchange/ashare";
 import { describeTradingDay, todayTradingStatus } from "./trading-day";
 import { monitorDir, orderedPool } from "./watchlist";
 import { describeRule, readRules } from "./rules";
-import { nextScheduledEntry, pushSchedule, readScheduleQueue } from "./schedule";
+import { nextScheduledEntry, readScheduleQueue } from "./schedule";
 import { isPaused } from "./pause";
 import { readRiskState } from "./risk";
 import { readPositionRisks } from "./risk-alerts";
@@ -445,17 +445,9 @@ export async function runAInspect(
     appendLog(`巡检中止：${abortReason}`);
   }
 
-  // 模型必须自己排下一轮；漏了就兜底 30 分钟，避免巡检停摆
-  const next = nextScheduledEntry();
-  if (!next || Date.parse(next.at) > Date.now() + 6 * 60 * 60_000) {
-    const entry = pushSchedule({
-      minutes: 30,
-      reason: "巡检未排期，兜底",
-      slot: "next",
-      origin: options.origin === "manual" ? "manual" : "inspect",
-    });
-    appendLog(`未发现有效排期，兜底 ${entry.at}`);
-  }
+  // 不再在巡检结尾自动补排期：与 btc moni 一致，兜底由**后台 tick** 负责
+  // （队列为空且距上次巡检满 60 分钟才跑一轮，见 `monitor.ts` 第 12 步）。
+  // 模型自己漏排期时，这条兜底会接住；模型已排好期则不会凭空多跑一轮。
 
   let summary = text.trim().slice(0, SUMMARY_LIMIT);
 

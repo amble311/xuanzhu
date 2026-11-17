@@ -3,7 +3,13 @@ import * as os from "os";
 import * as path from "path";
 import { selectionNeed } from "../src/a/score";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { inTradingWindow, shouldSell } from "../src/a/monitor";
+import { A_MONITOR_INTERVALS, inTradingWindow, shouldSell } from "../src/a/monitor";
+import {
+  MARKET_HEALTH_INTERVAL_MS,
+} from "../src/btc/market-health";
+import { ORDER_TTL_CHECK_INTERVAL_MS } from "../src/btc/order-ttl";
+import { TRIGGER_EVAL_INTERVAL_MS } from "../src/btc/triggers";
+import { DEFAULT_CHECK_MINUTES } from "../src/btc/schedule";
 import { decideMarketRegime } from "../src/a/regime";
 import { computeIndicators } from "../src/a/indicators";
 import { scoreDailyDetailed } from "../src/a/score";
@@ -282,5 +288,23 @@ describe("卖点与窗口", () => {
       expect(gate.reason).toBeTruthy();
       expect(inTradingWindow(new Date(at))).toBe(false);
     }
+  });
+});
+
+describe("A 股监控节奏与 btc moni 对齐", () => {
+  it("tick / 规则 / 挂单时效 / 行情健康 / 兜底 全部同 btc", () => {
+    // tick：btc moni 是 60 秒
+    expect(A_MONITOR_INTERVALS.tickMs).toBe(60_000);
+    // 三个 5 分钟节流：直接引用 btc 的常量，避免两边各改一份
+    expect(A_MONITOR_INTERVALS.ruleMs).toBe(TRIGGER_EVAL_INTERVAL_MS);
+    expect(A_MONITOR_INTERVALS.orderTtlMs).toBe(ORDER_TTL_CHECK_INTERVAL_MS);
+    expect(A_MONITOR_INTERVALS.marketHealthMs).toBe(MARKET_HEALTH_INTERVAL_MS);
+    // 数据同步 15 分钟（btc DEFAULT_SYNC_INTERVAL_MIN）
+    expect(A_MONITOR_INTERVALS.syncMs).toBe(15 * 60_000);
+    // 队列空兜底 60 分钟（btc DEFAULT_CHECK_MINUTES）
+    expect(A_MONITOR_INTERVALS.fallbackMs).toBe(DEFAULT_CHECK_MINUTES * 60_000);
+    // 监控叫醒限流：10 分钟最多 2 次
+    expect(A_MONITOR_INTERVALS.wakeWindowMs).toBe(10 * 60_000);
+    expect(A_MONITOR_INTERVALS.wakeLimit).toBe(2);
   });
 });

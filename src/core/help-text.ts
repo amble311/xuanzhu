@@ -53,7 +53,7 @@ export function commandHelpLines(): string[] {
     `  /switch <目录> 切换项目（载入该项目上次会话接着聊）`,
     `  /term          显示/隐藏右侧终端面板（/term clear 清空输出）`,
     `  /tools         列出本轮发给模型的工具（排查「某个工具似乎没被调用过」）`,
-    `  /tr [N]        查看交易记录（btc 实盘 = 本机动作账本；btc moni / a = 模拟盘成交；默认 20 条）`,
+    `  /tr [N]        查看交易记录（含未完结的挂单 / 持仓；btc 实盘 = 本机动作账本；btc moni / a = 模拟盘；默认 20 条）`,
     `  /undo [N]      撤销玄猪最近 N 次文件修改（默认 1，最多 20；改前自动备份）`,
     `  /usage         查看本轮 / 累计真实 token 用量（模型返回 usage 时）`,
     `  /wakeup        查看监控规则：btc 叫醒条件 / A 股监控条件（别名 /monitor）`,
