@@ -10,6 +10,7 @@ import {
 } from "../../btc/credentials";
 import {
   BACKEND_ROLES,
+  ensureBtcBackend,
   liveBackend,
   stopBtcBackend,
   type BackendRole,
@@ -420,6 +421,47 @@ export async function btcStopCommand(args: string[] = []): Promise<void> {
   }
   process.stdout.write("\n");
   if (failed.length > 0) process.exitCode = 1;
+}
+
+/**
+ * `xzh btc restart` / `xzh btc moni restart`：先停再起，等同 stop + start。
+ *
+ * 停止阶段失败就不继续启动 —— 旧进程还攥着锁文件，硬起一个只会「复用」旧进程，
+ * 看起来像重启成功、其实跑的是老代码。
+ */
+export async function btcRestartCommand(args: string[] = []): Promise<void> {
+  const role: BackendRole = args.includes("--paper") ? "paper" : "live";
+  const label = roleLabel(role);
+  const stopHint = `xzh btc ${role === "paper" ? "moni " : ""}stop`;
+  const wasRunning = liveBackend(getBtcHome(), role) !== null;
+
+  const stopped = await stopBtcBackend(role);
+  if (stopped.error) {
+    process.stdout.write(
+      `${ansi.red}✗${ansi.reset} btc ${label}后台重启失败：${stopped.error}\n\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  const backend = await ensureBtcBackend({ role });
+  if (!backend.running) {
+    process.stdout.write(
+      `${ansi.red}✗${ansi.reset} btc ${label}后台重启失败：${backend.error ?? "未知原因"}\n` +
+        `${ansi.gray}  先运行 ${ansi.reset}xzh btc setup${ansi.gray} 准备计算环境（首次需联网）${ansi.reset}\n\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  const next = backend.state?.nextCheckAt;
+  process.stdout.write(
+    `${ansi.green}✓${ansi.reset} btc ${label}后台已${wasRunning ? "重启" : "启动"}` +
+      `（pid ${backend.state?.pid ?? "?"}）${next ? `，下次巡检 ${next}` : ""}` +
+      `${wasRunning ? "" : `${ansi.gray}（重启前没在运行）${ansi.reset}`}\n` +
+      `${ansi.gray}  停止用 ${ansi.reset}${stopHint}${ansi.gray}；查看见 ${ansi.reset}xzh btc status${ansi.reset}\n`,
+  );
+  process.stdout.write("\n");
 }
 
 function roleLabel(role: BackendRole): string {

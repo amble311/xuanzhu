@@ -32,6 +32,7 @@ import {
   runManualInspection,
   saveWatchlist,
   screenConditionFromInput,
+  scoreHeldItems,
   selectTopWatchlist,
   startAService,
   stopAService,
@@ -43,6 +44,7 @@ import {
   readSettings,
   writeSettings,
   settingsPath,
+  todayTradingStatus,
   DEFAULT_MAX_POSITIONS,
   DEFAULT_POOL_SIZE,
   MAX_POSITIONS_LIMIT,
@@ -55,6 +57,7 @@ import { formatLocalTime } from "../../utils/time";
 import {
   BOARDS_CACHE,
   CALENDAR_CACHE,
+  CN_TRADING_SESSIONS,
   UNIVERSE_CACHE,
   boardsByType,
   fetchBars,
@@ -65,6 +68,8 @@ import {
   loadTradingCalendar,
   readCache,
   scanUniverse,
+  sessionKind,
+  sessionLabel,
   statCache,
   universeSummary,
   writeCache,
@@ -228,6 +233,7 @@ ${ansi.bold}横截面（全市场）${ansi.reset}
 ${ansi.bold}监控（独立进程）${ansi.reset}
   ${ansi.green}xzh a start${ansi.reset}                     启动后台服务（巡检 / 监控 / 模拟交易；交易日 09:30–11:30 / 13:00–15:00）
   ${ansi.green}xzh a stop${ansi.reset}                      关闭后台服务（巡检 / 监控 / 模拟交易一起停）
+  ${ansi.green}xzh a restart${ansi.reset}                   重启后台服务（等同 stop + start）
   ${ansi.green}xzh a pause [resume|status]${ansi.reset}       暂停/恢复巡检与模拟交易（进程仍在）
   ${ansi.green}xzh a fk [当日% 单票% 连亏]${ansi.reset}        查看 / 修改硬风控（fk reset [代码] 解除；单票锁只锁该股）
   ${ansi.green}xzh a watch${ansi.reset}                     查看自选池（监控池，含持仓）
@@ -510,6 +516,35 @@ async function syncCommand(parsed: ParsedArgs): Promise<void> {
   process.stdout.write(`${ansi.gray}缓存目录：${getAShareHome()}/cache${ansi.reset}\n`);
 }
 
+/**
+ * `xzh a calendar [--refresh]`：今天是不是交易日 + 当前时段 + 最近/下一个交易日。
+ *
+ * 这是给**人和脚本**看的版本；模型侧对应工具是 `a_trading_day`（同一份判断逻辑）。
+ * 排查「明明是交易日却说不是」时加 `--refresh` 强制重拉上证指数日线。
+ */
+async function calendarCommand(parsed: ParsedArgs): Promise<void> {
+  const refresh = parsed.options.get("refresh") === true;
+  const status = await todayTradingStatus(new Date(), { refresh });
+  const kind = sessionKind();
+  const line = (label: string, value: string): string =>
+    `  ${ansi.gray}${label}${ansi.reset} ${value}\n`;
+  process.stdout.write(
+    `${status.tradingDay ? ansi.green + "✓" : ansi.red + "⛔"} ${status.today} ` +
+      `${status.tradingDay ? "是交易日" : "非交易日（休市）"}${ansi.reset}\n` +
+      line("当前时段", `${sessionLabel(kind)}${kind === "continuous" ? "（可成交）" : "（不可成交）"}`) +
+      line("交易时段", CN_TRADING_SESSIONS.map((session) => `${session.start}–${session.end}`).join("、")) +
+      (status.lastTradingDay ? line("最近交易日", status.lastTradingDay) : "") +
+      (status.nextTradingDay ? line("下一个交易日", status.nextTradingDay) : "") +
+      line(
+        "数据源",
+        status.source === "calendar"
+          ? `上证指数日线（缓存更新 ${status.calendarUpdatedAt?.slice(0, 19).replace("T", " ")}）`
+          : `降级为工作日判断（${status.error ?? "日历不可用"}）`,
+      ) +
+      (status.tradingDay ? "" : `\n${ansi.gray}今天休市：后台会跳过巡检与撮合，下一轮排到下一个交易日 09:30${ansi.reset}\n`),
+  );
+}
+
 async function statusCommand(parsed: ParsedArgs): Promise<void> {
   const universe = statCache(UNIVERSE_CACHE);
   const indicators = statCache(INDICATORS_CACHE);
@@ -723,6 +758,28 @@ async function stopServiceCommand(): Promise<void> {
   );
 }
 
+/**
+ * `xzh a restart`：等同 `xzh a stop` + `xzh a start`。
+ *
+ * 升级 / 改配置后用得多，所以给一条命令。停止阶段失败就不启动 ——
+ * 旧进程可能还在写账本，强行再起一个会被锁挡住，报错反而更难看。
+ */
+async function restartServiceCommand(): Promise<void> {
+  const stopped = await stopAService();
+  if (!stopped.ok) {
+    process.stdout.write(`${ansi.red}✗ 重启失败：停止阶段出错 —— ${stopped.error}${ansi.reset}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const result = await startAService();
+  process.stdout.write(
+    result.ok
+      ? `${ansi.green}✓ A 股后台服务已重启${ansi.reset}${ansi.gray} pid ${result.state?.pid} · 交易日 09:30–11:30 / 13:00–15:00 · 监控 60 秒 / 巡检按排期 / 16:00 选股${ansi.reset}\n`
+      : `${ansi.red}✗ 重启失败：${result.error}${ansi.reset}\n`,
+  );
+  if (!result.ok) process.exitCode = 1;
+}
+
 function printWatchlist(): void {
   const list = loadWatchlist();
   process.stdout.write(
@@ -783,7 +840,11 @@ async function watchCommand(parsed: ParsedArgs): Promise<void> {
       code: position.code,
       name: position.name,
     }));
-    const merged = mergeWatchlist(picks, held, new Date(), size);
+    // 持仓不在选股漏斗里，分数要单独补（与 16:00 固定选股同一口径）
+    const heldScored = await scoreHeldItems(held, (message) =>
+      process.stdout.write(`${ansi.gray}${message}${ansi.reset}\n`),
+    );
+    const merged = mergeWatchlist([...picks, ...heldScored], held, new Date(), size);
     saveWatchlist(merged);
     process.stdout.write(
       `${ansi.green}✓ 已重选自选池 ${picks.length}/${size} 只（池内 ${merged.items.length}/${size}，持仓优先保留）${ansi.reset}\n`,
@@ -936,6 +997,9 @@ export async function aCommand(args: string[]): Promise<void> {
       case "sync":
         await syncCommand(parsed);
         return;
+      case "calendar":
+        await calendarCommand(parsed);
+        return;
       case "status":
         await statusCommand(parsed);
         return;
@@ -949,6 +1013,9 @@ export async function aCommand(args: string[]): Promise<void> {
         return;
       case "stop":
         await stopServiceCommand();
+        return;
+      case "restart":
+        await restartServiceCommand();
         return;
       case "pause": {
         const action = (parsed.positional[1] ?? "").toLowerCase();
@@ -993,7 +1060,7 @@ export async function aCommand(args: string[]): Promise<void> {
       default:
         process.stdout.write(
           `${ansi.red}未知子命令：a ${sub}${ansi.reset}\n` +
-            `${ansi.gray}可用：quote / bars / intraday / market / snapshot / screen / boards / sync / status / start / stop / watch / settings / monitor / backtest / research${ansi.reset}\n`,
+            `${ansi.gray}可用：quote / bars / intraday / market / snapshot / screen / boards / sync / calendar / status / start / stop / restart / watch / settings / monitor / backtest / research${ansi.reset}\n`,
         );
         process.exitCode = 1;
     }

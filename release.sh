@@ -220,7 +220,12 @@ fi
 # 否则每次发布都会留下一个孤儿 [未发布]，攒几轮后就分不清哪些改动属于哪个版本了。
 step "更新 CHANGELOG"
 
-if [ -f CHANGELOG.md ] && grep -q '^## \[未发布\]' CHANGELOG.md; then
+# 变更记录已迁到 docs/changelog.md（根目录只留 README.md 与 AGENTS.md）；
+# `CHANGELOG.md` 是旧检出的回退路径。
+CHANGELOG_FILE="docs/changelog.md"
+[ -f "$CHANGELOG_FILE" ] || CHANGELOG_FILE="CHANGELOG.md"
+
+if [ -f "$CHANGELOG_FILE" ] && grep -q '^## \[未发布\]' "$CHANGELOG_FILE"; then
   node -e "
     const fs = require('fs');
     const file = process.argv[1];
@@ -233,10 +238,10 @@ if [ -f CHANGELOG.md ] && grep -q '^## \[未发布\]' CHANGELOG.md; then
     );
     fs.writeFileSync(file, src);
     process.stdout.write('  ' + version + ' 已写入 CHANGELOG（新增 [未发布] 段供下次使用）\n');
-  " CHANGELOG.md "$NEW_VERSION"
+  " "$CHANGELOG_FILE" "$NEW_VERSION"
   ok "CHANGELOG 已标记为 $NEW_VERSION"
 else
-  warn "CHANGELOG.md 中没有 [未发布] 段，已跳过"
+  warn "$CHANGELOG_FILE 中没有 [未发布] 段，已跳过"
 fi
 
 # ──────────────────────── 4. 发布到 npm ────────────────────────

@@ -80,11 +80,28 @@ function documentedModules(): Map<string, number> {
 /** 解析 §10 测试表格里的文件名 */
 function documentedTests(): string[] {
   const names: string[] = [];
-  for (const line of section("docs/ARCHITECTURE.md", "10. 测试与本地开发")) {
+  for (const line of section("docs/ARCHITECTURE.md", "5. 测试与本地开发")) {
     const match = /\|\s*`([^`]+\.test\.ts)`\s*\|/.exec(line);
     if (match) names.push(match[1]);
   }
   return names.sort();
+}
+
+/**
+ * `docs/` 下的全部 md（递归）。
+ *
+ * 早期 docs 是扁平的一层，`readdirSync` 直接拼路径即可；现在有了 `modules/`、`modes/`
+ * 子目录，同一段代码会把目录当文件读（EISDIR）。这里统一递归，顺便让子目录里的文档
+ * 也接受「合并冲突标记」「本地链接可解析」两项检查。
+ */
+function docsFiles(dir = "docs"): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(join(ROOT, dir), { withFileTypes: true })) {
+    const path = `${dir}/${entry.name}`;
+    if (entry.isDirectory()) files.push(...docsFiles(path));
+    else files.push(path);
+  }
+  return files.sort();
 }
 
 /** 目录结构树里某个目录下直接列出的文件名 */
@@ -139,23 +156,14 @@ describe.skipIf(!hasDocs)("文档一致性", () => {
   });
 
   it("文档里没有遗留的合并冲突标记", () => {
-    const files = [
-      "AGENTS.md",
-      "README.md",
-      "CHANGELOG.md",
-      ...readdirSync(join(ROOT, "docs")).map((name) => `docs/${name}`),
-    ];
+    const files = ["AGENTS.md", "README.md", ...docsFiles()];
     expect(files.filter((file) => /^(<{7}|={7}|>{7}) /m.test(read(file)))).toEqual(
       [],
     );
   });
 
   it("文档里的本地链接都能解析", () => {
-    const files = [
-      "AGENTS.md",
-      "README.md",
-      ...readdirSync(join(ROOT, "docs")).map((name) => `docs/${name}`),
-    ];
+    const files = ["AGENTS.md", "README.md", ...docsFiles()];
     const missing: string[] = [];
     for (const file of files) {
       const text = read(file);

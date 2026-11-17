@@ -9,6 +9,8 @@ import type { ExecuteToolResult } from "../tools";
 import { accountSummary, loadPaperAccount } from "./paper";
 import { maxPositions, poolSize } from "./settings";
 import { inWorkWindow, WORK_WINDOW_LABEL } from "./window";
+import { sessionKind, sessionLabel } from "../exchange/ashare";
+import { describeTradingDay, todayTradingStatus } from "./trading-day";
 import { monitorDir, orderedPool } from "./watchlist";
 import { describeRule, readRules } from "./rules";
 import { nextScheduledEntry, pushSchedule, readScheduleQueue } from "./schedule";
@@ -109,7 +111,7 @@ function inAWorkWindow(now = new Date()): boolean {
   return inWorkWindow(now);
 }
 
-function contextSection(): string {
+async function contextSection(): Promise<string> {
   const account = loadPaperAccount();
   const summary = accountSummary(account);
   const cap = maxPositions();
@@ -123,11 +125,28 @@ function contextSection(): string {
   const queue = readScheduleQueue();
 
   const lines: string[] = [];
-  if (!inAWorkWindow()) {
+  // 交易时段必须每轮都明确告知：模型不知道「现在几点、能不能成交」时，
+  // 会在午休/收盘后反复尝试下单（代码会拒，纯烧轮次），或者把收盘价当现价判断。
+  const kind = sessionKind();
+  const trading = kind === "continuous";
+  lines.push(
+    `交易时段：${WORK_WINDOW_LABEL}（工作日；节假日休市）· 当前：${sessionLabel(kind)}` +
+      `${trading ? "（可成交）" : "（不可成交，只能挂 pending 等下一个连续竞价时段）"}`,
+  );
+  // 交易日必须用真实日历判断（`sessionKind()` 只看星期 + 时间，节假日会误判为盘中）
+  const tradingDay = await todayTradingStatus();
+  lines.push(`交易日：${describeTradingDay(tradingDay)}`);
+  if (!tradingDay.tradingDay) {
     lines.push(
-      `注意：当前不在 A 股交易时段（${WORK_WINDOW_LABEL}）。本轮是手动触发，**不要安排夜间 / 午休巡检**；` +
-        "下一轮请排到下一个交易时段开始（a_schedule 会自动顺延，允许跨日 —— " +
-        "例如 15:00 之后排到下一个工作日 09:30）。",
+      "**今天不是交易日**：不要下单、不要挂单、不要假设「现在有成交」，" +
+        "也不要按节前价格判断买卖点；本轮只做总结，并把下一轮排到 `nextTradingDay` 的 09:30。",
+    );
+  }
+  if (!trading) {
+    lines.push(
+      `注意：当前不在连续竞价时段。本轮仍可分析并排期，但 \`a_order\` 直接下单会被拒；` +
+        "要动手就用 `pending: true` 挂单，撮合由代码在开盘/午后第一分钟按限价执行。" +
+        "下一轮请排到交易时段内（a_schedule 会自动顺延，允许跨日 —— 例如 15:00 之后排到下一个工作日 09:30）。",
     );
   }
   lines.push(
@@ -237,59 +256,63 @@ function contextSection(): string {
   return lines.join("\n");
 }
 
-/** 提示词按当前配置生成：池子容量与持仓上限是用户可改的（`xzh a settings`） */
+/**
+ * 巡检提示词：**与 `xzh btc moni` 同构**（同一套「自主决策到底 + 结束前排期」骨架），
+ * 唯一的结构差异是 A 股一次要分析一整池（池子 = 持仓 + 自选），所以要求**逐只遍历**。
+ */
 function inspectPrompt(): string {
   const cap = maxPositions();
   const size = poolSize();
   return `你现在处于 A 股**后台巡检 / 无人值守**：没有用户在终端前，也没有人会回答你的提问。
-这一轮你必须**自主决策到底** —— 该卖就卖、该减就减、该买就买、该撤就撤、该观望就观望，直接调用工具执行；
-最终回复必须包含一段**正文结论**（不能只把内容留在思考/reasoning 里）；即使选择观望，也要写“结论：…”。
+这一轮你必须**自主决策到底** —— 该买就买、该卖就卖、该减就减、该撤就撤，直接调用工具执行；
+最终回复必须包含一段**正文结论**（不能只把内容留在思考/reasoning 里）；即使全部观望，也要写“结论：…”。
 不要写「请确认」「等你回复」（没有人会回），也不要只给方案不执行。
 
-任务：按持仓优先的顺序轮询自选池（${size} 只，含持仓），逐只判断买卖点，并决定下次巡检时间。
+任务：像 BTC 逐个标的巡检那样，**逐一遍历**自选池（${size} 只，含持仓，持仓排在最前）：
+对每一只都要得出「方向 / 15 分钟评分 / 动作」三件事，再决定下次巡检时间。
 
 步骤（a_* 工具可用）：
 1. \`a_account\` 看账本（总资产 / 可用 / 持仓 / 可卖数量），\`a_orders\` 看挂单时效。
-2. \`a_signal\`（不传 code）拿**全池速览**：每只股票的月 / 周 / 日三周期方向 + 15 分钟择时评分。
-   池内顺序已经是持仓在前；需要深挖的单只用 \`a_signal(code=…)\` 再看一次。
-   - 三周期方向只看结论（+1 / 0 / -1）：任一周期 -1 或全 0 就是 \`side_filter=none\`，**不做**；
-   - 15 分钟是**择时周期**：\`entry=now\`（≥60 分且形态成立）才考虑动手，\`wait\` 就明确在等什么；
-   - 数据不足（unknown）时用 \`a_bars(period=15m)\` / \`a_quote\` 自查一遍，仍不足就不做。
-3. 逐只决策（**持仓股优先**，先处理风险再谈机会）：
-   - 持仓：三周期出现 -1、或 15 分钟跌破 MA20/前 10 根低点、或触及 ATR 止损/移动止盈 → 减仓或清仓；
+2. \`a_signal\`（不传 code）拿**全池速览**：每只的月 / 周 / 日三周期方向 + 15 分钟择时评分。
+   需要深挖的单只再用 \`a_signal(code=…)\` 看一次明细。
+3. **逐只遍历（这是本模式与 btc 唯一的差别：btc 一次看一个标的，A 股一次看一整池）**：
+   按顺序（持仓优先）一只一只过，**不允许跳过**。每只给出：
+   - 方向：\`side_filter\` = long / none / unknown（月 / 周 / 日各 -1/0/+1，**只做多**；
+     任一 -1 或全 0 → none，不做；数据不足 → unknown，先补数据）；
+   - 择时：15 分钟 \`entry\` = now（≥60 分且形态成立）/ wait（说清在等什么）/ unknown；
+   - 动作：买入 / 加仓 / 持有 / 减仓 / 清仓 / 观望 —— 六选一，并写一句依据。
+   持有与买入的判断：
+   - 持仓：三周期出现 -1、15 分钟跌破 MA20 或前 10 根低点、触及 ATR 止损 / 移动止盈 → 减或清；
      T+1 当日买入不可卖，只能记录并用 \`a_trigger\` 盯住下一交易日；
-   - 买点：\`side_filter=long\`、15 分钟 \`entry=now\`、非涨停、当日涨幅 ≤5%、非停牌、
-     消息面无硬风险 → 才可买入；100 股整手，**持仓最多 ${cap} 只股票**（池内 ${size} 只是候选，
-     已持 ${cap} 只时只能加仓现有持仓或先减/清一只再换股）、每仓 20% 权益；
-   - 结论依赖消息面时先 \`a_news\`；硬风险（立案/退市/暴雷）禁止买入，持仓则考虑减。
-   - 不确定就按最保守的方案执行，并在结论里写明理由（为什么买 / 为什么不做 / 为什么减仓）。
+   - 买点：\`side_filter=long\` 且 \`entry=now\`、非涨停、当日涨幅 ≤5%、非停牌、消息面无硬风险；
+     100 股整手；**持仓最多 ${cap} 只**（池内 ${size} 只是候选），每仓 ≤20% 权益；
+     已持 ${cap} 只时只能加仓现有持仓，或先减/清一只再换（代码会拒绝超限）。
+   - 结论依赖消息面时先 \`a_news\`；硬风险（立案 / 退市 / 暴雷）禁止买入，持仓则考虑减。
+   - 拿不到数据就如实说「数据不足」，不要编造价格或指标；不确定时按最保守方案执行。
 4. **结束前必须把「怎么再次叫醒我」注入监控**（三件事，按需使用）：
-   a. \`a_schedule\`（必须有）：自己判断下一次巡检时间并说明理由 ——
+   a. \`a_schedule\`（必须有）：自己判断下次巡检时间并说明理由 ——
       信号刚触发 / 临近收盘 → 15–30 分钟；平静观望、无持仓 → 30–60 分钟；
-      **必须落在交易时段内**：${WORK_WINDOW_LABEL}（09:15–09:30 集合竞价、11:30–13:00 午休、
-      15:00 之后收盘都不算）。可以跨日 —— 收盘后要盯就排下一个工作日 09:30，
-      午休时想复核就排 13:00；a_schedule 也会自动把这些时间顺延到最近的交易时段；
-   b. \`a_trigger\`：本轮结论**依赖某个具体价位 / 均线 / 涨跌幅**时把阈值落盘
-      （例：站上 15m MA20、跌破 12.80、涨幅回落 3%）。不要只靠「等时间」；
-      每只股票最多 5 条，过时或已无意义的用 \`a_remove_trigger\` 删掉；
-   c. 有未成交挂单时：确认时效是否合理 —— 判断继续等就 \`a_renew\` 续期并说明理由，
-      不该继续等就 \`a_cancel_order\` 撤掉。**不要放任它挂着过期**（过期后代码会叫醒你，但那是兜底）。
-5. 最后用一段话总结本轮结论（会写进巡检日志供复盘）。
+      **必须落在交易时段内**：${WORK_WINDOW_LABEL}（集合竞价、午休、收盘后都不算）。
+      可以跨日 —— 收盘后要盯就排下一个工作日 09:30，午休要复核就排 13:00；
+      \`a_schedule\` 也会自动把越界时间顺延到最近的交易时段；
+   b. \`a_trigger\`：本轮结论**依赖某个具体价位 / 均线 / 涨跌幅**时落盘阈值
+      （例：站上 15m MA20、跌破 12.80、涨幅回落 3%）；每只最多 5 条，
+      过时或已无意义的用 \`a_remove_trigger\` 删掉；
+   c. 有未成交挂单时：判断继续等就 \`a_renew\` 续期并说明理由，不该等就 \`a_cancel_order\` 撤掉。
+      **不要放任挂单过期**（过期后代码会叫醒你，但那是兜底，不是常规）。
+5. 最后用一段话总结本轮结论（会写进巡检日志供复盘）：**按遍历顺序逐只列 代码 / 方向 / 15m 分 / 动作**，
+   没动的写「观望」，不要只写“全部正常”。
 
 硬约束：
-- **不做选股**：禁止调用 \`a_select\` / \`a_screen\` 重新筛选股票，禁止买入池外股票；
-  收盘后 16:00 有独立的固定选股任务，本轮只做「已有持仓 + 已有自选池」的实时分析。
-- 本模式下没有可用的下单工具以外的执行能力：不写文件、不执行 shell、不改环境、不重置账本。
-- **这正是模拟盘**（不涉及真钱）：成交以工具返回为准，不得声称真钱交易。
-- 硬性风控、涨跌停、停牌、T+1、100 股整手、**只在连续竞价时段成交**（09:30–11:30 / 13:00–15:00
-  且当天是交易日）都由代码强制：被拒绝时看懂原因再决定，不要反复重试同一条被拒的操作。
-  集合竞价 / 午休 / 盘前盘后 / 节假日只能 \`pending: true\` 挂单等开盘。
-- 若上下文提示「账户级硬风控已触发」，本轮禁止买入/加仓，只能减仓或观望；减仓后用 \`a_clear_risk\` 解除。
-- 若提示「单票硬风控」，**只禁止买入被锁的那只股票**，其他股票照常评估；该股减仓后用
-  \`a_clear_risk(code=…)\` 单独解锁，不要因为一只票停掉整个账户。
-- 若提示「持仓风控告警」，监控只是告警、不会自动卖；是否卖、卖多少由你判断并 \`a_order\`。
-- 行情不可用 / 数据缺失时不要猜价格，明确说明并排下一次。
-- 工具轮数由代码限制（约 12 轮），${size} 只股票要在轮次内分析完：能一次拿到的就别分多次。`;
+- **不做选股**：禁止 \`a_select\` / \`a_screen\` 重新筛选股票，禁止买入池外股票；
+  收盘后 16:00 有独立的固定选股任务，本轮只分析「已有持仓 + 已有自选池」。
+- 不写文件、不执行 shell、不改环境、不重置账本（后台无人确认，这类操作会被直接拒绝）。
+- **这是模拟盘**（不涉及真钱）：成交以工具返回为准，不得声称真钱交易。
+- **成交时间只有 ${WORK_WINDOW_LABEL}**（工作日，且当天是交易日）：集合竞价、午休、盘前盘后、节假日
+  一律不成交；非交易时段只能 \`pending: true\` 挂单。硬性风控、涨跌停、停牌、T+1、100 股整手也由代码强制：被拒绝时看懂原因再决定，不要反复重试同一条被拒的操作。
+- 账户级硬风控触发时禁止买入 / 加仓，只能减仓或观望；单票硬风控只锁那一只，其他照常评估。
+- 工具轮数由代码限制（约 12 轮），${size} 只要在轮次内遍历完：\`a_signal\` 一次拿全池，
+  不要每只都单独拉一遍；只有需要判断止损/形态细节时才追加深挖。`;
 }
 
 /** 读一次 policy，注入提示词前半段（后台进程读不到对话里的「记住了」） */
@@ -400,7 +423,7 @@ export async function runAInspect(
   }, TOTAL_TIMEOUT_MS);
   try {
     await agent.run(
-      `巡检原因：${reason}\n\n当前上下文：\n${contextSection()}\n` +
+      `巡检原因：${reason}\n\n当前上下文：\n${await contextSection()}\n` +
         policySection() +
         triggerSection(options.triggerNote) +
         orderSection(options.orderNote) +

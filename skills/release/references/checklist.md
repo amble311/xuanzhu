@@ -40,10 +40,11 @@ git diff --stat package.json package-lock.json   # 确认 lock 同步更新
 
 ## 3. CHANGELOG
 
-把顶部的 `## [未发布]` 收成本次版本（保留一个新的空 `[未发布]` 段供下次用）：
+把顶部的 `## [未发布]` 收成本次版本（保留一个新的空 `[未发布]` 段供下次用）。
+变更记录通常在 `CHANGELOG.md`；**本项目（玄猪）在 `docs/changelog.md`**：
 
 ```bash
-grep -n '^## \[' CHANGELOG.md | head -3
+grep -n '^## \[' CHANGELOG.md | head -3   # 本项目改用 docs/changelog.md
 ```
 
 若项目没有 CHANGELOG 约定，就在 `git commit` 信息里写清改动范围即可。
@@ -95,7 +96,7 @@ git tag "v$VERSION" && git push --tags     # 需要 tag / 触发 CI 发布时
 若项目用 `gh` 维护 Release：
 
 ```bash
-gh release create "v$VERSION" --title "v$VERSION" --notes-file CHANGELOG.md --latest
+gh release create "v$VERSION" --title "v$VERSION" --notes-file docs/changelog.md --latest
 ```
 
 ## 8. 发布后校验

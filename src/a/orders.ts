@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { isTradingTime, type Quote } from "../exchange/ashare";
+import type { Quote } from "../exchange/ashare";
 import { monitorDir } from "./watchlist";
 
 /**
@@ -156,9 +156,12 @@ export function renewOrder(
 export function matchOrders(
   quotes: Map<string, Quote>,
   now = new Date(),
-  options: { sessionOpen?: boolean } = {},
+  options: { sessionOpen: boolean },
 ): { fills: PendingOrder[]; expired: PendingOrder[]; sessionOpen: boolean } {
-  const sessionOpen = options.sessionOpen ?? isTradingTime(now);
+  // **不给默认值**：这个函数是纯函数、拿不到交易日历，自己按「时间」猜会把节假日放进来
+  // （节假日的工作日 `isTradingTime()` 也是 true）。闸门结论只能由调用方用
+  // `continuousSession()` 算好再传进来。
+  const sessionOpen = options.sessionOpen;
   const file = readFile();
   const fills: PendingOrder[] = [];
   const expired: PendingOrder[] = [];

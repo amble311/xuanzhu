@@ -27,7 +27,16 @@ import { readPolicy } from "./policy";
  */
 
 const MAX_TOOL_ROUNDS = 12;
-const DEFAULT_TIMEOUT_MS = 8 * 60_000;
+/**
+ * 超时拆成两档（与 A 股巡检 `src/a/inspect.ts` 对齐）：
+ * - **空闲超时**：模型停止输出（思考 / 工具 / 正文）超过 3 分钟才中止；
+ * - **总时长上限**：15 分钟硬顶，避免工具异常轮询把后台拖死。
+ *
+ * 以前只有一个 8 分钟总超时：工具多（下单 + 校验 + 排期 + 触发条件）的轮次里，
+ * 模型刚排完下一轮、正在写结论就被掐断，日志只留下「模型没有输出文字结论」。
+ */
+const IDLE_TIMEOUT_MS = 3 * 60_000;
+const TOTAL_TIMEOUT_MS = 15 * 60_000;
 /** 巡检结论写进状态/日志时截断到这个长度，避免把整段分析塞进 state */
 export const SUMMARY_LIMIT = 600;
 
@@ -157,6 +166,10 @@ export async function runInspectCycle(
   let text = "";
   let reasoning = "";
   let toolCalls = 0;
+  /** 中止原因（空闲超时 / 总时长上限），写日志与兜底摘要都要如实带上 */
+  let abortReason = "";
+  /** 有活动就续期空闲计时器（计时器创建后填上） */
+  let touch = (): void => undefined;
 
   // ── 过程流：前端据此实时展示「后台在想什么」 ──
   const round = new Date().toISOString();
@@ -194,21 +207,25 @@ export async function runInspectCycle(
     onText: (delta) => {
       text += delta;
       textBuf += delta;
+      touch();
       flush();
     },
     onReasoning: (delta) => {
       reasoning += delta;
       reasoningBuf += delta;
+      touch();
       flush();
     },
     onToolStart: (call) => {
       toolCalls += 1;
+      touch();
       flush(true);
       log(`  · ${call.name}`);
       const args = JSON.stringify(call.arguments ?? {});
       emit("tool", `${call.name} ${args.slice(0, 200)}`);
     },
     onToolEnd: (call: unknown, result: ExecuteToolResult) => {
+      touch();
       const name = (call as { name?: string })?.name ?? "工具";
       const brief = (result.content ?? "").replace(/\s+/g, " ").slice(0, 200);
       emit("tool-end", `${name} → ${result.ok ? "成功" : "失败"}${brief ? `：${brief}` : ""}`);
@@ -295,9 +312,18 @@ export async function runInspectCycle(
     : "";
 
   const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+  // 空闲超时：模型静止 3 分钟才中止；总上限 15 分钟（调用方可用 timeoutMs 覆盖上限）。
+  const idleTimer = setTimeout(() => {
+    abortReason = `空闲 ${Math.round(IDLE_TIMEOUT_MS / 60_000)} 分钟无输出`;
+    controller.abort();
+  }, IDLE_TIMEOUT_MS);
+  touch = () => idleTimer.refresh();
+  const totalTimer = setTimeout(
+    () => {
+      abortReason = `总时长超过 ${Math.round((options.timeoutMs ?? TOTAL_TIMEOUT_MS) / 60_000)} 分钟`;
+      controller.abort();
+    },
+    options.timeoutMs ?? TOTAL_TIMEOUT_MS,
   );
 
   try {
@@ -323,7 +349,14 @@ export async function runInspectCycle(
       error: message,
     };
   } finally {
-    clearTimeout(timer);
+    clearTimeout(idleTimer);
+    clearTimeout(totalTimer);
+    touch = () => undefined;
+  }
+
+  if (abortReason) {
+    log(`巡检中止：${abortReason}`);
+    emit("notice", `巡检中止：${abortReason}`);
   }
 
   flush(true);
@@ -351,6 +384,7 @@ export async function runInspectCycle(
             {
               role: "user",
               content:
+                `巡检中止原因：${abortReason || "（未中止）"}\n\n` +
                 `思考片段：\n${reasoning.slice(-4_000) || "（无）"}\n\n` +
                 `最近动作：\n${actions || "（无）"}\n\n` +
                 "请直接输出一句结论。",

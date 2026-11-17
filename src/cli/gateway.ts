@@ -157,7 +157,7 @@ export async function gatewayCommand(args: string[]): Promise<void> {
 
   if (sub && sub !== "start") {
     line(
-      `${ansi.gray}用法：xzh gateway（启动）· stop · restart · status · autostart [on|off]${ansi.reset}`,
+      `${ansi.gray}用法：xzh gateway（启动）· stop · restart · status · autostart [on|off] · weixin [login|logout|status]${ansi.reset}`,
     );
     return;
   }

@@ -181,6 +181,19 @@ export async function buildIndicators(
   };
 }
 
+/**
+ * **只读**指标缓存，缺了/过期返回 undefined，**不触发全市场重算**。
+ *
+ * 给「只给几只股票补分数」的场景用（收盘选股的持仓打分段）：那时日线指标要么刚由
+ * 选股流程刷过、要么完全没有 —— 没有就按单只日线现算，绝不能因为一只股票把
+ * 5000+ 只重算一遍（1–2 分钟），更不能把全市场缓存覆盖成 5 条。
+ */
+export function readCachedIndicators(): Map<string, Indicators> | undefined {
+  const cached = readCache<Indicators[]>(INDICATORS_CACHE, CACHE_TTL_MS);
+  if (!cached) return undefined;
+  return new Map(cached.value.map((item) => [item.code, item]));
+}
+
 export async function loadIndicators(
   options: {
     refresh?: boolean;

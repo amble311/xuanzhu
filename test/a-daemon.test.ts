@@ -343,15 +343,15 @@ describe("挂单状态机", () => {
 
     // 价格已经穿越，但不在连续竞价时段（09:20 集合竞价 / 12:00 午休）
     const quotes = new Map([["600519", { code: "600519", price: 10 } as never]]);
-    const auction = matchOrders(quotes, new Date("2026-11-09T09:20:00+08:00"));
+    const auction = matchOrders(quotes, new Date("2026-11-09T09:20:00+08:00"), { sessionOpen: false });
     expect(auction.sessionOpen).toBe(false);
     expect(auction.fills).toHaveLength(0);
-    const lunch = matchOrders(quotes, new Date("2026-11-09T12:00:00+08:00"));
+    const lunch = matchOrders(quotes, new Date("2026-11-09T12:00:00+08:00"), { sessionOpen: false });
     expect(lunch.fills).toHaveLength(0);
     expect(listOrders().find((item) => item.id === order.order.id)?.status).toBe("open");
 
     // 进入连续竞价才成交
-    const open = matchOrders(quotes, new Date("2026-11-09T10:00:00+08:00"));
+    const open = matchOrders(quotes, new Date("2026-11-09T10:00:00+08:00"), { sessionOpen: true });
     expect(open.sessionOpen).toBe(true);
     expect(open.fills.map((item) => item.id)).toContain(order.order.id);
     expect(listOrders().find((item) => item.id === order.order.id)?.status).toBe("filled");
@@ -391,6 +391,23 @@ describe("收盘后固定选股", () => {
     expect(text).toContain("1. 中国石油 601857 · 86 分");
     expect(text).toContain("新进：中国石油 601857、国泰君安 600901");
     expect(text).toContain("移出：莱美药业 300006");
+
+    // 持仓也走同一套打分（收盘选股时重算）：有分数就照实写，并标「持仓保留」
+    const rescoredHeld = describeSelection(
+      [
+        {
+          code: "601857",
+          name: "中国石油",
+          score: 72,
+          reason: "趋势 月+1/周+1/日+1 · 15m 72 分 wait",
+          source: "held",
+          addedAt: "2026-11-17T08:00:00.000Z",
+        },
+      ],
+      [],
+    );
+    expect(rescoredHeld).toContain("1. 中国石油 601857 · 72 分 · 趋势 月+1/周+1/日+1 · 15m 72 分 wait");
+    expect(rescoredHeld).toContain("15m 72 分 wait · 持仓保留");
 
     // 持仓是「强制保留」带进来的（score 0）：不能显示「0 分」，也不能被分项明细的括号刷屏
     const held = describeSelection(

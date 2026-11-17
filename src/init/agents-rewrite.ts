@@ -5,12 +5,19 @@ import { createProvider } from "../llm";
 import type { ChatMessage, LLMProvider } from "../llm/types";
 import type { ModelEntry, XuanZhuConfig } from "../config/store";
 import { resolveAgentsFilePath } from "../workspace";
-import { buildAgentsDoc, DOCS_SUBDIRS, generateProjectDocs } from "./generate";
+import {
+  buildAgentsDoc,
+  DOCS_INDEX_FILE,
+  DOCS_SUBDIRS,
+  generateProjectDocs,
+  MODULES_DIR,
+  withAgentsHeader,
+} from "./generate";
 import { scanProject, type ProjectFacts } from "./scan";
 
 /** 入口级文档：`/init` 模型阶段默认读取这些文件的摘要 */
 const DOC_ENTRY_FILES = [
-  "docs/README.md",
+  DOCS_INDEX_FILE,
   "docs/ARCHITECTURE.md",
   "docs/COMMANDS.md",
   "docs/CONVENTIONS.md",
@@ -114,11 +121,15 @@ function buildPrompt(
     "你是项目规范整理器。请根据下面的项目扫描结果，重写一份项目根 `AGENTS.md`。",
     "",
     "固定设计（必须遵守）：",
+    "0. **AGENTS.md 开头必须是这两行**（逐字保留，不要改写、不要在它前面加任何内容）：",
+    "   （必须执行）本文档只设计与记录重要说明、详细设计文档位置的映射、总体框架等",
+    "   （必须执行）改动代码时同步更新此设计文档与文档中对应的docs下的明细设计文档；",
     "1. **AGENTS.md 只描述入口级大纲**，详细内容写在 `docs/` 下的文件或子文件中；",
     "   不要在 AGENTS.md 展开完整命令表、目录树、模块职责、代码片段或长篇说明。",
-    `   \`docs/\` 根只放入口级四件套；专题文档放子目录：${DOCS_SUBDIRS.map(
-      (item) => `\`${item.path}/\`（${item.label}）`,
-    ).join("、")}，最多两层。`,
+    "   `docs/` 根只放 `INDEX.md`（索引）、`ARCHITECTURE.md`、`COMMANDS.md`、`CONVENTIONS.md`，" +
+      "**不要生成 `docs/README.md`**（README 是发布物，属于使用者）；" +
+      `细节按项目实际内容进子目录：${DOCS_SUBDIRS.map((item) => `\`${item.path}/\`（${item.label}）`).join("、")}，最多两层。`,
+    `   \`${MODULES_DIR}/\` 一篇对应一个实际顶层目录（如 \`${MODULES_DIR}/src.md\`），索引是 \`${MODULES_DIR}/INDEX.md\`。`,
     "2. **尽量简短**：目标是让 Agent 在 1 分钟内知道「项目是什么、怎么验证、去哪里看细节」，",
     "   全文控制在 3000 字符以内；能链接到 docs 的就不要抄进 AGENTS。",
     "3. 固定保持这些小节：项目概览、常用命令（只列关键命令）、目录结构（只列顶层/入口）、",
@@ -136,7 +147,7 @@ function buildPrompt(
     "</AGENTS>",
     "如需修改 docs，额外输出（只输出需要修改的文件，最多 6 个；路径必须在 `docs/` 下，" +
       "可以是 `docs/guides/xxx.md` 这类子目录文件，最多两层）：",
-    "<DOC path=\"docs/README.md\">",
+    `<DOC path="${DOCS_INDEX_FILE}">`,
     "（完整文件正文）",
     "</DOC>",
     "9. 不要解释、不要代码围栏、不要省略号；默认中文。AGENTS 正文控制在 3000 字符以内。",
@@ -166,7 +177,7 @@ export function parseAgentsRewriteResponse(raw: string): {
     if (content.trim()) docs.push({ path: rel, content });
   }
   return {
-    content: extractAgentsMarkdown(agentsMatch?.[1] ?? raw),
+    content: withAgentsHeader(extractAgentsMarkdown(agentsMatch?.[1] ?? raw)),
     docs,
   };
 }

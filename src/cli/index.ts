@@ -55,6 +55,7 @@ import {
   btcFkCommand,
   btcPlatformCommand,
   btcSetupCommand,
+  btcRestartCommand,
   btcStatusCommand,
   btcStopCommand,
 } from "./commands/btc";
@@ -218,6 +219,11 @@ async function main(): Promise<void> {
         await btcStopCommand(args.slice(2));
         return;
       }
+      if (sub === "restart") {
+        // 先停再起，等同 stop + start；模拟盘用 `xzh btc moni restart`
+        await btcRestartCommand(args.slice(2));
+        return;
+      }
       if (sub === "status") {
         await btcStatusCommand();
         return;
@@ -248,6 +254,10 @@ async function main(): Promise<void> {
           await btcStopCommand(["--paper"]);
           return;
         }
+        if (args[2] === "restart") {
+          await btcRestartCommand(["--paper"]);
+          return;
+        }
         process.env.XZH_BTC_ROLE = "paper";
         await startChat(mode.home, intentOverride, createBtcMode({ paper: true }));
         return;
@@ -257,8 +267,9 @@ async function main(): Promise<void> {
           `${ansi.red}未知子命令：${command} ${sub}${ansi.reset}\n` +
             `${ansi.gray}${command} 模式目前支持：` +
             `${command}${ansi.gray}（进入实盘模式）、${command} start（只启动实盘后台）、` +
-            `${command} stop（关闭实盘后台）、${command} moni（进入模拟盘）、` +
+            `${command} stop（关闭实盘后台）、${command} restart（重启实盘后台）、${command} moni（进入模拟盘）、` +
             `${command} moni start（只启动模拟盘后台）、${command} moni stop（关闭模拟盘后台）、` +
+            `${command} moni restart（重启模拟盘后台）、` +
             `${command} apikey（凭据管理）、${command} fk（硬性风控）、${command} platform（交易平台）、` +
             `${command} setup、${command} status${ansi.reset}\n`,
         );
@@ -601,6 +612,7 @@ ${ansi.bold}用法${ansi.reset}（按英文字母排序）
   ${ansi.green}xzh a snapshot${ansi.reset}           全市场温度（涨跌家数 / 涨跌停 / 成交额 / 分布）
   ${ansi.green}xzh a start${ansi.reset}              启动 A 股后台服务（巡检 / 监控 / 模拟交易）
   ${ansi.green}xzh a stop${ansi.reset}               关闭 A 股后台服务
+  ${ansi.green}xzh a restart${ansi.reset}            重启 A 股后台服务（等同 stop + start）
   ${ansi.green}xzh a sync|status${ansi.reset}        建股票池 + 预计算指标 / 查看缓存状态
   ${ansi.green}xzh a watch [add|remove]${ansi.reset}  自选池（默认 5 只，持仓强制保留）
   ${ansi.green}xzh autonomy${ansi.reset}            查看自治等级（ask / observe / auto）与最近拦截记录
@@ -613,11 +625,13 @@ ${ansi.bold}用法${ansi.reset}（按英文字母排序）
   ${ansi.green}xzh btc moni${ansi.reset}            启动 BTC 模拟盘：虚拟账本开平仓（前端 + 自动拉起模拟盘后台）
   ${ansi.green}xzh btc moni start${ansi.reset}      启动模拟盘后台（不进入界面）
   ${ansi.green}xzh btc moni stop${ansi.reset}       关闭模拟盘后台
+  ${ansi.green}xzh btc moni restart${ansi.reset}    重启模拟盘后台（等同 stop + start）
   ${ansi.green}xzh btc platform${ansi.reset}        选择交易平台（默认币安；已接入的只有币安）
   ${ansi.green}xzh btc setup${ansi.reset}           重建 btc 计算环境（首次进入模式时自动执行；此处用于修复 / ${ansi.gray}--force${ansi.reset} 重装）
   ${ansi.green}xzh btc start${ansi.reset}           启动实盘后台（不进入界面；已在跑则复用）
   ${ansi.green}xzh btc status${ansi.reset}          查看实盘 / 模拟盘两个后台与排期队列
   ${ansi.green}xzh btc stop${ansi.reset}            关闭实盘后台（退出界面不会停它；模拟盘用 ${ansi.gray}xzh btc moni stop${ansi.reset}）
+  ${ansi.green}xzh btc restart${ansi.reset}         重启实盘后台（等同 stop + start）
   ${ansi.green}xzh config${ansi.reset}              查看当前配置（API Key 脱敏）
   ${ansi.green}xzh config edit${ansi.reset}         使用 nano 编辑配置文件
   ${ansi.green}xzh config init${ansi.reset}         生成默认配置文件
@@ -639,6 +653,7 @@ ${ansi.bold}用法${ansi.reset}（按英文字母排序）
   ${ansi.green}xzh errors path${ansi.reset}         打印报告目录
   ${ansi.green}xzh errors show <序号|签名>${ansi.reset}  查看一份报告的完整内容
   ${ansi.green}xzh gateway${ansi.reset}             启动常驻 gateway（stop / restart / status / autostart）
+  ${ansi.green}xzh gateway weixin login${ansi.reset}  扫码登录个人微信（iLink Bot）；login / logout / 不带参数看状态
   ${ansi.green}xzh help${ansi.reset}                显示本帮助（同 --help）
   ${ansi.green}xzh init${ansi.reset}                搭建 AGENTS.md 与 docs/ 初始框架（确定性，不调用模型）
   ${ansi.green}xzh init --dry-run${ansi.reset}      只预览将生成的内容，不写文件

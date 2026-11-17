@@ -46,7 +46,7 @@ describe("对话内 init 的模型完善辅助", () => {
 <AGENTS>
 # Demo
 </AGENTS>
-<DOC path="docs/README.md">
+<DOC path="docs/INDEX.md">
 # 文档
 </DOC>
 <DOC path="docs/guides/deploy.md">
@@ -59,16 +59,20 @@ describe("对话内 init 的模型完善辅助", () => {
 # 不应写入
 </DOC>
 `);
-    expect(parsed.content).toBe("# Demo\n");
+    // 解析结果一定带强制开头两行（模型漏写也会被补上）
+    expect(parsed.content).toContain(
+      "（必须执行）本文档只设计与记录重要说明、详细设计文档位置的映射、总体框架等",
+    );
+    expect(parsed.content).toContain("# Demo");
     expect(parsed.docs.map((doc) => doc.path)).toEqual([
-      "docs/README.md",
+      "docs/INDEX.md",
       "docs/guides/deploy.md",
       "docs/reference/api/auth.md",
     ]);
   });
 
   it("docs 路径校验：只允许 docs 下的 md，最多两层子目录", () => {
-    expect(isAllowedDocPath("docs/README.md")).toBe(true);
+    expect(isAllowedDocPath("docs/INDEX.md")).toBe(true);
     expect(isAllowedDocPath("./docs/guides/deploy.md")).toBe(true);
     expect(isAllowedDocPath("docs\\reference\\api\\auth.md")).toBe(true);
     expect(isAllowedDocPath("docs/a/b/c/too-deep.md")).toBe(false);
@@ -86,9 +90,10 @@ describe("对话内 init 的模型完善辅助", () => {
       JSON.stringify({ name: "demo", scripts: { test: "npm test" } }),
     );
     const scaffold = buildDocsScaffold(cwd);
-    expect(scaffold.map((doc) => doc.path)).toContain("docs/README.md");
+    expect(scaffold.map((doc) => doc.path)).toContain("docs/INDEX.md");
+    expect(scaffold.map((doc) => doc.path)).not.toContain("docs/README.md");
     writeDocsFiles(cwd, scaffold);
-    expect(fs.existsSync(path.join(cwd, "docs", "README.md"))).toBe(true);
+    expect(fs.existsSync(path.join(cwd, "docs", "INDEX.md"))).toBe(true);
   });
 
   it("覆盖已有 AGENTS.md 前生成备份", () => {

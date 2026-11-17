@@ -1,3 +1,8 @@
+import {
+  describeTradingDay,
+  lastTradingDayOf,
+  nextTradingDay,
+} from "../src/a/trading-day";
 import { describe, expect, it } from "vitest";
 import {
   boardCodes,
@@ -214,5 +219,49 @@ describe("股票池与板块代码段", () => {
     expect(boards[0]).toEqual({ code: "881000", type: "industry" });
     expect(boards).toContainEqual({ code: "881101", type: "industry" });
     expect(boards).toContainEqual({ code: "885333", type: "concept" });
+  });
+});
+
+describe("交易日判断（A 股）", () => {
+  const calendar = {
+    updatedAt: "2026-11-17T00:00:00.000Z",
+    days: ["2026-11-13", "2026-11-16", "2026-11-17", "2026-11-19"],
+  };
+
+  it("下一个交易日严格大于今天（跳过周末与节假日缺口）", () => {
+    expect(nextTradingDay(calendar, "2026-11-16")).toBe("2026-11-17");
+    expect(nextTradingDay(calendar, "2026-11-17")).toBe("2026-11-19");
+    expect(nextTradingDay(calendar, "2026-11-20")).toBeUndefined();
+  });
+
+  it("最近交易日取 <= 今天的最后一个（节假日回落）", () => {
+    expect(lastTradingDayOf(calendar, "2026-11-18")).toBe("2026-11-17");
+    expect(lastTradingDayOf(calendar, "2026-11-17")).toBe("2026-11-17");
+    expect(lastTradingDayOf(calendar, "2026-11-01")).toBeUndefined();
+  });
+
+  it("描述里带出「是否交易日 / 最近 / 下一个 / 数据源」", () => {
+    const text = describeTradingDay({
+      today: "2026-11-18",
+      tradingDay: false,
+      source: "calendar",
+      calendarUpdatedAt: "2026-11-17T00:00:00.000Z",
+      lastTradingDay: "2026-11-17",
+      nextTradingDay: "2026-11-19",
+    });
+    expect(text).toContain("2026-11-18 非交易日");
+    expect(text).toContain("最近交易日 2026-11-17");
+    expect(text).toContain("下一交易日 2026-11-19");
+    expect(text).toContain("上证指数日线");
+
+    // 日历不可用时如实说明是降级判断，不能假装确定
+    const fallback = describeTradingDay({
+      today: "2026-11-18",
+      tradingDay: true,
+      source: "weekday",
+      error: "timeout",
+    });
+    expect(fallback).toContain("降级判断");
+    expect(fallback).toContain("timeout");
   });
 });

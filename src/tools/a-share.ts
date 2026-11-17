@@ -44,15 +44,21 @@ import {
   POLICY_MAX_CHARS,
   type Indicators,
   type PaperAccount,
+  describeTradingDay,
+  scoreHeldItems,
+  todayTradingStatus,
   type RuleKind,
 } from "../a";
-import { selectTopWatchlist } from "../a/score";
+import { selectionNeed, selectTopWatchlist } from "../a/score";
 import { loadWatchlist, mergeWatchlist, orderedPool, saveWatchlist } from "../a/watchlist";
 import { adjustByNews } from "../a/news";
 import {
+  CN_TRADING_SESSIONS,
   fetchBars,
   fetchQuote,
   readCache,
+  sessionKind,
+  sessionLabel,
   toThsSymbol,
   type Adjust,
   type BarPeriod,
@@ -662,15 +668,29 @@ const selectTool: ToolDefinition = {
       };
     }
     const size = poolSize();
-    const limit = Math.max(1, Math.min(size, Number(args.limit) || size));
-    const picks = await selectTopWatchlist(limit, (message) => ctx.emit?.(message));
     const account = loadPaperAccount();
-    const merged = mergeWatchlist(
-      picks,
-      account.positions.map((position) => ({ code: position.code, name: position.name })),
-      new Date(),
-      size,
-    );
+    const heldNow = account.positions.filter((position) => position.qty > 0).length;
+    // 与 16:00 固定选股同一口径：池子含持仓，只补「容量 − 持仓数」；
+    // 显式传 limit 时才覆盖（手动工具，允许用户临时多选几只）
+    const limit =
+      typeof args.limit === "number" && args.limit > 0
+        ? Math.max(1, Math.min(size, Math.floor(args.limit)))
+        : selectionNeed(size, heldNow);
+    if (limit === 0) {
+      return {
+        ok: true,
+        content: `持仓 ${heldNow}/${size} 已满（池子含持仓），无需选股；要换股请先减/清一只。`,
+        summary: "持仓已满，跳过选股",
+      };
+    }
+    const picks = await selectTopWatchlist(limit, (message) => ctx.emit?.(message));
+    // 持仓不在「全市场前 20」里，选股流程不会给它打分；补一遍，避免面板写「0 分」
+    const held = account.positions.map((position) => ({
+      code: position.code,
+      name: position.name,
+    }));
+    const heldScored = await scoreHeldItems(held, (message) => ctx.emit?.(message));
+    const merged = mergeWatchlist([...picks, ...heldScored], held, new Date(), size);
     saveWatchlist(merged);
     const lines = merged.items.map(
       (item, index) => `${index + 1}. ${item.code} ${item.name} ${item.score} 分`,
@@ -1060,7 +1080,60 @@ const removeTriggerTool: ToolDefinition = {
   },
 };
 
+
+/**
+ * `a_trading_day`：**今天是不是交易日**。
+ *
+ * 为什么需要它：模型（和旧代码）习惯用「星期几 + 现在几点」推断能不能交易，
+ * 但节假日、调休、临时休市都会让这个推断错 —— 结果是休市日拉行情、跑巡检、按节前价格下单。
+ * 判断依据必须是真实日历（上证指数日线日期序列），这里直接把它交给模型。
+ */
+const tradingDayTool: ToolDefinition = {
+  name: "a_trading_day",
+  modes: A_MODES,
+  description:
+    "查询今天是不是 A 股**交易日**（真实日历：上证指数有行情的日期），以及当前所处时段、" +
+    "最近交易日与下一个交易日。判断「今天能不能交易」一律以本工具为准 —— " +
+    "星期几不等于交易日（节假日、调休都会错）。**非交易日不要下单 / 挂单，也不要用节前价格判断买卖点**；" +
+    "下一轮巡检请排到下一个交易日的 09:30。",
+  parameters: {
+    type: "object",
+    properties: {
+      refresh: {
+        type: "boolean",
+        description: "强制重拉交易日历（默认用 24 小时缓存；怀疑日历过期时才用）",
+      },
+    },
+    required: [],
+  },
+  async execute(args): Promise<ToolResult> {
+    const status = await todayTradingStatus(new Date(), {
+      refresh: args.refresh === true,
+    });
+    const kind = sessionKind();
+    const lines = [
+      `${status.today}：${status.tradingDay ? "✅ 是交易日" : "⛔ 非交易日（休市）"}`,
+      `当前时段：${sessionLabel(kind)}${kind === "continuous" ? "（可成交）" : "（不可成交）"}`,
+      `交易时段：${CN_TRADING_SESSIONS.map((session) => `${session.start}–${session.end}`).join("、")}`,
+      describeTradingDay(status),
+    ];
+    if (!status.tradingDay) {
+      lines.push(
+        "",
+        "结论：今天休市。不要下单 / 挂单 / 假设有成交，也不要用节前价格判断买卖点；" +
+          `下一轮排到 ${status.nextTradingDay ?? "下一个交易日"} 09:30。`,
+      );
+    }
+    return {
+      ok: true,
+      content: lines.join("\n"),
+      summary: `${status.today} ${status.tradingDay ? "交易日" : "休市"}`,
+    };
+  },
+};
+
 export const aShareTools: ToolDefinition[] = [
+  tradingDayTool,
   snapshotTool,
   screenTool,
   selectTool,

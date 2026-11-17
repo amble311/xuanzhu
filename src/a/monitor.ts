@@ -43,7 +43,7 @@ import {
 } from "./risk-alerts";
 import { intradayWeak } from "./intraday";
 import { loadIndicators } from "./indicators";
-import { selectTopWatchlist } from "./score";
+import { scoreHeldItems, selectionNeed, selectTopWatchlist } from "./score";
 import {
   loadWatchlist,
   mergeWatchlist,
@@ -53,6 +53,7 @@ import {
 } from "./watchlist";
 import { poolSize } from "./settings";
 import { inWorkWindow, WORK_WINDOW_LABEL } from "./window";
+import { describeTradingDay, todayTradingStatus } from "./trading-day";
 import { ensureDir, getAShareHome } from "../utils/paths";
 import { VERSION } from "../utils/version";
 
@@ -424,7 +425,13 @@ async function warmupData(at: Date): Promise<void> {
   } catch (err) {
     log(`交易日历加载失败，按工作日判断：${err instanceof Error ? err.message : String(err)}`);
   }
-  if (at.getDay() === 0 || at.getDay() === 6) return;
+  // 非交易日（含节假日）不做全市场指标重算：5000+ 只 × 140 根日线要 1–2 分钟，
+  // 而当天根本不会有新数据。
+  const tradingDay = await todayTradingStatus(at).catch(() => null);
+  if (!tradingDay?.tradingDay) {
+    log(`今天不是交易日（${tradingDay ? describeTradingDay(tradingDay) : "日历不可用"}），跳过指标预热`);
+    return;
+  }
   const started = Date.now();
   log("预热日线指标（缓存缺失时全市场重算，约 1–2 分钟）…");
   try {
@@ -495,6 +502,9 @@ export async function runAServe(): Promise<void> {
     writeState(state);
   };
 
+  /** 非交易日只记一次日志，避免每分钟刷屏 */
+  let nonTradingLoggedFor = "";
+
   const cycle = async (): Promise<void> => {
     const at = new Date();
     refresh(at);
@@ -515,6 +525,18 @@ export async function runAServe(): Promise<void> {
     // 不在交易时段（集合竞价 / 午休 / 收盘后 / 周末）完全不拉行情：价格是冻结的，
     // 逐 tick 重拉持仓行情与 15m K 线只是白烧请求，而且会让巡检拿到假价格。
     if (!inTradingWindow(at)) return;
+
+    // 交易日闸门：`inTradingWindow()` 只按星期 + 时间判断，节假日落在工作日时会误判为
+    // 「可以巡检」。这里用真实日历（上证指数日线）再拦一道：非交易日直接返回，
+    // 不拉行情、不撮合、不叫模型 —— 这才是「避免空跑」的地方。
+    const tradingDay = await todayTradingStatus(at);
+    if (!tradingDay.tradingDay) {
+      if (nonTradingLoggedFor !== tradingDay.today) {
+        nonTradingLoggedFor = tradingDay.today;
+        log(`今天不是交易日，跳过巡检与撮合：${describeTradingDay(tradingDay)}`);
+      }
+      return;
+    }
 
     // 硬风控与 btc 对齐：只落盘 + 告警，不自动交易；工作时段内即使暂停也检查
     const account = loadPaperAccount(at);
@@ -846,7 +868,7 @@ async function detectPositionRisks(
  * 收盘后固定选股（工作日 16:00 后，每天一次）：
  * - 强制刷新快照与日线指标，确保用的是当天收盘数据；
  * - 完整三周期 MACD 漏斗 + 日线评分；
- * - 只替换非持仓自选股，持仓强制保留；
+ * - 只替换非持仓自选股，持仓强制保留（并用同一口径重算分数，不留「0 分」）；
  * - 不触发巡检，不交易。
  */
 export function shouldRunAfterCloseSelection(
@@ -879,7 +901,10 @@ export function describeSelection(items: WatchItem[], before: WatchItem[]): stri
     const reason = (raw.includes("（") ? raw.slice(0, raw.indexOf("（")) : raw).slice(0, 36);
     // 持仓是「强制保留」带进来的，score 恒为 0：写「0 分」会让人以为它不及格
     const score = item.score > 0 ? ` · ${item.score} 分` : "";
-    lines.push(`${index + 1}. ${item.name} ${item.code}${score}${reason ? ` · ${reason}` : ""}`);
+    const heldNote = item.source === "held" && !reason.includes("持仓保留") ? " · 持仓保留" : "";
+    lines.push(
+      `${index + 1}. ${item.name} ${item.code}${score}${reason ? ` · ${reason}` : ""}${heldNote}`,
+    );
   });
   const codes = new Set(items.map((item) => item.code));
   const added = items.filter((item) => !before.some((old) => old.code === item.code));
@@ -912,14 +937,35 @@ async function maybeRunAfterCloseSelection(now: Date, state: AMonitorState): Pro
   try {
     const size = poolSize();
     const before = loadWatchlist().items;
-    const picks = await selectTopWatchlist(size, log, { refresh: true });
     const account = loadPaperAccount(now);
-    const merged = mergeWatchlist(
-      picks,
-      account.positions.map((position) => ({ code: position.code, name: position.name })),
-      now,
-      size,
-    );
+    const held = account.positions
+      .filter((position) => position.qty > 0)
+      .map((position) => ({ code: position.code, name: position.name }));
+    const heldNow = held.length;
+    // 选股口径：池子含持仓 → 只补「容量 − 持仓数」；满仓不跑全市场，但**持仓仍要重新打分**
+    const need = selectionNeed(size, heldNow);
+    if (need === 0) {
+      const scored = await scoreHeldItems(held, log);
+      const merged = mergeWatchlist(scored, held, now, size);
+      saveWatchlist(merged);
+      state.lastSelectDay = today;
+      state.lastAction = `持仓 ${heldNow}/${size} 已满，重算持仓评分 ${scored.length} 只`;
+      writeSelectState({ day: today, attemptedAt: state.lastSelectAttemptAt });
+      appendAAction({
+        kind: "select",
+        ok: true,
+        codes: merged.items.map((item) => item.code),
+        message: describeSelection(merged.items, before),
+      });
+      log(`收盘后选股跳过（持仓 ${heldNow}/${size} 已满），已重算 ${scored.length} 只持仓评分`);
+      return true;
+    }
+    log(`收盘后选股：池子 ${size} 只、持仓 ${heldNow} 只 → 需要新选 ${need} 只`);
+    const picks = await selectTopWatchlist(need, log, { refresh: true });
+    // 持仓不在「全市场前 20」里，选股流程根本不会给它们打分；这里单独补一遍，
+    // 否则面板与推送只会写「0 分 · 已持仓，强制保留」，看不出持仓还行不行。
+    const heldScored = await scoreHeldItems(held, log);
+    const merged = mergeWatchlist([...picks, ...heldScored], held, now, size);
     saveWatchlist(merged);
     state.lastSelectDay = today;
     writeSelectState({ day: today, attemptedAt: state.lastSelectAttemptAt });

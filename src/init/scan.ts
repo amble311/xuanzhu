@@ -25,6 +25,13 @@ export interface ProjectDirectory {
   files: number;
   /** 该目录下（递归）子目录数 */
   dirs: number;
+  /**
+   * 该目录**一级**条目名（子目录带尾 `/`，最多 40 个）。
+   *
+   * 用来生成 `docs/modules/<目录>.md` 的文件表：只给「有多少文件」写不出可用的明细文档，
+   * 但递归列全部文件会让超大仓库的文档爆掉 —— 一级条目是够用且可控的粒度。
+   */
+  entries?: string[];
 }
 
 /** `docs/` 下的一个文档分组（根目录或子目录） */
@@ -106,6 +113,7 @@ const DOC_CANDIDATES = [
   "SECURITY.md",
   "AGENTS.md",
   "docs/ARCHITECTURE.md",
+  "docs/INDEX.md",
   "docs/README.md",
 ];
 
@@ -392,6 +400,23 @@ function countTree(dir: string, depth = 0): { files: number; dirs: number } {
   return { files, dirs };
 }
 
+function listEntries(dir: string, limit = 40): string[] {
+  try {
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => !entry.name.startsWith("."))
+      .filter((entry) => !IGNORED_DIRS.has(entry.name))
+      .sort((a, b) => {
+        if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      })
+      .slice(0, limit)
+      .map((entry) => (entry.isDirectory() ? `${entry.name}/` : entry.name));
+  } catch {
+    return [];
+  }
+}
+
 function scanDirectories(root: string): ProjectDirectory[] {
   let entries: fs.Dirent[];
   try {
@@ -403,8 +428,14 @@ function scanDirectories(root: string): ProjectDirectory[] {
     .filter((entry) => entry.isDirectory())
     .filter((entry) => !IGNORED_DIRS.has(entry.name))
     .map((entry) => {
-      const counts = countTree(path.join(root, entry.name));
-      return { name: entry.name, files: counts.files, dirs: counts.dirs };
+      const abs = path.join(root, entry.name);
+      const counts = countTree(abs);
+      return {
+        name: entry.name,
+        files: counts.files,
+        dirs: counts.dirs,
+        entries: listEntries(abs),
+      };
     })
     .sort((a, b) => a.name.localeCompare(b.name))
     .slice(0, 20);
@@ -431,7 +462,7 @@ function readDocTitle(file: string): string | undefined {
  * 收集既有文档：项目根候选 + `docs/` 递归（两层子目录）。
  *
  * 只认 `.md` / `.mdx`；隐藏目录与忽略目录不进入。分组按「目录」聚合，
- * 供 `docs/README.md` 做分层索引 —— 文档一多，平铺列表就没法看。
+ * 供 `docs/INDEX.md` 做分层索引 —— 文档一多，平铺列表就没法看。
  */
 function scanDocs(root: string): { docs: string[]; groups: ProjectDocGroup[] } {
   const docs: string[] = [];

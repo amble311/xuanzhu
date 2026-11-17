@@ -1,5 +1,10 @@
 import { fetch15mBars, fetchBars, mapLimit } from "../exchange/ashare";
-import { loadIndicators, type Indicators } from "./indicators";
+import {
+  computeIndicators,
+  loadIndicators,
+  readCachedIndicators,
+  type Indicators,
+} from "./indicators";
 import { dropIncompleteWeek } from "./macd";
 import { loadSnapshot, type SnapshotRow } from "./snapshot";
 import { applyNewsAdjustments } from "./news";
@@ -75,6 +80,99 @@ function baseUniverse(rows: SnapshotRow[]): SnapshotRow[] {
       row.amount > 0 &&
       row.board !== "index" &&
       row.board !== "board",
+  );
+}
+
+/**
+ * 本轮还需要新选几只：**池子容量 − 现有持仓数**（`xzh a` 的选股口径）。
+ *
+ * 池子含持仓（默认 5 只），持仓已经是池子的占用，所以只补差额；
+ * 满仓返回 0（此时不该再跑全市场筛选，省掉一轮全市场抓取与指标重算）。
+ */
+export function selectionNeed(size: number, heldCount: number): number {
+  return Math.max(0, Math.floor(size) - Math.max(0, Math.floor(heldCount)));
+}
+
+/**
+ * 收盘后给**持仓**单独打分（与选股同一口径）。
+ *
+ * 为什么需要：选股只对「全市场三周期过滤后的前 20 只」做 15 分钟深度评分，
+ * 持仓通常不在那 20 只里 —— 于是 `mergeWatchlist()` 只能给它记 0 分 +
+ * 「已持仓，强制保留」，面板和推送里看不出这只持仓还行不行（100 分的票和
+ * 快跌破 MA20 的票长得一模一样）。
+ *
+ * 这里按与选股**完全相同**的算法逐只现算：月/周/日趋势 + 15 分钟 0–100 评分，
+ * 理由格式也一致（`趋势 月+1/周+1/日-1 · 15m 42 分 wait`）。
+ *
+ * 只补分数，不做筛选：持仓不参与新闻否决与排名淘汰，分低也照样留在池内。
+ */
+export async function scoreHeldItems(
+  held: Array<{ code: string; name: string }>,
+  onProgress?: (message: string) => void,
+): Promise<WatchItem[]> {
+  if (held.length === 0) return [];
+  // 只读缓存：缺了就让每只自己算 140 根日线（下面 `dailyBars` 分支），
+  // 不能在这里触发全市场重算 —— 满仓时选股流程根本没跑过，缓存是空的。
+  const indicators = readCachedIndicators();
+  onProgress?.(`持仓打分：${held.length} 只（三周期 + 15 分钟，口径同选股）…`);
+
+  let done = 0;
+  return mapLimit(
+    held,
+    async (position) => {
+      try {
+        const [weekBars, monthBars, shortBars, dailyBars] = await Promise.all([
+          fetchBars(position.code, { period: "week", adjust: "backward", limit: 80 }).catch(
+            () => null,
+          ),
+          fetchBars(position.code, { period: "month", adjust: "backward", limit: 60 }).catch(
+            () => null,
+          ),
+          fetch15mBars(position.code, 160).catch(() => null),
+          indicators?.get(position.code)
+            ? Promise.resolve(null)
+            : fetchBars(position.code, { period: "day", adjust: "backward", limit: 140 }).catch(
+                () => null,
+              ),
+        ]);
+
+        const dailyIndicators =
+          indicators?.get(position.code) ??
+          (dailyBars ? computeIndicators(position.code, dailyBars) : undefined);
+        const daily = dailyTrend(dailyIndicators ?? undefined);
+        const weekly = weekBars
+          ? weeklyTrend(dropIncompleteWeek(weekBars))
+          : { score: null, reason: "周线获取失败" };
+        const monthly = monthBars
+          ? monthlyTrend(monthBars)
+          : { score: null, reason: "月线获取失败" };
+        const trend = combineTrend(monthly, weekly, daily);
+        const deep = shortBars ? score15m(shortBars) : null;
+
+        return {
+          code: position.code,
+          name: position.name,
+          score: deep?.score ?? 0,
+          reason:
+            `趋势 ${trend.reason} · ${deep?.reason ?? "15m 数据不足（0 分）"} · 持仓保留`,
+          source: "held" as const,
+          addedAt: new Date().toISOString(),
+        } satisfies WatchItem;
+      } catch (err) {
+        return {
+          code: position.code,
+          name: position.name,
+          score: 0,
+          reason: `打分失败（${err instanceof Error ? err.message : String(err)}）· 持仓保留`,
+          source: "held" as const,
+          addedAt: new Date().toISOString(),
+        } satisfies WatchItem;
+      } finally {
+        done += 1;
+        if (done === held.length) onProgress?.(`持仓打分完成 ${done}/${held.length}`);
+      }
+    },
+    3,
   );
 }
 

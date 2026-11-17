@@ -117,6 +117,7 @@ describe("模式与工具注册", () => {
       "a_select",
       "a_signal",
       "a_snapshot",
+      "a_trading_day",
       "a_trigger",
       "a_unschedule",
     ]);

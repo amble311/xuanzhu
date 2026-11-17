@@ -1319,7 +1319,7 @@ node bin/xzh.js     # 本地运行
 XZH_RELEASE_DRY_RUN=1 ./release.sh   # 先演练一遍，不做任何写入
 ```
 
-脚本会依次完成：**bump 版本号（含 lock）→ 把 `CHANGELOG.md` 的 `[未发布]` 段收成本次版本
+脚本会依次完成：**bump 版本号（含 lock）→ 把变更记录（`docs/changelog.md`）的 `[未发布]` 段收成本次版本
 → `npm publish` → 等待 registry 同步 → `git add -A` + 提交 + 推送 GitHub → 更新本机全局安装**。
 
 之所以需要脚本，是因为这条链路有几个反直觉的地方：`npm publish` 返回成功**不等于**

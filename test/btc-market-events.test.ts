@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { paperStatusHasExposure } from "../src/btc/daemon-main";
 import {
   dueMarketEvent,
   lastDailyClose,
@@ -14,6 +15,38 @@ import {
  * 这些规则存在的理由：模型把巡检定在 8 小时后，日线收盘 / 资金费结算 / 暴跌
  * 都会错过。代码必须自己兜住，且**不能重复触发**（宽限期 + 已处理标记）。
  */
+describe("模拟盘的「有仓位」判定", () => {
+  const at = (iso: string) => Date.parse(iso);
+
+  it("持仓或挂单都算有仓位（模拟盘靠虚拟账本，不靠交易所快照）", () => {
+    expect(paperStatusHasExposure(null)).toBe(false);
+    expect(paperStatusHasExposure({ position: null, open_orders: [] })).toBe(false);
+    expect(
+      paperStatusHasExposure({
+        position: { side: "long", qty: 0.01 },
+        open_orders: [],
+      }),
+    ).toBe(true);
+    expect(
+      paperStatusHasExposure({
+        position: null,
+        open_orders: [{ id: 1, side: "long" }],
+      }),
+    ).toBe(true);
+  });
+
+  it("模拟盘持仓时 4 小时收盘事件会触发（此前 hasPosition 恒为 false）", () => {
+    const h4 = at("2026-11-04T12:00:00Z");
+    const hasPosition = paperStatusHasExposure({
+      position: { side: "long", qty: 0.01 },
+    });
+    const event = dueMarketEvent(h4 + 60_000, { hasPosition, lastHandled: {} });
+    // 12:00 同时不是日线收盘/资金费，持仓时命中的就是 4h 收盘
+    expect(event?.kind).toBe("h4-close");
+    expect(event?.reason).toContain("4 小时线收盘后复核");
+  });
+});
+
 describe("市场事件时点", () => {
   const at = (iso: string) => Date.parse(iso);
 

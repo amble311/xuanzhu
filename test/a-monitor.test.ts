@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { selectionNeed } from "../src/a/score";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { inTradingWindow, shouldSell } from "../src/a/monitor";
 import { decideMarketRegime } from "../src/a/regime";
@@ -80,6 +81,16 @@ describe("日线详细评分", () => {
 
   it("指标缺失返回 0", () => {
     expect(scoreDailyDetailed(row(), undefined)).toBe(0);
+  });
+});
+
+describe("收盘选股口径（池子含持仓）", () => {
+  it("只补「池子容量 − 持仓数」，满仓为 0", () => {
+    expect(selectionNeed(5, 0)).toBe(5);
+    expect(selectionNeed(5, 2)).toBe(3);
+    expect(selectionNeed(5, 5)).toBe(0);
+    expect(selectionNeed(5, 7)).toBe(0);
+    expect(selectionNeed(5, -1)).toBe(5);
   });
 });
 

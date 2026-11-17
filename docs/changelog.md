@@ -1,8 +1,64 @@
-# Changelog
+# 变更记录
+
+> 本文件原在仓库根目录（`CHANGELOG.md`），2026-11-17 统一迁入 `docs/`；
+> `release.sh` 从这里读取并收掉顶部 `## [未发布]` 段，请不要改名或换位置。
 
 玄猪（XuanZhu）的所有重要变更都记录于此。
 
 ## [未发布]
+
+## [0.17.9] — 2026-11-17
+
+### 文档
+
+- **AGENTS.md 重写为「框架 + 映射 + 必守约定」**，开头四条硬性要求：本文档只记框架与映射、
+  改代码同步明细、**发版须用户同意**、**独立项目**（`npm i -g` 后行为一致，不依赖本机特例）。
+  命令全表、目录清单、机制说明全部下沉到 `docs/`，AGENTS 只留映射表（11 行）与六条约定（83 行）。
+- **ARCHITECTURE.md 拆分**：2186 行 → 377 行的总体框架（定位 / 分层 / 运行时数据流 / **明细映射表** /
+  测试清单 / 目录与模块总表）；长篇机制正文原样搬进 `docs/architecture/`：
+  `agent-loop.md`（§4）、`llm.md`（§5）、`tools.md`（§6）、`config.md`（§7）、`ui.md`（§8）、
+  `build-release.md`（§9 + §11–§13）。测试清单章节由 §10 改为 §5（`test/docs.test.ts` 同步）。
+- `docs/INDEX.md` 的阅读路径改指 `architecture/`，并补上「AGENTS 只放框架」的说明。
+
+### 变更
+
+- **`xzh init` 重做文档结构**（三条硬约束）：
+  1. **不再生成 `docs/README.md`** —— 索引改为 `docs/INDEX.md`。README 是发布物（面向使用者、
+     随 npm 包分发），开发文档不占用这个名字。
+  2. **docs 按项目实际内容多级管理**：新增 `docs/modules/INDEX.md`（模块总表）+
+     `docs/modules/<顶层目录>.md`（一篇对应一个真实存在的顶层目录，骨架含扫描到的一级条目文件表、
+     职责/入口/运行时数据待补），最多 12 篇；`docs/` 根只留四个入口文件。
+     `scan.ts` 的 `ProjectDirectory` 增加 `entries`（一级条目名），作为生成文件表的事实来源。
+  3. **AGENTS.md 开头强制两行**（逐字，新增 `AGENTS_MANDATORY_HEADER`）：
+     `（必须执行）本文档只设计与记录重要说明、详细设计文档位置的映射、总体框架等` /
+     `（必须执行）改动代码时同步更新此设计文档与文档中对应的docs下的明细设计文档；`。
+     新文件由生成器写入；已存在文件的「按小节合并」不会动前言，因此 `planInit()` 末尾统一补
+     （缺失时把文件标成 `append`）；对话内 `/init` 的模型输出同样会被 `withAgentsHeader()` 兜住。
+
+### 文档
+
+- **根目录 md 收敛到 `docs/`**：根目录只保留 `README.md`（面向使用者、随 npm 包分发）与
+  `AGENTS.md`（开发标尺，xzh 会读取并注入系统提示词）。`CHANGELOG.md` → `docs/changelog.md`；
+  `CONTRIBUTING.md` + `SECURITY.md` + `CODE_OF_CONDUCT.md` 合并为 `docs/contributing.md`
+  （顺带修正安全策略里过期的 `~/.xuanzhu/config.json` 路径，改为 `~/.xzh/config/config.json`
+  与 `~/.xzh/vault`）。`release.sh` 改为读取 `docs/changelog.md`（旧检出回退根 `CHANGELOG.md`）；
+  `.gitignore` 里对 `docs/` 整体忽略，但单独放行 `changelog.md` / `contributing.md`
+  （这两个原本就是公开文件，不能从仓库消失）。
+- **`docs/` 拆成索引 + 逐模块 + 专题**（本地文档，不进 npm 包）：新增 `docs/modules/`（13 篇，
+  按 `src/` 目录切分：core / llm / tools / cli / tui / gateway / a-share / btc / exchange / device /
+  modes / support / assets）、`docs/modes/btc-moni.md`（模拟盘架构 + 各种情况下的提示词清单）、
+  `docs/data-files.md`（四个 home 与项目 `.xuanzhu/` 的数据文件总表：是什么 / 能不能删）；
+  `docs/INDEX.md` 为按角色的阅读导航（`docs/` 内不放 README：README 只面向发布后的使用者）；`ARCHITECTURE.md` 同步模块文件数、目录树与分层指针，
+  `COMMANDS.md` 补运维命令（含三处 `restart`）。
+- `test/docs.test.ts` 支持 `docs/` 子目录：递归收集所有 md 做「冲突标记 / 本地链接」检查
+  （原来把 `docs/modes` 当文件读会 EISDIR）。
+
+### 新增
+
+- **`xzh a restart` / `xzh btc restart` / `xzh btc moni restart`**：重启对应后台，效果等同
+  先 `stop` 再 `start`（升级、改配置后不用敲两条）。停止阶段失败就不继续启动 ——
+  旧进程还攥着锁文件，硬起一个只会「复用」旧进程，看起来像重启成功、实际跑的还是老代码。
+  btc 的 `restart` 与 `stop` 一样按角色分离：`restart` 只动实盘，`moni restart` 只动模拟盘。
 
 ## [0.17.8] — 2026-11-16
 
@@ -31,6 +87,60 @@
 
 ### 修复
 
+- **`xzh help` 补上微信登录命令**：`xzh gateway weixin login`（扫码登录 iLink Bot）此前在
+  主帮助与 `xzh gateway` 的用法提示里都没有，只有 README 和「未登录」日志里能挖到。
+  现在两处都列出 `weixin [login|logout|status]`。
+- **收盘选股时持仓不再显示「0 分」**：选股只对「三周期过滤后的前 20 只」做 15 分钟深度评分，
+  持仓通常不在里面，于是 `mergeWatchlist()` 只能给它记 0 分 +「已持仓，强制保留」——
+  面板与 16:00 推送里 100 分的票和快跌破 MA20 的票长得一模一样。
+  现在收盘选股会给持仓**单独补一遍分**（`scoreHeldItems()`，口径与选股相同：月/周/日趋势 +
+  15 分钟 0–100，理由格式一致），只补分数不做筛选（不参与新闻否决与排名淘汰）；
+  满仓（不跑全市场）时同样重算；手动路径（`a_select` / `xzh a watch refresh`）也一样。
+  指标只读缓存 + 单只日线兜底，不会触发全市场重算，也不会把全市场缓存覆盖成几条。
+
+### 新增
+
+- **交易日判断（避免休市日空跑）**：新增 `src/a/trading-day.ts::todayTradingStatus()` ——
+  用真实日历（上证指数有行情的日期，24h 文件缓存 + 10 分钟内存缓存）判断今天是否交易日。
+  - 后台每轮 tick 与启动预热先过这道闸门：**非交易日不拉行情、不撮合、不叫模型**，只留心跳
+    （`inTradingWindow()` 只按星期 + 时间判断，节假日会误判成「可以巡检」）；
+  - 模型侧新增工具 `a_trading_day`（可 `refresh`）：今天是否交易日 / 当前时段 / 最近与下一个
+    交易日 / 数据源；巡检上下文每轮固定写出「交易日：…」；
+  - CLI 新增 `xzh a calendar [--refresh]`，供人和脚本直接查；
+  - 日历取不到时退回「工作日」判断，并在工具/日志/上下文里标注 `降级`（宁可多跑一天，
+    也不因一次网络失败让整个模式停摆）。成交仍由 `continuousSession()`（时段 + 交易日）兜底。
+
+### 变更
+
+- **A 股交易时段显式化**：成交时间固定为 **09:30–11:30 / 13:00–15:00（工作日且当天是交易日）**。
+  `matchOrders()` 的 `sessionOpen` 改为**必传**（以前缺省会按 `isTradingTime()` 猜，节假日的工作日
+  会被放行）；巡检上下文每轮写明「交易时段 + 当前处于哪一段（连续竞价 / 午间休市 / 收盘后…）」，
+  非连续竞价时明确“只能挂 `pending`，撮合等开盘/午后”，避免模型在午休反复尝试下单烧轮次。
+  详见 `docs/modes/a-share.md`「交易时段」。
+- **A 股模式按 `btc moni` 重构**（保留引擎、重写模式层）：
+  - 巡检提示词与 btc 同构（自主决策到底 + 结束前排期 + 逐只遍历），要求每只股票给出
+    「方向 / 15m 分 / 动作六选一（买入·加仓·持有·减仓·清仓·观望）」，结论按遍历顺序逐只列，
+    不允许只写「全部正常」；
+  - 16:00 固定选股改为 `need = poolSize − 持仓数`（新增 `selectionNeed()`）：满仓直接跳过、
+    不跑全市场；`a_select` 手动工具同口径（显式 `limit` 才覆盖）；
+  - 新增 [`docs/modes/a-share.md`](./modes/a-share.md)：btc moni ↔ A 股逐环节对照、
+    遍历差异、选股算法、数据重置方式。
+  - 说明：行情数据层 / 指标 / 15m 打分 / 模拟账本与撮合 / 风控 / 排期这些「引擎」保留复用
+    （相当于 btc 的 Python 计算层），不做无意义重写。
+
+### 修复
+
+- **BTC 模拟盘不会被「4h 收盘」叫醒**：`checkRisk()` 在 paper 角色下返回 null（不读交易所账户），
+  而 `checkEvents()` 只看实盘快照 → `hasPosition` 恒为 false，`h4-close` 候选永远不生成。
+  现在 `tick()` 对 paper 单独调 `paperHasExposure()`（读 `paper-status` 的 `position` / `open_orders`），
+  判断抽成纯函数 `paperStatusHasExposure()` 并补了回归用例；读不到状态时按「有仓位」处理。
+- **市场事件那一轮没有注入 `triggerNote`**：只把 `reason` 写进日志，模型看到的是常规巡检，
+  容易回一句「无变化」。现在 `checkEvents()` 返回 `triggerNote`（形如
+  「市场事件：日线收盘后复核（三周期打分依赖日线） · 08:00（北京时间）」，
+  波动触发带涨跌幅与阈值），经 `runInspect()` 注入 `triggerSection`。
+- **BTC 巡检改为空闲 + 总时长双超时**：原来只有单一 8 分钟总超时，工具多的轮次里
+  模型刚排完下一期、正在写结论就被掐断。现在空闲 3 分钟（有输出就续期）+ 总 15 分钟
+  （`timeoutMs` 可覆盖），中止原因写日志/过程流并注入兜底摘要器，与 A 股巡检一致。
 - **A 股巡检偶尔「没有结论」**：一轮巡检只有 6 分钟总超时，工具多的时候（13 次：下单、
   写策略、加/删触发、排期）模型刚排完下一轮、正在生成结论就被掐断，微信只收到
   「巡检完成（模型未生成正文结论，也未产生动作）」——而那一轮其实已经买入了中国核电。

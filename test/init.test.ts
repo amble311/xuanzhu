@@ -136,12 +136,21 @@ describe("计划与写入", () => {
     expect(plan.files.map((file) => file.relPath)).toContain("AGENTS.md");
     expect(plan.files.map((file) => file.relPath)).toContain("docs/ARCHITECTURE.md");
     expect(plan.files.map((file) => file.relPath)).toContain("docs/COMMANDS.md");
-    expect(plan.files.map((file) => file.relPath)).toContain("docs/README.md");
+    expect(plan.files.map((file) => file.relPath)).toContain("docs/INDEX.md");
+    // 逐模块：按实际顶层目录一篇一个文件，不是平铺
+    expect(plan.files.map((file) => file.relPath)).toContain("docs/modules/INDEX.md");
+    expect(plan.files.map((file) => file.relPath)).toContain("docs/modules/src.md");
+    expect(plan.files.map((file) => file.relPath)).toContain("docs/modules/tests.md");
     // 计划阶段不写盘
     expect(fs.existsSync(path.join(root, "AGENTS.md"))).toBe(false);
 
     const agents = plan.files.find((file) => file.relPath === "AGENTS.md")!;
     expect(agents.action).toBe("create");
+    // 开头必须是这两行（逐字）
+    expect(agents.content.startsWith(
+      "（必须执行）本文档只设计与记录重要说明、详细设计文档位置的映射、总体框架等\n" +
+        "（必须执行）改动代码时同步更新此设计文档与文档中对应的docs下的明细设计文档；\n",
+    )).toBe(true);
     expect(agents.content).toContain("# demo-app 开发规范");
     expect(agents.content).toContain("`npm run test`");
     expect(agents.content).toContain("## 目录结构");
@@ -151,13 +160,21 @@ describe("计划与写入", () => {
     expect(agents.content).toContain("docs/ARCHITECTURE.md");
     expect(agents.content).not.toContain("| 用途 | 命令 | 来源 |");
 
-    const docsIndex = plan.files.find((file) => file.relPath === "docs/README.md")!;
+    // 不再生成 docs/README.md（README 是发布物）
+    expect(plan.files.map((file) => file.relPath)).not.toContain("docs/README.md");
+
+    const docsIndex = plan.files.find((file) => file.relPath === "docs/INDEX.md")!;
     expect(docsIndex.content).toContain("对应关系");
     expect(docsIndex.content).toContain("AGENTS.md");
     expect(docsIndex.content).toContain("docs/ARCHITECTURE.md");
+    expect(docsIndex.content).toContain("## 模块明细");
+
+    const moduleDoc = plan.files.find((file) => file.relPath === "docs/modules/src.md")!;
+    expect(moduleDoc.content).toContain("`src/` 模块说明");
+    expect(moduleDoc.content).toContain("`index.ts`");
   });
 
-  it("docs 子目录：AGENTS 按目录汇总，docs/README.md 分组列出", () => {
+  it("docs 子目录：AGENTS 按目录汇总，docs/INDEX.md 分组列出", () => {
     const root = tmpProject();
     makeNodeProject(root);
     write(root, "docs/guides/setup.md", "# 本地安装\n");
@@ -167,11 +184,11 @@ describe("计划与写入", () => {
     const agents = plan.files.find((file) => file.relPath === "AGENTS.md")!;
     expect(agents.content).toContain("`docs/guides/`（1 篇）— 操作指南");
     expect(agents.content).toContain("`docs/reference/api/`（1 篇）— 参考手册");
-    expect(agents.content).toContain("完整文档地图（含子目录）见 `docs/README.md`");
+    expect(agents.content).toContain("完整文档地图（含子目录）见 `docs/INDEX.md`");
     // 子目录里的文件不逐条进 AGENTS
     expect(agents.content).not.toContain("docs/guides/setup.md");
 
-    const index = plan.files.find((file) => file.relPath === "docs/README.md")!;
+    const index = plan.files.find((file) => file.relPath === "docs/INDEX.md")!;
     expect(index.content).toContain("## 目录分工");
     expect(index.content).toContain("`docs/guides/` | 操作指南");
     expect(index.content).toContain("### `docs/guides/` — 操作指南");
@@ -185,7 +202,9 @@ describe("计划与写入", () => {
     applyInit(planInit(root));
     expect(fs.existsSync(path.join(root, "AGENTS.md"))).toBe(true);
     expect(fs.existsSync(path.join(root, "docs/ARCHITECTURE.md"))).toBe(true);
-    expect(fs.existsSync(path.join(root, "docs/README.md"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "docs/INDEX.md"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "docs/modules/INDEX.md"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "docs/README.md"))).toBe(false);
 
     const second = planInit(root);
     expect(second.files.every((file) => file.action === "skip")).toBe(true);

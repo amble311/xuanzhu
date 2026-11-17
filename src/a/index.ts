@@ -37,3 +37,4 @@ export * from "./deep15";
 export * from "./ta";
 export * from "./rule-audit";
 export * from "./risk-alerts";
+export * from "./trading-day";

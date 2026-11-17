@@ -3,6 +3,7 @@ import * as path from "path";
 import { loadConfig } from "../config/store";
 import { activeExchange } from "../exchange";
 import {
+  DEFAULT_VOLATILITY_PCT,
   dueMarketEvent,
   readEventsState,
   volatilityDue,
@@ -114,6 +115,28 @@ function appendInspectLog(home: string, block: string): void {
   } catch (err) {
     log(`⚠ 写巡检日志失败：${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+/**
+ * 模拟盘 `paper-status` 里与「有没有仓位」相关的字段。
+ *
+ * 只取这两个字段：虚拟账本是合约，持仓是单条 `position`，挂单在 `open_orders`。
+ */
+export interface PaperStatusLite {
+  position?: unknown | null;
+  open_orders?: unknown[];
+}
+
+/**
+ * 模拟盘是否有持仓或未成交挂单。
+ *
+ * 为什么单独抽出来：`checkRisk()` 在 paper 角色下返回 null（不读交易所账户），
+ * `checkEvents()` 若只看实盘快照就会认为「永远空仓」，`h4-close`（仅持仓时关心的
+ * 4 小时收盘复核）永远不触发。这里用虚拟账本自己的状态判断。
+ */
+export function paperStatusHasExposure(status: PaperStatusLite | null | undefined): boolean {
+  if (!status) return false;
+  return Boolean(status.position) || (status.open_orders?.length ?? 0) > 0;
 }
 
 export interface BackendOptions {
@@ -264,17 +287,31 @@ export async function runBtcBackend(
    * 所以由后端每分钟判断一次，命中就直接跑一轮（不占排期队列，
    * 否则每天固定几条 + 持仓时每小时一条，很快把 20 条上限撑爆）。
    */
+  /**
+   * 模拟盘是否有持仓 / 挂单。
+   *
+   * `checkRisk()` 在 paper 下直接返回 null（不读交易所账户），如果 `checkEvents()` 只看
+   * snapshot 就会认为「永远空仓」→ `h4-close`（4 小时收盘复核，仅持仓时）永远不触发。
+   * 这里单独问一次虚拟账本：`paper-status` 的 `position` 与 `open_orders` 才是真实仓位。
+   */
+  const paperHasExposure = async (): Promise<boolean> => {
+    const result = await runRunner<PaperStatusLite>("paper-status", {}, { timeoutMs: 20_000 });
+    if (!result.ok) {
+      // 读不到就别假装空仓：按「有仓位」处理，宁可多重一次 4h 复核
+      log(`市场事件：读取模拟盘仓位失败（${result.error}），按有仓位处理`);
+      return true;
+    }
+    return paperStatusHasExposure(result.data);
+  };
+
   const checkEvents = async (
-    snapshot: AccountSnapshot | null,
-  ): Promise<{ reason: string; price?: number } | null> => {
+    hasExposure: boolean,
+  ): Promise<{ reason: string; price?: number; triggerNote?: string } | null> => {
     const now = Date.now();
     const events = readEventsState(home);
 
-    const hasPosition =
-      (snapshot?.positions.length ?? 0) > 0 || (snapshot?.orders.length ?? 0) > 0;
-
     const event = dueMarketEvent(now, {
-      hasPosition,
+      hasPosition: hasExposure,
       lastHandled: events.lastHandled ?? {},
     });
     if (event) {
@@ -287,7 +324,8 @@ export async function runBtcBackend(
       events.lastHandled = marks as typeof events.lastHandled;
       writeEventsState(home, events);
       log(`市场事件：${event.reason}`);
-      return { reason: event.reason };
+      // 必须把「谁叫醒的」带进提示词：只写日志的话，模型会当成常规巡检回一句「无变化」
+      return { reason: event.reason, triggerNote: `市场事件：${event.reason}` };
     }
 
     // 波动判定：与「上次巡检时的价格」比，而不是与上一分钟比（噪音太大）
@@ -315,7 +353,13 @@ export async function runBtcBackend(
     events.lastPrice = price;
     writeEventsState(home, events);
     log(`价格波动：${check.changePct.toFixed(2)}%，提前巡检`);
-    return { reason: volatilityReason(check.changePct), price };
+    return {
+      reason: volatilityReason(check.changePct),
+      price,
+      triggerNote:
+        `价格异常波动：较上次巡检 ${check.changePct >= 0 ? "+" : ""}${check.changePct.toFixed(2)}%` +
+        `（阈值 ${DEFAULT_VOLATILITY_PCT}%），由代码提前叫醒`,
+    };
   };
 
   /**
@@ -798,7 +842,11 @@ export async function runBtcBackend(
     // 市场事件优先于队列：日线收盘/资金费/暴跌这类时刻比常规排期更该立刻看。
     // 而且这里**不能**先 takeDueSchedule —— 取出即出队，若事件又抢先跑，
     // 那条到期的计划就被吃掉了（既没执行也不会再排）。
-    const eventTrigger = await checkEvents(snapshot);
+    // 实盘看账户快照，模拟盘单独问虚拟账本 —— 后者在 checkRisk() 里是 null
+    const hasExposure = paper
+      ? await paperHasExposure()
+      : (snapshot?.positions.length ?? 0) > 0 || (snapshot?.orders.length ?? 0) > 0;
+    const eventTrigger = await checkEvents(hasExposure);
     if (eventTrigger) {
       running = true;
       try {

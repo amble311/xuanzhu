@@ -1,7 +1,12 @@
 import * as fs from "fs";
 import * as path from "path";
 import { VERSION } from "../utils/version";
-import { generateProjectDocs } from "./generate";
+import {
+  AGENTS_FILE,
+  generateProjectDocs,
+  hasAgentsHeader,
+  withAgentsHeader,
+} from "./generate";
 import { scanProject, type ProjectFacts } from "./scan";
 
 /**
@@ -175,6 +180,17 @@ export function planInit(cwd: string, options: { force?: boolean } = {}): InitPl
       keptSections: merged.kept,
       existingBytes,
     });
+  }
+
+  // AGENTS.md 开头两行是**强制**的：新增文件由 buildAgentsDoc 写入，
+  // 已存在的文件走「按小节合并」不会动前言，所以这里统一兜一次。
+  const agents = files.find((file) => file.relPath === AGENTS_FILE);
+  if (agents && !hasAgentsHeader(agents.content)) {
+    agents.content = withAgentsHeader(agents.content);
+    if (agents.action === "skip") agents.action = "append";
+    if (!agents.appendedSections.includes("（必须执行）开头两行")) {
+      agents.appendedSections = ["（必须执行）开头两行", ...agents.appendedSections];
+    }
   }
 
   return { cwd: root, facts, files };
