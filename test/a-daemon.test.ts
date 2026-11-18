@@ -10,7 +10,17 @@ import {
   removeSchedules,
   takeDueSchedule,
 } from "../src/a/schedule";
-import { addRule, commitRuleHit, evaluateRules, readRules, removeRules } from "../src/a/rules";
+import {
+  addRule,
+  commitRuleHit,
+  describeRule,
+  evaluateFormula,
+  evaluateRules,
+  readRules,
+  removeRules,
+  validateFormula,
+  type MonitorRule,
+} from "../src/a/rules";
 import { isPaused, readPause, setPaused } from "../src/a/pause";
 import { takeMarketEvent } from "../src/a/events";
 import { appendRuleAudit, readRuleAudits } from "../src/a/rule-audit";
@@ -673,5 +683,55 @@ describe("巡检前置数据核对", () => {
     expect(bad).toContain("数据有问题，先补数据再决策");
     expect(bad).toContain("601857 中国石油：行情取不到；15m K 线取不到；日线指标缺失");
     expect(bad).toContain("不要下单");
+  });
+});
+
+describe("监控规则表达力（结构 / 组合 / 链式）", () => {
+  it("公式能直接用 rsi / adx / macd / ma50（以前只能写价格）", () => {
+    expect(validateFormula("rsi < 40")).toBe(true);
+    expect(validateFormula("foo < 40")).toBe(false);
+    expect(evaluateFormula("price < ma20 && rsi < 40", { price: 10, ma20: 11, rsi: 35 })).toBe(
+      true,
+    );
+    expect(evaluateFormula("macd > 0 && adx > 20", { macd: 0.5, adx: 25 })).toBe(true);
+    expect(evaluateFormula("ma50 > ma20", { ma50: 12, ma20: 11 })).toBe(true);
+    // 缺值不误判
+    expect(evaluateFormula("rsi < 40", {})).toBeNull();
+  });
+
+  it("公式规则能命中；链式规则显示每一步在等什么", () => {
+    const now = new Date("2026-11-18T10:00:00+08:00");
+    const rule: MonitorRule = {
+      id: "r1",
+      code: "600901",
+      kind: "formula",
+      expression: "price < ma20 && rsi < 40",
+      note: "跌破 MA20 且 RSI 转弱",
+      once: false,
+      cooldownMin: 30,
+      createdAt: now.toISOString(),
+      expiresAt: new Date(now.getTime() + 3_600_000).toISOString(),
+    };
+    const quote = { code: "600901", name: "江苏金租", price: 7.4, changePct: -2 } as never;
+    const indicators = new Map([["600901", { code: "600901", asOf: "2026-11-17", close: 7.5, ma20: 7.6, rsi14: 35 }]]) as never;
+    const hit = evaluateRules([rule], new Map([["600901", quote]]), indicators, now);
+    expect(hit?.rule.id).toBe("r1");
+    expect(hit?.reason).toContain("RSI 转弱");
+
+    const chain: MonitorRule = {
+      id: "r2",
+      code: "601939",
+      kind: "chain",
+      steps: [
+        { kind: "price_above", value: 12.45 },
+        { kind: "price_below", value: 12.2 },
+      ],
+      step: 0,
+      note: "先站上再回踩",
+      once: false,
+      cooldownMin: 30,
+      createdAt: now.toISOString(),
+    };
+    expect(describeRule(chain)).toBe("601939 链式 0/2：价格 ≥ 12.45 → 价格 ≤ 12.2");
   });
 });

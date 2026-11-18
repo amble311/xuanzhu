@@ -177,6 +177,8 @@ export function addRule(input: {
 }
 
 function describeRuleInput(input: { kind: RuleKind; value?: number }): string {
+  if (input.kind === "chain") return "链式条件";
+  if (input.kind === "formula" || input.kind === "script") return "公式条件";
   switch (input.kind) {
     case "price_above":
       return `价格 ≥ ${input.value}`;
@@ -207,31 +209,43 @@ export function removeRules(input: { id?: string; code?: string }): number {
   return before - file.rules.length;
 }
 
+/** 单个条件的可读文本（`describeRule` 与 `chain` 的每一步共用） */
+function conditionText(kind: RuleKind, value?: number): string {
+  switch (kind) {
+    case "price_above":
+      return `价格 ≥ ${value}`;
+    case "price_below":
+      return `价格 ≤ ${value}`;
+    case "pct_above":
+      return `涨幅 ≥ ${value}%`;
+    case "pct_below":
+      return `跌幅 ≤ -${value}%`;
+    case "ma20_above":
+      return "站上日线 MA20";
+    case "ma20_break":
+      return "跌破日线 MA20";
+    case "ret20_above":
+      return `20 日涨幅 ≥ ${value}%`;
+    case "formula":
+    case "script":
+      return "公式";
+    default:
+      return "链式";
+  }
+}
+
 export function describeRule(rule: MonitorRule): string {
   if (rule.kind === "formula") return `${rule.code} 公式：${rule.expression ?? ""}`;
   if (rule.kind === "script") return `${rule.code} 脚本：${rule.expression ?? ""}`;
   if (rule.kind === "chain") {
-    return `${rule.code} 链式 ${rule.step ?? 0}/${rule.steps?.length ?? 0}`;
+    // 面板上只会看到「链式 0/2」，看不出在等什么 —— 把每一步写出来
+    const steps = rule.steps ?? [];
+    const detail = steps
+      .map((step) => conditionText(step.kind, step.value))
+      .join(" → ");
+    return `${rule.code} 链式 ${rule.step ?? 0}/${steps.length}：${detail}`;
   }
-  const target =
-    rule.kind === "price_above"
-      ? "价格 ≥"
-      : rule.kind === "price_below"
-        ? "价格 ≤"
-        : rule.kind === "pct_above"
-          ? "涨幅 ≥"
-          : rule.kind === "pct_below"
-            ? "跌幅 ≤ -"
-            : rule.kind === "ma20_above"
-              ? "站上日线 MA20"
-              : rule.kind === "ret20_above"
-                ? "20 日涨幅 ≥"
-                : "跌破日线 MA20";
-  if (rule.kind === "ma20_break" || rule.kind === "ma20_above") {
-    return `${rule.code} ${target}`;
-  }
-  const unit = rule.kind.startsWith("pct") ? "%" : "";
-  return `${rule.code} ${target} ${rule.value}${unit}`;
+  return `${rule.code} ${conditionText(rule.kind, rule.value)}`;
 }
 
 /** 评估规则：返回命中的第一条（持仓优先由调用方排序） */
@@ -247,13 +261,20 @@ const FORMULA_VARS = new Set([
   "price",
   "pct",
   "ma5",
+  "ma10",
   "ma20",
+  "ma50",
   "ma60",
   "ret5",
   "ret20",
   "ret60",
   "atr_pct",
   "amount",
+  // 指标缓存里本来就有 RSI / ADX / MACD，以前没暴露给公式，
+  // 结果模型只能把「RSI 超卖」「MACD 翻红」退化成价格阈值。
+  "rsi",
+  "adx",
+  "macd",
 ]);
 
 /** 白名单表达式：变量替换为数字后，只允许算术/比较/逻辑运算 */
@@ -394,13 +415,18 @@ export function evaluateRules(
             price: quote.price,
             pct: quote.changePct,
             ma5: ind?.ma5,
+            ma10: ind?.ma10,
             ma20: ind?.ma20,
+            ma50: ind?.ma50,
             ma60: ind?.ma60,
             ret5: ind?.ret5,
             ret20: ind?.ret20,
             ret60: ind?.ret60,
             atr_pct: ind?.atr20 && ind.close ? (ind.atr20 / ind.close) * 100 : undefined,
             amount: quote.amount,
+            rsi: ind?.rsi14,
+            adx: ind?.adx14,
+            macd: ind?.macdHist,
           }) === true;
         break;
       }

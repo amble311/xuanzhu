@@ -801,8 +801,21 @@ const triggerTool: ToolDefinition = {
   name: "a_trigger",
   modes: A_MODES,
   description:
-    "给持仓/自选股设置监控规则（只叫醒，不下单）。kind: price_above / price_below / pct_above / pct_below / ma20_break / ma20_above / ret20_above / chain / formula / script。" +
-    "命中后监控会唤醒巡检并说明原因；最多 20 条，默认 72 小时过期、30 分钟冷却。",
+    "给持仓/自选股设置**叫醒条件**（只叫醒，绝不下单）。后台每 5 分钟评估一次，命中才唤醒巡检。" +
+    "\n\n**kind 怎么选（重要）：**" +
+    "\n- price_above / price_below / pct_above / pct_below：最直白，适合明确的止损位 / 止盈位 / 涨跌幅。" +
+    "\n- ma20_break / ma20_above：**结构条件**——跌破 / 站上日线 MA20。别自己拿 MA20 的数值写价格阈值" +
+    "（均线每天在变，写死的价格第二天就失效）。" +
+    "\n- ret20_above：20 日涨幅达到多少。" +
+    "\n- chain：**有先后顺序**的条件，给 steps（2–3 步）。前一步满足**不叫醒**、只记住进度，" +
+    "最后一步也满足才叫醒；中间步骤超过 chainExpireMin（默认 240 分钟）没等到下一步就退回第一步。" +
+    "「先站上 12.45、再回踩 12.20 叫我」这类只能用 chain，拿两条独立价格规则表达不出顺序。" +
+    "\n- formula / script：受限公式（不是任意代码），适合组合条件，例：`price < ma20 && rsi < 40`、" +
+    "`price > ma20 && macd > 0`。可用变量：price / pct / ma5 / ma10 / ma20 / ma50 / ma60 / " +
+    "ret5 / ret20 / ret60 / atr_pct / rsi / adx / macd / amount（rsi/adx/macd 是日线 14/14/MACD 柱）。" +
+    "\n\n**用法建议**：每只优先给 1 条**能表达结构**的条件（ma20_break / formula），" +
+    "不要同一只写两条纯价格规则；同一价位区间要么用一条 formula（上下界一起写），要么用 chain 表达先后。" +
+    "\n\n默认一次性为 false（可反复触发），命中后 30 分钟冷却；最多 20 条，默认 72 小时过期。",
   parameters: {
     type: "object",
     properties: {
@@ -822,7 +835,10 @@ const triggerTool: ToolDefinition = {
           "script",
         ],
       },
-      value: { type: "number", description: "price/pct 的目标值；ma20_break 不需要" },
+      value: {
+        type: "number",
+        description: "price/pct/ret20 的目标值；ma20_break / ma20_above / chain / formula 不需要",
+      },
       note: { type: "string", description: "命中时给巡检看的原因" },
       once: { type: "boolean", description: "命中一次后删除" },
       cooldownMin: { type: "number", description: "冷却分钟，默认 30" },
@@ -831,13 +847,17 @@ const triggerTool: ToolDefinition = {
       endHour: { type: "number", description: "只在几点前评估（UTC+8，0–23）" },
       steps: {
         type: "array",
-        description: "chain 专用：步骤数组，如 [{kind:'pct_above',value:3},{kind:'ma20_break'}]；只有最后一步满足才唤醒",
+        description:
+          "chain 专用：步骤数组，如 [{kind:'price_above',value:12.45},{kind:'price_below',value:12.2}]；" +
+          "前一步满足只记进度，最后一步也满足才唤醒",
         items: { type: "object" },
       },
       chainExpireMin: { type: "number", description: "链式中间步骤有效期分钟，默认 240" },
       expression: {
         type: "string",
-        description: "formula / script 专用，如 price > ma20 && pct > 2；变量 price/pct/ma5/ma20/ma60/ret5/ret20/ret60/atr_pct/amount",
+        description:
+          "formula / script 专用，如 `price < ma20 && rsi < 40`、`price > ma20 && macd > 0`；" +
+          "变量 price/pct/ma5/ma10/ma20/ma50/ma60/ret5/ret20/ret60/atr_pct/rsi/adx/macd/amount",
       },
     },
     required: ["code", "kind", "note"],
