@@ -9,7 +9,13 @@ import type { ExecuteToolResult } from "../tools";
 import { accountSummary, loadPaperAccount } from "./paper";
 import { maxPositions, poolSize } from "./settings";
 import { inWorkWindow, WORK_WINDOW_LABEL } from "./window";
-import { sessionKind, sessionLabel } from "../exchange/ashare";
+import {
+  fetch15mBars,
+  fetchQuote,
+  mapLimit,
+  sessionKind,
+  sessionLabel,
+} from "../exchange/ashare";
 import { describeTradingDay, todayTradingStatus } from "./trading-day";
 import { monitorDir, orderedPool } from "./watchlist";
 import { describeRule, readRules } from "./rules";
@@ -20,6 +26,8 @@ import { readPositionRisks } from "./risk-alerts";
 import { appendAInspectEvent } from "./inspect-stream";
 import { describeOrder, listOrders } from "./orders";
 import { readPolicy } from "./policy";
+import { loadIndicators } from "./indicators";
+import { score15m } from "./deep15";
 
 /**
  * A 股后台巡检 —— 与 btc 的 `runInspectCycle` 同构。
@@ -337,6 +345,151 @@ function triggerSection(note?: string): string {
 }
 
 /** 挂单过期：必须给出「撤单 / 改价 / 继续等」的明确处理 */
+/**
+ * 巡检前置数据核对（对齐 btc `buildPreflight` 的位置：**调模型之前先看一遍数据**）。
+ *
+ * 为什么需要：以前巡检把「取数」完全交给模型 —— 本地模型经常直接拿 16:00 选股时算的旧分数、
+ * 或者不复核行情时间就开始判断；而 btc 那边是先 `fetchAccountSnapshot({force:true})` +
+ * `buildPreflight()` 把「上一轮动作落地没有、持仓有没有保护」摆到眼前再让模型决策。
+ *
+ * 这里做的是**只读核对**（不交易、不改账本）：
+ * - 池内每只（持仓优先）：现价 / 涨跌幅 / 行情时间 / 15m 最新 K 线与分数 / 日线指标 asOf；
+ * - 上证指数现价与时间（判断数据源是不是整体停了）；
+ * - 当前挂单、T+1 待卖（上一轮的动作是否还挂着）。
+ *
+ * 数据缺失 / 过期时会在提示词里明确要求「先补数据再决策」，而不是让模型猜。
+ */
+export interface PreflightRow {
+  code: string;
+  name: string;
+  held: boolean;
+  price?: number;
+  changePct?: number;
+  /** 行情时间（同花顺 `updatedAt`） */
+  quoteTime?: string;
+  /** 15m 最新一根 K 线时间 */
+  barTime?: string;
+  /** 15m 分数（0–100） */
+  deepScore?: number;
+  /** 日线指标 asOf（最后一根日线日期） */
+  indicatorAsOf?: string;
+  /** 数据问题（缺行情 / 缺 15m / 指标缺失 / 时间过旧） */
+  problems: string[];
+}
+
+function fmtPrice(value: number | undefined): string {
+  return value === undefined || !Number.isFinite(value) ? "—" : value.toFixed(2);
+}
+
+/** 把核对结果拼成提示词段落（纯函数，便于测试） */
+export function formatPreflight(
+  rows: PreflightRow[],
+  extra: { indexLine?: string; notes?: string[] } = {},
+): string {
+  const lines = ["", "", "## 巡检前数据核对（代码已拉取，无需重复请求）"];
+  if (extra.indexLine) lines.push(`- 大盘：${extra.indexLine}`);
+  for (const row of rows) {
+    const price =
+      row.price === undefined
+        ? "现价 —"
+        : `现价 ${fmtPrice(row.price)}（${(row.changePct ?? 0) >= 0 ? "+" : ""}${fmtPrice(row.changePct)}%）`;
+    const bars = row.barTime ? `15m 最新 ${row.barTime}` : "15m 无数据";
+    const deep = row.deepScore === undefined ? "15m 分数 —" : `15m ${row.deepScore} 分`;
+    const indicator = row.indicatorAsOf ? `日线指标 asOf ${row.indicatorAsOf}` : "日线指标缺失";
+    lines.push(
+      `- ${row.code} ${row.name}${row.held ? "（持仓）" : ""} ${price}` +
+        ` · 行情时间 ${row.quoteTime ?? "未知"} · ${bars} · ${deep} · ${indicator}`,
+    );
+  }
+  for (const note of extra.notes ?? []) lines.push(`- ${note}`);
+
+  const broken = rows.filter((row) => row.problems.length > 0);
+  if (broken.length > 0) {
+    lines.push("", "**数据有问题，先补数据再决策：**");
+    for (const row of broken) {
+      lines.push(`- ${row.code} ${row.name}：${row.problems.join("；")}`);
+    }
+    lines.push(
+      "  → 缺行情 / 时间过旧的标的**不要下单**；先用 `a_signal` / `a_bars` 重新取数，" +
+        "仍取不到就在结论里写明「数据不足」，并排下一轮。",
+    );
+  } else {
+    lines.push("", "数据检查结论：池内数据齐备，可直接判断。");
+  }
+  return lines.join("\n");
+}
+
+/** 采集前置数据（并发 3，避免把行情源打满） */
+async function preflightSection(now = new Date()): Promise<string> {
+  const account = loadPaperAccount(now);
+  const pool = orderedPool(
+    account.positions.map((position) => ({ code: position.code, name: position.name })),
+    undefined,
+    poolSize(),
+  );
+  if (pool.length === 0) {
+    return "\n\n## 巡检前数据核对\n- 池内没有股票（无持仓、无自选），本轮只做总结。";
+  }
+
+  const indicators = await loadIndicators({ allowPartial: true }).catch(() => new Map());
+  const indexQuote = await fetchQuote("1A0001").catch(() => null);
+  const rows = await mapLimit(
+    pool,
+    async (item): Promise<PreflightRow> => {
+      const [quote, bars] = await Promise.all([
+        fetchQuote(item.code).catch(() => null),
+        fetch15mBars(item.code, 160).catch(() => null),
+      ]);
+      const deep = bars ? score15m(bars) : null;
+      const indicator = indicators.get(item.code);
+      const problems: string[] = [];
+      if (!quote) problems.push("行情取不到");
+      if (!bars) problems.push("15m K 线取不到");
+      if (!indicator) problems.push("日线指标缺失");
+      // 行情时间不是今天 → 数据源整体没刷新（节假日 / 停牌 / 接口异常）
+      const quoteDay = quote?.updatedAt?.slice(0, 10);
+      const today = `${now.getFullYear()}-${`${now.getMonth() + 1}`.padStart(2, "0")}-${`${now.getDate()}`.padStart(2, "0")}`;
+      if (quote && quoteDay && quoteDay !== today) problems.push(`行情停在 ${quoteDay}`);
+      return {
+        code: item.code,
+        name: item.name,
+        held: item.held,
+        price: quote?.price,
+        changePct: quote?.changePct,
+        quoteTime: quote?.updatedAt,
+        barTime: bars?.[bars.length - 1]?.time,
+        deepScore: deep?.score,
+        indicatorAsOf: indicator?.asOf,
+        problems,
+      };
+    },
+    3,
+  );
+
+  const notes: string[] = [];
+  const orders = listOrders().filter((order) => order.status === "open");
+  notes.push(
+    orders.length > 0
+      ? `挂单 ${orders.length} 张：${orders.map((order) => describeOrder(order)).join("；")}`
+      : "当前没有挂单",
+  );
+  const pendingFile = path.join(monitorDir(), "run", "pending-sells.json");
+  try {
+    const pending = JSON.parse(fs.readFileSync(pendingFile, "utf8")) as Array<{ code: string; reason: string }>;
+    if (pending.length > 0) {
+      notes.push(`T+1 待卖：${pending.map((item) => `${item.code}（${item.reason}）`).join("；")}`);
+    }
+  } catch {
+    // 没有待卖
+  }
+
+  const indexLine = indexQuote
+    ? `上证指数 ${fmtPrice(indexQuote.price)}（${(indexQuote.changePct ?? 0) >= 0 ? "+" : ""}${fmtPrice(indexQuote.changePct)}%）· 时间 ${indexQuote.updatedAt ?? "未知"}`
+    : "上证指数行情取不到（数据源可能不可用）";
+
+  return formatPreflight(rows, { indexLine, notes });
+}
+
 function orderSection(note?: string): string {
   return note
     ? `\n\n## 挂单已过期（需要你处理）\n${note}\n` +
@@ -437,6 +590,7 @@ export async function runAInspect(
         policySection() +
         triggerSection(options.triggerNote) +
         orderSection(options.orderNote) +
+        (await preflightSection()) +
         `\n\n${inspectPrompt()}`,
       controller.signal,
     );

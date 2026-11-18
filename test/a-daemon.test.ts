@@ -636,3 +636,42 @@ describe("A 股缓存（SQLite + 裁剪）", () => {
     expect(fs.existsSync(legacy)).toBe(false);
   });
 });
+
+describe("巡检前置数据核对", () => {
+  it("数据齐备时给出结论；缺失/过期时要求先补数据再下单", async () => {
+    const { formatPreflight } = await import("../src/a/inspect");
+    const good = formatPreflight(
+      [
+        {
+          code: "600519",
+          name: "贵州茅台",
+          held: true,
+          price: 1500,
+          changePct: 1.2,
+          quoteTime: "2026-11-18 14:03:11",
+          barTime: "2026-11-18 14:00",
+          deepScore: 72,
+          indicatorAsOf: "2026-11-17",
+          problems: [],
+        },
+      ],
+      { indexLine: "上证指数 4021.33（+0.31%）· 时间 2026-11-18 14:03:11", notes: ["当前没有挂单"] },
+    );
+    expect(good).toContain("巡检前数据核对");
+    expect(good).toContain("600519 贵州茅台（持仓） 现价 1500.00（+1.20%）");
+    expect(good).toContain("15m 72 分");
+    expect(good).toContain("数据检查结论：池内数据齐备");
+
+    const bad = formatPreflight([
+      {
+        code: "601857",
+        name: "中国石油",
+        held: false,
+        problems: ["行情取不到", "15m K 线取不到", "日线指标缺失"],
+      },
+    ]);
+    expect(bad).toContain("数据有问题，先补数据再决策");
+    expect(bad).toContain("601857 中国石油：行情取不到；15m K 线取不到；日线指标缺失");
+    expect(bad).toContain("不要下单");
+  });
+});
