@@ -1353,7 +1353,10 @@ export async function startAService(): Promise<StartAServiceResult> {
     // `--foreground` 是内部标记：用户命令 `xzh a start` 只负责拉起后台并返回
     const child = spawn(process.execPath, [cliEntry(), "a", "start", "--foreground"], {
       detached: true,
-      stdio: ["ignore", fd, fd],
+      // stdout 不能也指向日志文件：`log()` 自己会 appendFileSync 一份，
+      // 再把 stdout 重定向到同一个文件就会**每行写两遍**。
+      // stderr 仍落到文件里，用来抓崩溃栈。
+      stdio: ["ignore", "ignore", fd],
       cwd: getAShareHome(),
       env: { ...process.env },
       windowsHide: true,
