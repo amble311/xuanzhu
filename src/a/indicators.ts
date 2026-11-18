@@ -198,13 +198,19 @@ export async function loadIndicators(
   options: {
     refresh?: boolean;
     codes?: string[];
+    /**
+     * 允许「部分缓存」：收盘选股后会把指标裁剪成只剩自选池（`complete:false`）。
+     * 巡检 / 风控只查池内股票，用部分缓存就够，不必为了 5 只把全市场重算一遍（1–2 分钟）；
+     * 全市场筛选（`a_screen` / 选股）**不能**传它，否则拿 5 条数据当全市场。
+     */
+    allowPartial?: boolean;
     /** 缺缓存时会全市场重算，进度回调给工具/CLI 显示 */
     onProgress?: (done: number, total: number) => void;
   } = {},
 ): Promise<Map<string, Indicators>> {
   if (!options.refresh) {
     const cached = readCache<Indicators[]>(INDICATORS_CACHE, CACHE_TTL_MS);
-    if (cached) {
+    if (cached && (cached.complete !== false || options.allowPartial)) {
       return new Map(cached.value.map((item) => [item.code, item]));
     }
   }

@@ -12,6 +12,13 @@ import {
 } from "./market-events";
 import { ensureBtcNetwork } from "./network";
 import { getBtcHome } from "../utils/paths";
+import {
+  closedSince,
+  liquidationNote,
+  readBaseline,
+  sameCodes,
+  writeBaseline,
+} from "../utils/position-baseline";
 import { VERSION } from "../utils/version";
 import {
   acquireBackendLock,
@@ -294,14 +301,47 @@ export async function runBtcBackend(
    * snapshot 就会认为「永远空仓」→ `h4-close`（4 小时收盘复核，仅持仓时）永远不触发。
    * 这里单独问一次虚拟账本：`paper-status` 的 `position` 与 `open_orders` 才是真实仓位。
    */
-  const paperHasExposure = async (): Promise<boolean> => {
+  const readPaperStatus = async (): Promise<PaperStatusLite | null> => {
     const result = await runRunner<PaperStatusLite>("paper-status", {}, { timeoutMs: 20_000 });
     if (!result.ok) {
-      // 读不到就别假装空仓：按「有仓位」处理，宁可多重一次 4h 复核
-      log(`市场事件：读取模拟盘仓位失败（${result.error}），按有仓位处理`);
-      return true;
+      // 读不到就别假装空仓：按「有仓位」处理，宁可多重一次 4h 复核 / 少报一次清仓
+      log(`读取模拟盘仓位失败（${result.error}），按有仓位处理`);
+      return null;
     }
-    return paperStatusHasExposure(result.data);
+    return result.data ?? {};
+  };
+
+  /**
+   * 清仓检测：与上一轮持仓基线对比，消失的代码 = 已清仓（对齐 A 股 `checkLiquidation()`）。
+   *
+   * 不用成交账本判断：btc 实盘走 `run/actions.jsonl`、模拟盘只写 Python 账本，
+   * 两边的「平仓」都不一定留下可对齐的成交记录；对比持仓本身才覆盖全部来源。
+   */
+  const checkLiquidation = (codes: string[], at: number): string[] => {
+    const name = `positions-${role}`;
+    const previous = readBaseline(home, name);
+    const closed = closedSince(previous, codes);
+    if (!previous || !sameCodes(previous.codes, codes)) {
+      writeBaseline(home, codes, new Date(at), name);
+    }
+    return closed;
+  };
+
+  /** 清仓后跑一轮复盘：不计入监控叫醒限流（清仓不频繁，且必须记录） */
+  const runLiquidationReview = async (codes: string[]): Promise<void> => {
+    running = true;
+    try {
+      await runInspect({
+        reason: `清仓复盘：${codes.join("、")}`,
+        triggerNote: liquidationNote(codes, "btc_policy"),
+      });
+    } catch (err) {
+      state.lastError = err instanceof Error ? err.message : String(err);
+      log(`清仓复盘异常：${state.lastError}`);
+    } finally {
+      running = false;
+      refreshQueueState();
+    }
   };
 
   const checkEvents = async (
@@ -839,12 +879,35 @@ export async function runBtcBackend(
       return;
     }
 
+    // 清仓检测：先看持仓有没有「从有到无」（清仓后必须复盘 + 写策略 + 记录）。
+    // 实盘读账户快照、模拟盘读虚拟账本；读不到（快照失败 / runner 报错）就跳过这一轮，
+    // 绝不把「读不到」当「已清仓」。
+    const paperStatus = paper ? await readPaperStatus() : null;
+    const positionCodes = paper
+      ? paperStatus === null
+        ? null
+        : paperStatus.position
+          ? [process.env.BTC_SYMBOL?.trim() || "BTC/USDT"]
+          : []
+      : snapshot?.ok
+        ? snapshot.positions.map((position) => position.symbol)
+        : null;
+    if (positionCodes !== null) {
+      const liquidated = checkLiquidation(positionCodes, now);
+      if (liquidated.length > 0) {
+        await runLiquidationReview(liquidated);
+        return;
+      }
+    }
+
     // 市场事件优先于队列：日线收盘/资金费/暴跌这类时刻比常规排期更该立刻看。
     // 而且这里**不能**先 takeDueSchedule —— 取出即出队，若事件又抢先跑，
     // 那条到期的计划就被吃掉了（既没执行也不会再排）。
     // 实盘看账户快照，模拟盘单独问虚拟账本 —— 后者在 checkRisk() 里是 null
     const hasExposure = paper
-      ? await paperHasExposure()
+      ? paperStatus === null
+        ? true
+        : paperStatusHasExposure(paperStatus)
       : (snapshot?.positions.length ?? 0) > 0 || (snapshot?.orders.length ?? 0) > 0;
     const eventTrigger = await checkEvents(hasExposure);
     if (eventTrigger) {

@@ -5,9 +5,9 @@ import {
   continuousSession,
   fetchBars,
   fetchQuote,
-  isTradingDay,
   loadTradingCalendar,
   mapLimit,
+  tradingDayStatus,
   type Quote,
 } from "../exchange/ashare";
 import {
@@ -42,7 +42,9 @@ import {
   type PositionRiskAlert,
 } from "./risk-alerts";
 import { intradayWeak } from "./intraday";
-import { loadIndicators } from "./indicators";
+import { INDICATORS_CACHE, loadIndicators } from "./indicators";
+import { SNAPSHOT_CACHE } from "./snapshot";
+import { deleteCache, pruneCacheCodes } from "../exchange/ashare";
 import { scoreHeldItems, selectionNeed, selectTopWatchlist } from "./score";
 import {
   loadWatchlist,
@@ -55,6 +57,13 @@ import { poolSize } from "./settings";
 import { inWorkWindow, WORK_WINDOW_LABEL } from "./window";
 import { describeTradingDay, todayTradingStatus } from "./trading-day";
 import { ensureDir, getAShareHome } from "../utils/paths";
+import {
+  closedSince,
+  liquidationNote,
+  readBaseline,
+  sameCodes,
+  writeBaseline,
+} from "../utils/position-baseline";
 import { VERSION } from "../utils/version";
 
 /**
@@ -127,6 +136,8 @@ export const A_MONITOR_INTERVALS = {
   wakeWindowMs: WAKE_WINDOW_MS,
   wakeLimit: WAKE_LIMIT,
 } as const;
+/** 清仓检测用的持仓基线文件名（<home>/monitor/run/<name>.json） */
+const POSITION_BASELINE = "positions-baseline";
 const LOCK_FILE = "run/monitor.lock";
 const STATE_FILE = "run/monitor.json";
 const ACTIONS_FILE = "actions.jsonl";
@@ -483,7 +494,7 @@ async function warmupData(at: Date): Promise<void> {
   const started = Date.now();
   log("预热日线指标（缓存缺失时全市场重算，约 1–2 分钟）…");
   try {
-    const indicators = await loadIndicators();
+    const indicators = await loadIndicators({ allowPartial: true });
     log(
       `日线指标就绪：${indicators.size} 只（${Math.round((Date.now() - started) / 1000)}s）`,
     );
@@ -619,7 +630,7 @@ export async function runAServe(): Promise<void> {
     lastSyncAt = at.getTime();
     const started = Date.now();
     try {
-      const indicators = await loadIndicators();
+      const indicators = await loadIndicators({ allowPartial: true });
       log(
         `数据同步：日线指标 ${indicators.size} 只（${Math.round((Date.now() - started) / 1000)}s）`,
       );
@@ -773,6 +784,25 @@ export async function runAServe(): Promise<void> {
   };
 
   /**
+   * 清仓检测：与上一轮持仓基线对比，**消失的代码 = 已清仓**。
+   *
+   * 为什么对比持仓而不是解析成交：模型下单（`a_order`）、用户手动下单、挂单成交
+   * 三条链路的写入位置各不相同（`paper.json` / `orders.json` / 撮合），
+   * 「上一轮有、这一轮没有」才是唯一可靠的信号；基线落盘，进程重启也能接上。
+   */
+  const checkLiquidation = (at: Date): string[] => {
+    const codes = loadPaperAccount(at)
+      .positions.filter((position) => position.qty > 0)
+      .map((position) => position.code);
+    const previous = readBaseline(monitorDir(), POSITION_BASELINE);
+    const closed = closedSince(previous, codes);
+    if (!previous || !sameCodes(previous.codes, codes)) {
+      writeBaseline(monitorDir(), codes, at, POSITION_BASELINE);
+    }
+    return closed;
+  };
+
+  /**
    * 对齐 btc 的兜底判断（`DEFAULT_CHECK_MINUTES = 60`）。
    *
    * 只有**队列里没有任何排期**、且距上次巡检已满 60 分钟才兜底 —— 模型排好期就不会多跑一轮。
@@ -814,6 +844,15 @@ export async function runAServe(): Promise<void> {
       const pending = await matchPendingOrders(at);
       // 账本已变（成交 / 撤销），先把状态落盘再判断要不要叫醒（btc 每个阶段后都 refreshQueueState）
       refresh(new Date());
+
+      // 5b) 清仓复盘：持仓归零 → 立刻叫醒一轮（复盘 + 写策略 + 记录），优先于其他触发
+      const liquidated = checkLiquidation(at);
+      if (liquidated.length > 0) {
+        await runInspectRound(`清仓复盘：${liquidated.join("、")}`, {
+          triggerNote: liquidationNote(liquidated, "a_policy"),
+        });
+        return;
+      }
 
       // 6) 行情故障（btc `checkMarketHealth()` 只记状态 → `shouldAlertMarket()` 判定）
       await checkMarketHealth(at);
@@ -1042,7 +1081,7 @@ async function detectPositionRisks(
     writePositionRisks([]);
     return [];
   }
-  const indicators = await loadIndicators();
+  const indicators = await loadIndicators({ allowPartial: true });
   const pending = new Map(readPendingSells().map((item) => [item.code, item]));
   const held = new Set(account.positions.map((position) => position.code));
   for (const code of [...pending.keys()]) if (!held.has(code)) pending.delete(code);
@@ -1173,10 +1212,11 @@ async function maybeRunAfterCloseSelection(now: Date, state: AMonitorState): Pro
   const today = dayKey(now);
 
   try {
-    const calendar = await loadTradingCalendar();
-    if (!isTradingDay(calendar, today)) return false;
+    // 日历只到上一个已收盘交易日：16:00 时今天可能还没入库，
+    // 直接查 isTradingDay 会让「收盘选股」在每个交易日被跳过（曾经的 bug）。
+    if (!(await tradingDayStatus(now))) return false;
   } catch {
-    // 日历不可用时按工作日处理，避免错过选股
+    // 日历 / 行情都不可用时按工作日处理，避免错过选股
   }
 
   state.lastSelectAttemptAt = iso(now);
@@ -1196,6 +1236,9 @@ async function maybeRunAfterCloseSelection(now: Date, state: AMonitorState): Pro
       const scored = await scoreHeldItems(held, log);
       const merged = mergeWatchlist(scored, held, now, size);
       saveWatchlist(merged);
+      const keptHeld = merged.items.map((item) => item.code);
+      pruneCacheCodes(INDICATORS_CACHE, keptHeld);
+      deleteCache(SNAPSHOT_CACHE);
       state.lastSelectDay = today;
       state.lastAction = `持仓 ${heldNow}/${size} 已满，重算持仓评分 ${scored.length} 只`;
       writeSelectState({ day: today, attemptedAt: state.lastSelectAttemptAt });
@@ -1215,6 +1258,12 @@ async function maybeRunAfterCloseSelection(now: Date, state: AMonitorState): Pro
     const heldScored = await scoreHeldItems(held, log);
     const merged = mergeWatchlist([...picks, ...heldScored], held, now, size);
     saveWatchlist(merged);
+    // 选股结束：把非自选股的数据从缓存里删掉（SQLite 里就是删行）。
+    // 指标裁到池内并标记 complete=false —— 全市场筛选会重算，巡检/风控照常用池内数据。
+    const keptCodes = merged.items.map((item) => item.code);
+    const removed = pruneCacheCodes(INDICATORS_CACHE, keptCodes);
+    deleteCache(SNAPSHOT_CACHE);
+    log(`缓存清理：日线指标删除 ${removed} 只非自选股，全市场快照已清空`);
     state.lastSelectDay = today;
     writeSelectState({ day: today, attemptedAt: state.lastSelectAttemptAt });
     state.lastAction = `收盘后选股 ${picks.length} 只`;
@@ -1262,7 +1311,7 @@ async function checkMonitorRules(
       .filter((code) => known.has(code))
       .map((code) => [code, known.get(code)!] as const),
   );
-  const indicators = await loadIndicators();
+  const indicators = await loadIndicators({ allowPartial: true });
   return evaluateRules(sorted, quotes, indicators, now);
 }
 

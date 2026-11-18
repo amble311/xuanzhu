@@ -308,3 +308,66 @@ describe("A 股监控节奏与 btc moni 对齐", () => {
     expect(A_MONITOR_INTERVALS.wakeLimit).toBe(2);
   });
 });
+
+describe("交易日判定（日历只到上一个已收盘交易日）", () => {
+  const calendar = {
+    updatedAt: "2026-11-17T08:00:00.000Z",
+    days: ["2026-11-13", "2026-11-16", "2026-11-17"],
+  };
+  const at = (iso: string) => new Date(iso);
+
+  it("盘中日历缺今天 → 看指数行情；行情是今天就算交易日", async () => {
+    const { resolveTradingDay } = await import("../src/exchange/ashare/calendar");
+    const verdict = await resolveTradingDay(
+      calendar,
+      at("2026-11-18T10:00:00+08:00"),
+      async () => ({ updatedAt: "2026-11-18 14:03:11" }),
+    );
+    expect(verdict.trading).toBe(true);
+    expect(verdict.basis).toBe("quote");
+  });
+
+  it("日历缺今天且行情停在昨天（盘中）→ 休市", async () => {
+    const { resolveTradingDay } = await import("../src/exchange/ashare/calendar");
+    const verdict = await resolveTradingDay(
+      calendar,
+      at("2026-11-18T10:00:00+08:00"),
+      async () => ({ updatedAt: "2026-11-17 14:59:00" }),
+    );
+    expect(verdict.trading).toBe(false);
+    expect(verdict.basis).toBe("holiday");
+  });
+
+  it("盘前行情还没更新 → 按工作日放行（不能把交易日判死）", async () => {
+    const { resolveTradingDay } = await import("../src/exchange/ashare/calendar");
+    const verdict = await resolveTradingDay(
+      calendar,
+      at("2026-11-18T08:30:00+08:00"),
+      async () => ({ updatedAt: "2026-11-17 15:00:00" }),
+    );
+    expect(verdict.trading).toBe(true);
+    expect(verdict.basis).toBe("weekday");
+  });
+
+  it("行情取不到也放行；周末与日历内的缺口一律休市", async () => {
+    const { resolveTradingDay } = await import("../src/exchange/ashare/calendar");
+    const fail = async (): Promise<{ updatedAt?: string }> => {
+      throw new Error("network");
+    };
+    expect((await resolveTradingDay(calendar, at("2026-11-18T10:00:00+08:00"), fail)).trading).toBe(
+      true,
+    );
+    expect((await resolveTradingDay(calendar, at("2026-11-21T10:00:00+08:00"), fail)).basis).toBe(
+      "weekend",
+    );
+    // 11-13 与 11-16 之间缺 11-14/15（周末）+ 日历里没有的其他工作日 = 休市
+    const gapped = { updatedAt: "", days: ["2026-11-13", "2026-11-17"] };
+    expect((await resolveTradingDay(gapped, at("2026-11-16T10:00:00+08:00"), fail)).basis).toBe(
+      "holiday",
+    );
+    // 日历明确包含今天
+    expect(
+      (await resolveTradingDay(calendar, at("2026-11-17T10:00:00+08:00"), fail)).basis,
+    ).toBe("calendar");
+  });
+});

@@ -1,6 +1,7 @@
 import {
   isTradingDay,
   loadTradingCalendar,
+  resolveTradingDay,
   todayString,
   type TradingCalendar,
 } from "../exchange/ashare";
@@ -25,8 +26,8 @@ export interface TradingDayStatus {
   today: string;
   /** 今天是否交易日 */
   tradingDay: boolean;
-  /** 判断依据：真实日历 / 降级为工作日 */
-  source: "calendar" | "weekday";
+  /** 判断依据：真实日历 / 指数行情（当日日线还没入库）/ 降级为工作日 */
+  source: "calendar" | "quote" | "weekday";
   /** 日历更新时间（ISO），降级时为空 */
   calendarUpdatedAt?: string;
   /** 最近一个 <= 今天的交易日 */
@@ -95,11 +96,13 @@ export async function todayTradingStatus(
   let status: TradingDayStatus;
   try {
     calendar = await loadTradingCalendar({ refresh: options.refresh });
-    const tradingDay = isTradingDay(calendar, today);
+    // 日历只到「上一个已收盘交易日」，盘中今天一定不在里面 —— 必须再看指数行情，
+    // 否则每个交易日盘中都会被判成休市（巡检：「非交易日，不能交易」）。
+    const verdict = await resolveTradingDay(calendar, now);
     status = {
       today,
-      tradingDay,
-      source: "calendar",
+      tradingDay: verdict.trading,
+      source: verdict.basis === "calendar" ? "calendar" : verdict.basis === "quote" ? "quote" : "weekday",
       calendarUpdatedAt: calendar.updatedAt,
       lastTradingDay: lastTradingDayOf(calendar, today),
       nextTradingDay: nextTradingDay(calendar, today),
@@ -129,7 +132,9 @@ export function describeTradingDay(status: TradingDayStatus): string {
     status.nextTradingDay ? `下一交易日 ${status.nextTradingDay}` : "",
     status.source === "calendar"
       ? `数据源 上证指数日线${status.calendarUpdatedAt ? `（${status.calendarUpdatedAt.slice(0, 10)} 更新）` : ""}`
-      : `降级判断：按工作日${status.error ? `（日历不可用：${status.error}）` : ""}`,
+      : status.source === "quote"
+        ? "依据 上证指数实时行情（当日日线尚未入库）"
+        : `降级判断：按工作日${status.error ? `（日历不可用：${status.error}）` : ""}`,
   ].filter(Boolean);
   return parts.join(" · ");
 }

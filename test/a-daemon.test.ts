@@ -550,3 +550,89 @@ describe("持仓风控告警", () => {
     expect(readPositionRisks().delivered).toBe(false);
   });
 });
+
+describe("清仓检测（持仓基线）", () => {
+  it("消失的代码算清仓；首次运行不误报；基线可落盘读回", async () => {
+    const { closedSince, readBaseline, sameCodes, writeBaseline } = await import(
+      "../src/utils/position-baseline"
+    );
+    // 首次：没有基线 → 什么都不算（否则每次重启都会误跑一轮复盘）
+    expect(closedSince(null, ["600519", "601857"])).toEqual([]);
+
+    const dir = path.join(home, "a");
+    writeBaseline(dir, ["600519", "601857"], new Date("2026-11-18T01:00:00Z"));
+    const baseline = readBaseline(dir);
+    expect(baseline?.codes).toEqual(["600519", "601857"]);
+    expect(sameCodes(baseline!.codes, ["601857", "600519"])).toBe(true);
+
+    // 601857 卖了（持仓归零）→ 只有它算清仓；600519 还在，不算
+    expect(closedSince(baseline, ["600519"])).toEqual(["601857"]);
+    // 换仓：老代码消失、新代码出现 → 只报消失的那个
+    expect(closedSince(baseline, ["000001"])).toEqual(["600519", "601857"]);
+  });
+
+  it("清仓复盘的叫醒说明点名策略工具，并要求记录", async () => {
+    const { liquidationNote } = await import("../src/utils/position-baseline");
+    const note = liquidationNote(["601857"], "a_policy");
+    expect(note).toContain("清仓复盘：601857");
+    expect(note).toContain("`a_policy`");
+    expect(note).toContain("【清仓复盘】");
+  });
+});
+
+describe("A 股缓存（SQLite + 裁剪）", () => {
+  it("读写在库里往返；stat 有大小；delete 后读不到", async () => {
+    const cache = await import("../src/exchange/ashare/cache");
+    cache.resetCacheConnection();
+    const rows = [
+      { code: "600519", close: 1500 },
+      { code: "601857", close: 9 },
+    ];
+    cache.writeCache("test-cache.json", rows);
+    const read = cache.readCache<typeof rows>("test-cache.json", 60_000);
+    expect(read?.value).toEqual(rows);
+    expect(read?.complete).toBe(true);
+
+    const stat = cache.statCache("test-cache.json");
+    expect(stat.exists).toBe(true);
+    expect(stat.bytes).toBeGreaterThan(0);
+
+    cache.deleteCache("test-cache.json");
+    expect(cache.readCache("test-cache.json", 60_000)).toBeNull();
+  });
+
+  it("按代码裁剪：只留自选池，并标记 complete=false（全市场筛选会重算）", async () => {
+    const cache = await import("../src/exchange/ashare/cache");
+    cache.resetCacheConnection();
+    const rows = [
+      { code: "600519", close: 1500 },
+      { code: "601857", close: 9 },
+      { code: "000001", close: 11 },
+    ];
+    cache.writeCache("prune.json", rows);
+    const removed = cache.pruneCacheCodes("prune.json", ["601857", "000001"]);
+    expect(removed).toBe(1);
+    const after = cache.readCache<typeof rows>("prune.json", 60_000);
+    expect(after?.value.map((row) => row.code)).toEqual(["601857", "000001"]);
+    expect(after?.complete).toBe(false);
+  });
+
+  it("旧版 cache/*.json 会在首次打开时迁移进库并删除文件", async () => {
+    const cache = await import("../src/exchange/ashare/cache");
+    cache.resetCacheConnection();
+    const dir = cache.ashareCacheDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const legacy = path.join(dir, "legacy.json");
+    fs.writeFileSync(
+      legacy,
+      JSON.stringify({ updatedAt: new Date().toISOString(), value: { days: ["2026-11-18"] } }),
+      "utf8",
+    );
+    // 重新打开连接触发迁移
+    cache.resetCacheConnection();
+    expect(cache.readCache<{ days: string[] }>("legacy.json", 60_000)?.value.days).toEqual([
+      "2026-11-18",
+    ]);
+    expect(fs.existsSync(legacy)).toBe(false);
+  });
+});

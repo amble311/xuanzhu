@@ -1,5 +1,5 @@
 import { readCache, writeCache } from "./cache";
-import { fetchBars } from "./ths";
+import { fetchBars, fetchQuote } from "./ths";
 
 /**
  * A 股交易日历。
@@ -128,25 +128,80 @@ export interface SessionGate {
   reason?: string;
 }
 
-/** 当天交易日状态的内存缓存：避免每轮 tick 都读日历文件 */
+/** 当天交易日状态的内存缓存：避免每轮 tick 都读日历 / 拉指数行情 */
 let dayStatusCache: { day: string; trading: boolean; expiresAt: number } | null = null;
 
-/** 今天是否交易日；日历不可用时按工作日放行（10 分钟后重试） */
+export interface TradingDayVerdict {
+  trading: boolean;
+  /** 判定依据：日历明确 / 指数行情 / 工作日放行 / 周末 / 休市 */
+  basis: "calendar" | "quote" | "weekday" | "weekend" | "holiday";
+  detail?: string;
+}
+
+/**
+ * 今天是否交易日 —— **唯一判定**（撮合闸门、后台 tick、巡检上下文都走它）。
+ *
+ * 老实现只看「日历里有没有今天」，而日历是用**上证指数日线**建的：
+ * 当天的日线要等收盘后才入库，于是**盘中日历永远缺今天** → 把交易日判成休市，
+ * 巡检直接说「非交易日，不能交易」，撮合闸门也一直关着（2026-11-18 实测）。
+ *
+ * 现在的顺序：
+ * 1. 周末 → 休市；
+ * 2. 日历里有今天 → 交易日（正常情况，收盘后/缓存已更新）；
+ * 3. 今天落在日历覆盖范围内但缺失 → 休市（节假日、调休）；
+ * 4. 今天晚于日历最后一天（盘中常见）→ 看**上证指数实时行情**：
+ *    行情时间就是今天 → 交易日；行情还停在昨天且已过 09:35 → 休市；
+ *    取不到行情 / 盘前 → 按工作日放行（宁可多跑一天，也别把交易日判死）。
+ */
+export async function resolveTradingDay(
+  calendar: TradingCalendar,
+  now = new Date(),
+  /** 指数行情探针（默认拉上证指数；测试可注入假数据） */
+  probe: () => Promise<{ updatedAt?: string }> = () => fetchQuote("1A0001"),
+): Promise<TradingDayVerdict> {
+  const today = todayString(now);
+  if (now.getDay() === 0 || now.getDay() === 6) {
+    return { trading: false, basis: "weekend" };
+  }
+  if (calendar.days.includes(today)) {
+    return { trading: true, basis: "calendar" };
+  }
+  const last = calendar.days[calendar.days.length - 1];
+  if (last && today < last) {
+    return { trading: false, basis: "holiday", detail: `${today} 不在交易日历中（休市）` };
+  }
+  try {
+    const quote = await probe();
+    const stamp = quote.updatedAt?.slice(0, 10);
+    if (stamp === today) {
+      return { trading: true, basis: "quote", detail: "上证指数行情已更新到今天" };
+    }
+    const minutes = now.getHours() * 60 + now.getMinutes();
+    if (stamp && stamp < today && minutes >= 9 * 60 + 35) {
+      return {
+        trading: false,
+        basis: "holiday",
+        detail: `上证指数行情停在 ${stamp}，今天休市`,
+      };
+    }
+  } catch {
+    // 行情取不到：按工作日放行，别把交易日判死
+  }
+  return { trading: true, basis: "weekday", detail: "日历未覆盖今天，按工作日放行" };
+}
+
+/** 今天是否交易日；日历 / 行情都不可用时按工作日放行（缓存 10 分钟，避免每 tick 重试） */
 export async function tradingDayStatus(now = new Date()): Promise<boolean> {
   const today = todayString(now);
   const nowMs = now.getTime();
   if (dayStatusCache && dayStatusCache.day === today && dayStatusCache.expiresAt > nowMs) {
     return dayStatusCache.trading;
   }
-  if (now.getDay() === 0 || now.getDay() === 6) {
-    dayStatusCache = { day: today, trading: false, expiresAt: nowMs + 6 * 60 * 60_000 };
-    return false;
-  }
   try {
     const calendar = await loadTradingCalendar();
-    const trading = isTradingDay(calendar, today);
-    dayStatusCache = { day: today, trading, expiresAt: nowMs + 6 * 60 * 60_000 };
-    return trading;
+    const verdict = await resolveTradingDay(calendar, now);
+    dayStatusCache = { day: today, trading: verdict.trading, expiresAt: nowMs + 10 * 60_000 };
+    return verdict.trading;
   } catch {
     dayStatusCache = { day: today, trading: true, expiresAt: nowMs + 10 * 60_000 };
     return true;
