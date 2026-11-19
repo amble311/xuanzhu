@@ -36,7 +36,7 @@ describe("三周期方向闸门", () => {
   });
 
   it("同向放行", () => {
-    const gate = gateFromSignal({ side_filter: "short", score: { weekly: -1, daily: -1, h4: 0, sum: -2 } });
+    const gate = gateFromSignal({ side_filter: "short", score: { weekly: -1, daily: -1, h4: -1, sum: -3 } });
     const decision = decideSideGate(gate, "short");
     expect(decision.ok).toBe(true);
     expect(decision.message).toBe("");

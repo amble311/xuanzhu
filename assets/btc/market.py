@@ -547,7 +547,11 @@ def _stage4_1h(side: str) -> dict:
 def _side_filter(scores: dict) -> tuple[str, str]:
     """三周期打分 → 只做多 / 只做空 / 不做。
 
-    规则（用户设定）：三周期都 ≥0 只做多，都 ≤0 只做空，**全 0 不做**。
+    规则（用户设定）：
+    - 三周期都 ≥0 只做多，都 ≤0 只做空，**全 0 不做**；
+    - **最短周期（4h）必须与交易方向同向**：做多要 4h=+1、做空要 4h=-1。
+      周/日多头但 4h 横盘（0），说明短期没跟上 —— 此时只观望，不做多；
+      反过来 4h 没转空也不做空。长周期的方向不能替代这笔单子的择时周期。
     任一周期数据不足 → unknown（不放行）：拿不到数据时「默认允许」是最危险的
     选择，所以这里宁可挡掉，并在 `side_reason` 里说清缺什么。
     """
@@ -557,12 +561,23 @@ def _side_filter(scores: dict) -> tuple[str, str]:
             "unknown",
             "至少一个周期数据不足（4 小时线由本地 1h 重采样，先 btc_sync 补 1h）",
         )
+    weekly, daily, h4 = values
     if all(v == 0 for v in values):
         return "none", "三周期全部横盘（0 / 0 / 0）：不做"
     if all(v >= 0 for v in values):
-        return "long", "三周期均 ≥0 且至少一个向上：只做多"
+        if h4 != 1:
+            return (
+                "none",
+                f"4 小时线未转多（周 {weekly} / 日 {daily} / 4h {h4}）：短期横盘，等 4h 转多再做",
+            )
+        return "long", "三周期均 ≥0 且 4h 已转多：只做多"
     if all(v <= 0 for v in values):
-        return "short", "三周期均 ≤0 且至少一个向下：只做空"
+        if h4 != -1:
+            return (
+                "none",
+                f"4 小时线未转空（周 {weekly} / 日 {daily} / 4h {h4}）：短期横盘，等 4h 转空再做",
+            )
+        return "short", "三周期均 ≤0 且 4h 已转空：只做空"
     return "none", "三周期方向冲突（有正有负）：不做"
 
 
@@ -577,7 +592,7 @@ def _decide(
     if side == "unknown":
         return "stand_aside", "数据不足：至少一个周期的行情不可用，不做", "0"
     if side == "none":
-        return "stand_aside", "三周期不同向（或全为横盘）：不做", "0"
+        return "stand_aside", "三周期不同向（含 4h 未同向 / 全为横盘）：不做", "0"
 
     direction = "多" if side == "long" else "空"
     position = "半仓（0.5x，含横盘周期）" if neutral else "标准仓位（1.0x）"

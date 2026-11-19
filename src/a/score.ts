@@ -16,7 +16,8 @@ import type { WatchItem } from "./watchlist";
 /**
  * A 股选股：三周期趋势过滤 + 15 分钟深度技术分析 + 消息面打分。
  *
- * 1. 月/周/日各算 -1 / 0 / +1；任一周期 -1、数据不足、三周期全 0、没有 +1 都丢弃；
+ * 1. 月/周/日各算 -1 / 0 / +1；任一周期 -1、数据不足、三周期全 0、**日线不是 +1**
+ *    都丢弃（最短周期必须与做多方向同向）；
  * 2. 非涨停，按趋势强度和成交额取前 20；
  * 3. 对 20 只逐只拉 15 分钟 K 线，做结构/位置/动量/量能/形态评分（0–100）；
  * 4. 消息面硬否决 + ±10 微调，按最终得分取前 `poolSize` 只（默认 5，含持仓），不足不补。
@@ -184,17 +185,24 @@ export async function selectTopWatchlist(
   onProgress?.(
     options.refresh ? "刷新全市场快照与日线指标（收盘后选股）…" : "读取全市场快照与日线指标…",
   );
-  const [loaded, indicators] = await Promise.all([
-    loadSnapshot({ refresh: options.refresh }),
-    loadIndicators({
-      refresh: options.refresh,
-      onProgress: (done, total) => {
-        if (done === total || done % 1000 === 0) {
-          onProgress?.(`重算日线指标 ${done}/${total}…`);
-        }
-      },
-    }),
-  ]);
+  // 先拿快照，再算指标：快照里今天的 OHLCV 就是「缺的那一根」，
+  // 指标可以据此只补当天数据，不用对 5000+ 只各重取 140 根日线
+  const loaded = await loadSnapshot({ refresh: options.refresh });
+  const snapshotDate = (
+    loaded.snapshot.quotesAt ?? loaded.snapshot.asOf
+  ).slice(0, 10);
+  const indicators = await loadIndicators({
+    refresh: options.refresh,
+    snapshot: {
+      date: snapshotDate,
+      rows: new Map(loaded.snapshot.rows.map((row) => [row.code, row])),
+    },
+    onProgress: (done, total) => {
+      if (done === total || done % 1000 === 0) {
+        onProgress?.(`更新日线指标 ${done}/${total}…`);
+      }
+    },
+  });
   const universe = baseUniverse(loaded.snapshot.rows);
 
   // 1) 日线趋势：缓存指标计算，-1 / 数据不足直接丢弃
@@ -264,7 +272,7 @@ export async function selectTopWatchlist(
     } => item !== null,
   );
 
-  // 4) 三周期合成：任一向下 / 全 0 / 没有 +1 都丢弃
+  // 4) 三周期合成：任一向下 / 全 0 / 日线不是 +1 都丢弃
   const trendPass = monthlyPass
     .map((item) => ({ ...item, trend: combineTrend(item.monthly, item.weekly, item.daily) }))
     .filter((item) => item.trend.pass);

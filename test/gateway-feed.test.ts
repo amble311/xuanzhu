@@ -3,9 +3,12 @@ import * as os from "os";
 import * as path from "path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { appendInspectEvent } from "../src/btc/inspect-stream";
+import { appendAInspectEvent } from "../src/a/inspect-stream";
 import {
+  composeAStreamText,
   composeRoundText,
   formatRoundPush,
+  formatStreamPush,
   groupInspectRounds,
   isRoundFinished,
   pickBtcImportant,
@@ -103,6 +106,55 @@ describe("btc 事件筛选与按轮聚合", () => {
     );
     expect(chunks.length).toBeGreaterThan(1);
     expect(chunks[0].endsWith("。")).toBe(true);
+  });
+});
+
+/**
+ * A 股结论曾经在推送前被两刀砍掉：源头 `SUMMARY_LIMIT=600`，转发时再
+ * `slice(0, 300)`。用户看到的是半张表 + 一行孤零零的 `6`（`601939` 的前半个字）。
+ * 这里锁住「只切不砍」：内容要么完整送达，要么明确分条。
+ */
+describe("A 股推送只切不砍", () => {
+  const conclusion = [
+    "**结论（2026-11-19 收盘总结）：**",
+    "",
+    "| 代码 | 名称 | 方向 | 15m 分 | 动作 | 依据 |",
+    "|---|---|---|---|---|---|",
+    "| 600901 | 江苏金租 | long | 28 | 持有（已减半） | 15m 结构 0；止损 7.5 未触发 |",
+    "| 600886 | 国投电力 | long | 80 | 持有 | 三周期全多，止损 15.4 未触发 |",
+    "| 601939 | 建设银行 | long | 100 | 持有 | 15m 满分，止损 12.1 未触发 |",
+    "| 603565 | 中谷物流 | long | 73 | 观望 | 持仓已满 3 只 |",
+    "",
+    "**账户**：总资产 1,003,211.92，可用 504,061.92。",
+  ].join("\n");
+
+  it("结论正文逐字保留（错误事件另起一行）", () => {
+    const body = composeAStreamText([
+      { ts: "t", kind: "text", text: conclusion },
+      { ts: "t", kind: "error", text: "行情超时" },
+    ]);
+    expect(body).toContain("601939");
+    expect(body).toContain("账户");
+    expect(body).toContain("· 巡检异常：行情超时");
+  });
+
+  it("超长正文分条，拼回去与原文完全一致", () => {
+    const body = `${conclusion}\n${"补充说明。".repeat(300)}`;
+    const messages = formatStreamPush("A 股巡检结论", body);
+    expect(messages.length).toBeGreaterThan(1);
+    for (const message of messages) {
+      expect(message.length).toBeLessThanOrEqual(900);
+      expect(message).toMatch(/^\[A 股巡检结论( · \d+\/\d+)?\]\n/);
+    }
+    // 气泡边界上会丢掉一个换行（切点落在两行之间），其余字符必须逐字一致
+    const restored = messages
+      .map((message) => message.replace(/^\[[^\]]*\]\n/, ""))
+      .join("");
+    expect(restored.replace(/\s/g, "")).toBe(body.replace(/\s/g, ""));
+  });
+
+  it("空正文不发空气泡", () => {
+    expect(formatStreamPush("A 股巡检结论", "  \n ")).toEqual([]);
   });
 });
 
@@ -312,5 +364,37 @@ describe("转发循环", () => {
     expect(sent2).toHaveLength(1);
     expect(sent2[0]).toContain("1. 中国石油 601857 · 86 分");
     expect(sent2[0]).toContain("移出：莱美药业 300006");
+  });
+
+  it("A 股巡检结论不再被砍成 300 字（表格最后几行必须送达）", async () => {
+    // 首次调用初始化 a-stream 偏移（从当前末尾开始，不回放）
+    await runFeedTick({ offsetsFile, send: async () => true });
+
+    const rows = [
+      "**结论（2026-11-19 收盘总结）：**",
+      "| 代码 | 名称 | 方向 | 15m 分 | 动作 | 依据 |",
+      "|---|---|---|---|---|---|",
+      `| 600901 | 江苏金租 | long | 28 | 持有（已减半） | 今日已卖出 12500 股 @ 7.78，剩余 12500 股；15m 结构 0（跌破 MA20 与前 10 根低点），止损 7.5 未触发，明日开盘复核结构是否修复 |`,
+      `| 600886 | 国投电力 | long | 80 | 持有 | 三周期全多，15m 结构 30/量能 15/形态 15，止损 15.4 未触发 |`,
+      `| 601939 | 建设银行 | long | 100 | 持有 | 三周期全多，15m 满分（结构 30/动量 20/量能 15/形态 15），已收复上午高点附近，止损 12.1 未触发 |`,
+      `| 603565 | 中谷物流 | long | 73 | 观望 | 持仓已满 3 只，无法开新仓 |`,
+      "",
+      "**账户**：总资产 1,003,211.92（+0.32%），可用 504,061.92，无挂单。",
+      "**监控规则更新**：保留 600901 ≤ 7.5、600886 ≤ 15.4（止损）",
+    ];
+    const body = rows.join("\n");
+    // 必须有内容落在旧的 300 字切点之外，否则这条用例证明不了什么
+    expect(body.length).toBeGreaterThan(400);
+    appendAInspectEvent("text", body);
+
+    const sent: string[] = [];
+    await runFeedTick({ offsetsFile, send: async (text) => (sent.push(text), true) });
+
+    const all = sent.join("\n");
+    expect(all).toContain("[A 股巡检结论]");
+    // 最后两行以前正好落在那 300 字之外
+    expect(all).toContain("601939");
+    expect(all).toContain("监控规则更新");
+    expect(sent.every((message) => message.length <= 900)).toBe(true);
   });
 });

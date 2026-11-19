@@ -7,7 +7,11 @@ import {
   type InspectEventItem,
 } from "../btc/inspect-stream";
 import { aActionsPath } from "../a/monitor";
-import { currentAInspectOffset, readAInspectEvents } from "../a/inspect-stream";
+import {
+  currentAInspectOffset,
+  readAInspectEvents,
+  type AInspectEvent,
+} from "../a/inspect-stream";
 import { getAShareHome, getBtcHome } from "../utils/paths";
 
 /**
@@ -54,6 +58,14 @@ export type FeedOffsets = Record<string, number>;
  * 开始的那一轮里，前几条气泡已经送达。整轮送达后 `btc-batch` 归零。
  */
 const BTC_BATCH_KEY = "btc-batch";
+
+/**
+ * A 股巡检结论的气泡进度键（与 `btc-batch` 同义）。
+ *
+ * 结论正文放宽到 2000 字后，一条推送可能被切成多条气泡；第 2 条失败时若不记进度，
+ * 下个 tick 会把第 1 条重发一遍。这里同样记「这一批已送达几条」。
+ */
+const A_STREAM_BATCH_KEY = "a-stream-batch";
 
 export function feedOffsetsPath(gatewayHome: string): string {
   return path.join(gatewayHome, "run", "feed-offsets.json");
@@ -197,6 +209,44 @@ export function splitWechatBody(body: string, limit: number): string[] {
   }
   if (buffer) chunks.push(buffer);
   return chunks;
+}
+
+/**
+ * 一段正文 → 一条或多条气泡（带标题与序号），**只切不砍**。
+ *
+ * 这是 A 股推送的公共出口。以前两条路径都在「切」之前先 `slice(0, 300)`：
+ * 600 字的收盘总结只剩 300 字，客户端看到的是半张表 + 一行孤零零的 `6`
+ * （`601939` 的前半个字符）。长度超限的正确做法是多发一条，而不是把内容丢掉。
+ */
+export function formatStreamPush(title: string, body: string): string[] {
+  const text = body.trim();
+  if (!text) return [];
+  const chunks = splitWechatBody(text, MAX_PUSH_CHARS - HEADER_RESERVE - title.length);
+  const total = chunks.length;
+  return chunks.map((chunk, index) => {
+    const head = total > 1 ? `${title} · ${index + 1}/${total}` : title;
+    return `[${head}]\n${chunk}`;
+  });
+}
+
+/**
+ * A 股巡检结论正文：text 事件按时间顺序拼接，错误另起一行加 `·`。
+ *
+ * A 股这边 `text` 事件是一整段结论（不是 btc 那种 1.5 秒一段的流式增量），
+ * 所以直接按段落拼接即可，**不逐条截断**。
+ */
+export function composeAStreamText(events: AInspectEvent[]): string {
+  const parts: string[] = [];
+  for (const event of events) {
+    const text = event.text.trim();
+    if (!text) continue;
+    if (event.kind === "error") {
+      parts.push(`· 巡检异常：${text}`);
+      continue;
+    }
+    parts.push(text);
+  }
+  return parts.join("\n\n").trim();
 }
 
 /** 气泡太多时保留开头与结尾（结论通常在最后），中间省略并说明去处 */
@@ -395,13 +445,19 @@ export async function runFeedTick(deps: FeedTickDeps): Promise<void> {
     } else {
       const total = Math.ceil(formatted.length / MAX_EVENTS_PER_PUSH);
       let ok = true;
-      for (let index = 0; index < total; index += 1) {
+      for (let index = 0; index < total && ok; index += 1) {
         const chunk = formatted.slice(
           index * MAX_EVENTS_PER_PUSH,
           (index + 1) * MAX_EVENTS_PER_PUSH,
         );
         const title = total > 1 ? `A 股巡检 ${index + 1}/${total}` : "A 股巡检";
-        ok = (await deps.send(`[${title}]\n${chunk.map((line) => `- ${line.slice(0, 300)}`).join("\n")}`)) && ok;
+        const messages = formatStreamPush(title, chunk.map((line) => `- ${line}`).join("\n"));
+        for (const message of messages) {
+          if (!(await deps.send(message))) {
+            ok = false;
+            break;
+          }
+        }
       }
       if (ok) updates[aKey] = offset;
       else failed = true;
@@ -412,23 +468,32 @@ export async function runFeedTick(deps: FeedTickDeps): Promise<void> {
   const aStreamKey = "a-stream";
   if (!(aStreamKey in offsets)) {
     updates[aStreamKey] = currentAInspectOffset();
+    updates[A_STREAM_BATCH_KEY] = 0;
   } else {
     const { events, offset } = readAInspectEvents(offsets[aStreamKey]);
-    const important = events
-      .filter((event) => event.kind === "text" || event.kind === "error")
-      .map((event) => `- ${event.text.trim().slice(0, 300)}`);
-    if (important.length === 0) {
-      updates[aStreamKey] = offset;
-    } else {
-      const total = Math.ceil(important.length / MAX_EVENTS_PER_PUSH);
-      let ok = true;
-      for (let index = 0; index < total; index += 1) {
-        const chunk = important.slice(index * MAX_EVENTS_PER_PUSH, (index + 1) * MAX_EVENTS_PER_PUSH);
-        const title = total > 1 ? `A 股巡检结论 ${index + 1}/${total}` : "A 股巡检结论";
-        ok = (await deps.send(`[${title}]\n${chunk.join("\n")}`)) && ok;
+    const important = events.filter(
+      (event) => event.kind === "text" || event.kind === "error",
+    );
+    const messages = formatStreamPush("A 股巡检结论", composeAStreamText(important));
+    // 上次停在第几条气泡（0 = 这批还没开始推）：失败重试只补发没送达的部分
+    const resume = Math.max(0, Math.floor(offsets[A_STREAM_BATCH_KEY] ?? 0));
+    let batch = Math.min(resume, messages.length);
+    let ok = true;
+    for (let at = batch; at < messages.length; at += 1) {
+      if (!(await deps.send(messages[at]))) {
+        ok = false;
+        break;
       }
-      if (ok) updates[aStreamKey] = offset;
-      else failed = true;
+      batch = at + 1;
+    }
+    if (ok) {
+      updates[aStreamKey] = offset;
+      updates[A_STREAM_BATCH_KEY] = 0;
+    } else {
+      // 偏移不前进，但记住已送达的气泡数，避免下个 tick 重发前面几条
+      updates[aStreamKey] = offsets[aStreamKey];
+      updates[A_STREAM_BATCH_KEY] = batch;
+      failed = true;
     }
   }
 

@@ -1,7 +1,8 @@
 import * as fs from "fs";
 import * as path from "path";
-import type { Quote } from "../exchange/ashare";
+import type { Bar, Quote } from "../exchange/ashare";
 import type { Indicators } from "./indicators";
+import { intradayMa, priorExtreme } from "./intraday";
 import { monitorDir } from "./watchlist";
 
 /**
@@ -9,6 +10,10 @@ import { monitorDir } from "./watchlist";
  *
  * 规则由巡检 Agent 通过 `a_trigger` 写入；监控循环只做确定性评估，
  * 命中后把 reason 交给巡检，由巡检决定操作。
+ *
+ * **15 分钟结构**（`*_15m`）与巡检/买点/卖点共用 `intraday.ts` 的算法：
+ * 巡检说「15m 跌破 MA20 与前 10 根低点」，就该有对应的叫醒条件，
+ * 否则这类判断只能等下一轮排期，等于没有监控。
  */
 
 export type RuleKind =
@@ -19,9 +24,35 @@ export type RuleKind =
   | "ma20_break"
   | "ma20_above"
   | "ret20_above"
+  /** 15 分钟结构：跌破 / 站上 15m MA20 */
+  | "ma20_break_15m"
+  | "ma20_above_15m"
+  /** 15 分钟结构：跌破前 10 根低点 / 突破前 10 根高点（不含当前这根） */
+  | "low10_break_15m"
+  | "high10_above_15m"
   | "chain"
   | "formula"
   | "script";
+
+/** 需要 15 分钟 K 线的规则（评估时由调用方按需取数） */
+export function ruleNeedsBars15m(rule: {
+  kind: RuleKind;
+  steps?: RuleStep[];
+}): boolean {
+  return (
+    isBars15mKind(rule.kind) ||
+    (rule.steps ?? []).some((step) => isBars15mKind(step.kind))
+  );
+}
+
+function isBars15mKind(kind: RuleKind): boolean {
+  return (
+    kind === "ma20_break_15m" ||
+    kind === "ma20_above_15m" ||
+    kind === "low10_break_15m" ||
+    kind === "high10_above_15m"
+  );
+}
 
 export interface RuleStep {
   kind: Exclude<RuleKind, "chain" | "formula" | "script">;
@@ -116,6 +147,7 @@ export function addRule(input: {
   if (
     input.kind !== "ma20_break" &&
     input.kind !== "ma20_above" &&
+    !isBars15mKind(input.kind) &&
     input.kind !== "chain" &&
     input.kind !== "formula" &&
     input.kind !== "script" &&
@@ -150,6 +182,7 @@ export function addRule(input: {
     value:
       input.kind === "ma20_break" ||
       input.kind === "ma20_above" ||
+      isBars15mKind(input.kind) ||
       input.kind === "chain" ||
       input.kind === "formula" ||
       input.kind === "script"
@@ -192,6 +225,14 @@ function describeRuleInput(input: { kind: RuleKind; value?: number }): string {
       return "站上日线 MA20";
     case "ret20_above":
       return `20 日涨幅 ≥ ${input.value}%`;
+    case "ma20_break_15m":
+      return "跌破 15m MA20";
+    case "ma20_above_15m":
+      return "站上 15m MA20";
+    case "low10_break_15m":
+      return "跌破前 10 根 15m 低点";
+    case "high10_above_15m":
+      return "突破前 10 根 15m 高点";
     default:
       return "跌破日线 MA20";
   }
@@ -224,6 +265,14 @@ function conditionText(kind: RuleKind, value?: number): string {
       return "站上日线 MA20";
     case "ma20_break":
       return "跌破日线 MA20";
+    case "ma20_break_15m":
+      return "跌破 15m MA20";
+    case "ma20_above_15m":
+      return "站上 15m MA20";
+    case "low10_break_15m":
+      return "跌破前 10 根 15m 低点";
+    case "high10_above_15m":
+      return "突破前 10 根 15m 高点";
     case "ret20_above":
       return `20 日涨幅 ≥ ${value}%`;
     case "formula":
@@ -304,11 +353,50 @@ export function evaluateFormula(
   }
 }
 
+/**
+ * 15 分钟结构条件：用**实时价**与该周期结构比较。
+ *
+ * 时间周期与巡检/买点/卖点一致（`intraday.ts`）：MA20 取最近 20 根收盘，
+ * 极值取前 10 根（不含正在走的那根）。数据不足（<21 根）视为不命中，
+ * 不用「拿不到 15m 就当满足」这种危险兜底。
+ */
+function bars15mHit(
+  kind: RuleKind,
+  bars: Bar[] | undefined,
+  price: number,
+): boolean {
+  if (!bars || bars.length < 21) return false;
+  switch (kind) {
+    case "ma20_break_15m": {
+      const ma20 = intradayMa(bars);
+      return ma20 !== undefined && price < ma20;
+    }
+    case "ma20_above_15m": {
+      const ma20 = intradayMa(bars);
+      return ma20 !== undefined && price >= ma20;
+    }
+    case "low10_break_15m": {
+      const low = priorExtreme(bars, "low");
+      return low !== undefined && price < low;
+    }
+    case "high10_above_15m": {
+      const high = priorExtreme(bars, "high");
+      return high !== undefined && price > high;
+    }
+    default:
+      return false;
+  }
+}
+
 function stepHit(
   step: RuleStep,
   quote: Quote,
   indicators: Map<string, Indicators>,
+  bars15m: Map<string, Bar[]>,
 ): boolean {
+  if (isBars15mKind(step.kind)) {
+    return bars15mHit(step.kind, bars15m.get(quote.code), quote.price);
+  }
   switch (step.kind) {
     case "price_above":
       return quote.price >= (step.value ?? 0);
@@ -342,11 +430,23 @@ function markChainStep(id: string, step: number): void {
   writeFile(file);
 }
 
+/** 命中原因的固定文案（价格类才带现价，避免「600519 600519 …」这种重复） */
+const HIT_LABELS: Partial<Record<RuleKind, string>> = {
+  ma20_break: "跌破日线 MA20",
+  ma20_above: "站上日线 MA20",
+  ma20_break_15m: "跌破 15m MA20",
+  ma20_above_15m: "站上 15m MA20",
+  low10_break_15m: "跌破前 10 根 15m 低点",
+  high10_above_15m: "突破前 10 根 15m 高点",
+};
+
 export function evaluateRules(
   rules: MonitorRule[],
   quotes: Map<string, Quote>,
   indicators: Map<string, Indicators>,
   now = new Date(),
+  /** 15 分钟 K 线：只有 `*_15m` 规则需要，调用方按需取数（取不到就不命中） */
+  bars15m: Map<string, Bar[]> = new Map(),
 ): { rule: MonitorRule; reason: string } | null {
   for (const rule of rules) {
     if (rule.expiresAt && Date.parse(rule.expiresAt) <= now.getTime()) continue;
@@ -368,7 +468,7 @@ export function evaluateRules(
         index = 0;
       }
       while (index < steps.length) {
-        if (!stepHit(steps[index], quote, indicators)) break;
+        if (!stepHit(steps[index], quote, indicators, bars15m)) break;
         if (index === steps.length - 1) {
           return { rule, reason: `${rule.code} 链式触发（${steps.length}/${steps.length}）：${rule.note}` };
         }
@@ -407,6 +507,12 @@ export function evaluateRules(
       case "ret20_above":
         hit = (indicators.get(rule.code)?.ret20 ?? -Infinity) >= (rule.value ?? 0);
         break;
+      case "ma20_break_15m":
+      case "ma20_above_15m":
+      case "low10_break_15m":
+      case "high10_above_15m":
+        hit = bars15mHit(rule.kind, bars15m.get(rule.code), quote.price);
+        break;
       case "formula":
       case "script": {
         const ind = indicators.get(rule.code);
@@ -433,13 +539,9 @@ export function evaluateRules(
     }
     if (!hit) continue;
     const detail =
-      rule.kind === "ma20_break"
-        ? "跌破日线 MA20"
-        : rule.kind === "ma20_above"
-          ? "站上日线 MA20"
-          : rule.kind === "ret20_above"
-            ? `20 日涨幅达标（${indicators.get(rule.code)?.ret20?.toFixed(1) ?? "—"}%）`
-            : `${describeRule(rule)}（现价 ${quote.price}）`;
+      rule.kind === "ret20_above"
+        ? `20 日涨幅达标（${indicators.get(rule.code)?.ret20?.toFixed(1) ?? "—"}%）`
+        : (HIT_LABELS[rule.kind] ?? `${describeRule(rule)}（现价 ${quote.price}）`);
     return { rule, reason: `${rule.code} ${detail}：${rule.note}` };
   }
   return null;

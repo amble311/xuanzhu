@@ -359,6 +359,7 @@ const signalTool: ToolDefinition = {
     "「月/周/日三周期 + 15 分钟择时」打分（对齐 btc_signal），只分析不下单。" +
     "不传 code 时按**持仓优先**的顺序轮询自选池（5 只，含持仓），每只给出方向闸门" +
     "（long=可开新仓 / none=不做 / unknown=数据不足）、15 分钟评分与建议；传 code 只看这一只的明细。" +
+    "方向闸门要求三周期都 ≥0 **且日线=+1**（最短周期必须同向；月 0/周 +1/日 0 只观望），" +
     "巡检和选股共用同一套评分口径：三周期只定方向，15 分钟才决定「现在有没有机会」。",
   parameters: {
     type: "object",
@@ -649,7 +650,9 @@ const selectTool: ToolDefinition = {
   description:
     "重新跑一次完整 A 股选股：全市场月/周/日三周期方向过滤 → 逐只 15 分钟深度评分 → 消息面校正，取前 5，" +
     "并写入自选股（**持仓强制保留，与自选合计 5 只**）。**用户说“重新选股”时直接调这个**，" +
-    "不要用 a_screen + a_bars 手动模拟；全流程约 1–2 分钟，可用 emit 看进度。",
+    "不要用 a_screen + a_bars 手动模拟；全流程约 1–2 分钟，可用 emit 看进度。" +
+    "**一次性动作**：同一次请求里只调用一次；返回「X/5」的 X = 需要补的空位数（池子含持仓），" +
+    "少于 5 是正常结果，不要为了凑满重复选股。",
   parameters: {
     type: "object",
     properties: {
@@ -698,8 +701,9 @@ const selectTool: ToolDefinition = {
     return {
       ok: true,
       content:
-        `✓ 选股完成：${picks.length}/${size} 只（不足不补），已写入自选股` +
-        `（池内 ${merged.items.length}/${size}，持仓优先保留）\n` +
+        `✓ 选股完成：本次补入 ${picks.length} 只` +
+        `（池子 ${merged.items.length}/${size}，其中持仓 ${held.length} 只强制保留）\n` +
+        `· 只补「容量 − 持仓」的空位，少于 ${size} 只是正常结果，**不要重复选股凑数**\n` +
         (lines.length > 0 ? lines.join("\n") : "（本次没有符合条件的股票）"),
       summary: `重新选股 ${picks.length} 只`,
     };
@@ -807,14 +811,21 @@ const triggerTool: ToolDefinition = {
     "\n- ma20_break / ma20_above：**结构条件**——跌破 / 站上日线 MA20。别自己拿 MA20 的数值写价格阈值" +
     "（均线每天在变，写死的价格第二天就失效）。" +
     "\n- ret20_above：20 日涨幅达到多少。" +
+    "\n- ma20_break_15m / ma20_above_15m：**15 分钟结构**——跌破 / 站上 15m MA20。" +
+    "\n- low10_break_15m / high10_above_15m：跌破前 10 根 15m 低点 / 突破前 10 根 15m 高点。" +
+    "这四个 `*_15m` 与巡检的 15 分钟择时、持仓风控（`intraday.ts`）用同一套算法，" +
+    "「15m 跌破 MA20 与前 10 根低点」可以拆成两条规则（规则之间是或），也可以用 chain 表达先后。" +
     "\n- chain：**有先后顺序**的条件，给 steps（2–3 步）。前一步满足**不叫醒**、只记住进度，" +
     "最后一步也满足才叫醒；中间步骤超过 chainExpireMin（默认 240 分钟）没等到下一步就退回第一步。" +
     "「先站上 12.45、再回踩 12.20 叫我」这类只能用 chain，拿两条独立价格规则表达不出顺序。" +
     "\n- formula / script：受限公式（不是任意代码），适合组合条件，例：`price < ma20 && rsi < 40`、" +
     "`price > ma20 && macd > 0`。可用变量：price / pct / ma5 / ma10 / ma20 / ma50 / ma60 / " +
     "ret5 / ret20 / ret60 / atr_pct / rsi / adx / macd / amount（rsi/adx/macd 是日线 14/14/MACD 柱）。" +
-    "\n\n**用法建议**：每只优先给 1 条**能表达结构**的条件（ma20_break / formula），" +
-    "不要同一只写两条纯价格规则；同一价位区间要么用一条 formula（上下界一起写），要么用 chain 表达先后。" +
+    "\n\n**用法建议**：结构类判断尽量落成结构条件（`ma20_break` / `*_15m` / `formula` / `chain`），" +
+    "价格规则只用来表达止损 / 止盈位；不要同一只写两条纯价格规则，同一价位区间要么用一条 formula" +
+    "（上下界一起写），要么用 chain 表达先后。" +
+    "\n`*_15m` 规则会让监控每 5 分钟为该股票取一次 15 分钟 K 线（只对设了这类规则的代码），" +
+    "取不到数据时按「不命中」处理，不会误叫。" +
     "\n\n默认一次性为 false（可反复触发），命中后 30 分钟冷却；最多 20 条，默认 72 小时过期。",
   parameters: {
     type: "object",
@@ -830,6 +841,10 @@ const triggerTool: ToolDefinition = {
           "ma20_break",
           "ma20_above",
           "ret20_above",
+          "ma20_break_15m",
+          "ma20_above_15m",
+          "low10_break_15m",
+          "high10_above_15m",
           "chain",
           "formula",
           "script",
@@ -837,7 +852,8 @@ const triggerTool: ToolDefinition = {
       },
       value: {
         type: "number",
-        description: "price/pct/ret20 的目标值；ma20_break / ma20_above / chain / formula 不需要",
+        description:
+          "price/pct/ret20 的目标值；ma20_break / ma20_above / *_15m / chain / formula 不需要",
       },
       note: { type: "string", description: "命中时给巡检看的原因" },
       once: { type: "boolean", description: "命中一次后删除" },

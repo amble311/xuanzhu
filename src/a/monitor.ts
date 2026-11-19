@@ -8,6 +8,7 @@ import {
   loadTradingCalendar,
   mapLimit,
   tradingDayStatus,
+  type Bar,
   type Quote,
 } from "../exchange/ashare";
 import {
@@ -19,7 +20,13 @@ import {
   type PaperAccount,
 } from "./paper";
 import { runAInspect } from "./inspect";
-import { commitRuleHit, describeRule, evaluateRules, readRules } from "./rules";
+import {
+  commitRuleHit,
+  describeRule,
+  evaluateRules,
+  readRules,
+  ruleNeedsBars15m,
+} from "./rules";
 import {
   nextScheduledEntry,
   normalizeScheduleTimes,
@@ -42,9 +49,7 @@ import {
   type PositionRiskAlert,
 } from "./risk-alerts";
 import { intradayWeak } from "./intraday";
-import { INDICATORS_CACHE, loadIndicators } from "./indicators";
-import { SNAPSHOT_CACHE } from "./snapshot";
-import { deleteCache, pruneCacheCodes } from "../exchange/ashare";
+import { loadIndicators } from "./indicators";
 import { scoreHeldItems, selectionNeed, selectTopWatchlist } from "./score";
 import {
   loadWatchlist,
@@ -1236,9 +1241,6 @@ async function maybeRunAfterCloseSelection(now: Date, state: AMonitorState): Pro
       const scored = await scoreHeldItems(held, log);
       const merged = mergeWatchlist(scored, held, now, size);
       saveWatchlist(merged);
-      const keptHeld = merged.items.map((item) => item.code);
-      pruneCacheCodes(INDICATORS_CACHE, keptHeld);
-      deleteCache(SNAPSHOT_CACHE);
       state.lastSelectDay = today;
       state.lastAction = `持仓 ${heldNow}/${size} 已满，重算持仓评分 ${scored.length} 只`;
       writeSelectState({ day: today, attemptedAt: state.lastSelectAttemptAt });
@@ -1258,12 +1260,13 @@ async function maybeRunAfterCloseSelection(now: Date, state: AMonitorState): Pro
     const heldScored = await scoreHeldItems(held, log);
     const merged = mergeWatchlist([...picks, ...heldScored], held, now, size);
     saveWatchlist(merged);
-    // 选股结束：把非自选股的数据从缓存里删掉（SQLite 里就是删行）。
-    // 指标裁到池内并标记 complete=false —— 全市场筛选会重算，巡检/风控照常用池内数据。
-    const keptCodes = merged.items.map((item) => item.code);
-    const removed = pruneCacheCodes(INDICATORS_CACHE, keptCodes);
-    deleteCache(SNAPSHOT_CACHE);
-    log(`缓存清理：日线指标删除 ${removed} 只非自选股，全市场快照已清空`);
+    // **不清理全市场数据**：日线仓库会保留历史（每天只补一根），指标缓存也保留全市场。
+    // 以前选股后把指标裁到池内并删掉快照 —— 结果当天再选一次就得重取 5000+ 只，
+    // 而这正是「每天都在拉全市场」的来源。过期由各自 TTL 负责，不需要手动清。
+    log(
+      `选股完成：池内 ${merged.items.length}/${size} 只` +
+        `（全市场日线与快照保留在缓存中，供当天再次选股/巡检复用）`,
+    );
     state.lastSelectDay = today;
     writeSelectState({ day: today, attemptedAt: state.lastSelectAttemptAt });
     state.lastAction = `收盘后选股 ${picks.length} 只`;
@@ -1312,7 +1315,28 @@ async function checkMonitorRules(
       .map((code) => [code, known.get(code)!] as const),
   );
   const indicators = await loadIndicators({ allowPartial: true });
-  return evaluateRules(sorted, quotes, indicators, now);
+
+  // 15m 结构类规则（ma20_break_15m / low10_break_15m …）才去取 15m K 线：
+  // 只对「真的有这类规则」的代码各拉一次（池子很小，5 分钟一次可以接受），
+  // 取不到的代码不进 map —— 规则按「数据不足 = 不命中」处理，不做危险兜底。
+  const need15m = [...new Set(sorted.filter(ruleNeedsBars15m).map((rule) => rule.code))];
+  const bars15m = new Map<string, Bar[]>();
+  if (need15m.length > 0) {
+    const fetched = await mapLimit(
+      need15m,
+      async (code) => {
+        const bars = await fetchBars(code, {
+          period: "15m",
+          adjust: "backward",
+          limit: 80,
+        }).catch(() => null);
+        return [code, bars] as const;
+      },
+      4,
+    );
+    for (const [code, bars] of fetched) if (bars) bars15m.set(code, bars);
+  }
+  return evaluateRules(sorted, quotes, indicators, now, bars15m);
 }
 
 export interface AServiceStatus {

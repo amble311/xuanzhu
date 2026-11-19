@@ -6,8 +6,12 @@ import {
   fetchBars,
   loadUniverse,
   mapLimit,
+  sessionKind,
+  todayString,
   type Bar,
 } from "../exchange/ashare";
+import { openDailyBarStore, type DailyBarStore } from "./bar-store";
+import type { SnapshotRow } from "./snapshot";
 
 /**
  * 全市场预计算指标。
@@ -146,26 +150,249 @@ export function computeIndicators(code: string, bars: Bar[]): Indicators | null 
   };
 }
 
+export interface SnapshotBarSource {
+  /** 快照所属交易日 `YYYY-MM-DD` */
+  date: string;
+  rows: Map<string, SnapshotRow>;
+}
+
 export interface BuildIndicatorsOptions {
   onProgress?: (done: number, total: number) => void;
   /** 只算一部分（调试 / 指定股票池） */
   codes?: string[];
+  /**
+   * 当日收盘快照：给出后，库里已有历史的股票**只补今天这一根**（原始价 × 复权比例），
+   * 不再逐只重取 140 根。盘中快照不会落库（那一根还没收完）。
+   */
+  snapshot?: SnapshotBarSource;
+  /** 日线仓库；`undefined` 用默认库，`null` 显式禁用（退回老路径） */
+  store?: DailyBarStore | null;
+  /** 基准时间（测试用） */
+  now?: Date;
+  /** 测试注入：替代 `fetchBars(day, 140)` */
+  fetchDaily?: (code: string) => Promise<Bar[]>;
+  /**
+   * 每天抽样校对几只「刚补过今天」的股票（与官方日线比收盘），默认 3；
+   * 0 = 关闭。校对不一致时按官方数据覆盖并重算，用来兜住复权比例漂移。
+   */
+  verifySample?: number;
 }
 
-/** 批量抓日线并计算指标（并发由同花顺适配层限制） */
+/** 复权价按 2 位小数落库：与官方日线口径一致，避免浮点尾数在指标里累积 */
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+/**
+ * 原始 bar × 复权比例 → 后复权 bar。
+ *
+ * 复权只改价格，成交量 / 成交额保持原值（同花顺的后复权口径同样不调量）。
+ */
+export function toAdjustedBar(row: SnapshotRow, date: string, ratio: number): Bar {
+  return {
+    time: date,
+    open: round2(row.open * ratio),
+    high: round2(row.high * ratio),
+    low: round2(row.low * ratio),
+    close: round2(row.price * ratio),
+    volume: row.volume,
+    amount: row.amount,
+  };
+}
+
+/**
+ * 除权检测：昨收（后复权）应该等于「今日原始 preClose × 旧 ratio」。
+ *
+ * 分红 / 送转当天，交易所给的 preClose 已经是除权后的价格，而库里的 ratio 还是旧的 ——
+ * 两者一比就会差出一个除权幅度（通常 >1%）。偏差超过 `tolerance` 就判定除权，
+ * 该股票必须整段重取（历史后复权价全变了），不能按旧 ratio 补今天的 bar。
+ */
+export function adjustmentChanged(
+  prevAdjustedClose: number,
+  rawPreClose: number,
+  ratio: number,
+  tolerance = 0.003,
+): boolean {
+  if (!(prevAdjustedClose > 0) || !(rawPreClose > 0) || !(ratio > 0)) return false;
+  const expected = rawPreClose * ratio;
+  return Math.abs(expected - prevAdjustedClose) / prevAdjustedClose > tolerance;
+}
+
+/** 「今天这根」是否已经收盘、可以落库 */
+function appendPlan(
+  snapshot: SnapshotBarSource | undefined,
+  now: Date,
+): SnapshotBarSource | undefined {
+  if (!snapshot || snapshot.rows.size === 0) return undefined;
+  // 盘中落库会把「没收完的那一根」写进历史，之后所有指标都被这根脏数据带偏
+  if (sessionKind(now) !== "closed") return undefined;
+  const today = todayString(now);
+  // 周末 / 节假日拿到的是上一次的快照（quotesAt 不是今天），不能当成新的一根
+  if (snapshot.date !== today) return undefined;
+  return snapshot;
+}
+
+/**
+ * 两个日期之间还有几个工作日（周一至周五，含头不含尾）。
+ *
+ * 用来判断「库里最后一根到目标日期之间，是不是漏了交易日」：
+ * - 0 = 相邻交易日（周五 → 下周一也算 0），可以只补一根；
+ * - >0 = 中间漏了交易日（进程停过 / 长假），历史不连续，必须整段重取。
+ *
+ * 故意不查交易日历：日历本身要拉指数日线（网络），而这里只做保守判断 ——
+ * 长假后会多取一次全市场，代价可以接受，比用旧数据算错趋势好得多。
+ */
+export function weekdayGap(from: string, to: string): number {
+  const start = Date.parse(`${from}T00:00:00Z`);
+  const end = Date.parse(`${to}T00:00:00Z`);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return 0;
+  let gap = 0;
+  for (let at = start + 86_400_000; at < end; at += 86_400_000) {
+    const day = new Date(at).getUTCDay();
+    if (day !== 0 && day !== 6) gap += 1;
+  }
+  return gap;
+}
+
+/**
+ * 批量取日线并计算指标。
+ *
+ * 有日线仓库时走**增量**：只对「库里没有 / 落后太多 / 除权了」的代码发请求，
+ * 其余直接读库 + 补今天一根。没有 `node:sqlite`（或显式 `store: null`）时行为与以前一致。
+ */
+export interface BuildIndicatorsResult {
+  items: Indicators[];
+  failed: number;
+  /** 直接读库的只数 */
+  reused: number;
+  /** 走了网络请求的只数 */
+  fetched: number;
+  /** 抽样校对发现的差异只数（已按官方数据覆盖） */
+  mismatched: number;
+}
+
+/**
+ * 盘中取回的日线里，最后一根可能是**还没收盘**的当天 K 线。
+ *
+ * 绝不能把它写进仓库：A 股一天只有一根，写进去之后「今天」就变成过去时，
+ * 第二天再也分不清这根是收盘价还是 14:00 的价格 —— 指标会永久带着这个错误。
+ * 因此未收盘时统一丢掉落库，等收盘后再用快照补一根最终的。
+ */
+export function dropUnclosedDaily(now: Date, bars: Bar[]): Bar[] {
+  if (bars.length === 0 || sessionKind(now) === "closed") return bars;
+  const last = bars[bars.length - 1];
+  return last.time.slice(0, 10) === todayString(now) ? bars.slice(0, -1) : bars;
+}
+
+/**
+ * 构建全市场指标（有日线仓库时走增量）。
+ *
+ * **数据新鲜度不变量**（回答「盘中更新后崩了怎么保证正确」）：
+ * 1. 只有当 `sessionKind(now) === "closed"`、且快照就是当天的，才把「今天」写进仓库；
+ * 2. 盘中取回的官方日线里，若最后一根是当天，直接丢掉（`dropUnclosedDaily`）——
+ *    宁可少一根，也不把没收盘的价格当真收盘；
+ * 3. 每根 bar 与 `meta` 在同一个事务里写入，崩溃只会「这根没写」，不会写一半；
+ * 4. 重启后若库内 `lastDate` 与目标日期之间漏了交易日（`weekdayGap > 0`），
+ *    该股票整段重取 —— 崩溃/停机漏掉的交易日会在这里补回来；
+ * 5. 每天抽样校对少量「刚补过今天」的股票（`verifySample`，默认 3 只）：
+ *    与官方日线收盘差超过 0.5% 就按官方覆盖重算，及早发现复权/数据源口径问题。
+ */
 export async function buildIndicators(
   codes: string[],
   options: BuildIndicatorsOptions = {},
-): Promise<{ items: Indicators[]; failed: number }> {
+): Promise<BuildIndicatorsResult> {
   let done = 0;
   let failed = 0;
+  let reused = 0;
+  let fetched = 0;
+  let mismatched = 0;
+  const now = options.now ?? new Date();
+  const store = options.store === undefined ? openDailyBarStore() : options.store;
+  const snapshot = store ? appendPlan(options.snapshot, now) : undefined;
+  const today = todayString(now);
+  const fetchDaily =
+    options.fetchDaily ??
+    ((code: string) =>
+      fetchBars(code, { period: "day", adjust: "backward", limit: 140 }));
+  /** 「今天这根」是刚补/刚确认的代码：抽样校对只挑这些人（它们最可能出错） */
+  const appended: string[] = [];
+
   const rows = await mapLimit(codes, async (code) => {
     try {
-      const bars = await fetchBars(code, {
-        period: "day",
-        adjust: "backward",
-        limit: 140,
-      });
+      const saved = store?.meta(code);
+      let bars = saved ? store!.load(code, 140) : [];
+      let fromStore = Boolean(saved) && bars.length >= 140;
+
+      // 库里漏了交易日 → 历史不连续，老数据算出来的三周期是错的，整段重取。
+      // 有当日快照时严格判断（漏一天就重取）；没有快照时容忍 2 个工作日（长假）。
+      if (fromStore && saved) {
+        const stale = snapshot
+          ? saved.lastDate < snapshot.date && weekdayGap(saved.lastDate, snapshot.date) > 0
+          : weekdayGap(saved.lastDate, today) > 2;
+        if (stale) fromStore = false;
+      }
+
+      if (fromStore && saved && snapshot && bars.length > 0) {
+        const quote = snapshot.rows.get(code);
+        const last = bars[bars.length - 1];
+        if (
+          quote &&
+          saved.ratio > 0 &&
+          saved.lastDate < snapshot.date &&
+          quote.price > 0 &&
+          quote.open > 0 &&
+          quote.volume > 0
+        ) {
+          if (adjustmentChanged(last.close, quote.preClose, saved.ratio)) {
+            // 除权：历史后复权价全部失效，按新口径整段重取
+            fromStore = false;
+          } else {
+            const bar = toAdjustedBar(quote, snapshot.date, saved.ratio);
+            store!.append(code, bar, {
+              code,
+              ratio: saved.ratio,
+              lastDate: snapshot.date,
+              rawClose: quote.price,
+              updatedAt: now.toISOString(),
+            });
+            bars = store!.load(code, 140);
+            appended.push(code);
+          }
+        }
+      }
+
+      if (!fromStore) {
+        // 盘中取回的最后那根是「正在走」的，不能入库（见函数注释的不变量 2）
+        const fresh = dropUnclosedDaily(now, await fetchDaily(code));
+        const last = fresh[fresh.length - 1];
+        const lastDate = last?.time.slice(0, 10) ?? "";
+        // 复权比例 = 后复权价 / 原始价。两种取法：
+        // ① 官方日线已包含快照当天 → 用「后复权收盘 / 当日原始价」；
+        // ② 官方日线还停在昨天（实测 21:00 时部分股票仍只到前一交易日）→
+        //    用「最后一根后复权收盘 / 快照的 preClose」（preClose 就是那一天的原始收盘）。
+        // 取不到就记 0：宁可让这只票明天多取一次，也不要猜一个比例把历史带偏。
+        const quote = snapshot?.rows.get(code);
+        let ratio = 0;
+        if (quote && last && snapshot) {
+          if (lastDate === snapshot.date && quote.price > 0) {
+            ratio = last.close / quote.price;
+          } else if (quote.preClose > 0 && weekdayGap(lastDate, snapshot.date) === 0) {
+            ratio = last.close / quote.preClose;
+          }
+        }
+        store?.upsert(code, fresh, {
+          code,
+          ratio,
+          lastDate,
+          rawClose: quote?.price ?? 0,
+          updatedAt: now.toISOString(),
+        });
+        bars = fresh;
+        fetched += 1;
+      } else {
+        reused += 1;
+      }
+
       return computeIndicators(code, bars);
     } catch {
       failed += 1;
@@ -175,10 +402,48 @@ export async function buildIndicators(
       options.onProgress?.(done, codes.length);
     }
   });
-  return {
-    items: rows.filter((row): row is Indicators => row !== null),
-    failed,
-  };
+
+  const items = rows.filter((row): row is Indicators => row !== null);
+
+  // 抽样校对：只挑「今天这根刚补过」的股票，与官方日线比收盘价。
+  // 差异 >0.5% 视为增量结果有问题（复权比例漂移 / 快照口径不对），按官方覆盖重算。
+  const sampleSize = Math.min(
+    Math.max(0, Math.floor(options.verifySample ?? 3)),
+    appended.length,
+  );
+  if (store && snapshot && sampleSize > 0) {
+    for (const code of appended.slice(0, sampleSize)) {
+      try {
+        const official = dropUnclosedDaily(now, await fetchDaily(code));
+        const last = official[official.length - 1];
+        const index = items.findIndex((item) => item.code === code);
+        const item = index >= 0 ? items[index] : undefined;
+        if (!last || !item || last.time.slice(0, 10) !== item.asOf) continue;
+        if (Math.abs(last.close - item.close) / Math.max(item.close, 1e-9) <= 0.005) continue;
+
+        const quote = snapshot.rows.get(code);
+        const lastDate = last.time.slice(0, 10);
+        const ratio =
+          quote && quote.price > 0 && lastDate === snapshot.date
+            ? last.close / quote.price
+            : store.meta(code)?.ratio ?? 0;
+        store.upsert(code, official, {
+          code,
+          ratio,
+          lastDate,
+          rawClose: quote?.price ?? 0,
+          updatedAt: now.toISOString(),
+        });
+        const fixed = computeIndicators(code, official);
+        if (fixed) items[index] = fixed;
+        mismatched += 1;
+      } catch {
+        // 校对失败只影响这一次的可信度标注，不打断整体构建
+      }
+    }
+  }
+
+  return { items, failed, reused, fetched, mismatched };
 }
 
 /**
@@ -199,26 +464,48 @@ export async function loadIndicators(
     refresh?: boolean;
     codes?: string[];
     /**
-     * 允许「部分缓存」：收盘选股后会把指标裁剪成只剩自选池（`complete:false`）。
-     * 巡检 / 风控只查池内股票，用部分缓存就够，不必为了 5 只把全市场重算一遍（1–2 分钟）；
+     * 允许「部分缓存」：老版本收盘选股后会把指标裁剪成只剩自选池（`complete:false`）。
+     * 巡检 / 风控只查池内股票，用部分缓存就够，不必为了 5 只把全市场重算一遍；
      * 全市场筛选（`a_screen` / 选股）**不能**传它，否则拿 5 条数据当全市场。
      */
     allowPartial?: boolean;
     /** 缺缓存时会全市场重算，进度回调给工具/CLI 显示 */
     onProgress?: (done: number, total: number) => void;
+    /** 当日收盘快照：有它就能「只补今天一根」，不必逐只重取 140 根 */
+    snapshot?: SnapshotBarSource;
+    /** 日线仓库注入（测试用）；默认用 `<XZH_A_HOME>/cache/bars.db` */
+    store?: DailyBarStore | null;
   } = {},
 ): Promise<Map<string, Indicators>> {
   if (!options.refresh) {
     const cached = readCache<Indicators[]>(INDICATORS_CACHE, CACHE_TTL_MS);
     if (cached && (cached.complete !== false || options.allowPartial)) {
-      return new Map(cached.value.map((item) => [item.code, item]));
+      // 缓存「没过 TTL」不等于「是今天收盘的」：昨天 16:00 写入的指标到今天晚上仍在新旧
+      // 36 小时窗口内，但快照已经是今天收盘 —— 这时候必须按快照补今天那根。
+      // 判定用「缓存里最新的一根」而不是逐只：停牌股本来就停在旧日期，不该拖累整体。
+      const snapshot = options.snapshot;
+      const afterClose =
+        snapshot &&
+        sessionKind(new Date()) === "closed" &&
+        snapshot.date === todayString();
+      const newest = cached.value.reduce(
+        (latest, item) => (item.asOf > latest ? item.asOf : latest),
+        "",
+      );
+      if (!afterClose || newest >= snapshot!.date) {
+        return new Map(cached.value.map((item) => [item.code, item]));
+      }
     }
   }
   const codes =
     options.codes && options.codes.length > 0
       ? options.codes
       : (await loadUniverse()).map((stock) => stock.code);
-  const { items } = await buildIndicators(codes, { onProgress: options.onProgress });
+  const { items } = await buildIndicators(codes, {
+    onProgress: options.onProgress,
+    snapshot: options.snapshot,
+    store: options.store,
+  });
   if (items.length > 0) writeCache(INDICATORS_CACHE, items);
   return new Map(items.map((item) => [item.code, item]));
 }

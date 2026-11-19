@@ -101,6 +101,73 @@ const runThenAbort = async (agent: Agent, delayMs: number): Promise<void> => {
   await running;
 };
 
+/**
+ * 「重工具」在同一轮里被重新规划时不能反复执行。
+ *
+ * 2026-11-19 实测：A 股对话里模型陷入
+ * `a_select → a_schedule → memory_write → a_select → …`，因为中间夹了别的工具，
+ * 原有的「连续相同调用」检测（连续 4 次）永远不会命中，于是一直烧到 200 轮上限。
+ */
+describe("重工具重复调用", () => {
+  const countedTools = (counter: { select: number }): ToolDefinition[] => {
+    const tool = (name: string): ToolDefinition => ({
+      name,
+      description: "测试用",
+      parameters: { type: "object", properties: {} },
+      async execute() {
+        if (name === "a_select") counter.select += 1;
+        return { ok: true, content: `${name} 结果`, summary: "ok" };
+      },
+    });
+    return [tool("a_select"), tool("a_schedule")];
+  };
+
+  /** 交错重复：a_select → a_schedule → a_select → a_select */
+  const interleavedProvider = (): LLMProvider => {
+    const plan = ["a_select", "a_schedule", "a_select", "a_select"];
+    let index = 0;
+    return {
+      id: "fake",
+      model: "fake",
+      async *chat(): AsyncGenerator<StreamChunk> {
+        const name = plan[index];
+        index += 1;
+        if (!name) {
+          yield { type: "text", text: "已按结果给结论" };
+          yield { type: "done", finishReason: "stop" };
+          return;
+        }
+        yield { type: "tool_call", toolCall: { id: `c${index}`, name, arguments: "{}" } };
+        yield { type: "done", finishReason: "tool_calls" };
+      },
+    };
+  };
+
+  it("同一参数的重工具只执行一次，再次重复即中止本轮", async () => {
+    const counter = { select: 0 };
+    const agent = new Agent(
+      interleavedProvider(),
+      configOf(),
+      tmpCwd(),
+      events(),
+      model,
+      { tools: countedTools(counter) },
+    );
+
+    await agent.run("重新进行一次选股");
+
+    // 只真正跑了一次 a_select；后面的重复被跳过
+    expect(counter.select).toBe(1);
+    expect(agent.getAbortReason()).toContain("a_select");
+    const skipped = agent.messages.filter((message) =>
+      message.content.includes("本次调用已跳过"),
+    );
+    expect(skipped.length).toBeGreaterThanOrEqual(1);
+    // 提示里要说明「结果不会变」，让模型改成总结而不是继续重试
+    expect(agent.messages.some((message) => message.content.includes("结果不会变化"))).toBe(true);
+  });
+});
+
 describe("中断后本轮整体回滚", () => {
   it("纯文本：历史不留下任何东西", async () => {
     const agent = new Agent(plainProvider(), configOf(), tmpCwd(), events(), model);

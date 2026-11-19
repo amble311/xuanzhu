@@ -8,7 +8,9 @@ import { adx, slopePct } from "./ta";
  * - 周线：收盘 > MA20 > MA50，MA20 近 5 周斜率 > +0.1%，ADX ≥18 → +1；镜像 → -1；
  * - 日线：btc 的 4 项检查 + 边缘反转 → +1 / 0 / -1。
  *
- * 最终过滤：任一周期 -1 → 丢弃；三周期必须都 ≥0 且至少一个 +1。
+ * 最终过滤：任一周期 -1 → 丢弃；**日线（最短周期）必须是 +1**，且三周期都 ≥0。
+ * 月 0 / 周 +1 / 日 0 这种「长周期多头、短期横盘」不买：日线没同向就观望，
+ * 不能拿月/周的方向去替代当前这笔交易的择时方向。
  */
 
 export type TrendScore = -1 | 0 | 1;
@@ -128,7 +130,12 @@ export interface CombinedTrend {
   daily: TrendScore | null;
 }
 
-/** A 股多头过滤：任一周期向下 / 数据不足 / 三周期全 0 / 没有 +1 → 丢弃 */
+/**
+ * A 股多头过滤：任一周期向下 / 数据不足 / 三周期全 0 / **日线不是 +1** → 丢弃。
+ *
+ * 最后一条是用户明确要求的：**最短周期必须与交易方向同向**。例：月 0 / 周 +1 / 日 0，
+ * 整体趋势看着偏多，但日线没走出来 → `side_filter=none`，只观望，不提前埋单。
+ */
 export function combineTrend(
   monthly: CycleTrend,
   weekly: CycleTrend,
@@ -144,6 +151,16 @@ export function combineTrend(
   }
   if (scores.every((score) => score === 0)) {
     return { pass: false, reason: "三周期均无向上", sum, monthly: monthly.score, weekly: weekly.score, daily: daily.score };
+  }
+  if (daily.score !== 1) {
+    return {
+      pass: false,
+      reason: `日线未同向（M${monthly.score} W${weekly.score} D${daily.score}）`,
+      sum,
+      monthly: monthly.score,
+      weekly: weekly.score,
+      daily: daily.score,
+    };
   }
   return {
     pass: true,

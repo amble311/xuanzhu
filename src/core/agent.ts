@@ -344,6 +344,22 @@ const MAX_IDENTICAL_TOOL_CALLS = 4;
 const MAX_SELF_CORRECTIONS = 1;
 
 /**
+ * 「同一轮里重复执行没有意义」的重工具。
+ *
+ * 这些调用一次要几十秒到两分钟，结果只取决于行情与参数 —— 本轮用**完全相同的参数**
+ * 再跑一遍，返回值不会变。本地模型在长上下文里很容易把「重新选股」重新规划一遍，
+ * 且中间夹着 a_schedule / memory_write，**连续重复检测**（上面那段）不会命中：
+ * 实测 2026-11-19 的 `a_select → a_schedule → memory_write → a_select → …` 就是这样
+ * 一直转到轮次上限。
+ *
+ * 因此按「本轮成功执行次数」硬挡：第二次起跳过执行，并把「结果不会变、直接给结论」
+ * 写进工具结果；仍然重复就中止本轮（决定权交回用户，而不是烧掉 200 轮配额）。
+ */
+const NON_REPEATABLE_TOOLS = new Set(["a_select", "a_screen", "a_backtest", "btc_backtest"]);
+/** 同一轮里允许「跳过重复重工具」的次数，超过即中止本轮 */
+const MAX_REPEATABLE_SKIPS = 2;
+
+/**
  * 只读「调研类」工具。
  *
  * 它们的输出会**持续占用上下文**（几十屏的文件内容、搜索结果），正是子代理的适用场景，
@@ -1954,6 +1970,10 @@ export class Agent {
     // 本轮已做过这些」就能接着往下走，而不是重新规划。
     const completedSignatures = new Map<string, number>();
 
+    // 本轮「重工具」被跳过的次数（见 NON_REPEATABLE_TOOLS）：超过阈值就中止，
+    // 不让同一次请求把轮次配额烧在重复的选股 / 回测上
+    const nonRepeatableSkips = new Map<string, number>();
+
     // 本轮的只读调研累计量，以及「是否已经建议过改用子代理」「是否已经在用子代理」。
     // 用途见 EXPLORATION_REMINDER_CALLS 的注释：把「该委托」从主观判断变成客观触发。
     let explorationCalls = 0;
@@ -2261,6 +2281,52 @@ export class Agent {
             );
             this.abortReason = "陷入重复调用（自我修正无效）";
             return;
+          }
+
+          // —— 重工具：本轮已用相同参数执行过就不再执行 ——
+          // 与上面的「连续重复」不同，这里计的是**本轮累计**，中间夹别的工具也能挡住
+          // （a_select → a_schedule → memory_write → a_select 这种「重新规划整轮」）。
+          if (
+            NON_REPEATABLE_TOOLS.has(call.name) &&
+            (completedSignatures.get(signature) ?? 0) >= 1
+          ) {
+            const skips = (nonRepeatableSkips.get(call.name) ?? 0) + 1;
+            nonRepeatableSkips.set(call.name, skips);
+
+            if (skips >= MAX_REPEATABLE_SKIPS) {
+              // 补上剩余调用的 tool 结果，保持 assistant.tool_calls 与 tool 消息配对
+              this.skipToolCalls(
+                turn,
+                toolCalls,
+                index,
+                () => "[系统] 本次调用已跳过：本轮已多次重复调用同一个重工具。",
+              );
+              commitTurn();
+              this.events.onStatus("已中止", "重复执行重工具");
+              this.events.onNotice?.(
+                `检测到本轮反复调用 \`${call.name}\`（参数相同、结果不会变），已中止本轮。\n` +
+                  `· 这类工具一次要几十秒，重复跑只会在同一份行情上得到同一份结果\n` +
+                  `· 需要重新选股时，请新发一条消息（或换个参数，如 limit）`,
+              );
+              this.abortReason = `重复调用重工具（${call.name}）`;
+              return;
+            }
+
+            turn.push({
+              role: "tool",
+              content:
+                `[系统] 本轮已经用完全相同的参数执行过 \`${call.name}\`，结果不会变化，` +
+                `本次调用已跳过。请直接基于已有结果给用户结论，不要重复调用。`,
+              toolCallId: call.id,
+              name: call.name,
+            });
+            this.events.onToolEnd(call, {
+              ok: false,
+              content: "已跳过重复调用（结果不会变化）",
+              summary: "跳过重复调用",
+            });
+            index += 1;
+            continue;
           }
 
           // —— 并行批次 ——

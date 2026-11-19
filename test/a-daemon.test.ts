@@ -18,6 +18,7 @@ import {
   evaluateRules,
   readRules,
   removeRules,
+  ruleNeedsBars15m,
   validateFormula,
   type MonitorRule,
 } from "../src/a/rules";
@@ -167,6 +168,60 @@ describe("监控规则", () => {
     const quotes = new Map([["300750", { code: "300750", price: 9, changePct: -2 } as never]]);
     const indicators = new Map([["300750", { ma20: 10 } as never]]);
     expect(evaluateRules(readRules(), quotes, indicators)?.reason).toContain("MA20");
+  });
+
+  it("15m 结构规则：跌破 15m MA20 / 前 10 根低点 / 突破前 10 根高点", () => {
+    // 21 根 15m K 线：收盘 10、前 10 根低点 10.2、高点 10.5
+    const bars = Array.from({ length: 21 }, (_, index) => ({
+      time: `2026-11-19 10:${String(index).padStart(2, "0")}`,
+      open: 10,
+      high: 10.5,
+      low: 10.2,
+      close: 10,
+      volume: 1000,
+    }));
+    const quote = (price: number) =>
+      new Map([["600519", { code: "600519", price, changePct: -2 } as never]]);
+    const bars15m = new Map([["600519", bars]]);
+
+    removeRules({});
+    addRule({ code: "600519", kind: "ma20_break_15m", note: "15m 破位" });
+    expect(evaluateRules(readRules(), quote(9), new Map(), new Date(), bars15m)?.reason).toContain(
+      "跌破 15m MA20",
+    );
+    // 站上 15m MA20 不命中「跌破」
+    expect(evaluateRules(readRules(), quote(10.5), new Map(), new Date(), bars15m)).toBeNull();
+
+    removeRules({});
+    addRule({ code: "600519", kind: "low10_break_15m", note: "破前低" });
+    expect(evaluateRules(readRules(), quote(10.1), new Map(), new Date(), bars15m)?.reason).toContain(
+      "前 10 根 15m 低点",
+    );
+
+    removeRules({});
+    addRule({ code: "600519", kind: "high10_above_15m", note: "突破" });
+    expect(evaluateRules(readRules(), quote(10.6), new Map(), new Date(), bars15m)?.reason).toContain(
+      "前 10 根 15m 高点",
+    );
+  });
+
+  it("15m 规则缺 K 线时不命中（不做「取不到就当满足」的兜底）", () => {
+    removeRules({});
+    addRule({ code: "600519", kind: "ma20_break_15m", note: "15m 破位" });
+    const quotes = new Map([["600519", { code: "600519", price: 9, changePct: -2 } as never]]);
+    expect(evaluateRules(readRules(), quotes, new Map())).toBeNull();
+  });
+
+  it("chain 里含 15m 步骤时也要取 15m K 线", () => {
+    expect(
+      ruleNeedsBars15m({
+        kind: "chain",
+        steps: [{ kind: "pct_above", value: 2 }, { kind: "ma20_break_15m" }],
+      }),
+    ).toBe(true);
+    expect(
+      ruleNeedsBars15m({ kind: "chain", steps: [{ kind: "pct_above", value: 2 }, { kind: "ma20_break" }] }),
+    ).toBe(false);
   });
 
   it("链式规则：先涨幅达标，再跌破 MA20 才唤醒", () => {

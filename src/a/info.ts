@@ -273,7 +273,11 @@ export function aInfoLines(data: APanelData): string[] {
   lines.push(
     `  收盘选股：每个交易日 16:00${service.state?.lastSelectDay ? ` · 上次 ${service.state.lastSelectDay}` : ""}`,
   );
-  if (service.state?.lastAction) lines.push(`  最近一轮：${service.state.lastAction}`);
+  if (service.state?.lastAction) {
+    // 结论上限已放宽到 2000 字（要完整推到微信），面板/`/info` 这里只留一行摘要
+    const oneLine = service.state.lastAction.replace(/\s+/g, " ").trim();
+    lines.push(`  最近一轮：${oneLine.length > 160 ? `${oneLine.slice(0, 160)}…` : oneLine}`);
+  }
   if (service.state?.lastError) lines.push(`  最近错误：${service.state.lastError}`);
   for (const action of data.lastActions.slice(0, 5)) {
     lines.push(`  ${action}`);

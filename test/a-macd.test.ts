@@ -136,6 +136,21 @@ describe("三周期趋势与 15m 评分", () => {
     expect(combineTrend(flat, flat, flat).pass).toBe(false);
   });
 
+  it("最短周期（日线）必须与做多方向同向，否则只观望", () => {
+    const up = { score: 1 as const, reason: "" };
+    const flat = { score: 0 as const, reason: "" };
+
+    // 用户给的例子：月 0 / 周 +1 / 日 0 → 日线没走出来，不做
+    const mixed = combineTrend(flat, up, flat);
+    expect(mixed.pass).toBe(false);
+    expect(mixed.reason).toContain("日线未同向");
+
+    // 月/周再强，日线 0 也不买
+    expect(combineTrend(up, up, flat).pass).toBe(false);
+    // 日线 +1 时，长周期横盘仍可通过（强度弱，但不拦方向）
+    expect(combineTrend(flat, flat, up).pass).toBe(true);
+  });
+
   it("日线 4 项检查多数向上判为 +1", () => {
     const result = dailyTrend({
       code: "600519",
