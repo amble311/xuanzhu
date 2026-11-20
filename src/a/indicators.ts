@@ -77,8 +77,32 @@ function percentChange(current: number, previous: number | undefined): number | 
   return ((current - previous) / previous) * 100;
 }
 
+/**
+ * 一根日线是否可用。
+ *
+ * 必须挡掉「占位 K 线」：实测 16:00 时同花顺对部分股票（601939 / 601328 / 601838）
+ * 返回的当天日线是 `open/high/low = 0、volume = 0`、只有 close 有值 ——
+ * 这种行一旦入库，`low20` 会算成 0，`dailyTrend()` 的 `!low20` 判定就让整只股票
+ * 变成「日线指标不足」，巡检里看到的就是「日线数据不足」，而且**每天都复现**。
+ */
+export function isValidDailyBar(bar: Bar): boolean {
+  return (
+    Number.isFinite(bar.open) &&
+    Number.isFinite(bar.high) &&
+    Number.isFinite(bar.low) &&
+    Number.isFinite(bar.close) &&
+    bar.open > 0 &&
+    bar.high > 0 &&
+    bar.low > 0 &&
+    bar.close > 0 &&
+    bar.high >= bar.low
+  );
+}
+
 /** 从升序日线计算指标；不足根数的字段留空（不要用 0 冒充） */
-export function computeIndicators(code: string, bars: Bar[]): Indicators | null {
+export function computeIndicators(code: string, input: Bar[]): Indicators | null {
+  // 脏行（占位 K 线 / 数据源异常）直接剔除：宁可少一根，也不能让 low20 变成 0
+  const bars = input.filter(isValidDailyBar);
   if (bars.length === 0) return null;
   const closes = bars.map((bar) => bar.close);
   const last = bars[bars.length - 1];
@@ -279,9 +303,12 @@ export interface BuildIndicatorsResult {
  * 因此未收盘时统一丢掉落库，等收盘后再用快照补一根最终的。
  */
 export function dropUnclosedDaily(now: Date, bars: Bar[]): Bar[] {
-  if (bars.length === 0 || sessionKind(now) === "closed") return bars;
-  const last = bars[bars.length - 1];
-  return last.time.slice(0, 10) === todayString(now) ? bars.slice(0, -1) : bars;
+  if (bars.length === 0) return bars;
+  // 占位 K 线（OHLC 为 0）任何时候都不能留：它不是「没收盘」，而是**坏数据**
+  const clean = bars.filter(isValidDailyBar);
+  if (clean.length === 0 || sessionKind(now) === "closed") return clean;
+  const last = clean[clean.length - 1];
+  return last.time.slice(0, 10) === todayString(now) ? clean.slice(0, -1) : clean;
 }
 
 /**
@@ -323,6 +350,12 @@ export async function buildIndicators(
       let bars = saved ? store!.load(code, 140) : [];
       let fromStore = Boolean(saved) && bars.length >= 140;
 
+      // 库里最后一根是占位 K 线（open/high/low = 0）→ 既不能拿它算指标，也不能认为
+      // 「今天已入库」；整段重取一次，顺便把 ratio 按正确口径重算。
+      if (fromStore && bars.length > 0 && !isValidDailyBar(bars[bars.length - 1])) {
+        fromStore = false;
+      }
+
       // 库里漏了交易日 → 历史不连续，老数据算出来的三周期是错的，整段重取。
       // 有当日快照时严格判断（漏一天就重取）；没有快照时容忍 2 个工作日（长假）。
       if (fromStore && saved) {
@@ -341,6 +374,8 @@ export async function buildIndicators(
           saved.lastDate < snapshot.date &&
           quote.price > 0 &&
           quote.open > 0 &&
+          quote.high > 0 &&
+          quote.low > 0 &&
           quote.volume > 0
         ) {
           if (adjustmentChanged(last.close, quote.preClose, saved.ratio)) {

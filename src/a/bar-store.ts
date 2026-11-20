@@ -41,6 +41,9 @@ export interface BarMeta {
   updatedAt: string;
 }
 
+/** 周线 / 月线：只做「同花顺偶发失败」时的兜底，不参与增量 */
+export type BarPeriodKey = "week" | "month";
+
 export interface DailyBarStore {
   /** 升序返回最近 `limit` 根（不足就返回全部） */
   load(code: string, limit?: number): Bar[];
@@ -49,6 +52,15 @@ export interface DailyBarStore {
   /** 追加一根（当天增量），并顺手裁剪过老的行 */
   append(code: string, bar: Bar, meta: BarMeta): void;
   meta(code: string): BarMeta | undefined;
+  /**
+   * 周 / 月线缓存。
+   *
+   * 为什么需要：`a_signal` 每轮要给池内 5 只各拉一次周线（80 根）与月线（60 根），
+   * 同花顺连续请求偶发失败时，`weeklyTrend` 只能给 `null` → 三周期变 unknown。
+   * 这里保留上一次成功拿到的序列，失败时顶上（周线 7 天、月线更新更慢，旧一两天不影响方向）。
+   */
+  loadPeriod(code: string, period: BarPeriodKey, limit?: number): Bar[];
+  upsertPeriod(code: string, period: BarPeriodKey, bars: Bar[]): void;
   /** 库里有多少个代码（状态展示 / 测试） */
   size(): number;
   close(): void;
@@ -100,6 +112,21 @@ function openDatabase(file: string): SqliteDatabase | null {
          last_date TEXT NOT NULL,
          raw_close REAL,
          updated_at TEXT NOT NULL
+       )`,
+    );
+    // 周线 / 月线的兜底缓存（同花顺偶发失败时顶上，见 DailyBarStore.loadPeriod）
+    db.exec(
+      `CREATE TABLE IF NOT EXISTS period_bars (
+         code TEXT NOT NULL,
+         period TEXT NOT NULL,
+         date TEXT NOT NULL,
+         open REAL NOT NULL,
+         high REAL NOT NULL,
+         low REAL NOT NULL,
+         close REAL NOT NULL,
+         volume REAL NOT NULL DEFAULT 0,
+         amount REAL,
+         PRIMARY KEY (code, period, date)
        )`,
     );
     return db;
@@ -159,6 +186,15 @@ function createStore(db: SqliteDatabase): DailyBarStore {
        AND date NOT IN (SELECT date FROM daily WHERE code = ? ORDER BY date DESC LIMIT ${KEEP_BARS})`,
   );
   const countCodes = db.prepare("SELECT COUNT(*) AS total FROM meta");
+  const selectPeriod = db.prepare(
+    `SELECT date, open, high, low, close, volume, amount FROM period_bars
+     WHERE code = ? AND period = ? ORDER BY date DESC LIMIT ?`,
+  );
+  const deletePeriod = db.prepare("DELETE FROM period_bars WHERE code = ? AND period = ?");
+  const insertPeriod = db.prepare(
+    `INSERT OR REPLACE INTO period_bars (code, period, date, open, high, low, close, volume, amount)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
 
   const writeMeta = (meta: BarMeta): void => {
     const value = normalizeMeta(meta);
@@ -239,6 +275,42 @@ function createStore(db: SqliteDatabase): DailyBarStore {
       };
     },
 
+    loadPeriod(code, period, limit = 120) {
+      const rows = selectPeriod.all(code, period, Math.max(1, Math.floor(limit)));
+      const bars: Bar[] = [];
+      for (const row of rows) {
+        const bar = toBar(row);
+        if (bar) bars.push(bar);
+      }
+      return bars.reverse();
+    },
+
+    upsertPeriod(code, period, bars) {
+      const clean = bars.filter((bar) => Number.isFinite(bar.close) && bar.close > 0).slice(-120);
+      if (clean.length === 0) return;
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        deletePeriod.run(code, period);
+        for (const bar of clean) {
+          insertPeriod.run(
+            code,
+            period,
+            bar.time.slice(0, 10),
+            bar.open,
+            bar.high,
+            bar.low,
+            bar.close,
+            bar.volume,
+            bar.amount ?? null,
+          );
+        }
+        db.exec("COMMIT");
+      } catch (err) {
+        db.exec("ROLLBACK");
+        throw err;
+      }
+    },
+
     size() {
       return Number(countCodes.get()?.total ?? 0);
     },
@@ -287,6 +359,8 @@ export function resetDailyBarStore(): void {
 export function createMemoryBarStore(): DailyBarStore {
   const bars = new Map<string, Bar[]>();
   const metas = new Map<string, BarMeta>();
+  const periods = new Map<string, Bar[]>();
+  const periodKey = (code: string, period: BarPeriodKey): string => `${period}:${code}`;
   return {
     load: (code, limit = 140) => (bars.get(code) ?? []).slice(-Math.max(1, limit)),
     upsert(code, list, meta) {
@@ -300,10 +374,19 @@ export function createMemoryBarStore(): DailyBarStore {
       metas.set(code, normalizeMeta(meta));
     },
     meta: (code) => metas.get(code),
+    loadPeriod: (code, period, limit = 120) =>
+      (periods.get(periodKey(code, period)) ?? []).slice(-Math.max(1, limit)),
+    upsertPeriod(code, period, list) {
+      periods.set(
+        periodKey(code, period),
+        list.slice(-120).map((bar) => ({ ...bar })),
+      );
+    },
     size: () => metas.size,
     close() {
       bars.clear();
       metas.clear();
+      periods.clear();
     },
   };
 }

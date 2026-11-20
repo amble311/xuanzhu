@@ -1,4 +1,5 @@
-import { fetch15mBars, fetchBars, fetchQuote, mapLimit } from "../exchange/ashare";
+import { fetch15mBars, fetchBars, fetchQuote, mapLimit, type Bar } from "../exchange/ashare";
+import { openDailyBarStore, type BarPeriodKey, type DailyBarStore } from "./bar-store";
 import { score15m } from "./deep15";
 import { computeIndicators, type Indicators } from "./indicators";
 import { dropIncompleteWeek } from "./macd";
@@ -61,6 +62,102 @@ function failed(reason: string): CycleTrend {
   return { score: null, reason };
 }
 
+export interface DailyIndicatorDeps {
+  /** 全市场日线指标缓存（巡检/工具应当传，省掉每只一次 140 根日线的请求） */
+  indicators?: Map<string, Indicators>;
+  /** 测试注入：替代 `fetchBars(day, 140)` */
+  fetchDaily?: (code: string) => Promise<Bar[]>;
+  /** 本地日线仓库；`undefined` 用默认库，`null` 禁用 */
+  store?: DailyBarStore | null;
+}
+
+/**
+ * 取一只股票的日线指标，三级兜底：
+ * 1. 全市场缓存（正常路径，`readCachedIndicators()` 一次读 5500 只）；
+ * 2. 单只拉 140 根日线现算（缓存缺失/过期时）；
+ * 3. **本地日线仓库**（`cache/bars.db`）—— 网络抖动时用它，避免巡检把方向判成 unknown。
+ *
+ * 为什么必须有第 3 级：同花顺对连续请求会偶发失败，而 `a_signal` 一次要跑 5 只；
+ * 以前任何一只的日线请求失败就直接「日线指标缺失 → unknown」，结论里看到的就是
+ * 「日线数据不足」，而本地其实已经有一份完整的日线。
+ */
+export interface PeriodBarDeps {
+  /** 本地日线仓库（周/月线缓存在同一库里）；`undefined` 用默认库，`null` 禁用 */
+  store?: DailyBarStore | null;
+  /** 测试注入：替代 `fetchBars(week|month)` */
+  fetch?: (code: string, period: BarPeriodKey) => Promise<Bar[]>;
+}
+
+/**
+ * 取数重试：同花顺的偶发失败大多是网关 502（实测 600886 周线：第 1 次 502、
+ * 第 2 次就好）。再试一次的成本远低于「整只股票方向变 unknown」。
+ */
+async function fetchWithRetry<T>(task: () => Promise<T>, attempts = 2): Promise<T> {
+  let lastError: unknown;
+  for (let index = 0; index < attempts; index += 1) {
+    try {
+      return await task();
+    } catch (err) {
+      lastError = err;
+      if (index < attempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * 周线 / 月线：**先取网络，失败用上次成功的结果兜底**。
+ *
+ * 巡检每轮要给池内每只各拉一次周线（80 根）与月线（60 根），同花顺连续请求会偶发失败。
+ * 失败一次就 `weeklyTrend → null` → 三周期 unknown，结论里显示「周线获取失败 / 月线失败」。
+ * 周线一周才更新一次、月线更慢，用上一次成功的序列顶一下完全够用 ——
+ * 顶不上（从没成功过）才返回 null，让结论如实说数据缺失。
+ */
+export async function periodBarsFor(
+  code: string,
+  period: BarPeriodKey,
+  limit: number,
+  deps: PeriodBarDeps = {},
+): Promise<Bar[] | null> {
+  const store = deps.store === undefined ? openDailyBarStore() : deps.store;
+  const fetchPeriod =
+    deps.fetch ??
+    ((target: string, kind: BarPeriodKey) =>
+      fetchBars(target, { period: kind, adjust: "backward", limit }));
+  try {
+    const bars = await fetchWithRetry(() => fetchPeriod(code, period));
+    if (bars.length > 0) {
+      store?.upsertPeriod(code, period, bars);
+      return bars;
+    }
+  } catch {
+    // 两次都失败：走缓存（下面统一读）
+  }
+  const cached = store?.loadPeriod(code, period, limit) ?? [];
+  return cached.length > 0 ? cached : null;
+}
+
+export async function dailyIndicatorsFor(
+  code: string,
+  deps: DailyIndicatorDeps = {},
+): Promise<Indicators | null> {
+  const hit = deps.indicators?.get(code);
+  if (hit) return hit;
+
+  const fetchDaily =
+    deps.fetchDaily ??
+    ((target: string) =>
+      fetchBars(target, { period: "day", adjust: "backward", limit: 140 }));
+  const bars = await fetchWithRetry(() => fetchDaily(code)).catch(() => null);
+  if (bars && bars.length > 0) return computeIndicators(code, bars);
+
+  const store = deps.store === undefined ? openDailyBarStore() : deps.store;
+  const stored = store?.load(code, 140) ?? [];
+  return stored.length > 0 ? computeIndicators(code, stored) : null;
+}
+
 export async function scoreStock(
   target: { code: string; name?: string; held?: boolean },
   options: ScoreStockOptions = {},
@@ -72,19 +169,12 @@ export async function scoreStock(
   const quote = await fetchQuote(code).catch(() => null);
 
   const [weeklyBars, monthlyBars, shortBars, cachedDaily] = await Promise.all([
-    fetchBars(code, { period: "week", adjust: "backward", limit: 80 }).catch(() => null),
-    fetchBars(code, { period: "month", adjust: "backward", limit: 60 }).catch(() => null),
+    // 周/月线：网络失败时用上次成功的缓存顶上（见 periodBarsFor）
+    periodBarsFor(code, "week", 80),
+    periodBarsFor(code, "month", 60),
     fetch15mBars(code, 160).catch(() => null),
-    // 日线指标：有全市场缓存就直接用；否则按这一只的日线现算（140 根一次请求，
-    // 比触发一次全市场重算便宜得多）
-    (async () => {
-      const hit = options.indicators?.get(code);
-      if (hit) return hit;
-      const bars = await fetchBars(code, { period: "day", adjust: "backward", limit: 140 }).catch(
-        () => null,
-      );
-      return bars ? computeIndicators(code, bars) : null;
-    })(),
+    // 日线指标：全市场缓存 → 单只现算 → 本地日线仓库兜底（见 dailyIndicatorsFor）
+    dailyIndicatorsFor(code, { indicators: options.indicators }),
   ]);
 
   const weekly = weeklyBars ? weeklyTrend(dropIncompleteWeek(weeklyBars)) : failed("周线获取失败");

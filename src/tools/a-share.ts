@@ -36,6 +36,7 @@ import {
   replacePolicy,
   clearPolicy,
   formatSignal,
+  readCachedIndicators,
   scanPool,
   scoreStock,
   maxPositions,
@@ -371,8 +372,12 @@ const signalTool: ToolDefinition = {
   async execute(args, ctx): Promise<ToolResult> {
     const code = typeof args.code === "string" ? args.code.trim() : "";
     try {
+      // 日线指标直接读全市场缓存（5500+ 只，一次读库）：以前这里不传，
+      // 每只股票都要各拉 140 根日线，而同花顺连续请求会偶发失败 ——
+      // 一失败 `dailyTrend` 就是「日线指标缺失」，巡检结论里显示成「日线数据不足」。
+      const indicators = readCachedIndicators();
       if (code) {
-        const signal = await scoreStock({ code });
+        const signal = await scoreStock({ code }, { indicators });
         return {
           ok: true,
           content: formatSignal(signal),
@@ -380,7 +385,7 @@ const signalTool: ToolDefinition = {
         };
       }
       ctx.emit?.("轮询自选池（持仓优先，5 只）…");
-      const signals = await scanPool();
+      const signals = await scanPool({ indicators });
       if (signals.length === 0) {
         return {
           ok: true,

@@ -2,11 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   adjustmentChanged,
   buildIndicators,
+  computeIndicators,
   dropUnclosedDaily,
   toAdjustedBar,
   weekdayGap,
 } from "../src/a/indicators";
 import { createMemoryBarStore } from "../src/a/bar-store";
+import { dailyIndicatorsFor, periodBarsFor } from "../src/a/signal";
 import type { Bar } from "../src/exchange/ashare";
 import type { SnapshotRow } from "../src/a/snapshot";
 
@@ -98,6 +100,64 @@ describe("漏交易日判断（不查日历）", () => {
   });
 });
 
+/**
+ * 占位 K 线：2026-11-20 实测同花顺对 601939 / 601328 / 601838 返回
+ * `open/high/low = 0、volume = 0`、只有 close 有值的当天日线。
+ * 它是「日线数据不足」的直接原因（low20 被算成 0 → dailyTrend 的 !low20 命中）。
+ */
+describe("占位 K 线（OHLC=0）", () => {
+  const placeholder = (): Bar => ({
+    time: TODAY,
+    open: 0,
+    high: 0,
+    low: 0,
+    close: 10,
+    volume: 0,
+    amount: 0,
+  });
+
+  it("computeIndicators 会剔除它，low20 不再变成 0", () => {
+    const list = [...bars(139, 10, "2026-11-19"), placeholder()];
+    const item = computeIndicators(CODE, list);
+    expect(item?.bars).toBe(139);
+    expect(item?.low20).toBeGreaterThan(0);
+    expect(item?.high20).toBeGreaterThan(0);
+  });
+
+  it("收盘后也会丢掉它（不是「没收盘」，是坏数据）", () => {
+    const list = [...bars(2, 10, "2026-11-18"), placeholder()];
+    expect(dropUnclosedDaily(NOW, list)).toHaveLength(2);
+  });
+
+  it("库里最后一根是占位 K 线 → 整段重取并修好", async () => {
+    const store = createMemoryBarStore();
+    store.upsert(CODE, [...bars(139, 10, "2026-11-19"), placeholder()], {
+      code: CODE,
+      ratio: 1.478,
+      lastDate: TODAY,
+      rawClose: 10,
+      updatedAt: NOW.toISOString(),
+    });
+
+    let calls = 0;
+    const result = await buildIndicators([CODE], {
+      store,
+      snapshot: snapshotOf(snapshotRow({ price: 10.4, preClose: 10 })),
+      now: NOW,
+      verifySample: 0,
+      fetchDaily: async () => {
+        calls += 1;
+        return bars(140, 10, TODAY);
+      },
+    });
+
+    expect(calls).toBe(1);
+    expect(result.items[0].low20).toBeGreaterThan(0);
+    // 重取后入库的那根必须是有效 OHLC
+    expect(store.load(CODE, 1)[0].open).toBeGreaterThan(0);
+  });
+});
+
 describe("未收盘数据不入库（崩溃场景）", () => {
   it("盘中取回的日线会带一根「正在走」的当天 K 线，必须丢掉", () => {
     const intraday = new Date(2026, 10, 19, 14, 0, 0);
@@ -120,6 +180,108 @@ describe("未收盘数据不入库（崩溃场景）", () => {
 
     expect(result.items[0].asOf).toBe("2026-11-18");
     expect(store.meta(CODE)?.lastDate).toBe("2026-11-18");
+  });
+});
+
+/**
+ * 巡检里「日线数据不足」的真正来源：`a_signal` 以前不传全市场指标缓存，
+ * 每只股票都各拉 140 根日线；同花顺连续请求偶发失败 → 那一只直接判 unknown。
+ */
+describe("单只日线指标的三级兜底", () => {
+  it("全市场缓存命中：不再发请求", async () => {
+    const cached = new Map([
+      [
+        CODE,
+        {
+          code: CODE,
+          asOf: "2026-11-19",
+          close: 10,
+          ma20: 9,
+          ma50: 8,
+          high20: 11,
+          low20: 9,
+          rsi14: 55,
+          bars: 140,
+        } as never,
+      ],
+    ]);
+    const value = await dailyIndicatorsFor(CODE, { indicators: cached, fetchDaily: neverFetch });
+    expect(value?.ma20).toBe(9);
+  });
+
+  it("单只请求失败：退回本地日线仓库，不把方向判成 unknown", async () => {
+    const store = createMemoryBarStore();
+    store.upsert(CODE, bars(140, 10), {
+      code: CODE,
+      ratio: 1,
+      lastDate: "2026-11-19",
+      rawClose: 10,
+      updatedAt: NOW.toISOString(),
+    });
+    const value = await dailyIndicatorsFor(CODE, {
+      store,
+      fetchDaily: async () => {
+        throw new Error("同花顺偶发失败");
+      },
+    });
+    expect(value?.bars).toBe(140);
+    expect(value?.ma20).toBeCloseTo(10, 5);
+  });
+
+  it("缓存与仓库都没有：返回 null（结论如实说数据缺失）", async () => {
+    const value = await dailyIndicatorsFor(CODE, {
+      store: createMemoryBarStore(),
+      fetchDaily: async () => {
+        throw new Error("失败");
+      },
+    });
+    expect(value).toBeNull();
+  });
+});
+
+/**
+ * 周线 / 月线是巡检里最容易「偶发失败」的两类请求（每轮每只各一次）。
+ * 失败一次就让三周期变 unknown，所以要有「上次成功」的兜底。
+ */
+describe("周/月线缓存兜底", () => {
+  it("成功时写入仓库", async () => {
+    const store = createMemoryBarStore();
+    const got = await periodBarsFor(CODE, "week", 80, {
+      store,
+      fetch: async () => bars(80, 10, "2026-11-20"),
+    });
+    expect(got).toHaveLength(80);
+    expect(store.loadPeriod(CODE, "week", 80)).toHaveLength(80);
+  });
+
+  it("网络失败时用上次成功的序列", async () => {
+    const store = createMemoryBarStore();
+    store.upsertPeriod(CODE, "week", bars(70, 9, "2026-11-13"));
+    const got = await periodBarsFor(CODE, "week", 80, {
+      store,
+      fetch: async () => {
+        throw new Error("同花顺 502");
+      },
+    });
+    expect(got).toHaveLength(70);
+    expect(got?.[got.length - 1].close).toBe(9);
+  });
+
+  it("返回空数组也算失败（同样走缓存）", async () => {
+    const store = createMemoryBarStore();
+    store.upsertPeriod(CODE, "month", bars(30, 8, "2026-11-01"));
+    const got = await periodBarsFor(CODE, "month", 60, { store, fetch: async () => [] });
+    expect(got).toHaveLength(30);
+  });
+
+  it("从来没成功过才返回 null（让结论如实说缺失）", async () => {
+    const got = await periodBarsFor(CODE, "month", 60, {
+      store: createMemoryBarStore(),
+      fetch: async () => {
+        throw new Error("失败");
+      },
+    });
+    expect(got).toBeNull();
   });
 });
 
