@@ -119,11 +119,6 @@ export async function todayTradingStatus(
   return status;
 }
 
-/** 仅供测试与「切换交易日」时清理内存缓存 */
-export function resetTradingDayCache(): void {
-  cache = null;
-}
-
 /** 一行可读描述（日志 / 工具返回 / 巡检上下文共用） */
 export function describeTradingDay(status: TradingDayStatus): string {
   const parts = [

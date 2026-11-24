@@ -25,11 +25,6 @@ export const TRADING_SESSIONS: TradingSession[] = [
   { start: 13 * 60, end: 15 * 60 },
 ];
 
-/** 兼容旧命名：窗口起点（早盘开始） */
-export const WORK_START_MIN = TRADING_SESSIONS[0].start;
-/** 兼容旧命名：窗口终点（尾盘收盘） */
-export const WORK_END_MIN = TRADING_SESSIONS[TRADING_SESSIONS.length - 1].end;
-
 /** 展示用（提示词 / 帮助 / 日志统一取这个，别再各写一份） */
 export const WORK_WINDOW_LABEL = "09:30–11:30、13:00–15:00";
 

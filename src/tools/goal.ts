@@ -14,17 +14,14 @@ import type { ToolDefinition, ToolResult } from "./types";
 export const goalCompleteTool: ToolDefinition = {
   name: "goal_complete",
   description:
-    "声明当前 /goal 目标已全部完成（**仅目标模式使用**）。" +
-    "只有当你确认目标真正完成并通过验证（构建 / 测试 / 实际运行）时才调用；" +
-    "目标确实无法完成（缺凭据、外部依赖不可用）时也调用它，并在 summary 里写明阻塞原因。" +
-    "调用后目标模式结束，不会再自动继续。当前没有进行中的目标时不要调用。",
+    "声明 /goal 目标已完成（仅目标模式）。只在确认目标真正完成并验证后调用；" +
+    "确实无法完成时也调用，并在 summary 写明阻塞原因。没有进行中的目标时不要调用。",
   parameters: {
     type: "object",
     properties: {
       summary: {
         type: "string",
-        description:
-          "完成情况总结：做了什么、如何验证的、还有哪些未做或阻塞（若有）。会展示给用户。",
+        description: "做了什么、如何验证、还有什么未做或阻塞（展示给用户）",
       },
     },
     required: ["summary"],

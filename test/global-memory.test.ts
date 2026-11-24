@@ -23,8 +23,10 @@ import {
 } from "../src/workspace";
 import {
   deleteSecret,
+  hasCredentialAssignment,
   listSecrets,
   loadSecret,
+  resolveSecret,
   protectSecretsInText,
   storeSecret,
   vaultDir,
@@ -132,6 +134,16 @@ describe("自动全局记忆捕获", () => {
     expect(memory).toContain("[加密凭据 ");
     expect(memory).not.toContain("s3cret-pw");
     expect(loadSecret(result.credentialIds[0])).toBe("s3cret-pw");
+  });
+
+  it("「密码是什么？」不会被当成凭据，也不会卡死", () => {
+    // 回归：hasCredentialAssignment 的 RegExp 少了 g，遇到「密码是什么？」这类
+    // 值为占位符的匹配会让 exec 永远停在 lastIndex=0，TUI 100% CPU 卡死。
+    expect(hasCredentialAssignment("本机的sudo密码是什么？")).toBe(false);
+    expect(hasCredentialAssignment("sudo 密码是 abc123")).toBe(true);
+    expect(captureGlobalMemoryFromUser("本机的sudo密码是什么？").added).toBe(
+      false,
+    );
   });
 
   it("问题句不写入，避免把「密码怎么设置」当成事实", () => {
@@ -252,6 +264,18 @@ describe("加密凭据库", () => {
     expect(loadSecret(id)).toBeNull();
   });
 
+  it("resolveSecret 支持 id 与唯一 label，同名 label 不猜", () => {
+    const label = `测试凭据-${Date.now()}`;
+    const id = storeSecret("p@ssw0rd", label);
+    expect(resolveSecret(id)?.value).toBe("p@ssw0rd");
+    expect(resolveSecret(`[加密凭据 ${id}]`)?.value).toBe("p@ssw0rd");
+    expect(resolveSecret(label)?.id).toBe(id);
+    expect(resolveSecret("不存在的凭据")).toBeNull();
+
+    storeSecret("another", label);
+    expect(resolveSecret(label)).toBeNull();
+  });
+
   it("文本保护只替换凭据值，返回引用 id", () => {
     const protectedText = protectSecretsInText(
       "sudo 密码是 abc123\n数据库密码是 dbpass。",
@@ -304,6 +328,10 @@ describe("加密凭据库", () => {
     );
     expect(result.ok).toBe(true);
     expect(result.content).toContain("已加密");
+    // 返回可复用的 sec_ 引用（bash 的 stdin_secret 用它，不必再让用户输入）
+    const ref = /`(sec_[0-9a-f]+)`/.exec(result.content)?.[1];
+    expect(ref).toBeTruthy();
+    expect(loadSecret(ref!)).toBe("p@ssw0rd");
 
     const memory = readGlobalMemory().longTerm;
     expect(memory).toContain("[加密凭据 ");

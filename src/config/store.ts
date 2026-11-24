@@ -186,11 +186,35 @@ export interface XuanZhuConfig {
    */
   confirmSensitiveRead?: boolean;
   /**
+   * 是否允许玄猪使用 sudo / SSH 等特权认证密码（默认 **true**）。
+   *
+   * 玄猪是终端全自动 agent：需要提权时应当能向用户询问并使用密码，而不是一律拒绝。
+   * 设为 false 后，提示词会禁止索取密码，`bash` 也只放行 `sudo -n`（NOPASSWD）。
+   * 切换：`xzh config privileged off` / `on`。
+   */
+  allowPrivilegedAuth?: boolean;
+  /**
    * 上下文策略：`auto`（默认）按模型窗口自动判断；`small` 强制精简档；`full` 强制完整档。
    */
   contextProfile?: "auto" | "small" | "full";
   /** 单次回复的最大输出 token 数；不设则用 Provider 默认值（small 档默认 2048） */
   maxOutputTokens?: number;
+  /**
+   * 历史用到本轮预算的 85% 时，自动用一次模型调用压成滚动摘要（默认 true）。
+   *
+   * 在此之前只能手动 `/compact`，日常靠静默裁剪兜底 —— 裁掉的部分永久丢失，
+   * 模型可能忘记「做到哪了」而重复劳动。自动摘要只在**超过阈值且每轮 run 一次**时触发；
+   * 子代理不参与（它们本来就活在受限上下文里）。想完全交给自己控制时设为 false。
+   */
+  autoCompact?: boolean;
+  /**
+   * TUI 同步卡死看门狗（秒）：主线程连续这么久没有心跳就强制退出（默认 180）。
+   *
+   * 只能兜底**同步死循环 / 阻塞**（事件循环停住）—— 模型慢、网络挂起时心跳照常，
+   * 由 idle timeout / 中断处理，不会误杀。设为 0 关闭（调试器附加时也会自动关闭）。
+   * 切换：`xzh config watchdog 180` / `xzh config watchdog off`。
+   */
+  hangWatchdogSeconds?: number;
   /**
    * 长期记忆（MEMORY.md）的字符上限。默认 12000（见 workspace 的 DEFAULT_MEMORY_MAX_CHARS）。
    *
@@ -253,6 +277,10 @@ export const DEFAULT_CONFIG: XuanZhuConfig = {
   // （同一工具 + 同一参数连续 4 次即中止），且达到上限时还会询问是否继续，
   // 因此放宽是安全的。
   maxToolRounds: 200,
+  // 历史逼近预算时自动摘要一次，避免静默裁剪把任务进度整段抹掉
+  autoCompact: true,
+  // 同步卡死兜底：事件循环连续 3 分钟无心跳就强制退出，避免 100% CPU 挂死
+  hangWatchdogSeconds: 180,
   // 巡检总时长默认**不限制**（0）：本地模型慢，按总时长掐断只会得到空结论；
   // 真正防挂死的是空闲 3 分钟超时。要兜底用 `xzh config inspect 60`。
   inspectMaxMinutes: 0,
@@ -266,6 +294,9 @@ export const DEFAULT_CONFIG: XuanZhuConfig = {
   // 默认不拦凭据读取：autoApprove 为 true 时应当「完全自动放行」，
   // 否则「自动批准」的语义会被一个罕见的例外破坏。
   confirmSensitiveRead: false,
+  // 默认允许 sudo / SSH 密码：全自动 agent 需要提权时不应被一刀切拦住；
+  // 不想让它碰密码的用户用 `xzh config privileged off` 显式关闭。
+  allowPrivilegedAuth: true,
   // 长期记忆超过 12000 字符即触发精简（去重 + 丢弃最旧的追加块 + 提示模型语义压缩）
   memoryMaxChars: DEFAULT_MEMORY_MAX_CHARS,
   // 全局记忆注入每个项目，默认 4000 字符，避免跨项目把提示词顶爆
@@ -398,6 +429,13 @@ function mergeConfig(partial: Partial<XuanZhuConfig>): XuanZhuConfig {
     },
     providers: { ...DEFAULT_CONFIG.providers, ...(partial.providers ?? {}) },
     maxToolRounds: partial.maxToolRounds ?? DEFAULT_CONFIG.maxToolRounds,
+    autoCompact: partial.autoCompact !== false,
+    hangWatchdogSeconds:
+      partial.hangWatchdogSeconds === 0
+        ? 0
+        : Number.isFinite(partial.hangWatchdogSeconds)
+          ? Math.max(30, Math.floor(partial.hangWatchdogSeconds as number))
+          : DEFAULT_CONFIG.hangWatchdogSeconds,
     inspectMaxMinutes:
       Number.isFinite(partial.inspectMaxMinutes) && (partial.inspectMaxMinutes ?? 0) > 0
         ? Math.floor(partial.inspectMaxMinutes as number)
@@ -408,6 +446,7 @@ function mergeConfig(partial: Partial<XuanZhuConfig>): XuanZhuConfig {
     mouseCapture: partial.mouseCapture ?? DEFAULT_CONFIG.mouseCapture,
     confirmSensitiveRead:
       partial.confirmSensitiveRead ?? DEFAULT_CONFIG.confirmSensitiveRead,
+    allowPrivilegedAuth: partial.allowPrivilegedAuth !== false,
     memoryMaxChars: partial.memoryMaxChars ?? DEFAULT_CONFIG.memoryMaxChars,
     globalMemoryMaxChars:
       partial.globalMemoryMaxChars ?? DEFAULT_CONFIG.globalMemoryMaxChars,

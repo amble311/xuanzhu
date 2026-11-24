@@ -3,6 +3,8 @@ import * as fs from "fs";
 import * as path from "path";
 import { expandHome } from "../utils/paths";
 import { isProxyActive } from "../network/proxy";
+import { estimateTokens, sliceToTokenBudget } from "../llm/context";
+import { resolveSecret } from "../secrets/vault";
 import type { ToolDefinition, ToolResult } from "./types";
 
 const MAX_OUTPUT = 30000;
@@ -50,7 +52,9 @@ function runCommand(
   cwd: string,
   timeoutMs: number,
   signal?: AbortSignal,
+  stdinSecret?: string,
 ): Promise<RunResult> {
+  const feedStdin = typeof stdinSecret === "string" && stdinSecret.length > 0;
   return new Promise((resolve) => {
     if (signal?.aborted) {
       resolve({
@@ -82,7 +86,18 @@ function runCommand(
       windowsHide: true,
       // 独立进程组：超时或中断时可以整组终止
       detached: !isWindows,
+      // ⚠️ stdin 必须 **忽略**：bash 工具没有 stdin 参数，子进程永远等不到输入。
+      // 之前用默认 pipe 且父进程从不 close，`sudo -S` / `cat` / `python input()` 这类
+      // 读 stdin 的命令会一直挂到 120s 超时，表现为「xzh 整个终端卡住」
+      // （尤其是问模型「sudo 密码是什么」时，它常会去跑 `sudo -S ...`）。
+      stdio: [feedStdin ? "pipe" : "ignore", "pipe", "pipe"],
     });
+
+    if (feedStdin && child.stdin) {
+      // 命令可能不读 stdin 就退出，EPIPE 属于正常情况
+      child.stdin.on("error", () => {});
+      child.stdin.end(`${stdinSecret}\n`);
+    }
 
     let stdout = "";
     let stderr = "";
@@ -176,7 +191,16 @@ function runCommand(
  * 一段 `Password:`，既浪费时间又容易误判成网络/工具故障（2026-10-25 实测）。
  * 这里在启动前直接拒绝，并给出非交互的替代做法。
  */
-export function interactiveCommandName(command: string): string | undefined {
+export interface InteractiveCommandOptions {
+  /** 是否允许 sudo -S（用 stdin 提供密码）。默认 true；`xzh config privileged off` 后为 false */
+  allowPrivilegedAuth?: boolean;
+}
+
+export function interactiveCommandName(
+  command: string,
+  options: InteractiveCommandOptions = {},
+): string | undefined {
+  const allowAuth = options.allowPrivilegedAuth !== false;
   // 按 shell 分隔符切段，只看每段的第一个词（避免把 `echo su` / `grep passwd` 也拦掉）
   const segments = command.split(/(?:&&|\|\||[;|\n(){}])/);
   for (const raw of segments) {
@@ -193,12 +217,12 @@ export function interactiveCommandName(command: string): string | undefined {
     ) {
       return name;
     }
-    // sudo 在无 TTY 时会等密码直到超时。允许 -n（NOPASSWD）和 -S（自己喂 stdin），
-    // 其余情况直接拒绝，避免白等到超时。
-    if (
-      name === "sudo" &&
-      !/(^|\s)(-n|--non-interactive|-S|--stdin)(\s|$)/.test(segment)
-    ) {
+    // sudo 在无 TTY 时会等密码直到超时。
+    // -n（NOPASSWD）始终放行；-S 在允许使用特权密码时放行（密码通过管道传入），
+    // 否则只允许 -n。裸 sudo 一定拦：它需要 TTY，必然等到超时。
+    if (name === "sudo") {
+      if (/(^|\s)(-n|--non-interactive)(\s|$)/.test(segment)) continue;
+      if (allowAuth && /(^|\s)(-S|--stdin)(\s|$)/.test(segment)) continue;
       return "sudo";
     }
   }
@@ -271,6 +295,7 @@ export const bashTool: ToolDefinition = {
     "命令在非交互式 shell 中执行，长时间运行的命令请设置 timeout。",
   requiresConfirmation: true,
   danger: true,
+  smallProfile: true,
   parameters: {
     type: "object",
     properties: {
@@ -286,8 +311,12 @@ export const bashTool: ToolDefinition = {
       run_in_background: {
         type: "boolean",
         description:
-          "立即返回、不阻塞本轮（适合 dev server、监听、长时间测试）。结束后会自动通知你，**不要轮询**；" +
-          "需要中途看输出或终止时用 bash_output / bash_kill。",
+          "立即返回、不阻塞（dev server / 监听 / 长测试）。结束会自动通知，不要轮询；中途看输出或终止用 bash_job。",
+      },
+      stdin_secret: {
+        type: "string",
+        description:
+          "凭据 id（sec_xxx）或唯一 label；写入子进程 stdin（供 `sudo -S` 等），命令里不要写明文。",
       },
     },
     required: ["command"],
@@ -299,15 +328,53 @@ export const bashTool: ToolDefinition = {
     }
 
     // 交互式命令没有 TTY，会一直等到超时（如 `su` 等密码）。提前失败并给出替代方案。
-    const interactive = interactiveCommandName(command);
+    const allowAuth = ctx.allowPrivilegedAuth !== false;
+    const stdinSecretRef =
+      typeof args.stdin_secret === "string" ? args.stdin_secret.trim() : "";
+    if (stdinSecretRef && !allowAuth) {
+      return {
+        ok: false,
+        content:
+          "错误：当前配置禁止使用 sudo / SSH 密码（xzh config privileged off），" +
+          "不能通过 stdin_secret 注入凭据。",
+      };
+    }
+    if (stdinSecretRef && args.run_in_background === true) {
+      return {
+        ok: false,
+        content:
+          "错误：stdin_secret 只支持前台命令；后台任务没有可注入 stdin 的通道。" +
+          "请去掉 run_in_background 后重试。",
+      };
+    }
+    let stdinSecret: string | undefined;
+    if (stdinSecretRef) {
+      const resolved = resolveSecret(stdinSecretRef);
+      if (!resolved) {
+        return {
+          ok: false,
+          content:
+            `错误：没有找到凭据 \`${stdinSecretRef}\`（id 或唯一 label）。\n` +
+            "可先用 memory_read target=global 查看 `[加密凭据 sec_xxx]`，" +
+            "或先用 memory_write 保存；不要把明文密码写进命令。",
+        };
+      }
+      stdinSecret = resolved.value;
+    }
+    const interactive = interactiveCommandName(command, {
+      allowPrivilegedAuth: allowAuth,
+    });
     if (interactive) {
       if (interactive === "sudo") {
         return {
           ok: false,
           content:
             `错误：\`sudo\` 在非交互 shell 中会等待密码直到超时。\n` +
-            `若系统已配置 NOPASSWD，请直接用 \`sudo -n <命令>\`；` +
-            `否则请在真实终端中执行，或让用户配置 NOPASSWD。`,
+            (allowAuth
+              ? `需要密码时：已保存的凭据请用 \`stdin_secret\` + \`sudo -S <命令>\`；` +
+                `临时也可 \`printf '%s\\n' "密码" | sudo -S <命令>\`；` +
+                `若系统已配置 NOPASSWD，直接用 \`sudo -n <命令>\` 即可。`
+              : `当前配置禁止使用 sudo 密码（xzh config privileged off），只允许 \`sudo -n\` 或让用户在真实终端执行。`),
         };
       }
       return {
@@ -315,8 +382,7 @@ export const bashTool: ToolDefinition = {
         content:
           `错误：\`${interactive}\` 需要交互式输入（密码 / 按键），而 xzh 的 bash 是` +
           `非交互 shell，会一直等待直到超时。\n` +
-          `请在终端里手动执行；需要提权时改用已配置 NOPASSWD 的 \`sudo -n <命令>\`，` +
-          `不要依赖 xzh 输入密码。`,
+          `请在真实终端里手动执行；需要提权时用 \`sudo -n\` 或（允许时）\`sudo -S\`。`,
       };
     }
 
@@ -354,8 +420,8 @@ export const bashTool: ToolDefinition = {
           `已转入后台：${job.id}（pid ${job.pid ?? "未知"}）\n` +
           `日志：${job.logFile}\n` +
           `它结束后会**自动把结果推送给你**，不要轮询 ` +
-          `（除非需要中途排查，才用 bash_output job_id=${job.id}）。\n` +
-          `若不再需要它，用 bash_kill job_id=${job.id} 终止。`,
+          `（除非需要中途排查，才用 bash_job action=output job_id=${job.id}）。\n` +
+          `若不再需要它，用 bash_job action=kill job_id=${job.id} 终止。`,
         summary: `后台 ${job.id}`,
       };
     }
@@ -364,7 +430,13 @@ export const bashTool: ToolDefinition = {
       typeof args.timeout === "number" ? args.timeout : DEFAULT_TIMEOUT;
     const timeout = Math.min(Math.max(1000, rawTimeout), MAX_TIMEOUT);
 
-    const result = await runCommand(command, cwd, timeout, ctx.signal);
+    const result = await runCommand(
+      command,
+      cwd,
+      timeout,
+      ctx.signal,
+      stdinSecret,
+    );
 
     const limit = Math.max(1000, ctx.limits?.maxOutputChars ?? MAX_OUTPUT);
     const stdout = result.stdout.trimEnd();
@@ -429,13 +501,23 @@ export const bashTool: ToolDefinition = {
     parts.push(`[退出码] ${result.code ?? "未知"}`);
 
     const output = parts.join("\n\n");
+    // 字符上限之外再按 token 兜底：30k 英文 ≈ 8.6k token，30k 中文 ≈ 30k token，
+    // 只按字符截断时中文明明「没超上限」却能把半个窗口吃掉。
+    let content =
+      (!artifact && result.truncated ? `${TRUNCATED_NOTE}\n\n` : "") +
+      output.slice(0, artifact ? limit : MAX_OUTPUT);
+    const tokenCap = ctx.limits?.maxResultTokens;
+    if (tokenCap && estimateTokens(content) > tokenCap) {
+      content =
+        sliceToTokenBudget(content, tokenCap) +
+        `\n\n[按上下文预算截断] 单条结果上限约 ${tokenCap} tokens；` +
+        (artifact
+          ? `完整输出见 ${artifact}。`
+          : "完整输出请重定向到文件后用 read_file / grep 查看。");
+    }
     return {
       ok: result.code === 0 && !result.timedOut && !result.aborted,
-      // 截断提示必须放在**最前面**：正文本身已经顶到上限，
-      // 放在末尾会被下面的 slice 直接切掉，等于没提示。
-      content:
-        (!artifact && result.truncated ? `${TRUNCATED_NOTE}\n\n` : "") +
-        output.slice(0, artifact ? limit : MAX_OUTPUT),
+      content,
       summary: result.aborted
         ? "已中断"
         : result.timedOut

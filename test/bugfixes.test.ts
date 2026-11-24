@@ -16,7 +16,13 @@ import {
   interactiveCommandName,
 } from "../src/tools/bash";
 import { editFileTool, writeFileTool } from "../src/tools/filesystem";
-import type { ToolContext } from "../src/tools/types";
+import { storeSecret } from "../src/secrets/vault";
+import { watchdogTool } from "../src/tools/watchdog";
+import type {
+  ToolContext,
+  WatchdogControl,
+  WatchdogStatus,
+} from "../src/tools/types";
 
 /**
  * 2026-10-13 bug 审计所修问题的回归测试。
@@ -180,15 +186,61 @@ describe("D18：bash 输出截断必须有提示", () => {
     fs.rmSync(cwd, { recursive: true, force: true });
   }, 30_000);
 
+  it("stdin_secret 把凭据喂给子进程，命令里不出现明文", async () => {
+    const cwd = tmpDir("xzh-bash-secret-");
+    const id = storeSecret("p@ss word", `bash-test-${Date.now()}`);
+    const result = await bashTool.execute(
+      { command: "cat", stdin_secret: id, timeout: 30_000 },
+      toolCtx(cwd),
+    );
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain("p@ss word");
+    expect(result.content).not.toContain(id);
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }, 30_000);
+
+  it("关闭特权密码后 stdin_secret 被拒绝", async () => {
+    const cwd = tmpDir("xzh-bash-secret-off-");
+    const id = storeSecret("p@ss word", `bash-off-${Date.now()}`);
+    const result = await bashTool.execute(
+      { command: "cat", stdin_secret: id, timeout: 30_000 },
+      { ...toolCtx(cwd), allowPrivilegedAuth: false },
+    );
+    expect(result.ok).toBe(false);
+    expect(result.content).toContain("禁止");
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }, 30_000);
+
+  it("stdin 被忽略：读 stdin 的命令立即 EOF，不会挂满超时", async () => {
+    const cwd = tmpDir("xzh-bash-stdin-");
+    const started = Date.now();
+    const result = await bashTool.execute(
+      {
+        command:
+          `node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write('eof'))"`,
+        timeout: 30_000,
+      },
+      toolCtx(cwd),
+    );
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain("eof");
+    // 若 stdin 仍是打开的 pipe，这里会等满 30s 超时
+    expect(Date.now() - started).toBeLessThan(5000);
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }, 30_000);
+
   it("只匹配命令位置，不误伤 echo / grep 里的同名文本", async () => {
     expect(interactiveCommandName("echo su root")).toBeUndefined();
     expect(interactiveCommandName("grep passwd README.md")).toBeUndefined();
     expect(interactiveCommandName("echo hi && su root")).toBe("su");
     expect(interactiveCommandName("FOO=bar vim a.txt")).toBe("vim");
-    // sudo 无 TTY 会等密码；带 -n / -S 时不应拦截
+    // sudo 无 TTY 会等密码：-n 始终放行；-S 默认允许（用管道喂密码），关闭后只允许 -n
     expect(interactiveCommandName("sudo ls")).toBe("sudo");
     expect(interactiveCommandName("sudo -n ls")).toBeUndefined();
     expect(interactiveCommandName("sudo -S ls")).toBeUndefined();
+    expect(
+      interactiveCommandName("sudo -S ls", { allowPrivilegedAuth: false }),
+    ).toBe("sudo");
   });
 
   it("sudo 无 TTY 时提前失败并提示 NOPASSWD", async () => {
@@ -216,6 +268,64 @@ describe("D18：bash 输出截断必须有提示", () => {
     expect(result.ok).toBe(false);
     expect(result.content).toContain("[网络提示]");
     expect(result.content).toContain("load_skill v2ray");
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+});
+
+describe("watchdog 工具：只能临时放宽，不能关闭", () => {
+  it("status / extend / restore / 无句柄", async () => {
+    const cwd = tmpDir("xzh-watchdog-tool-");
+    let timeout = 180;
+    const status = (): WatchdogStatus => ({
+      active: true,
+      timeoutSeconds: timeout,
+      defaultSeconds: 180,
+      extended: timeout > 180,
+    });
+    const control: WatchdogControl = {
+      status,
+      extend: (seconds) => {
+        timeout = Math.max(180, seconds);
+        return status();
+      },
+      restore: () => {
+        timeout = 180;
+        return status();
+      },
+    };
+    const ctx: ToolContext = { cwd, autoApprove: true, watchdog: control };
+
+    expect((await watchdogTool.execute({ action: "status" }, ctx)).content).toContain(
+      "180s",
+    );
+
+    const extended = await watchdogTool.execute(
+      { action: "extend", seconds: 600 },
+      ctx,
+    );
+    expect(extended.ok).toBe(true);
+    expect(timeout).toBe(600);
+    expect(extended.content).toContain("600s");
+
+    // 不允许通过工具关闭看门狗
+    const zero = await watchdogTool.execute(
+      { action: "extend", seconds: 0 },
+      ctx,
+    );
+    expect(zero.ok).toBe(false);
+    expect(timeout).toBe(600);
+
+    await watchdogTool.execute({ action: "restore" }, ctx);
+    expect(timeout).toBe(180);
+
+    // 非 TUI 会话没有控制句柄
+    const none = await watchdogTool.execute(
+      { action: "status" },
+      { cwd, autoApprove: true },
+    );
+    expect(none.ok).toBe(false);
+    expect(none.content).toContain("没有可用的看门狗");
+
     fs.rmSync(cwd, { recursive: true, force: true });
   });
 });

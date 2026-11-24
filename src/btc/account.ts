@@ -197,11 +197,6 @@ export async function fetchAccountSnapshot(
   }
 }
 
-/** 配置变更（换凭据）后清缓存，否则面板会继续显示旧账户 */
-export function invalidateAccountCache(): void {
-  cache = null;
-}
-
 /** 当前持仓里「亏损百分比」最严重的一个（供硬风控判定），无持仓返回 null */
 export function worstPositionLoss(
   snapshot: AccountSnapshot,

@@ -40,6 +40,14 @@ export interface BackendState {
   lastInspectAt?: string;
   /** 最近一次巡检的结论（已截断） */
   lastInspectSummary?: string;
+  /**
+   * 最近一轮巡检耗时（毫秒）与工具调用次数。
+   *
+   * 本地小上下文模型一轮 8–10 分钟很常见，光看「8 分钟前跑完」看不出是不是变慢了；
+   * 面板与 `xzh btc status` 直接显示 `9m34s / 10 次工具`，异常变慢一眼可见。
+   */
+  lastInspectMs?: number;
+  lastInspectTools?: number;
   /** 队列里最早一条计划的时间（ISO）——由模型决定，前后台共享 */
   nextCheckAt?: string;
   /** 为什么定在那个时候 */

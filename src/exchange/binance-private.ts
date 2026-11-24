@@ -248,22 +248,6 @@ export async function fetchLeverage(
   return Number.isFinite(leverage) && leverage > 0 ? leverage : 0;
 }
 
-/** 查单（确认限价单是否成交） */
-export async function queryOrder(
-  params: { symbol: string; orderId: string | number },
-  credential: PrivateCredential,
-): Promise<OrderResponse> {
-  return signedRequest<OrderResponse>(
-    {
-      method: "GET",
-      base: FUTURES_BASE,
-      path: "/fapi/v1/order",
-      params: { symbol: params.symbol, orderId: params.orderId },
-    },
-    credential,
-  );
-}
-
 /** 撤单（按 orderId） */
 export async function cancelOrder(
   params: { symbol: string; orderId: string | number },

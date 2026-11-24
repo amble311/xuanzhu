@@ -19,7 +19,6 @@ import {
   placePaperOrder,
   type PaperAccount,
 } from "./paper";
-import { runAInspect } from "./inspect";
 import {
   commitRuleHit,
   describeRule,
@@ -662,6 +661,9 @@ export async function runAServe(): Promise<void> {
 
     state.lastInspectReason = reason;
     log(`唤醒巡检：${reason}`);
+    // 巡检实现（inspect）会间接拉起 Agent / 工具层；面板与状态查询只需要本模块的轻量部分，
+    // 因此放到真正要巡检时才加载，避免 TUI 启动时为整套 A 股分析栈付内存。
+    const { runAInspect } = await import("./inspect");
     const result = await runAInspect(reason, {
       origin: "inspect",
       triggerNote: options.triggerNote,
@@ -992,6 +994,7 @@ export async function runManualInspection(): Promise<CycleResult> {
   );
   const alerts = await detectPositionRisks(at, quotes);
   actions.push(...alerts.map((item) => `${item.code} ${item.reason}`));
+  const { runAInspect } = await import("./inspect");
   const result = await runAInspect("手动巡检", { origin: "manual" });
   actions.push(`巡检：${result.summary}`);
   if (result.error) actions.push(`巡检失败：${result.error}`);
@@ -1356,13 +1359,6 @@ export function aServiceStatus(): AServiceStatus {
   const state = readAMonitorState();
   const alive = state !== null && pidAlive(state.pid);
   return { running: alive, state: alive ? state : null, stale: state !== null && !alive };
-}
-
-export interface StartAServiceResult {
-  ok: boolean;
-  started: boolean;
-  state?: AMonitorState;
-  error?: string;
 }
 
 export async function startAService(): Promise<StartAServiceResult> {

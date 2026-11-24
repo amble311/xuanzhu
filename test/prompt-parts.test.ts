@@ -43,10 +43,65 @@ describe("提示词分片", () => {
     expect(prompt).toContain("## 输出风格");
   });
 
+  it("默认允许 sudo / SSH 密码，仅在显式关闭时禁止", () => {
+    const allowed = base();
+    expect(allowed).toContain("sudo / sshpass");
+    expect(allowed).toContain("stdin_secret");
+    expect(allowed).toContain("memory_write target=global");
+    expect(allowed).not.toContain("不要获取或输入 sudo / SSH 密码");
+
+    const denied = base({ allowPrivilegedAuth: false });
+    expect(denied).toContain("不要获取或输入 sudo / SSH 密码");
+    expect(denied).not.toContain("sudo / sshpass");
+    expect(denied).not.toContain("stdin_secret");
+  });
+
+  it("告知模型看门狗时限与长任务策略", () => {
+    const prompt = base();
+    expect(prompt).toContain("180s 会被看门狗强制退出");
+    expect(prompt).toContain("不会误杀异步下载");
+    expect(prompt).toContain("run_in_background");
+    expect(prompt).toContain("watchdog action=extend");
+    expect(prompt).toContain("`xzh sudo`");
+    expect(prompt).toContain("`stdin_secret`");
+
+    // 关闭看门狗后不应再声称会被强杀，也不该教模型去 extend
+    const off = base({ hangWatchdogSeconds: 0 });
+    expect(off).not.toContain("看门狗强制退出");
+    expect(off).not.toContain("watchdog action=extend");
+  });
+
   it("空串表示删掉该段", () => {
     const prompt = base({ overrides: { output: "" } });
     expect(prompt).not.toContain("## 输出风格");
     expect(prompt).toContain("## 核心原则");
+  });
+
+  it("项目记忆过长只注入主题目录，日志只带尾部", () => {
+    const longTerm = Array.from(
+      { length: 20 },
+      (_, i) => `## 主题${i}\n${"正文".repeat(80)}`,
+    ).join("\n");
+    const daily =
+      "早期唯一标记AAA\n" + "流水".repeat(300) + "\n最新一条结论";
+
+    const prompt = buildSystemPrompt(
+      "/tmp/demo",
+      undefined,
+      null,
+      { longTerm, recentDaily: daily },
+      undefined,
+      false,
+      false,
+    );
+
+    expect(prompt).toContain("现有长期记忆（主题目录）");
+    expect(prompt).toContain("- 主题0");
+    // 只给目录（每节带一句摘要），不把整段正文塞进来
+    expect(prompt).not.toContain("正文".repeat(80));
+    // 日志只保留尾部，早期内容不再每轮付费
+    expect(prompt).toContain("最新一条结论");
+    expect(prompt).not.toContain("早期唯一标记AAA");
   });
 
   it("未知 key 被忽略而不是让组装失败", () => {

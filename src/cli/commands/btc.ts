@@ -523,8 +523,16 @@ function printRoleBlock(
       ` · ${modeText} · 已完成 ${state.cycles ?? 0} 轮${pausedText}\n`,
   );
   if (state.mode !== "sync") {
+    // 带上耗时与工具次数：本地小上下文模型跑 10 分钟很常见，但「突然变成 25 分钟」
+    // 才是需要处理的信号，只看「最近巡检时间」看不出来
+    const cost =
+      state.lastInspectMs !== undefined
+        ? `（${Math.floor(state.lastInspectMs / 60_000)}m` +
+          `${Math.round((state.lastInspectMs % 60_000) / 1000)}s` +
+          `${state.lastInspectTools !== undefined ? ` / ${state.lastInspectTools} 次工具` : ""}）`
+        : "";
     process.stdout.write(
-      `    最近巡检：${state.lastInspectAt ?? "尚未完成"} · 队列 ${queue.length} 条\n`,
+      `    最近巡检：${state.lastInspectAt ?? "尚未完成"}${cost} · 队列 ${queue.length} 条\n`,
     );
     printQueue(queue, "    ");
     if (state.lastInspectSummary) {

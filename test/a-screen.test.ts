@@ -13,7 +13,8 @@ import {
 } from "../src/a";
 import type { Bar } from "../src/exchange/ashare";
 import { findMode } from "../src/modes";
-import { TOOLS, toolVisibleInMode } from "../src/tools";
+import { aShareTools } from "../src/tools/a-share";
+import { toolVisibleInMode } from "../src/tools";
 
 /**
  * A 股横截面核心：指标、快照聚合、筛选器。
@@ -99,7 +100,8 @@ describe("模式与工具注册", () => {
     expect(mode?.promptSection).toContain(`自选池 ${poolSize()} 只`);
     expect(mode?.promptSection).toContain(`持仓最多 ${maxPositions()} 只股票`);
 
-    const names = TOOLS.filter((tool) => tool.modes?.includes("a")).map((tool) => tool.name);
+    const names = aShareTools.map((tool) => tool.name);
+    expect(mode?.tools).toBe(aShareTools);
     expect(names.sort()).toEqual([
       "a_account",
       "a_bars",
@@ -121,7 +123,7 @@ describe("模式与工具注册", () => {
       "a_trigger",
       "a_unschedule",
     ]);
-    const screen = TOOLS.find((tool) => tool.name === "a_screen")!;
+    const screen = aShareTools.find((tool) => tool.name === "a_screen")!;
     expect(toolVisibleInMode(screen, "a")).toBe(true);
     expect(toolVisibleInMode(screen, undefined)).toBe(false);
     expect(toolVisibleInMode(screen, "btc")).toBe(false);
@@ -263,7 +265,7 @@ describe("巡检不选股", () => {
     try {
       const ctx = { cwd: process.cwd(), mode: "a", autoApprove: true } as never;
       for (const name of ["a_select", "a_screen"]) {
-        const tool = TOOLS.find((item) => item.name === name)!;
+        const tool = aShareTools.find((item) => item.name === name)!;
         const result = await tool.execute({}, ctx);
         expect(result.ok).toBe(false);
         expect(result.content).toContain("巡检");

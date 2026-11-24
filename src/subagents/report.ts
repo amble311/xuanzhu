@@ -31,7 +31,7 @@ export interface NormalizedReport {
 /** 归一化子代理报告；`maxChars` 为进入主上下文的硬上限 */
 export function normalizeSubagentReport(
   report: string,
-  maxChars = 12_000,
+  maxChars = 6_000,
 ): NormalizedReport {
   const clean = report.replace(ANSI, "").replace(/\r/g, "").trim();
   const before = clean.length;

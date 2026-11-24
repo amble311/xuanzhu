@@ -125,16 +125,6 @@ export function encodeJsonText(text: string): Buffer {
   return concatBuffers([headerBytes(payload.length, AUTOJS6_TYPE_JSON), payload]);
 }
 
-/** 编码一条 JSON 帧 */
-export function encodeJsonFrame(value: unknown): Buffer {
-  return encodeJsonText(JSON.stringify(value));
-}
-
-/** 编码一条二进制帧 */
-export function encodeBytesFrame(data: Buffer): Buffer {
-  return concatBuffers([headerBytes(data.length, AUTOJS6_TYPE_BYTES), data]);
-}
-
 /**
  * 增量帧解码器。
  *
@@ -221,14 +211,6 @@ export function helloReply(extensionVersion = AUTOJS6_EXTENSION_VERSION): string
   return JSON.stringify({ type: "hello", data: { extensionVersion } });
 }
 
-/**
- * 握手拒绝（客户端模式）。手机收到 `data.errorMessage` 会直接弹框并断开。
- * 只在真的无法服务时用；正常一律用 `helloReply()`。
- */
-export function helloRejection(errorMessage: string): string {
-  return JSON.stringify({ type: "hello", data: { errorMessage } });
-}
-
 /** 手机侧 hello 里的信息 */
 export interface AutoJs6HelloData {
   deviceName: string;
@@ -256,24 +238,6 @@ export function commandMessage(
   data: Record<string, unknown> = {},
 ): string {
   return JSON.stringify({ type: "command", data: { command, ...data } });
-}
-
-/**
- * 二进制指令（项目级 zip）。
- *
- * 与 AutoJs6 的实现一致：**先发二进制帧，再发这条带 md5 的 `bytes_command`**，
- * 手机按 md5 把两者配对（哪个先到都行，两边各有一个等待表）。
- */
-export function bytesCommandMessage(
-  command: string,
-  md5: string,
-  data: Record<string, unknown> = {},
-): string {
-  return JSON.stringify({
-    type: "bytes_command",
-    md5,
-    data: { command, ...data },
-  });
 }
 
 /** 从 log 消息里取文本；不是 log 或没有内容时返回 null */

@@ -1,14 +1,16 @@
 import * as fs from "fs";
+import * as fsp from "fs/promises";
 import * as path from "path";
 import { snapshotForUndo } from "../utils/backups";
 import { diffNote } from "../utils/diff";
 import { expandHome } from "../utils/paths";
+import { estimateTokens, sliceToTokenBudget } from "../llm/context";
 import type { ToolDefinition, ToolResult } from "./types";
 
 const MAX_READ_LINES = 2000;
 const MAX_FILE_BYTES = 2 * 1024 * 1024; // 2MB
 const MAX_GLOB_RESULTS = 200;
-const MAX_GREP_RESULTS = 200;
+const MAX_GREP_RESULTS = 100;
 const MAX_GREP_FILE_BYTES = 1024 * 1024; // 1MB
 /** 单行参与正则匹配的最大字符数（见 looksCatastrophic 的说明） */
 const MAX_GREP_LINE_CHARS = 2000;
@@ -154,8 +156,11 @@ function isBinaryBuffer(buffer: Buffer): boolean {
 export const readFileTool: ToolDefinition = {
   name: "read_file",
   description:
-    "读取文本文件内容，返回带行号的文本。支持通过 offset/limit 读取指定行范围。" +
-    "在修改文件前应先读取确认内容。",
+    "读取文本文件（带行号），可用 offset/limit 读指定行范围。修改前必读。",
+  // 只读、无共享可变状态；IO 走 fs/promises，同一轮里的多个读取能真正重叠
+  parallelSafe: true,
+  smallProfile: true,
+  exploration: true,
   parameters: {
     type: "object",
     properties: {
@@ -173,10 +178,12 @@ export const readFileTool: ToolDefinition = {
   },
   async execute(args, ctx): Promise<ToolResult> {
     const target = resolvePath(asString(args.path), ctx.cwd);
-    if (!fs.existsSync(target)) {
+    let stat: fs.Stats;
+    try {
+      stat = await fsp.stat(target);
+    } catch {
       return { ok: false, content: `错误：文件不存在：${target}` };
     }
-    const stat = fs.statSync(target);
     if (stat.isDirectory()) {
       return { ok: false, content: `错误：${target} 是一个目录，请使用 list_dir` };
     }
@@ -196,7 +203,7 @@ export const readFileTool: ToolDefinition = {
       };
     }
 
-    const buffer = fs.readFileSync(target);
+    const buffer = await fsp.readFile(target);
     if (isBinaryBuffer(buffer)) {
       return { ok: false, content: `错误：${target} 是二进制文件，无法作为文本读取` };
     }
@@ -211,21 +218,29 @@ export const readFileTool: ToolDefinition = {
     );
     const slice = allLines.slice(offset - 1, offset - 1 + limit);
 
-    const body = slice
+    let body = slice
       .map((line, index) => {
         const lineNo = offset + index;
         return `${String(lineNo).padStart(6, " ")}| ${line}`;
       })
       .join("\n");
 
-    const truncated =
+    let note =
       offset - 1 + limit < allLines.length
         ? `\n…（文件共 ${allLines.length} 行，已截断）`
         : "";
 
+    // 行数上限之外再按 token 兜底：一行很长的代码 / 压缩后的 JSON 也会把窗口撑爆。
+    const tokenCap = ctx.limits?.maxResultTokens;
+    if (tokenCap && estimateTokens(body) > tokenCap) {
+      body = sliceToTokenBudget(body, tokenCap);
+      const shown = body.split("\n").length;
+      note += `\n…（已按上下文预算截断，可用 offset=${offset + shown} 继续）`;
+    }
+
     return {
       ok: true,
-      content: body + truncated,
+      content: body + note,
       summary: `读取 ${slice.length} 行`,
     };
   },
@@ -235,8 +250,9 @@ export const readFileTool: ToolDefinition = {
 export const writeFileTool: ToolDefinition = {
   name: "write_file",
   description:
-    "写入（覆盖）文件。会创建缺失的父目录。请谨慎使用，优先使用 edit_file 做局部修改。",
+    "写入（覆盖）整个文件，会创建父目录。优先用 edit_file 做局部修改。",
   requiresConfirmation: true,
+  smallProfile: true,
   parameters: {
     type: "object",
     properties: {
@@ -288,10 +304,10 @@ export const writeFileTool: ToolDefinition = {
 export const editFileTool: ToolDefinition = {
   name: "edit_file",
   description:
-    "精确替换文件中的文本。将 search 指定的文本替换为 replace。" +
-    "search 必须与文件内容完全一致（含缩进）；若 search 匹配到多处则默认拒绝执行，" +
-    "需提供更精确的 search 或设置 replace_all 为 true。",
+    "把文件中的 search 原文替换为 replace。search 必须完全一致（含缩进）；" +
+    "匹配到多处时默认拒绝，需更精确的 search 或 replace_all=true。",
   requiresConfirmation: true,
+  smallProfile: true,
   parameters: {
     type: "object",
     properties: {
@@ -401,6 +417,9 @@ export const editFileTool: ToolDefinition = {
 export const listDirTool: ToolDefinition = {
   name: "list_dir",
   description: "列出目录中的文件与子目录。省略 path 时列出当前工作目录。",
+  parallelSafe: true,
+  smallProfile: true,
+  exploration: true,
   parameters: {
     type: "object",
     properties: {
@@ -412,15 +431,17 @@ export const listDirTool: ToolDefinition = {
     const target = args.path
       ? resolvePath(asString(args.path), ctx.cwd)
       : ctx.cwd;
-    if (!fs.existsSync(target)) {
+    let stat: fs.Stats;
+    try {
+      stat = await fsp.stat(target);
+    } catch {
       return { ok: false, content: `错误：目录不存在：${target}` };
     }
-    if (!fs.statSync(target).isDirectory()) {
+    if (!stat.isDirectory()) {
       return { ok: false, content: `错误：${target} 不是目录` };
     }
 
-    const entries = fs
-      .readdirSync(target, { withFileTypes: true })
+    const entries = (await fsp.readdir(target, { withFileTypes: true }))
       .filter((entry) => !IGNORED_DIRS.has(entry.name))
       .sort((a, b) => {
         if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
@@ -445,6 +466,9 @@ export const globTool: ToolDefinition = {
   name: "glob",
   description:
     "按通配符查找文件，支持 **、*、? 语法。例如 'src/**/*.ts'。返回匹配的文件路径。",
+  parallelSafe: true,
+  smallProfile: true,
+  exploration: true,
   parameters: {
     type: "object",
     properties: {
@@ -460,7 +484,7 @@ export const globTool: ToolDefinition = {
     const matcher = globToRegExp(pattern);
     const matches: string[] = [];
 
-    walk(root, (filePath) => {
+    await walk(root, (filePath) => {
       if (matches.length >= MAX_GLOB_RESULTS) return;
       const relative = path.relative(root, filePath).split(path.sep).join("/");
       if (matcher.test(relative)) matches.push(relative);
@@ -486,6 +510,9 @@ export const grepTool: ToolDefinition = {
   name: "grep",
   description:
     "在文件中按正则表达式搜索文本内容。返回 文件:行号:内容。可通过 include 限定文件类型（如 '*.ts'）。",
+  parallelSafe: true,
+  smallProfile: true,
+  exploration: true,
   parameters: {
     type: "object",
     properties: {
@@ -536,7 +563,7 @@ export const grepTool: ToolDefinition = {
         : 0;
     const collectLimit = MAX_GREP_RESULTS + offset + 1;
 
-    walk(root, (filePath) => {
+    await walk(root, async (filePath) => {
       if (results.length >= collectLimit) return;
       // 跳过 .gitignore 里显式忽略的文件（.env / 密钥 / 凭据等）
       if (ignore.length > 0 && matchesGitignore(path.relative(root, filePath), ignore)) {
@@ -548,7 +575,7 @@ export const grepTool: ToolDefinition = {
       }
       let stat: fs.Stats;
       try {
-        stat = fs.statSync(filePath);
+        stat = await fsp.stat(filePath);
       } catch {
         return;
       }
@@ -556,7 +583,7 @@ export const grepTool: ToolDefinition = {
 
       let buffer: Buffer;
       try {
-        buffer = fs.readFileSync(filePath);
+        buffer = await fsp.readFile(filePath);
       } catch {
         return;
       }
@@ -573,7 +600,7 @@ export const grepTool: ToolDefinition = {
             ? line.slice(0, MAX_GREP_LINE_CHARS)
             : line;
         if (regex.test(subject)) {
-          results.push(`${relative}:${i + 1}: ${line.trim().slice(0, 300)}`);
+          results.push(`${relative}:${i + 1}: ${line.trim().slice(0, 200)}`);
         }
       }
     });
@@ -597,18 +624,36 @@ export const grepTool: ToolDefinition = {
       : offset > 0
         ? `\n（已跳过前 ${offset} 条）`
         : "";
+    let content = page.join("\n") + truncated;
+    // 200 条 × 每行 200 字符在极端情况下仍有 4 万字符，再按 token 兜底一次
+    const tokenCap = ctx.limits?.maxResultTokens;
+    if (tokenCap && estimateTokens(content) > tokenCap) {
+      content =
+        sliceToTokenBudget(content, tokenCap) +
+        "\n…（已按上下文预算截断，可用 offset 继续翻页）";
+    }
     return {
       ok: true,
-      content: page.join("\n") + truncated,
+      content,
       summary: `${page.length} 条匹配${more ? "（还有更多）" : ""}`,
     };
   },
 };
 
-function walk(root: string, onFile: (filePath: string) => void): void {
+/**
+ * 递归遍历目录。
+ *
+ * 用 `fs/promises` 而不是同步 API：多个只读工具在同一轮里并发执行时，
+ * 读目录 / 读文件会进入 libuv 线程池真正重叠（尤其是网络挂载盘），
+ * 同步版本会把它们串成一条线。
+ */
+async function walk(
+  root: string,
+  onFile: (filePath: string) => void | Promise<void>,
+): Promise<void> {
   let entries: fs.Dirent[];
   try {
-    entries = fs.readdirSync(root, { withFileTypes: true });
+    entries = await fsp.readdir(root, { withFileTypes: true });
   } catch {
     return;
   }
@@ -616,9 +661,9 @@ function walk(root: string, onFile: (filePath: string) => void): void {
     if (IGNORED_DIRS.has(entry.name)) continue;
     const full = path.join(root, entry.name);
     if (entry.isDirectory()) {
-      walk(full, onFile);
+      await walk(full, onFile);
     } else if (entry.isFile() || entry.isSymbolicLink()) {
-      onFile(full);
+      await onFile(full);
     }
   }
 }

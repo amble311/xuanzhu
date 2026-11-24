@@ -1,9 +1,7 @@
-import { fetchBars, readCache } from "../exchange/ashare";
-import {
-  SNAPSHOT_CACHE,
-  summarizeSnapshot,
-  type MarketSnapshot,
-} from "./snapshot";
+/**
+ * 只保留纯判定（`decideMarketRegime`）：实时取指数 / 快照的部分已随
+ * `evaluateMarketRegime` 一起删除，避免这个模块再把交易所与快照层拖进 TUI 启动。
+ */
 
 /**
  * A 股市场环境门控。
@@ -31,41 +29,6 @@ export interface MarketRegime {
 
 const MIN_UP_RATIO = 45;
 const MAX_LIMIT_DOWN = 20;
-
-function cachedSnapshot(): MarketSnapshot | null {
-  try {
-    const cached = readCache<MarketSnapshot>(SNAPSHOT_CACHE, Number.POSITIVE_INFINITY);
-    return cached?.value ?? null;
-  } catch {
-    return null;
-  }
-}
-
-async function loadIndex(): Promise<{
-  name: string;
-  price: number;
-  ma20: number;
-} | null> {
-  for (const item of [
-    { code: "1B0300", name: "沪深300" },
-    { code: "1A0001", name: "上证指数" },
-  ]) {
-    try {
-      const bars = await fetchBars(item.code, {
-        period: "day",
-        adjust: "none",
-        limit: 30,
-      });
-      if (bars.length < 20) continue;
-      const closes = bars.slice(-20).map((bar) => bar.close);
-      const ma20 = closes.reduce((sum, value) => sum + value, 0) / closes.length;
-      return { name: item.name, price: bars[bars.length - 1].close, ma20 };
-    } catch {
-      // 换下一个指数
-    }
-  }
-  return null;
-}
 
 export interface RegimeBreadth {
   up: number;
@@ -113,11 +76,4 @@ export function decideMarketRegime(
     upRatio,
     limitDown,
   };
-}
-
-export async function evaluateMarketRegime(): Promise<MarketRegime> {
-  const index = await loadIndex();
-  const snapshot = cachedSnapshot();
-  const summary = snapshot ? summarizeSnapshot(snapshot.rows) : null;
-  return decideMarketRegime(index, summary);
 }

@@ -44,11 +44,30 @@ export interface PromptOptions {
    * 哪些约束」（目录不可切、技能已收窄），被用户整段替换掉就会与真实行为不符。
    */
   modeSection?: string;
+  /**
+   * 极小窗口（本地 8k / 16k）：在 compact 基础上再压一档 ——
+   * AGENTS 只留硬规则、记忆节选更短、全局记忆目录更小。
+   */
+  tiny?: boolean;
+  /**
+   * 是否允许使用 sudo / SSH 等特权密码（默认 true）。
+   *
+   * 由 `config.allowPrivilegedAuth` 驱动；false 时提示词改为「禁止索取密码」。
+   */
+  allowPrivilegedAuth?: boolean;
+  /**
+   * TUI 同步卡死看门狗秒数（0 = 关闭），用于告诉模型长下载 / 长命令该怎么安排。
+   * 由 `config.hangWatchdogSeconds` 驱动。
+   */
+  hangWatchdogSeconds?: number;
 }
 
 interface PromptContext {
   cwd: string;
   compact: boolean;
+  tiny: boolean;
+  allowPrivilegedAuth: boolean;
+  hangWatchdogSeconds: number;
   deviceEnabled: boolean;
   proxyConfigured: boolean;
   projectRules?: string | null;
@@ -71,18 +90,38 @@ function compactCore(): string {
 3. 改完验证：修改后运行相关测试 / 构建 / 类型检查；无法运行时说明原因。
 4. 只做用户**最新消息**要求的事；不要擅自接着做上下文里的旧任务。
 5. 3 步以上的任务先用 todo_write 列计划，并随进度更新。
-6. 完成实质工作后，用 memory_write 记录跨会话有价值的结论（不确定就记当日日志）；从命令/文件/网页输出总结的内容标 source=tool。
+6. 完成实质工作后，用 memory（action=write）记录跨会话有价值的结论（默认记当日日志）；从命令/文件/网页输出总结的内容标 source=tool。
 7. 少轮次：互不依赖的 read_file / list_dir / glob / grep 在同一轮一起发出，它们会并行执行。`;
 }
 
-function compactTools(): string {
+function compactTools(
+  allowPrivilegedAuth = true,
+  hangWatchdogSeconds = 180,
+): string {
+  const privilege = allowPrivilegedAuth
+    ? "- 需要提权 / SSH 时可以用 sudo / sshpass；密码只用于当次命令，不写入记忆、不回显。\n" +
+      "- xzh **没有** `xzh sudo` 子命令，也没有 `~/.xzh/secrets/sudo`；提权直接调用 `sudo`，" +
+      "密码用 `[加密凭据 sec_xxx]` + bash 的 stdin_secret。\n" +
+      "- 用户给的 sudo / SSH 密码：先验证；已有 `sec_xxx` 就直接用 bash 的 stdin_secret，" +
+      "没有才 memory_write target=global 保存；失败不要保存，不要反复索要。"
+    : "- 不要索取或输入 sudo / SSH 密码；提权只能用 sudo -n，否则让用户手动执行。";
+  const longTask =
+    hangWatchdogSeconds > 0
+      ? `- 长命令 / 大文件下载用 bash 的 run_in_background：立刻返回，结束自动通知；` +
+        `前台单条最多 600s。同步阻塞超过 ${hangWatchdogSeconds}s 会被看门狗强制退出（异步下载不受影响）。`
+      : "- 长命令 / 大文件下载用 bash 的 run_in_background：立刻返回，结束自动通知；前台单条最多 600s。";
+  const watchdogRule =
+    hangWatchdogSeconds > 0
+      ? `- 预计同步步骤会超过 ${hangWatchdogSeconds}s 时：先 watchdog action=extend seconds=目标（≤1800），完成后 restore；下载/长命令用 run_in_background，不要 extend。`
+      : "";
   return `## 工具
-- repo_map / find_symbol / read_symbol：先定位再读，避免整文件塞进上下文。
+- code_nav（action=map / find / read）：先定位再读，避免整文件塞进上下文。
 - read_file（带行号）、list_dir、glob、grep：读取与查找；大文件用 offset/limit。
 - write_file / edit_file / bash：修改与验证；bash 是非交互 shell，不要用 su / vim 等。
+${privilege}
 - 需要外网（curl/git/npm/pip）且直连失败时：load_skill v2ray，按指南临时使用本机代理。
 - todo_write：任务清单；report_status：受阻 / 需要用户决定 / 没把握时上报。
-- 长命令用 bash 的 run_in_background：立刻返回，结束时自动通知；不要轮询。
+${longTask}${watchdogRule ? `\n${watchdogRule}` : ""}
 - 必须由用户决定的事用 ask_user 直接问（一次一个，能给选项就给）。`;
 }
 
@@ -95,9 +134,10 @@ function fullCore(): string {
 5. 工具优先：需要查找文件用 glob，搜索内容用 grep，不要靠猜路径。
 6. 收尾时沉淀记忆：**在给出本轮最终答复之前**，先判断这次是否产出了跨会话仍有价值的内容
    （确定的技术方案、项目约定、踩过的坑与解法、重要发现、用户的偏好要求）。
-   只要有，就**必须先调用 memory_write 记录，再结束本轮**。
-   写长期记忆（scope=long）前先 memory_read：属于**已有主题**的内容要用 memory_compact
-   并进那个小节，只有全新主题才追加新块 —— 长期记忆是按主题整理的结论库，不是流水账。
+   只要有，就**必须先调用 memory（action=write）记录，再结束本轮**。
+   写长期记忆（scope=long）前先 memory（action=read）：属于**已有主题**的内容要用
+   memory（action=compact）并进那个小节，只有全新主题才追加新块 ——
+   长期记忆是按主题整理的结论库，不是流水账。
    不要留到"下次再说"——本轮结束后上下文就没了，这些结论会永久丢失。
    琐碎的过程细节、临时路径、工具报错不必记录（当天的进展记 scope=daily）。
 7. 分清「当前任务」与「上下文里的旧任务」：**用户最新一条消息就是本轮要做的事**。
@@ -126,28 +166,40 @@ function fullCore(): string {
     本地模型每多一轮都要重新处理上下文，轮次越少总耗时越短。`;
 }
 
-function fullTools(): string {
+function fullTools(
+  allowPrivilegedAuth = true,
+  hangWatchdogSeconds = 180,
+): string {
+  // 每个工具的「何时用、参数怎么填」已经在各自 schema 的 description 里，这里只保留
+  // 跨工具的纪律，避免同一份信息付两次 token。
+  // 特权密码默认允许（全自动 agent 的宗旨）：只有用户显式 `xzh config privileged off`
+  // 才改成禁止；两种文案都保留，避免实现里出现「一刀切」。
+  const privilege = allowPrivilegedAuth
+    ? "- 需要提权或 SSH 时可以使用 sudo / sshpass 等方式；密码只用于当次命令，不要写入记忆、不要在回复里回显。\n" +
+      "- xzh **没有** `xzh sudo` 子命令，也没有 `~/.xzh/secrets/sudo`（0.8.4 已移除）；" +
+      "提权直接调用 `sudo`，密码用 `[加密凭据 sec_xxx]` + bash 的 `stdin_secret`。\n" +
+      "- 用户告知 sudo / SSH 密码时按**重要凭据**处理：先用真实命令验证" +
+      "（如 `printf '%s\\n' '密码' | sudo -S -v`）；已有 `[加密凭据 sec_xxx]` 就直接用 " +
+      "bash 的 `stdin_secret` 复用，没有才用 memory_write target=global 保存（会返回 `sec_xxx`）；" +
+      "不要反复向用户索要。验证失败不要保存，已自动写入的用 memory_compact 删掉。"
+    : "- **不要获取或输入 sudo / SSH 密码**：提权只用 sudo -n，或让用户在真实终端执行。";
+  const longTask =
+    hangWatchdogSeconds > 0
+      ? "- 长命令 / 大文件下载用 bash 的 run_in_background：立刻返回，结束会自动通知；" +
+        "查看 / 终止用 bash_job。前台单条最多 600s；主线程同步阻塞超过 " +
+        `${hangWatchdogSeconds}s 会被看门狗强制退出（只针对同步卡死，不会误杀异步下载）。`
+      : "- 长命令 / 大文件下载用 bash 的 run_in_background：立刻返回，结束会自动通知；" +
+        "查看 / 终止用 bash_job。前台单条最多 600s。";
+  const watchdogRule =
+    hangWatchdogSeconds > 0
+      ? `- 预计同步步骤会超过 ${hangWatchdogSeconds}s 时：先 watchdog action=extend seconds=目标（≤1800），完成后 restore；下载/长命令用 run_in_background，不要 extend。`
+      : "";
   return `## 工具使用规范
-- repo_map：仓库地图（文件 + 符号概览），不确定从哪看时先用它定位
-- find_symbol：按名称查找定义，返回 文件:行号 与签名
-- read_symbol：只读某个函数 / 类 / 类型 / Markdown 标题的代码范围
-- read_file：读取文件（带行号），修改前必读
-- list_dir：查看目录结构
-- glob：按模式查找文件，如 "src/**/*.ts"
-- grep：用正则搜索文件内容
-- write_file：覆盖写入整个文件（危险，需确认）
-- edit_file：精确替换文本（危险，需确认）
-- bash：执行 shell 命令（危险，需确认）。**长任务用 run_in_background**：
-  立刻返回 job id，结束时系统会自动把结果推送给你 —— **不要轮询**；
-  要看中途输出用 bash_output，要停用 bash_kill。
-- todo_write：创建 / 更新任务列表（每次提交完整列表）
-- report_status：卡住 / 必须由用户决定 / 把握不足 / **无需处理** / 等待下一步时**结构化上报**
-  （blocked / needs_input / low_confidence / dropped / waiting）。能用工具自己解决的事不要上报，
-  更不要用编造的结论或反复重试来掩盖问题；只有真的无法推进时才用它
-- ask_user：向用户提**一个**具体问题并等待回答（可给 2–4 个选项让用户按数字选）。
-  只用于必须由用户决定的选择或只有用户才知道的信息；**不要**用它确认自己查得清的事
-- task：派生子代理（默认 code-explorer）执行子任务，只返回结论
-- memory_compact：用精简后的完整内容重写长期记忆 —— 把新结论并进已有主题小节，或整体压缩`;
+- 先定位再读：不确定从哪看先用 code_nav（action=map）或 glob / grep 定位，再 read_file 只读需要的范围。
+- 有副作用的操作（write_file / edit_file / bash）只在确有把握时用，改完尽量跑测试 / 构建 / 类型检查验证。
+${privilege}
+${longTask}${watchdogRule ? `\n${watchdogRule}` : ""}
+- 3 步以上的任务先 todo_write 列计划；卡住 / 需用户决定用 report_status 或 ask_user；大范围调研派 task 子代理。`;
 }
 
 /**
@@ -158,27 +210,12 @@ function fullTools(): string {
  * 单独一段便于用户在不需要时整段覆盖掉。
  */
 function fullDevice(): string {
+  // 完整约定在 `load_skill autojs6` 里，这里只留会真正闯祸的几条纪律。
   return `## 手机设备（AutoJs6 / AutoX.js）
-- device_list / device_push / device_run / device_stop / device_logs：把脚本推到**手机**
-  （AutoJs6 / AutoX.js）上运行，并回收手机上的日志（这就是"操作手机"的方式）。
-  · **要操作手机时先 load_skill autojs6** —— 里面有 API 速查与必须遵守的约定；
-  · **要"看"手机屏幕内容用 device_read_screen**（返回文字的界面树，你才读得到）；
-    device_screenshot 只产出**你看不到**的图片文件，那是给用户看的，别拿它当"看屏幕"；
-  · **手机上的选择框 / 弹窗：绝不点「取消」，绝不勾选「不再询问」，绝不替用户挑**。
-    尤其是多开（应用分身）选择框：必须先把候选列表报给用户、等他确认选哪个，再记住这个
-    选择；「不再询问」会**永久改变用户的系统设置**，只有用户明确同意才能勾。
-    点「取消」只意味着"这次放弃"，不是"关掉弹窗"的通用手段 —— 实测被误用成后者，
-    导致该次操作直接失败。
-  · 脚本回报统一用 **【…】开头的 console.log**：**不要用 toastLog / toast** ——
-    它们会在**用户屏幕上弹气泡**，每步都弹很烦；console.log 走同一条日志通道，
-    你读得到、用户看不见。device_read_screen 会自动滤掉 【 开头的行，
-    避免你自己的提示混进界面内容造成误判；
-  · 三条要点：脚本在手机上跑、**拿不到返回值**，所以每步都要用上面那种
-    【…】开头的 console.log 回报（**不是 toastLog**），再用 device_logs 读；
-    device_run 是**发出即返回**，日志**异步**回来（先 sleep 再读）；
-    手机只有一台，会挂住的脚本记得 device_stop；
-  · 需要 UI 操作的脚本**必须**以 auto.waitFor(8000) 开头（auto() 在服务未真正运行时直接抛错）；
-  · 桥没开时工具会明确告诉你如何让用户启动（connect / serve），不要反复重试。`;
+- 操作手机前先 load_skill autojs6（API 速查与脚本回报 / 看屏幕的约定都在里面）。
+- 脚本回报用 【…】 开头的 console.log，不要 toastLog；要「看」屏幕用 device_read_screen（文字界面树），device_screenshot 只给用户看。
+- 手机弹窗 / 多开选择框：绝不点「取消」、不勾选「不再询问」、不替用户挑，先把候选报给用户确认。
+- 桥没开时工具会说明如何启动（connect / serve），不要反复重试。`;
 }
 
 function fullSkills(): string {
@@ -191,7 +228,7 @@ function fullSkills(): string {
 - **需要访问外网（curl / git / npm / pip / API）且直连失败时，先 load_skill v2ray**：
   按指南探测本机已有的 v2ray / Clash / sing-box 入站端口，验证后**只对当前命令**临时设置
   HTTP_PROXY / HTTPS_PROXY / ALL_PROXY（并加 NO_PROXY=127.0.0.1,localhost），
-  不修改系统代理或全局配置；成功后用 memory_write target=global 记下本地端点。
+  不修改系统代理或全局配置；成功后用 memory（action=write, target=global）记下本地端点。
   节点 UUID、订阅地址、密码一律不要读取或写入记忆。`;
 }
 
@@ -224,6 +261,13 @@ function compactOutput(): string {
 }
 
 const MEMORY_EXCERPT_CHARS = 1500;
+/**
+ * 当日日志只注入尾部这么多字符。
+ *
+ * 它主要用来告诉模型「今天已经记过什么」（避免重复写），不需要全文；
+ * 一条日志动辄上千字，整段注入等于每轮都在为上午的流水账付费。
+ */
+const DAILY_EXCERPT_CHARS = 600;
 export const GLOBAL_MEMORY_EXCERPT_CHARS = 2500;
 
 /** 全局记忆段落的固定说明（可覆盖；动态节选由代码追加） */
@@ -232,17 +276,17 @@ function globalMemoryIntro(): string {
 全局记忆存放在 \`~/.xzh/data/memory/\`，内容对**所有项目**生效。
 - 当用户明确说「全局 / 所有项目 / 以后都 / 统一 / 跨项目」，或提供跨项目环境事实
   （代理地址、常用安装方式、sudo 使用方式、个人偏好）时，用
-  \`memory_write target=global\` 记录。
+  \`memory\`（action=write, target=global）记录。
 - **禁止把密码、Token、UUID、API Key 原文写进回复或记忆**。写入记忆时，
   工具会自动把凭据值加密为 \`[加密凭据 ...]\` 引用并存入 ~/.xzh/vault；
   不要读取、猜测或复述凭据值。
 - 项目专属的事实、路径、约定写项目记忆，不要污染全局记忆。
-- 全局长期记忆过长时用 \`memory_read target=global\` + \`memory_compact target=global\` 精简。`;
+- 全局长期记忆过长时用 \`memory\`（action=read / compact, target=global）精简。`;
 }
 
 function compactGlobalMemoryIntro(): string {
   return `## 全局记忆（跨项目）
-- 路径 \`~/.xzh/data/memory\`；用户说「全局/所有项目/以后都」时用 \`memory_write target=global\`；项目内容仍写项目记忆。
+- 路径 \`~/.xzh/data/memory\`；用户说「全局/所有项目/以后都」时用 \`memory\`（action=write, target=global）；项目内容仍写项目记忆。
 - 密码/Token/UUID/API Key 原文**禁止出现在回复里**；记忆工具会自动加密为\`[加密凭据 ...]\` 引用，不要读取或猜测其值。`;
 }
 
@@ -260,35 +304,10 @@ function compactGlobalMemoryIntro(): string {
  */
 function projectMemoryIntro(): string {
   return `## 项目记忆
-本项目在 \`.xuanzhu/memory/\` 中保存跨会话记忆，分两层：
-- **长期记忆 \`MEMORY.md\`**：**按主题整理的结论库** —— 跨会话稳定的事实、口径与踩坑。
-- **当日日志 \`YYYY-MM-DD.md\`**：当天的进展与过程记录。
-工具：
-- **\`memory_read\`**：读取长期记忆全文与最近一份日志。开始一项需要项目背景的任务前**应当先读**，
-  避免重复摸索、重复踩坑。
-- **\`memory_write\`**：写入值得跨会话保留的信息，**每完成一件实质工作都必须写**。
-  \`scope=daily\`（默认）追加当日进展；\`scope=long\` 追加一条长期记忆块。
-- **\`memory_compact\`**：用精简后的**完整内容**重写长期记忆。
-  **要把新结论并进已有小节时用它，而不是再追加一块。**
-
-**长期记忆怎么写（决定它在后续会话里是否真的有用）**：
-1. **按主题分节，不按时间堆砌**：如 \`## 环境与部署\`、\`## 权限机制\`、\`## 常见坑\`；
-   同一主题的新发现要**并进已有小节**（\`memory_read\` → \`memory_compact\` 重写），
-   不要在文末再挂一条日期块。文首留一行维护说明：这份文件放什么 + 最近一次整理日期。
-   小节**按重要性从前往后排**（注入提示词的只是开头一节选）。
-2. **只写跨会话稳定、可复用的内容**：结论与口径、项目约定、用户的偏好与要求、
-   踩过的坑及其**原因与解法**、关键路径 / 命令 / 端口之类的环境事实。
-3. **条目格式：先结论，再说依据** —— 具体到 \`file.ts::func()\`、表名或可直接执行的命令，
-   必要时带日期 / 版本锚点；**危险或不可逆的操作标 \`⚠\`**。
-4. **细节外置**：版本叙事与长篇论证留在项目文档和代码里，长期记忆只留结论 + 指针
-   （如 \`详见 docs/xxx.md\`）—— 记忆要短到能整篇读完，细节靠工具去取。
-5. **删除和写入一样重要**：已过时、已被推翻、已写进项目文档的内容要删掉，
-   新旧结论并存只会让记忆把人带偏。
-6. **不要记录**：临时路径、一次性命令输出、工具报错、纯探索过程、当天的流水进展
-   （这些进当日日志）—— 写进去只会挤占后续会话的上下文。
-- 长期记忆超出上限时会被**自动精简**：去除完全重复的记录 + 裁剪最旧的追加块
-  （\`## 时间戳\`，最新的一块保留）；**按主题整理的稳定小节不会被自动删除**，
-  仍超限时会提示你用 \`memory_compact\` 做语义压缩。`;
+本项目在 \`.xuanzhu/memory/\` 保存跨会话记忆：\`MEMORY.md\`（长期记忆，按主题整理的结论库）+ \`YYYY-MM-DD.md\`（当日日志）。
+- 每完成一件实质工作就用 \`memory\`（action=write）记录（默认 scope=daily 当日日志）；需要项目背景前先 \`memory\`（action=read）。
+- 长期记忆按主题分节、只留结论 + 依据 + 指针，不写流水账；同一主题的新结论用 \`memory\`（action=compact）并进已有小节，别在文末追加；过时的内容删掉。
+- 密码 / Token / UUID / API Key 原文禁止写入，工具会自动加密为 \`[加密凭据 ...]\`。`;
 }
 
 /* ------------------------------------------------------------------ 段落解析 */
@@ -298,7 +317,12 @@ const DEFAULTS: Record<
   { full: (ctx: PromptContext) => string; compact?: (ctx: PromptContext) => string }
 > = {
   core: { full: fullCore, compact: compactCore },
-  tools: { full: fullTools, compact: compactTools },
+  tools: {
+    full: (ctx) =>
+      fullTools(ctx.allowPrivilegedAuth, ctx.hangWatchdogSeconds),
+    compact: (ctx) =>
+      compactTools(ctx.allowPrivilegedAuth, ctx.hangWatchdogSeconds),
+  },
   // 设备段只在连接设备桥时出现；默认文本按「已连接」计算，否则指纹与预览都是空
   device: {
     full: (ctx) => (ctx.deviceEnabled ? fullDevice() : ""),
@@ -319,6 +343,9 @@ export function defaultPartText(key: PromptPartKey, compact = false): string {
   const ctx: PromptContext = {
     cwd: "",
     compact,
+    tiny: false,
+    allowPrivilegedAuth: true,
+    hangWatchdogSeconds: 180,
     deviceEnabled: true,
     proxyConfigured: false,
   };
@@ -390,11 +417,12 @@ function globalMemorySection(
   let section = partText("memory-global", ctx, overrides);
 
   const longTerm = ctx.globalMemory?.longTerm?.trim();
-  const excerptChars = ctx.compact ? 1_200 : GLOBAL_MEMORY_EXCERPT_CHARS;
+  // 目录本身也要短：它每轮都出现，相关正文由 effectiveSystemParts() 按消息注入。
+  const indexChars = ctx.tiny ? 400 : ctx.compact ? 800 : 1_200;
   if (longTerm) {
-    const long = longTerm.length > excerptChars;
+    const long = longTerm.length > indexChars;
     const excerpt = long
-      ? `${globalMemoryIndex(longTerm, excerptChars)}\n…（只显示主题目录；相关小节会按当前消息注入，` +
+      ? `${globalMemoryIndex(longTerm, indexChars)}\n…（只显示主题目录；相关小节会按当前消息注入，` +
         `完整内容可用 memory_read target=global 查看）`
       : longTerm;
     section += `\n\n### 现有全局记忆${long ? "（主题目录）" : "（节选）"}\n${excerpt}`;
@@ -420,11 +448,16 @@ function projectMemorySection(
 
   const longTerm = ctx.projectMemory?.longTerm?.trim();
   if (longTerm) {
-    const excerpt =
-      longTerm.length > MEMORY_EXCERPT_CHARS
-        ? `${longTerm.slice(0, MEMORY_EXCERPT_CHARS)}\n…（已截断，可用 memory_read 查看完整内容）`
-        : longTerm;
-    section += `\n\n### 现有长期记忆（节选）\n${excerpt}`;
+    // 超过节选上限时只注入**主题目录**（每节一行），相关小节靠 memory_read 按需取。
+    // 直接把前 1500 字截进来，等于每轮都为一两条旧结论付全价，还把后面的主题挤掉。
+    // 极小窗口只给 600 字符（约 3–4 个主题），其余靠 memory（action=read）取
+    const excerptLimit = ctx.tiny ? 600 : MEMORY_EXCERPT_CHARS;
+    const long = longTerm.length > excerptLimit;
+    const excerpt = long
+      ? `${globalMemoryIndex(longTerm, excerptLimit, "memory_read")}\n` +
+        `…（只显示主题目录；需要正文时用 memory_read 读取）`
+      : longTerm;
+    section += `\n\n### 现有长期记忆${long ? "（主题目录）" : "（节选）"}\n${excerpt}`;
   }
 
   // 长期记忆达到上限时会**由 Agent 自动精简**（去重 + 裁剪最旧的追加块），通常不需要模型介入。
@@ -447,11 +480,12 @@ function projectMemorySection(
   // 让模型知道今天已经记过什么（避免重复写），以及给当天的会话一个连贯的起点。
   const daily = ctx.projectMemory?.recentDaily?.trim();
   if (daily) {
+    const dailyLimit = ctx.tiny ? 300 : DAILY_EXCERPT_CHARS;
     const excerpt =
-      daily.length > MEMORY_EXCERPT_CHARS
-        ? `${daily.slice(-MEMORY_EXCERPT_CHARS)}\n…（已截断，可用 memory_read 查看完整内容）`
+      daily.length > dailyLimit
+        ? `…（更早内容已省略）\n${daily.slice(-dailyLimit)}`
         : daily;
-    section += `\n\n### 今日日志（节选）\n${excerpt}`;
+    section += `\n\n### 今日日志（尾部节选，全文用 memory_read）\n${excerpt}`;
   }
   return section.trim();
 }
@@ -478,6 +512,52 @@ function autonomySection(mode: AutonomyMode): string {
 - 用户拒绝时不要重试同一个操作，先说明理由或换方案。`;
   }
   return "";
+}
+
+/* ------------------------------------------------------------------ 项目规则节选 */
+
+/**
+ * AGENTS.md 太长时只注入「必须遵守」的硬规则小节整段，其余小节只给标题 + 首行。
+ *
+ * 判断标准是标题关键词（必守约定 / 安全 / 发布 / 修改流程 / 交易 等）—— 这些小节里
+ * 写的是「不能破坏的不变量」，必须全文保留；命令表、目录映射这类查询性内容，需要时
+ * 模型自己 `read_file AGENTS.md` 取即可，不必每轮整份塞进上下文。
+ */
+function rulesExcerpt(rules: string, threshold: number): string {
+  if (rules.length <= threshold) return rules;
+  const keepRe = /必守约定|约定|安全|发布|修改流程|交易|不得|禁止/;
+  const chunks = rules.split(/(?=^## )/m);
+  const preamble = chunks.find((chunk) => !chunk.startsWith("## "))?.trim() ?? "";
+  const sections = chunks.filter((chunk) => chunk.startsWith("## "));
+
+  const out: string[] = [];
+  let used = 0;
+  if (preamble) {
+    out.push(preamble);
+    used += preamble.length + 2;
+  }
+  for (const section of sections) {
+    const heading = section.split("\n")[0].trim();
+    const firstLine =
+      section
+        .split("\n")
+        .slice(1)
+        .find((line) => line.trim())
+        ?.trim() ?? "";
+    const body = keepRe.test(heading)
+      ? section.trim()
+      : `${heading}\n  ${firstLine}`;
+    if (used + body.length + 2 > threshold) {
+      out.push("…（其余章节用 read_file AGENTS.md 查看）");
+      break;
+    }
+    out.push(body);
+    used += body.length + 2;
+  }
+  return (
+    out.join("\n\n") +
+    "\n\n（AGENTS.md 较长，此处为摘要；修改代码 / 拿不准时先 read_file AGENTS.md 查看对应章节。）"
+  );
 }
 
 /* ------------------------------------------------------------------ 组装 */
@@ -515,6 +595,15 @@ export function buildSystemPrompt(
   const ctx: PromptContext = {
     cwd,
     compact,
+    tiny: options?.tiny === true,
+    allowPrivilegedAuth: options?.allowPrivilegedAuth !== false,
+    hangWatchdogSeconds:
+      options?.hangWatchdogSeconds === undefined
+        ? 180
+        : Number.isFinite(options.hangWatchdogSeconds) &&
+            options.hangWatchdogSeconds > 0
+          ? options.hangWatchdogSeconds
+          : 0,
     deviceEnabled,
     proxyConfigured,
     projectRules,
@@ -547,10 +636,13 @@ export function buildSystemPrompt(
   if (proxyConfigured) sections.push(proxySection());
 
   if (projectRules && projectRules.trim()) {
-    // 小窗口模型下规则也必须有上限：AGENTS.md 是用户手写的，可能很长
-    const rules = compact
-      ? projectRules.trim().slice(0, 2500)
-      : projectRules.trim();
+    // AGENTS.md 是用户手写的、可能很长：完整注入会吃掉大量窗口。
+    // 超过阈值时只保留「必须遵守」的硬规则小节整段 + 其余小节给目录，
+    // 模型需要细节时用 read_file 读对应章节。compact 档的阈值更紧。
+    const rules = rulesExcerpt(
+      projectRules.trim(),
+      ctx.tiny ? 800 : compact ? 1600 : 2600,
+    );
     sections.push(`## 项目规则（AGENTS.md，请优先遵守）\n${rules}`);
   }
 

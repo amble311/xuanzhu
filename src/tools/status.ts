@@ -41,35 +41,26 @@ const STOPPING: RunStatusKind[] = ["blocked", "needs_input", "dropped", "waiting
  */
 export const reportStatusTool: ToolDefinition = {
   name: "report_status",
+  smallProfile: true,
   description:
-    "结构化上报当前状态，用于「卡住 / 必须由用户决定 / 把握不足 / 无需处理 / 等待下一步」五类情形：" +
-    "blocked=外部条件不满足（缺凭据、权限、网络、依赖），无法继续；" +
-    "needs_input=必须由用户做出选择才能继续（更推荐直接调用 ask_user 把选项摆给用户）；" +
-    "low_confidence=还能继续，但结论/判断没有把握；" +
-    "dropped=已查清，这件事**无需处理**（不是缺陷 / 已被别人修掉 / 需求已取消）；" +
-    "waiting=本轮结束但没有未决问题，等下一次触发。" +
-    "blocked / needs_input / dropped / waiting 会让目标停止并把原因显示给用户；" +
-    "low_confidence 不打断，只做标注。" +
-    "**能用工具自己解决的事不要上报**；也不要用它逃避困难步骤（目标模式下，本轮一次工具都没调用就报 blocked / needs_input 会被拒绝）。",
+    "结构化上报状态。kind：blocked=外部条件不满足；needs_input=必须用户决定（优先 ask_user）；" +
+    "low_confidence=能继续但没把握；dropped=无需处理；waiting=等下次触发。" +
+    "前四者会让目标停下。能自己解决的不上报，也不要用来逃避困难步骤。",
   parameters: {
     type: "object",
     properties: {
       kind: {
         type: "string",
         enum: KINDS,
-        description:
-          "blocked=无法继续（外部条件）；needs_input=需要用户决定；low_confidence=能继续但没把握；" +
-          "dropped=无需处理；waiting=等待下一次触发",
+        description: "blocked / needs_input / low_confidence / dropped / waiting",
       },
       summary: {
         type: "string",
-        description: "一句话说明：卡在哪 / 需要用户决定什么 / 哪部分没把握 / 为什么无需处理",
+        description: "一句话说明：卡在哪 / 需要决定什么 / 哪部分没把握 / 为什么无需处理",
       },
       detail: {
         type: "string",
-        description:
-          "可选：已经尝试过什么、缺什么、建议用户怎么处理（needs_input 时请给出具体选项，" +
-          "或改用 ask_user 直接在界面上让用户选）",
+        description: "可选：已尝试什么、缺什么、建议怎么处理",
       },
     },
     required: ["kind", "summary"],

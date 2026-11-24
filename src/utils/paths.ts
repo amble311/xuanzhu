@@ -53,10 +53,6 @@ export function getStateSubdir(): string {
   return path.join(getConfigDir(), "state");
 }
 
-export function getCacheSubdir(): string {
-  return path.join(getConfigDir(), "cache");
-}
-
 export function getRuntimeSubdir(): string {
   return path.join(getConfigDir(), "runtime");
 }

@@ -105,10 +105,6 @@ export async function loadUniverse(
   return stocks;
 }
 
-export function findStock(stocks: UniverseStock[], code: string): UniverseStock | undefined {
-  return stocks.find((stock) => stock.code === code);
-}
-
 export function universeSummary(stocks: UniverseStock[]): Record<string, number> {
   const summary: Record<string, number> = {};
   for (const stock of stocks) summary[stock.board] = (summary[stock.board] ?? 0) + 1;

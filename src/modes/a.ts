@@ -1,6 +1,6 @@
-import { startAService } from "../a/monitor";
 import { maxPositions, poolSize } from "../a/settings";
 import { WORK_WINDOW_LABEL } from "../a/window";
+import { aShareTools } from "../tools/a-share";
 import { getAShareHome } from "../utils/paths";
 import type { AgentMode } from "./types";
 
@@ -24,10 +24,14 @@ export function createAShareMode(): AgentMode {
     label: "A 股量化交易",
     home,
     cwdLocked: true,
+    tools: aShareTools,
     startupHint:
       `A 股模式：工作目录固定为 ${home}（不可 /switch）；` +
       `分析工具 a_*、模拟盘 a_order / a_account 已启用（池内 5 只，含持仓）`,
     ensureService: async () => {
+      // 常驻服务只在真正进入 A 股模式时才需要；放函数内动态导入，
+      // 避免 `xzh` 普通会话因为模式注册表而拉起整套监控实现。
+      const { startAService } = await import("../a/monitor");
       const service = await startAService();
       return {
         ok: service.ok,
@@ -51,6 +55,10 @@ export function createAShareMode(): AgentMode {
 - **轮询而不是盯一只**：\`a_signal\` 不传 code = 按**持仓优先**的顺序轮询整个池子，每只给出
   方向闸门 + 15m 评分 + 建议；需要深挖再 \`a_signal(code=…)\`、\`a_news\`、\`a_bars(period=15m)\`。
   所有票池外的股票**不得买入** —— 想换标的就走 \`a_select\`（或等收盘后 16:00 的固定选股）。
+- **提到个股必须「代码 + 名称」**：一律写成 \`601988 中国银行\`、\`601398 工商银行\` 这种形式，
+  **不要只发六位代码** —— 微信里看不到行情软件，光有数字用户认不出是哪只。
+  结论、逐只分析、表格（代码 / 名称两列都要有）、挂单与成交说明、排期与叫醒条件都适用；
+  名称取工具返回值（\`a_signal\` / \`a_account\` / \`a_select\` / 自选池）里的，不要自己编。
 - **交易能力**（模拟盘，不涉及真钱，但纪律与实盘一致）：
   \`a_account\`（权益 / 可用 / 持仓 / 可卖）→ \`a_signal\`（打分）→ \`a_order\`（买卖，100 股整手）→
   \`a_orders\` / \`a_cancel_order\` / \`a_renew\`（挂单查询、撤单、续期）→

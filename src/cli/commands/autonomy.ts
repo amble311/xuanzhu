@@ -2,6 +2,7 @@ import { loadConfig, saveConfig } from "../../config/store";
 import {
   AUTONOMY_MODES,
   autonomyModeOf,
+  OBSERVE_BLOCKED_TOOLS,
   observeLogPath,
   readObservedActions,
   type AutonomyMode,
@@ -23,7 +24,10 @@ const LABEL: Record<AutonomyMode, string> = {
   observe: "观察（危险操作一律拦截并记录，只做只读调研）",
 };
 
-const BLOCKED = "write_file / edit_file / bash / bash_kill / device_run / device_push / device_stop";
+// 直接由拦截集合派生，避免「代码里拦的」和「帮助里写的」两套名单漂移
+const BLOCKED = [...OBSERVE_BLOCKED_TOOLS]
+  .map((name) => (name === "bash" ? "bash / bash_job(kill)" : name))
+  .join(" / ");
 
 function usage(): void {
   console.log(

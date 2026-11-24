@@ -1,4 +1,3 @@
-import type { ProjectMemory } from "./index";
 
 /**
  * 全局记忆的「按相关性注入」与自动 TTL。
@@ -76,8 +75,17 @@ function scoreSection(section: MemorySection, tokens: string[]): number {
   return score;
 }
 
-/** 长记忆的目录；每节只占一行，足够模型知道有什么，不占满上下文 */
-export function globalMemoryIndex(text: string, maxChars = 1_200): string {
+/**
+ * 长记忆的目录；每节只占一行，足够模型知道有什么，不占满上下文。
+ *
+ * `readHint` 是「看全文」的提示语：全局记忆与项目记忆的读取工具 / 参数不同，
+ * 由调用方给出，避免把 `target=global` 硬编码进公共函数。
+ */
+export function globalMemoryIndex(
+  text: string,
+  maxChars = 1_200,
+  readHint = "memory（action=read, target=global）",
+): string {
   const { preface, sections } = splitMemorySections(text);
   const lines: string[] = [];
   if (preface) lines.push(preface);
@@ -93,7 +101,7 @@ export function globalMemoryIndex(text: string, maxChars = 1_200): string {
   let output = "";
   for (const line of lines) {
     if (output.length + line.length + 1 > maxChars) {
-      output += "\n…（目录已截断，可用 memory_read target=global 查看）";
+      output += `\n…（目录已截断，可用 ${readHint} 查看）`;
       break;
     }
     output += `${output ? "\n" : ""}${line}`;
@@ -103,7 +111,10 @@ export function globalMemoryIndex(text: string, maxChars = 1_200): string {
 
 /**
  * 按当前用户消息挑相关小节。
- * 没有任何 token 命中时退回前若干节，避免「一条都没注入」。
+ *
+ * 没有 token 命中时**不注入任何内容**（返回空串）：全局记忆目录已在系统提示词里，
+ * 模型需要时用 `memory`（action=read）取。之前会退回前 2 节，等于每轮为两条
+ * 大概率无关的旧结论付全价。
  */
 export function selectRelevantGlobalMemory(
   text: string,
@@ -111,8 +122,9 @@ export function selectRelevantGlobalMemory(
   maxChars = 1_800,
 ): string {
   const { preface, sections } = splitMemorySections(text);
-  if (sections.length === 0) return text.slice(0, maxChars);
+  if (sections.length === 0) return "";
   const tokens = tokensOf(query);
+  if (tokens.length === 0) return "";
 
   const scored = sections
     .map((section, index) => ({
@@ -122,10 +134,9 @@ export function selectRelevantGlobalMemory(
     }))
     .sort((a, b) => b.score - a.score || a.index - b.index);
 
-  const picked = (tokens.length > 0 ? scored.filter((item) => item.score > 0) : [])
-    .slice(0, 4);
-  const chosen = picked.length > 0 ? picked : scored.slice(0, 2);
-  const selected = new Set(chosen.map((item) => item.index));
+  const picked = scored.filter((item) => item.score > 0).slice(0, 4);
+  if (picked.length === 0) return "";
+  const selected = new Set(picked.map((item) => item.index));
 
   const parts: string[] = [];
   let used = 0;
@@ -137,7 +148,7 @@ export function selectRelevantGlobalMemory(
     if (!selected.has(sections.indexOf(section))) continue;
     const block = `${section.heading}\n${section.body}`;
     if (used + block.length + 2 > maxChars) {
-      parts.push(`${section.heading}\n（内容较长，可用 memory_read target=global 查看）`);
+      parts.push(`${section.heading}\n（内容较长，可用 memory（action=read, target=global）查看）`);
       break;
     }
     parts.push(block);
@@ -189,6 +200,3 @@ export function pruneAutoMemory(
 
   return { text: out.join("\n").replace(/\n{3,}/g, "\n\n").trim(), removed };
 }
-
-/** 类型别名，避免调用方依赖 workspace 的具体接口 */
-export type GlobalMemorySnapshot = Pick<ProjectMemory, "longTerm" | "recentDaily">;

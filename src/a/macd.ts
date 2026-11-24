@@ -101,20 +101,3 @@ export function dropIncompleteWeek(bars: Bar[], now = new Date()): Bar[] {
   if (current >= fridayClose) return bars;
   return bars.slice(0, -1);
 }
-
-/**
- * 日线是否用「上一交易日收盘」：盘前 / 盘中拿到的当日日线是半根，
- * 不能参与 MACD 比较。交易日 15:05 之后才把最后一根算作完整日线。
- */
-export function dropIncompleteDay(bars: Bar[], now = new Date()): Bar[] {
-  if (bars.length === 0) return bars;
-  const current = shanghaiDate(now);
-  const today = dateKey(current);
-  const lastDate = bars[bars.length - 1].time.slice(0, 10);
-  if (lastDate !== today) return bars;
-
-  const h = current.getHours();
-  const m = current.getMinutes();
-  const closed = h > 15 || (h === 15 && m >= 5);
-  return closed ? bars : bars.slice(0, -1);
-}

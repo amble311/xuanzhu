@@ -26,18 +26,10 @@ const SUBAGENT_LIST = SUBAGENTS.map(
 export const taskTool: ToolDefinition = {
   name: "task",
   description:
-    "派生一个**子代理**去独立完成一件子任务，只把最终结论返回给你（中间过程不进你的上下文）。\n\n" +
-    "**什么时候该用它**（满足任一条就该用，不要因为「自己做更省事」而略过）：\n" +
-    "· 一件子任务预计要读 **3 个以上文件**；\n" +
-    "· 需要在多个目录 / 多种命名约定之间**反复 glob / grep** 才能定位；\n" +
-    "· 有多件**互不依赖**的调研任务（此时在**同一条回复里并列发出多个 task 调用**，" +
-    "它们会**并行执行**，总耗时取决于最慢的一路；并发上限见配置 maxParallelAgents）。\n" +
-    "这类任务的中间过程会吃掉大量上下文，交给子代理只带回结论明显更划算。\n" +
-    "反之，一两个文件就能解决的事直接自己做更快。\n\n" +
-    "**prompt 必须自包含**（子代理看不到我们的对话历史）：" +
-    "背景、目标、已知线索、期望的输出格式与边界（哪些事不要做）。\n\n" +
-    `可用子代理：\n${SUBAGENT_LIST}\n\n` +
-    "子代理不会写入项目记忆 —— 记忆由你根据它的结论统一记录。",
+    "派生子代理独立完成子任务，只把结论带回（中间过程不进上下文）。\n" +
+    "适用：需读 3 个以上文件、或反复 glob/grep 才能定位；互不依赖的调研可并列多个（并行）。\n" +
+    "prompt 必须自包含：背景、目标、线索、期望输出、边界。\n" +
+    `可用子代理：\n${SUBAGENT_LIST}`,
   // 每个子代理是独立的 Agent 实例，不共享可变状态，因此可以安全地并发执行
   parallelSafe: true,
   parameters: {
@@ -46,17 +38,15 @@ export const taskTool: ToolDefinition = {
       subagent_name: {
         type: "string",
         enum: subAgentNames(),
-        description: `要派生的子代理名称，默认 ${DEFAULT_SUBAGENT_NAME}。`,
+        description: `子代理名称，默认 ${DEFAULT_SUBAGENT_NAME}`,
       },
       description: {
         type: "string",
-        description: "子任务的一句话说明（3-5 个词），用于界面显示与结果摘要",
+        description: "子任务的一句话说明（3-5 个词），用于界面显示",
       },
       prompt: {
         type: "string",
-        description:
-          "交给子代理的完整任务描述。子代理看不到当前对话，必须自包含：" +
-          "背景、目标、已知线索、要产出的结论与格式、不要做什么。",
+        description: "完整任务描述（子代理看不到当前对话）：背景、目标、已知线索、期望输出、边界",
       },
     },
     required: ["description", "prompt"],

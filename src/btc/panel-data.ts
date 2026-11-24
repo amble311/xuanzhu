@@ -84,6 +84,10 @@ export interface BtcPanelData {
   triggers: Trigger[];
   /** 后端算出的下次触发器评估时间（ISO） */
   nextTriggerEvalAt?: string;
+  /** 上一轮巡检耗时（后端 state 上报；旧版后端没有） */
+  lastInspectMs?: number;
+  /** 上一轮巡检的工具调用次数 */
+  lastInspectTools?: number;
   /** 后端进程是否在跑（旧版后端不会上报 nextTriggerEvalAt，需要区分「没跑」与「没上报」） */
   backendRunning: boolean;
   /** 行情连续失败次数（后端 health check 上报） */
@@ -123,6 +127,8 @@ export async function collectBtcPanelData(
     triggers: readTriggers(home, role),
     // 后端把「下次评估时间」写进 state；旧版后端没有这个字段，面板要能区分「没跑」与「没上报」
     nextTriggerEvalAt: backend?.nextTriggerEvalAt,
+    lastInspectMs: backend?.lastInspectMs,
+    lastInspectTools: backend?.lastInspectTools,
     backendRunning: backend !== null,
     marketFailures: backend?.marketFailures ?? 0,
     lastMarketError: backend?.lastMarketError,
@@ -276,11 +282,24 @@ export function btcInfoLines(data: BtcPanelData): string[] {
 
   lines.push(divider);
   lines.push(`巡检（排期 ${data.queue.length} 条）`);
+  // 「叫醒条件评估」和「巡检排期」是两件事：前者每 5 分钟扫一次阈值，只有命中才巡检。
+  // 以前只写「下次叫醒评估 20:23」，用户会当成 20:23 一定巡检，到点没动静就以为卡住了。
   if (data.nextTriggerEvalAt) {
-    lines.push(`下次叫醒评估 ${formatLocalTime(data.nextTriggerEvalAt, "monthday")}`);
+    lines.push(
+      `下次检查叫醒条件 ${formatLocalTime(data.nextTriggerEvalAt, "monthday")}` +
+        `（每 5 分钟扫一次，命中才巡检）`,
+    );
   }
-  for (const entry of data.queue.slice(0, 3)) {
-    lines.push(`- ${formatLocalTime(entry.at, "monthday")} ${entry.reason}`);
+  data.queue.slice(0, 3).forEach((entry, index) => {
+    const head = index === 0 ? "下一轮巡检" : "-";
+    lines.push(`${head} ${formatLocalTime(entry.at, "monthday")} ${entry.reason}`);
+  });
+  if (data.lastInspectMs !== undefined) {
+    const seconds = Math.round(data.lastInspectMs / 1000);
+    const cost =
+      seconds >= 60 ? `${Math.floor(seconds / 60)}m${seconds % 60}s` : `${seconds}s`;
+    const tools = data.lastInspectTools !== undefined ? ` / ${data.lastInspectTools} 次工具` : "";
+    lines.push(`上一轮耗时 ${cost}${tools}`);
   }
 
   if (data.role === "live" && data.actions.length > 0) {

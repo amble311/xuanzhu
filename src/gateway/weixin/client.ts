@@ -230,6 +230,24 @@ export async function getUpdates(options: {
   };
 }
 
+/**
+ * iLink 的写接口经常以 HTTP 200 + `ret/errcode` 业务码返回失败
+ * （限频、会话不新鲜等）。只检查 HTTP status 会把失败当成功 ——
+ * 表现就是 gateway 日志写「已送达」，用户微信里却没有消息。
+ */
+export function assertSendOk(data: {
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
+}): void {
+  const ret = typeof data.ret === "number" ? data.ret : 0;
+  const errcode = typeof data.errcode === "number" ? data.errcode : 0;
+  if (ret === 0 && errcode === 0) return;
+  throw new Error(
+    `iLink sendmessage 失败（ret=${ret} errcode=${errcode}）：${data.errmsg ?? "无错误信息"}`,
+  );
+}
+
 /** 发文本；`-2 unknown error` 这类陈旧会话会让 iLink 拒绝，去掉 context_token 再试一次 */
 export async function sendText(options: {
   baseUrl: string;
@@ -239,7 +257,11 @@ export async function sendText(options: {
   contextToken?: string;
 }): Promise<void> {
   const send = async (contextToken: string | undefined): Promise<void> => {
-    await requestJson("POST", {
+    const data = await requestJson<{
+      ret?: number;
+      errcode?: number;
+      errmsg?: string;
+    }>("POST", {
       baseUrl: options.baseUrl,
       endpoint: "ilink/bot/sendmessage",
       token: options.token,
@@ -255,6 +277,7 @@ export async function sendText(options: {
         },
       },
     });
+    assertSendOk(data);
   };
 
   try {

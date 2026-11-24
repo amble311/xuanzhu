@@ -164,7 +164,7 @@ pip install --proxy http://127.0.0.1:10809 <包名>
 验证成功后，把**本地端点**记到全局记忆（不是项目记忆），方便下次直接尝试：
 
 ```text
-memory_write target=global
+memory action=write target=global
 content:
 ## 网络代理
 - 2026-10-31：本机 SOCKS5 127.0.0.1:1080 / HTTP 127.0.0.1:10809 可用（v2rayN）；
@@ -174,7 +174,7 @@ content:
 只记录：日期、客户端类型（可选）、本地协议/地址/端口、是否可用。
 不要记录：节点名、服务器地址、UUID、订阅 URL、密码、访问过的具体 URL。
 
-如果全局记忆里已有 `## 网络代理` 小节，**优先用 `memory_compact target=global` 更新那一节**，
+如果全局记忆里已有 `## 网络代理` 小节，**优先用 `memory`（action=compact, target=global） 更新那一节**，
 不要每次都追加一条带日期的流水；只保留最近一次验证结果即可。
 
 ## 找不到或全部失败时

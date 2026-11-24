@@ -3,6 +3,7 @@ import { ensureBtcBackend } from "../btc/daemon";
 import { setupBtcEnv } from "../btc/setup";
 import { ansi } from "../utils/ansi";
 import { getBtcHome } from "../utils/paths";
+import { btcTools } from "../tools/btc";
 import type { AgentMode } from "./types";
 
 /** 模式名，同时是 `xzh btc` 的子命令名 */
@@ -47,6 +48,7 @@ export function createBtcMode(options: BtcModeOptions = {}): AgentMode {
     label: paper ? "BTC 模拟盘" : "BTC 量化交易",
     home,
     cwdLocked: true,
+    tools: btcTools,
     startupHint: paper
       ? `btc 模拟盘：工作目录固定为 ${home}（不可 /switch），` +
         `虚拟账本开平仓可用（btc_paper_*），不涉及真钱`
@@ -94,8 +96,10 @@ export function createBtcMode(options: BtcModeOptions = {}): AgentMode {
 - 工作目录固定为 ${home}，**本次运行不可 \`/switch\`**。行情库、日志、计算脚本都在这里；
   要改路径只能退出重开，不要试图绕过。
 - 交易相关能力用专用工具，不要自己拼 bash 去算：
-  \`btc_status\`（环境与数据是否新鲜）→ \`btc_sync\`（增量同步 K 线）→
-  \`btc_signal\`（三周期打分 + 1h 择时）→ \`btc_backtest\`（全量回测，支持临时覆盖参数）
+  \`btc_brief\`（**一次拿全**：环境与数据新鲜度 + 三周期打分 + 1h 择时${paper ? " + 模拟盘账本" : ""}，
+  想省时间就只调它）→ \`btc_status\` / \`btc_signal\`（只看某一项明细时）→
+  \`btc_sync\`（增量同步 K 线）→
+  \`btc_backtest\`（全量回测，支持临时覆盖参数）
   → \`btc_schedule\` / \`btc_unschedule\`（安排与撤销后台巡检）→
   \`btc_policy\`（把用户的长期要求落盘，注入后台每一轮巡检）→
   \`btc_trigger\`（把「到某价位 / 某指标值叫醒我」落盘，后台每 5 分钟评估；**只叫醒不下单**）。

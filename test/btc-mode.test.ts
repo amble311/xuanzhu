@@ -7,6 +7,7 @@ import { resolveModeHomeDir } from "../src/utils/paths";
 import { buildSystemPrompt } from "../src/core/prompt";
 import { discoverSkills, parseFrontmatter } from "../src/skills";
 import { TOOLS, toolVisibleInMode } from "../src/tools";
+import { btcTools } from "../src/tools/btc";
 import {
   btcSetupNeeded,
   btcVenvMarkPath,
@@ -191,10 +192,12 @@ describe("技能的模式归属（frontmatter: modes）", () => {
 
 describe("工具的模式归属", () => {
   it("btc_* 只在 btc 模式可见，通用工具在所有模式可见", () => {
-    const btcTools = TOOLS.filter((tool) => tool.name.startsWith("btc_"));
+    expect(createBtcMode().tools).toBe(btcTools);
+    expect(TOOLS.some((tool) => tool.name.startsWith("btc_"))).toBe(false);
     expect(btcTools.map((tool) => tool.name)).toEqual([
       "btc_price",
       "btc_status",
+      "btc_brief",
       "btc_sync",
       "btc_signal",
       "btc_backtest",

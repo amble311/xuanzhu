@@ -7,9 +7,7 @@ import type { ToolDefinition, ToolResult } from "./types";
 export const listSkillsTool: ToolDefinition = {
   name: "list_skills",
   description:
-    "列出玄猪当前可用的全部技能（名称与用途）。" +
-    "技能是一份指导你使用特定外部 CLI 工具的指南。" +
-    "当任务可能涉及某个领域（浏览器自动化、Office 文档、GitHub、数据库等）时，先调用本工具查看是否有对应技能。",
+    "列出可用技能（名称与用途）。涉及浏览器、文档、GitHub、数据库等领域时先查。",
   parameters: {
     type: "object",
     properties: {},
@@ -36,10 +34,9 @@ export const listSkillsTool: ToolDefinition = {
 /** load_skill —— 加载技能指南，并确保其外部依赖已安装 */
 export const loadSkillTool: ToolDefinition = {
   name: "load_skill",
+  smallProfile: true,
   description:
-    "加载指定技能的完整指南（SKILL.md 全文），随后请严格按指南中的步骤与命令操作。" +
-    "若该技能依赖的外部命令尚未安装，玄猪会自动安装（可能需要用户确认一次）。" +
-    "指南在本次对话中持续有效，同一个技能无需重复加载。",
+    "加载技能指南并严格按步骤操作；缺失的外部命令会自动安装。同一技能无需重复加载。",
   parameters: {
     type: "object",
     properties: {

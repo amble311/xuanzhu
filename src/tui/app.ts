@@ -26,29 +26,28 @@ import {
   type PromptPartKey,
 } from "../core/prompt";
 import type { AskUserAnswer, AskUserRequest } from "../tools/types";
+// 直接 import 具体模块，避免 `../a` barrel 的 `export *` 把整个 A 股分析栈
+// （inspect / backtest / screen / snapshot …）拉进普通会话的 TUI 进程。
 import {
   accountSummary,
-  aServiceStatus,
   loadPaperAccount,
-  loadWatchlist,
   markPaperAccount,
+  type PaperAccount,
+} from "../a/paper";
+import {
+  aServiceStatus,
   readPendingSells,
-  readPause as readAPause,
-  readRules,
-  readRuleAudits,
-  describeRule,
-  readScheduleQueue as readAScheduleQueue,
-  setPaused as setAPaused,
   startAService,
   stopAService,
-  poolSize,
-  maxPositions,
-  type PaperAccount,
-} from "../a";
+} from "../a/monitor";
+import { loadWatchlist } from "../a/watchlist";
+import { readPause as readAPause, setPaused as setAPaused } from "../a/pause";
+import { describeRule, readRules } from "../a/rules";
+import { readRuleAudits } from "../a/rule-audit";
+import { readScheduleQueue as readAScheduleQueue } from "../a/schedule";
+import { maxPositions, poolSize } from "../a/settings";
 import { fetchQuote, sessionKind, sessionLabel, type Quote } from "../exchange/ashare";
 import type { AgentMode } from "../modes";
-import { createAShareMode } from "../modes/a";
-import { createBtcMode } from "../modes/btc";
 import { formatLocalTime } from "../utils/time";
 import { activeExchange } from "../exchange";
 import { ensureBtcBackend, liveBackend, stopBtcBackend } from "../btc/daemon";
@@ -145,6 +144,7 @@ import {
 } from "../utils/ansi";
 import { MarkdownRenderer } from "./markdown";
 import { completeTermInput, ShellPanel } from "./terminal";
+import { startHangWatchdog, type WatchdogHandle } from "./watchdog";
 
 /**
  * 目标模式（`/goal`）最多自动继续多少轮（含首轮）。
@@ -376,6 +376,8 @@ export class TuiApp {
   private inputCursor = 0;
   private scrollOffset = 0;
   private statusText = "就绪";
+  /** 同步卡死看门狗；只在 TUI 启动期间存在 */
+  private watchdog?: WatchdogHandle;
   private statusDetail = "";
   /** 当前任务列表（todo_write），显示在顶部信息区 */
   private todoItems: TodoItem[] = [];
@@ -641,6 +643,25 @@ export class TuiApp {
 
   async start(): Promise<void> {
     this.enterTerminal();
+    // 事件循环被同步代码占满时，同进程的定时器不会触发，必须靠 Worker 心跳兜底。
+    // 默认 180s；0 关闭（配置里也能改）。调试器附加时 watchdog 会自动跳过。
+    const watchdogSeconds = Number(
+      this.options.config.hangWatchdogSeconds ?? 180,
+    );
+    try {
+      this.watchdog =
+        startHangWatchdog({
+          timeoutMs:
+            Number.isFinite(watchdogSeconds) && watchdogSeconds > 0
+              ? watchdogSeconds * 1000
+              : 0,
+        }) ?? undefined;
+    } catch {
+      // 看门狗是兜底能力，创建失败不能影响正常启动
+      this.watchdog = undefined;
+    }
+    // 让模型可以通过 watchdog 工具查看 / 临时放宽（不提供关闭）
+    this.agent.setWatchdogControl(this.watchdog);
     if (this.options.startupNotice) {
       for (const line of this.options.startupNotice.split("\n")) {
         this.lines.push(line);
@@ -852,6 +873,7 @@ export class TuiApp {
     } catch {
       // 收尾阶段不该再抛异常（终端可能已经消失）：至少让等待 start() 的地方继续
       this.exited = true;
+      this.stopWatchdog();
       try {
         restoreTerminalSafely();
       } catch {
@@ -867,6 +889,7 @@ export class TuiApp {
   private shutdown(): void {
     if (this.exited) return;
     this.exited = true;
+    this.stopWatchdog();
     // 本轮没收尾就退出：在会话文件里补一条说明，下次 /resume 才知道「上一轮没有结论」
     this.noteInterruptedTurn();
     // 设备桥持有监听中的 http/ws 句柄 —— 不关掉事件循环不会空，进程会退不出去
@@ -896,6 +919,13 @@ export class TuiApp {
     this.term.dispose();
     this.exitTerminal();
     this.resolveExit?.();
+  }
+
+  private stopWatchdog(): void {
+    // 先撤掉工具侧的控制句柄，避免 shutdown 期间还有工具拿到已停止的看门狗
+    this.agent.setWatchdogControl(undefined);
+    this.watchdog?.stop();
+    this.watchdog = undefined;
   }
 
   /**
@@ -3091,7 +3121,7 @@ export class TuiApp {
         if (sub === "off" || sub === "exit") {
           this.switchBackToXzh();
         } else if (sub === "" || sub === "moni" || sub === "paper") {
-          this.switchToBtc(sub !== "");
+          void this.switchToBtc(sub !== "");
         } else {
           this.lines.push(
             `${ansi.gray}用法：/btc（实盘）· /btc moni（模拟盘）· /xzh（回到普通模式）${ansi.reset}`,
@@ -3104,7 +3134,7 @@ export class TuiApp {
         if (sub === "off" || sub === "exit") {
           this.switchBackToXzh();
         } else if (sub === "") {
-          this.switchToAShare();
+          void this.switchToAShare();
         } else {
           this.lines.push(
             `${ansi.gray}用法：/a（进入 A 股分析）· /xzh（回到普通模式）${ansi.reset}`,
@@ -4121,9 +4151,11 @@ export class TuiApp {
     this.scheduleRender();
   }
 
-  private switchToBtc(paper: boolean): void {
+  private async switchToBtc(paper: boolean): Promise<void> {
     const home = getBtcHome();
     const role = paper ? "paper" : "live";
+    // 模式实现（连带 btc_* 工具与 BTC 业务层）只在真正切换时才加载
+    const { createBtcMode } = await import("../modes/btc");
     const mode = createBtcMode({ paper });
 
     if (this.mode?.name === "btc") {
@@ -4163,7 +4195,7 @@ export class TuiApp {
   }
 
   /** `/a`：进入 A 股分析模式 */
-  private switchToAShare(): void {
+  private async switchToAShare(): Promise<void> {
     if (this.mode?.name === "a") {
       this.lines.push(`${ansi.gray}已在 A 股分析模式；/xzh 可回到原项目${ansi.reset}`);
       this.ensureServiceFor(this.mode);
@@ -4171,6 +4203,8 @@ export class TuiApp {
       return;
     }
     process.env.XZH_BTC_ROLE = "live";
+    // A 股模式连带 aShareTools 与监控实现，按需加载
+    const { createAShareMode } = await import("../modes/a");
     const mode = createAShareMode();
     this.enterMode(mode);
     this.lines.push(

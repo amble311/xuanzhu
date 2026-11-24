@@ -42,6 +42,7 @@ import {
   executeTool,
   findTool,
   getToolSpecs,
+  resolveTool,
   TOOLS,
   toolsForSubAgent,
   toolVisibleInMode,
@@ -66,6 +67,7 @@ import type {
   ToolContext,
   ToolDefinition,
   ToolResult,
+  WatchdogControl,
 } from "../tools/types";
 import type { DeviceBridge } from "../device";
 import type { AgentMode } from "../modes";
@@ -360,12 +362,12 @@ const NON_REPEATABLE_TOOLS = new Set(["a_select", "a_screen", "a_backtest", "btc
 const MAX_REPEATABLE_SKIPS = 2;
 
 /**
- * 只读「调研类」工具。
+ * 只读「调研类」工具的判定已移到 `ToolDefinition.exploration`。
  *
- * 它们的输出会**持续占用上下文**（几十屏的文件内容、搜索结果），正是子代理的适用场景，
- * 因此单独统计：本轮累积到一定规模时把「可改用子代理」明确摆到模型面前。
+ * 以前是这里的一份工具名 Set，合并出 `code_nav` 后名单没跟上，
+ * 用 `code_nav` 大面积调研就不会再触发「可改用子代理」的提醒。
  */
-const EXPLORATION_TOOLS = new Set(["read_file", "list_dir", "glob", "grep"]);
+
 
 /**
  * 触发「建议改用子代理」提醒的阈值（满足任一条即触发，且整轮只提醒一次）。
@@ -412,33 +414,18 @@ const DEFAULT_PARALLEL_AGENTS = 4;
 
 /** 窗口不超过该值视为「小上下文模型」，自动使用精简档 */
 const SMALL_CONTEXT_WINDOW = 32_768;
+/**
+ * 窗口不超过该值视为「极小上下文模型」（本地 8k / 16k 常见）。
+ *
+ * 仍归在 small 档下，但会再压一档：输出上限 1024、工具描述截到一句话、
+ * 读取行数 / 输出字符减半、AGENTS 与记忆节选更短。
+ */
+const TINY_CONTEXT_WINDOW = 20_000;
 /** 小上下文档的默认输出上限（给输入留空间） */
 const SMALL_MAX_OUTPUT_TOKENS = 2048;
-/**
- * 小上下文档保留的工具：读写、检索、执行、计划、状态与记忆。
- * 子代理 / 技能 / 记忆压缩等低频工具暂不下发，节省 schema token。
- */
-const SMALL_TOOL_NAMES = new Set([
-  "repo_map",
-  "find_symbol",
-  "read_symbol",
-  "read_file",
-  "list_dir",
-  "glob",
-  "grep",
-  "write_file",
-  "edit_file",
-  "bash",
-  "bash_output",
-  "bash_kill",
-  "todo_write",
-  "memory_read",
-  "memory_write",
-  "memory_compact",
-  "load_skill",
-  "report_status",
-  "ask_user",
-]);
+/** 极小窗口的输出上限：8k 窗口下 2048 就占 25%，压到 1024 才留得下对话 */
+const TINY_MAX_OUTPUT_TOKENS = 1024;
+/* 小上下文档保留哪些工具，见 `ToolDefinition.smallProfile`（跟着工具定义走，避免名单漂移）。 */
 
 /**
  * 目标模式下，单次 `run` 允许「追加工具轮次配额」的次数。
@@ -475,19 +462,13 @@ const ABORT_NOTE_ARG_CHARS = 120;
  * 因此一旦这次会话裁过历史，之后每次请求都附上这条说明：明确告诉模型"你看的不是完整历史"，
  * 残缺的旧任务不是待办，当前消息才是要做的事。
  */
-function contextTrimmedNote(taskDigest?: string | null): ChatMessage {
-  let content =
+function contextTrimmedNote(): ChatMessage {
+  const content =
     "[上下文提醒] 更早的对话已因超出上下文窗口被裁剪，你看到的**不是完整历史**：\n" +
     "· 被裁掉的内容不要推测、不要补做；\n" +
     "· 上文里那些没有结论的旧任务只是残片，**不代表要接着做**；\n" +
     "· 只有当用户最新一条消息明确要求继续时才续做，否则先回答他当前这条消息；\n" +
-    "· 若当前消息指向你已经看不到的上下文，先问清楚，再动手。";
-  if (taskDigest) {
-    content +=
-      "\n\n[任务账本 · 历史裁剪后重建]\n" +
-      taskDigest +
-      "\n（以这份账本为准继续当前任务，不要重做已完成的部分。）";
-  }
+    "· 任务进度以[当前状态]块里的账本为准，不要重做已完成的部分。";
   return { role: "system", content };
 }
 
@@ -588,6 +569,14 @@ export class Agent {
   /** 是否已就「系统提示词撑满窗口」提示过（避免每条消息都刷一遍） */
   private warnedTightContext = false;
   /**
+   * 本轮开始时的会话预算（token）。
+   *
+   * 工具结果上限按它计算；缓存一份避免并行批次里每个工具都重算一遍历史估算。
+   */
+  private roundBudget = 0;
+  /** 本轮 run 是否已经自动压缩过一次（避免在阈值附近反复触发） */
+  private autoCompactedThisRun = false;
+  /**
    * 本次会话的历史**是否被裁过**（裁剪是永久性的，裁掉的部分就没了）。
    *
    * 一旦为真，组装请求时会附上 `contextTrimmedNote()` —— 否则模型会把残缺的旧任务
@@ -675,6 +664,12 @@ export class Agent {
    * 因此用户在另一个终端跑 `xzh device serve` 时同样可用（见 `tools/device.ts`）。
    */
   private deviceBridge?: DeviceBridge;
+  /**
+   * 看门狗运行时控制（由 TUI 在 start 时注入）。
+   *
+   * 只用于 `watchdog` 工具的 status/extend/restore；非 TUI 会话为 undefined。
+   */
+  private watchdogControl?: WatchdogControl;
   /** 是否允许后台 shell 任务（子代理关闭） */
   private readonly backgroundJobsEnabled: boolean;
   /** 后台任务注册表（主代理首次用到时创建） */
@@ -809,6 +804,9 @@ export class Agent {
         overrides: this.config.promptOverrides,
         autonomy: autonomyModeOf(this.config),
         modeSection: this.mode?.promptSection,
+        tiny: this.isTinyContext(),
+        allowPrivilegedAuth: this.config.allowPrivilegedAuth !== false,
+        hangWatchdogSeconds: this.config.hangWatchdogSeconds ?? 180,
       },
     );
   }
@@ -833,10 +831,11 @@ export class Agent {
       this.globalMemory?.longTerm &&
       this.globalMemory.longTerm.length > GLOBAL_MEMORY_EXCERPT_CHARS
     ) {
+      // 极小窗口只挑 600 字符：目录已经在本轮之前注入过，足够模型判断要不要读全文。
       const relevant = selectRelevantGlobalMemory(
         this.globalMemory.longTerm,
         recent,
-        1_800,
+        this.isTinyContext() ? 600 : this.contextProfile() === "small" ? 800 : 1_800,
       );
       if (relevant) parts.push(`## 本轮相关全局记忆\n${relevant}`);
     }
@@ -898,7 +897,7 @@ export class Agent {
       "## 本轮全局记忆提醒\n" +
       "系统已尝试自动捕获这条消息里明确的全局信息（凭据已加密）。" +
       "如果还有遗漏的跨项目稳定事实（用户偏好、代理地址、统一安装/构建方式），" +
-      "请在本轮结束前用 `memory_write target=global` 补充；" +
+      "请在本轮结束前用 `memory`（action=write, target=global）补充；" +
       "只属于当前项目的内容仍写项目记忆。\n" +
       "**密码 / Token / UUID / API Key 原文绝对不能写进回复**；" +
       "写入记忆时工具会自动加密为 `[加密凭据 ...]`，不要复述或猜测其值。"
@@ -935,7 +934,7 @@ export class Agent {
       this.pendingMemoryNotices.push(
         `${label}长期记忆已自动精简（${parts.join("、")}，${result.before} → ${result.after} 字符）。` +
           `按主题整理的稳定小节不受自动裁剪影响；` +
-          `若需要更彻底的压缩，可让玄猪用 memory_compact 重写为精简版本。`,
+          `若需要更彻底的压缩，可让玄猪用 memory（action=compact）重写为精简版本。`,
       );
     };
 
@@ -1421,12 +1420,35 @@ export class Agent {
     return window > 0 && window <= SMALL_CONTEXT_WINDOW ? "small" : "full";
   }
 
+  /** 极小窗口（本地 8k / 16k）：在 small 档基础上再收紧一档 */
+  private isTinyContext(): boolean {
+    if (this.config.contextProfile === "full") return false;
+    const window =
+      this.activeModel?.contextWindow ??
+      inferContextWindow(this.activeModel?.model ?? "");
+    return window > 0 && window <= TINY_CONTEXT_WINDOW;
+  }
+
+  /**
+   * 工具 schema 的压缩选项：只在小窗口下生效。
+   *
+   * 小模型难消化长描述，且每轮都要付这份 token；截到「一句话 + 关键词」通常足够
+   * 让它选对工具与参数。极小窗口再紧一档。
+   */
+  private toolSpecOptions(): { maxDescriptionChars: number; maxParamDescriptionChars: number } | undefined {
+    if (this.contextProfile() !== "small") return undefined;
+    return this.isTinyContext()
+      ? { maxDescriptionChars: 90, maxParamDescriptionChars: 40 }
+      : { maxDescriptionChars: 140, maxParamDescriptionChars: 60 };
+  }
+
   /** 本次请求的输出上限（配置优先，small 档默认 2048） */
   private requestMaxTokens(): number | undefined {
     const configured = this.config.maxOutputTokens;
     if (typeof configured === "number" && configured > 0) {
       return Math.floor(configured);
     }
+    if (this.isTinyContext()) return TINY_MAX_OUTPUT_TOKENS;
     return this.contextProfile() === "small" ? SMALL_MAX_OUTPUT_TOKENS : undefined;
   }
 
@@ -1443,7 +1465,7 @@ export class Agent {
       ? estimateMessageTokens({ role: "system", content: stateBlock })
       : 0;
     const toolsTokens = estimateTokens(
-      JSON.stringify(getToolSpecs(this.requestTools())),
+      JSON.stringify(getToolSpecs(this.requestTools(), this.toolSpecOptions())),
     );
     const historyTokens = this.history.reduce(
       (sum, message) => sum + estimateMessageTokens(message),
@@ -1581,6 +1603,10 @@ export class Agent {
   }
 
   /** 注入 / 撤销设备桥（界面在 `/device serve` 与 `/device stop` 时调用） */
+  setWatchdogControl(control?: WatchdogControl): void {
+    this.watchdogControl = control;
+  }
+
   setDeviceBridge(bridge?: DeviceBridge): void {
     const changed = Boolean(this.deviceBridge) !== Boolean(bridge);
     this.deviceBridge = bridge;
@@ -1613,8 +1639,21 @@ export class Agent {
    * 每轮都发会白白增加提示词（本地模型 prefill 很贵），模型也可能去调用
    * 一个根本连不上的设备。连接后再恢复。
    */
+  /**
+   * 本次会话可用的全部工具。
+   *
+   * 优先级：调用方给定的受限集（子代理）> 通用集 + 模式专属集。
+   * 模式工具（`btc_*` / `a_*`）只在 `mode.tools` 存在时合并 —— 普通会话不加载它们，
+   * 也就不会为整套 A 股 / 交易所业务层付内存。`requestTools()` 再按模式过滤 schema。
+   */
+  private allTools(): ToolDefinition[] {
+    if (this.tools) return this.tools;
+    const extra = this.mode?.tools;
+    return extra && extra.length > 0 ? [...TOOLS, ...extra] : TOOLS;
+  }
+
   private requestTools(): ToolDefinition[] {
-    const tools = this.tools ?? TOOLS;
+    const tools = this.allTools();
     const goalActive = Boolean(this.goal && !this.goal.completed);
     const small = this.contextProfile() === "small";
     return tools.filter((tool) => {
@@ -1629,7 +1668,7 @@ export class Agent {
         if (tool.name === "goal_complete" && goalActive) return true;
         // 模式专属工具是那个模式的全部能力，小窗口下也不能砍掉
         if (tool.modes && tool.modes.length > 0) return true;
-        if (!SMALL_TOOL_NAMES.has(tool.name)) return false;
+        if (tool.smallProfile !== true) return false;
       }
       return true;
     });
@@ -1764,6 +1803,7 @@ export class Agent {
     this.runVerifyOk = false;
     this.runWroteMemory = false;
     this.backgroundWaitNotified = false;
+    this.autoCompactedThisRun = false;
     // 用户最新一条消息定义当前任务；旧任务暂停时不会自动继续
     this.beginTask(userInput);
     // 原始输入用于全局记忆相关性/提醒；意图分析后的 content 可能丢失关键词
@@ -1984,7 +2024,8 @@ export class Agent {
     /** 记录一次只读调研；首次超过阈值时返回一段追加到工具结果末尾的提醒 */
     const explorationReminder = (toolName: string, output: string): string => {
       if (delegationSuggested || usedSubAgent) return "";
-      if (!EXPLORATION_TOOLS.has(toolName)) return "";
+      // 含旧名别名（如 repo_map → code_nav）
+      if (resolveTool(toolName, this.allTools())?.tool.exploration !== true) return "";
       explorationCalls++;
       explorationChars += output.length;
       if (
@@ -2051,6 +2092,50 @@ export class Agent {
         // 每轮裁剪「已提交」的历史；本轮未提交的 turn 由 buildConversation 在组装
         // 请求时一并裁剪，避免单轮内上下文突破模型窗口。
         this.trimHistory();
+        // 工具结果上限按本轮预算算（见 runTool 的 ctx.limits）
+        this.roundBudget = this.conversationBudget();
+
+        // 历史逼近预算时先做一次滚动摘要，而不是等 trimHistory 静默裁掉：
+        // 裁掉的部分永久丢失，模型会忘记「做到哪了」而重复劳动。
+        // 每轮 run 只尝试一次；子代理不参与（它们本来就活在受限上下文里）。
+        if (
+          !this.autoCompactedThisRun &&
+          !this.systemPromptOverride &&
+          this.config.autoCompact !== false &&
+          this.history.length >= COMPACT_KEEP_MESSAGES * 2
+        ) {
+          const used = this.history.reduce(
+            (sum, message) => sum + estimateMessageTokens(message),
+            0,
+          );
+          if (this.roundBudget > 0 && used > this.roundBudget * 0.85) {
+            this.autoCompactedThisRun = true;
+            this.events.onStatus(
+              "自动压缩上下文",
+              `已用 ${Math.round((used / this.roundBudget) * 100)}% 预算`,
+            );
+            try {
+              const result = await this.compactHistory(signal);
+              if (result.compacted) {
+                this.events.onNotice?.(
+                  `上下文接近上限，已自动压缩：${result.before} → ${result.after} 条消息。`,
+                );
+                this.roundBudget = this.conversationBudget();
+              }
+            } catch (err) {
+              if (signal?.aborted) {
+                rollbackTurn("被用户中断");
+                this.events.onStatus("已中断");
+                return;
+              }
+              // 摘要失败不能影响本轮：退回常规裁剪兜底
+              this.events.onNotice?.(
+                `自动压缩失败，继续使用常规裁剪：` +
+                  `${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          }
+        }
 
         this.events.onStatus("思考中", `第 ${round + 1} 轮`);
 
@@ -2117,7 +2202,7 @@ export class Agent {
                   .map((job) => `${job.id}（\`${job.command}\`）`)
                   .join("、")}\n\n` +
                 "· 如果你在等它的结果：本轮先不要收尾 —— 继续做别的事，或用 " +
-                "bash_output 查看当前输出；\n" +
+                "bash_job（action=output）查看当前输出；\n" +
                 "· 如果它本来就该长期运行（dev server / 监听）：忽略本条直接给出结论，" +
                 "它会在后台继续，结束时系统会提示。",
             });
@@ -2670,7 +2755,7 @@ export class Agent {
     try {
       const stream = this.provider.chat({
         messages,
-        tools: getToolSpecs(this.requestTools()),
+        tools: getToolSpecs(this.requestTools(), this.toolSpecOptions()),
         temperature: this.config.temperature,
         maxTokens: this.requestMaxTokens(),
         systemCachePrefix: system.static,
@@ -2954,7 +3039,9 @@ export class Agent {
     call: ToolCall,
     signal?: AbortSignal,
   ): Promise<ExecuteToolResult> {
-    const tool = findTool(call.name, this.tools);
+    // 解析旧名别名：合并工具后，恢复的旧会话里可能仍残留 `memory_write(...)`
+    const resolved = resolveTool(call.name, this.allTools());
+    const tool = resolved?.tool;
     if (!tool) {
       return { ok: false, content: `错误：未知工具 "${call.name}"` };
     }
@@ -2973,7 +3060,10 @@ export class Agent {
     // 自治等级闸门（确定性）：observe 模式下「会改动环境」的操作一律不执行。
     // 放在确认框之前 —— 观察模式的语义是「根本不放行」，而不是「先问再说」。
     const autonomy = autonomyModeOf(this.config);
-    if (autonomy === "observe" && OBSERVE_BLOCKED_TOOLS.has(tool.name)) {
+    if (
+      autonomy === "observe" &&
+      this.isObserveBlocked(tool.name, call.arguments, call.name)
+    ) {
       let parsed: Record<string, unknown> = {};
       try {
         const value = JSON.parse(call.arguments);
@@ -3039,6 +3129,19 @@ export class Agent {
 
     this.events.onToolStart(call);
 
+    // 单条工具结果最多占本轮预算的 15%（上限 8000，下限 300）。
+    // 下限必须低：8k 窗口的会话预算只有 ~3–4k，固定 800 会让一条工具结果吃掉 20%。
+    // 字符上限（maxOutputChars）与 token 上限是两道不同口径的闸门，
+    // 后者才能挡住「中文没超字符数、却把窗口吃光」的情况。
+    const budgetForResult =
+      this.roundBudget > 0 ? this.roundBudget : this.conversationBudget();
+    const resultTokenCap = Math.min(
+      8000,
+      Math.max(300, Math.floor(budgetForResult * 0.15)),
+    );
+    const tiny = this.isTinyContext();
+    const small = this.contextProfile() === "small";
+
     const ctx: ToolContext = {
       cwd: this.cwd,
       // 技能过滤必须在这里传下去：只在提示词里说「只有 btc 技能」是拦不住模型的，
@@ -3053,9 +3156,13 @@ export class Agent {
       status: this.statusStore(),
       memoryMaxChars: this.config.memoryMaxChars,
       globalMemoryMaxChars: this.config.globalMemoryMaxChars,
+      // 默认允许 sudo / SSH 密码；用户 `xzh config privileged off` 后 bash 只放行 sudo -n
+      allowPrivilegedAuth: this.config.allowPrivilegedAuth !== false,
+      watchdog: this.watchdogControl,
       limits: {
-        maxReadLines: this.contextProfile() === "small" ? 300 : undefined,
-        maxOutputChars: this.contextProfile() === "small" ? 6000 : undefined,
+        maxReadLines: tiny ? 150 : small ? 300 : undefined,
+        maxOutputChars: tiny ? 3000 : small ? 6000 : undefined,
+        maxResultTokens: resultTokenCap,
         artifactDir: path.join(this.cwd, ".xuanzhu", "artifacts"),
       },
       spawnAgent: (input) => this.spawnSubAgent(input, signal),
@@ -3070,7 +3177,7 @@ export class Agent {
       call.name,
       call.arguments,
       ctx,
-      this.tools ?? this.requestTools(),
+      this.allTools(),
     );
     this.recordToolResult(call.name, call.arguments, outcome);
     return outcome;
@@ -3082,6 +3189,41 @@ export class Agent {
    * 只从 `runTool` 的成功路径调用（用户拒绝 / 中断的早退不会走到这里），
    * 因此状态块里的「最近动作」都是确实发生过的。
    */
+  /**
+   * observe 模式下是否应拦截。
+   *
+   * `bash_job` 是合并后的工具：`action=output` 只是读日志，不该拦；
+   * `action=kill` 会终止进程，必须按旧 `bash_kill` 的规则拦下。
+   */
+  private isObserveBlocked(
+    name: string,
+    argsJson: string,
+    rawName = name,
+  ): boolean {
+    if (OBSERVE_BLOCKED_TOOLS.has(name)) return true;
+    // 旧名 bash_kill：别名解析发生在 executeTool 里，这里拿到的是原始调用名
+    if (rawName === "bash_kill") return true;
+    if (name !== "bash_job") return false;
+    try {
+      const args = JSON.parse(argsJson) as { action?: unknown };
+      return args.action === "kill";
+    } catch {
+      return false;
+    }
+  }
+
+  /** 本次调用是否是「写记忆」（含合并前的旧名 memory_write） */
+  private isMemoryWrite(name: string, argsJson: string): boolean {
+    if (name === "memory_write") return true;
+    if (name !== "memory") return false;
+    try {
+      const args = JSON.parse(argsJson) as { action?: unknown };
+      return args.action === "write";
+    } catch {
+      return false;
+    }
+  }
+
   private recordToolResult(
     name: string,
     argsJson: string,
@@ -3092,7 +3234,7 @@ export class Agent {
     if (this.recentActions.length > 8) this.recentActions.shift();
     this.runActionSeq += 1;
     this.runToolCounts.set(name, (this.runToolCounts.get(name) ?? 0) + 1);
-    if (name === "memory_write" && outcome.ok) this.runWroteMemory = true;
+    if (outcome.ok && this.isMemoryWrite(name, argsJson)) this.runWroteMemory = true;
 
     let args: Record<string, unknown> = {};
     try {
@@ -3154,7 +3296,7 @@ export class Agent {
 
   /** 该工具是否可与其它可并行工具同时执行 */
   private isParallelTool(name: string): boolean {
-    return findTool(name, this.tools)?.parallelSafe === true;
+    return findTool(name, this.allTools())?.parallelSafe === true;
   }
 
   /** 并行执行的工具数量上限（配置值经夹取，防止误配置打爆服务商） */
@@ -3304,7 +3446,7 @@ export class Agent {
     const limit =
       this.contextProfile() === "small"
         ? 4000
-        : (definition.maxReportChars ?? 12_000);
+        : (definition.maxReportChars ?? 6_000);
     const normalized = normalizeSubagentReport(output, limit);
     const report = normalized.text;
     if (!report) {
@@ -3345,37 +3487,37 @@ export class Agent {
    * 而不是等到撞上 400 再靠 `CONTEXT_RETRY_BUDGET_RATIO` 收敛重试。
    */
   private conversationBudget(): number {
-    const raw = resolveConversationBudget(
-      this.activeModel?.contextWindow,
-      this.activeModel?.model ?? "",
-      this.effectiveSystemPrompt(),
-    );
-    // 小窗口模型：system + tools + state + 输出预留必须先扣掉，否则
-    // 「会话预算」看似 55% 窗口，加上工具 schema 后总量会超过窗口。
     const window =
       this.activeModel?.contextWindow ??
       inferContextWindow(this.activeModel?.model ?? "");
-    if (this.contextProfile() === "small" && window > 0) {
-      const fixed =
-        estimateMessageTokens({
-          role: "system",
-          content: this.effectiveSystemPrompt(),
-        }) +
-        estimateTokens(JSON.stringify(getToolSpecs(this.requestTools()))) +
-        (this.buildSelfStateBlock()
-          ? estimateMessageTokens({
-              role: "system",
-              content: this.buildSelfStateBlock() ?? "",
-            })
-          : 0) +
-        (this.requestMaxTokens() ?? 0);
-      const available = Math.max(1, window - fixed);
-      return calibrateBudget(
-        Math.min(raw, available),
-        this.tokenCalibrator().factor(),
-      );
+    const system = this.effectiveSystemPrompt();
+    const raw = resolveConversationBudget(
+      this.activeModel?.contextWindow,
+      this.activeModel?.model ?? "",
+      system,
+    );
+    if (!(window > 0)) {
+      return calibrateBudget(raw, this.tokenCalibrator().factor());
     }
-    return calibrateBudget(raw, this.tokenCalibrator().factor());
+    // system + tools + state + 输出预留必须在**所有档位**都扣掉。
+    // 只扣 system（full 档此前的行为）会把 5k+ 的工具声明当成不存在：
+    // 预算看起来够、实际发出去超窗，只能靠 400 之后收敛重试 —— 那一次请求纯属浪费。
+    // 小窗口下这道扣除更是必需，否则「会话预算」加上 schema 后总量直接超过窗口。
+    const stateBlock = this.buildSelfStateBlock();
+    const fixed =
+      estimateMessageTokens({ role: "system", content: system }) +
+      estimateTokens(
+        JSON.stringify(getToolSpecs(this.requestTools(), this.toolSpecOptions())),
+      ) +
+      (stateBlock
+        ? estimateMessageTokens({ role: "system", content: stateBlock })
+        : 0) +
+      (this.requestMaxTokens() ?? 0);
+    const available = Math.max(1, window - fixed);
+    return calibrateBudget(
+      Math.min(raw, available),
+      this.tokenCalibrator().factor(),
+    );
   }
 
   /**
@@ -3404,13 +3546,10 @@ export class Agent {
     const trimmed = trimMessagesToBudget(capped, budget);
     // 本次请求自己丢了消息（条数上限或 token 预算）→ 记下来
     if (trimmed.length < capped.length) this.historyTrimmed = true;
-    // 历史被裁过就附上说明 + 任务账本摘要：模型看到的不是完整历史，
-    // 但「做到哪了 / 还差什么」由代码维护，不依赖它从残片里猜。
+    // 历史被裁过就附上说明。任务进度由状态块承载（buildSelfStateBlock 已带账本摘要），
+    // 这里不再重复一份 —— 否则裁剪后每次请求会出现两份几乎相同的「任务/已完成/决策」。
     this.ensureTaskLoaded();
-    const digest = this.task ? formatTaskDigest(this.task) : null;
-    return this.historyTrimmed
-      ? [contextTrimmedNote(digest), ...trimmed]
-      : trimmed;
+    return this.historyTrimmed ? [contextTrimmedNote(), ...trimmed] : trimmed;
   }
 
   /**

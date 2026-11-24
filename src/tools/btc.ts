@@ -240,9 +240,17 @@ const statusTool: ToolDefinition = {
   modes: BTC_MODES,
   description:
     "查看 btc 模式的运行环境与本地行情库状态：计算环境是否装好、日线/4 小时线各多少根、" +
-    "最新数据时间、交易标的与风控参数。**任何交易判断之前先调它**，以免拿着过期数据下结论。",
+    "最新数据时间、交易标的与风控参数。**任何交易判断之前先确认数据新鲜**，以免拿着过期数据下结论" +
+    "（后台巡检可以直接调 `btc_brief`，它把状态与信号一次返回）。",
   parameters: { type: "object", properties: {}, required: [] },
   async execute(): Promise<ToolResult> {
+    return runStatusReport();
+  },
+};
+
+/** `btc_status` 的实现：`btc_brief` 复用同一份，避免两个工具的口径分叉 */
+async function runStatusReport(): Promise<ToolResult> {
+  {
     const home = getBtcHome();
     const assets = ensureBtcAssets(home);
     const lines = describeEnv(home);
@@ -304,8 +312,8 @@ const statusTool: ToolDefinition = {
       ].join("\n"),
       summary: "btc 环境与数据状态",
     };
-  },
-};
+  }
+}
 
 // ─────────────────────────── btc_sync ───────────────────────────
 
@@ -373,27 +381,33 @@ const signalTool: ToolDefinition = {
     "≥60 分且形态成立才是 `entry=now`。" +
     "返回 `side_filter`（方向）、`score`（三周期打分）、`stage4_1h`（机会评分/关键位/失效条件/" +
     "止损/目标）与建议动作（long/short/wait/stand_aside）。" +
-    "数据来自本地库：先 btc_status 确认数据新鲜，必要时 btc_sync 补齐（尤其 1h）。" +
+    "数据来自本地库：先确认数据新鲜（`btc_brief` 已带状态，或单独 btc_status），" +
+    "必要时 btc_sync 补齐（尤其 1h）。" +
     "`side_filter` 为 none / unknown，或 `stage4_1h.entry=wait` 时不得下单（btc_order 也会拒绝）。",
   parameters: { type: "object", properties: {}, required: [] },
   async execute(): Promise<ToolResult> {
-    ensureBtcAssets(getBtcHome());
-    const result = await runRunner<unknown>("signal", {}, { timeoutMs: 60_000 });
-    if (!result.ok) {
-      return {
-        ok: false,
-        content: `✗ 三周期信号计算失败：${result.error}${
-          result.detail ? `\n${result.detail}` : ""
-        }`,
-      };
-    }
-    return {
-      ok: true,
-      content: formatSignal(result.data),
-      summary: "三周期打分 + 1h 择时",
-    };
+    return runSignalReport();
   },
 };
+
+/** `btc_signal` 的实现：`btc_brief` 复用同一份 */
+async function runSignalReport(): Promise<ToolResult> {
+  ensureBtcAssets(getBtcHome());
+  const result = await runRunner<unknown>("signal", {}, { timeoutMs: 60_000 });
+  if (!result.ok) {
+    return {
+      ok: false,
+      content: `✗ 三周期信号计算失败：${result.error}${
+        result.detail ? `\n${result.detail}` : ""
+      }`,
+    };
+  }
+  return {
+    ok: true,
+    content: formatSignal(result.data),
+    summary: "三周期打分 + 1h 择时",
+  };
+}
 
 // ─────────────────────────── btc_backtest ───────────────────────────
 
@@ -1183,24 +1197,29 @@ const paperStatusTool: ToolDefinition = {
     "**模拟盘不涉及真钱**，用于验证策略与决策，不要把它当成实盘账户。",
   parameters: { type: "object", properties: {}, required: [] },
   async execute(): Promise<ToolResult> {
-    ensureBtcAssets(getBtcHome());
-    const mark = await fetchMarkPrice();
-    const result = await runRunner<PaperStatusData>("paper-status", {
-      mark_price: mark,
-    });
-    if (!result.ok) {
-      return {
-        ok: false,
-        content: `✗ 读取模拟盘失败：${result.error}${result.detail ? `\n${result.detail}` : ""}`,
-      };
-    }
-    return {
-      ok: true,
-      content: formatPaperStatus(result.data),
-      summary: `模拟盘权益 ${formatNumber(result.data.equity)}`,
-    };
+    return runPaperReport();
   },
 };
+
+/** `btc_paper_status` 的实现：`btc_brief` 复用同一份 */
+async function runPaperReport(): Promise<ToolResult> {
+  ensureBtcAssets(getBtcHome());
+  const mark = await fetchMarkPrice();
+  const result = await runRunner<PaperStatusData>("paper-status", {
+    mark_price: mark,
+  });
+  if (!result.ok) {
+    return {
+      ok: false,
+      content: `✗ 读取模拟盘失败：${result.error}${result.detail ? `\n${result.detail}` : ""}`,
+    };
+  }
+  return {
+    ok: true,
+    content: formatPaperStatus(result.data),
+    summary: `模拟盘权益 ${formatNumber(result.data.equity)}`,
+  };
+}
 
 const paperOpenTool: ToolDefinition = {
   name: "btc_paper_open",
@@ -1992,9 +2011,53 @@ const triggerTool: ToolDefinition = {
   },
 };
 
+// ─────────────────────────── btc_brief ───────────────────────────
+
+/**
+ * 一次拿全的「巡检快照」。
+ *
+ * 为什么合并：后台巡检原本要依次调 `btc_status` → `btc_signal` →（模拟盘）`btc_paper_status`，
+ * 本地模型每次工具往返 30–60 秒，光取数就多烧 2 分钟。这三个都是**只读**、互不依赖，
+ * 合成一次调用后模型少两轮推理，耗时直接降下来；口径仍复用各自实现，不会出现两套结果。
+ *
+ * 模拟盘账本只在 `XZH_BTC_ROLE=paper` 时附上（实盘看那个没意义，还占上下文）。
+ */
+const briefTool: ToolDefinition = {
+  name: "btc_brief",
+  modes: BTC_MODES,
+  description:
+    "**一次拿全判断所需的数据**：数据新鲜度与环境（btc_status）、三周期方向 + 1h 择时（btc_signal）、" +
+    "模拟盘账本（仅模拟盘后端）。后台巡检 / 叫醒复核**请先调它** —— " +
+    "分开调 2–3 个工具会多烧两轮模型推理（本地模型每轮 30–60 秒）。" +
+    "需要某一项明细时再单独调 btc_status / btc_signal / btc_paper_status。",
+  parameters: { type: "object", properties: {}, required: [] },
+  async execute(): Promise<ToolResult> {
+    // 角色走任务上下文（gateway 允许实盘 / 模拟盘会话并发，env 会串）
+    const paper = currentScheduleRole() === "paper";
+    // status 与 signal 各起一个 Python 进程，彼此独立：并行执行，墙钟时间只算最长的那一个
+    const [status, signal] = await Promise.all([runStatusReport(), runSignalReport()]);
+    const parts = [
+      `【环境与数据】\n${status.content}`,
+      `【三周期 + 1h 择时】\n${signal.content}`,
+    ];
+    let paperOk = true;
+    if (paper) {
+      const paperStatus = await runPaperReport();
+      paperOk = paperStatus.ok;
+      parts.push(`【模拟盘】\n${paperStatus.content}`);
+    }
+    return {
+      ok: status.ok && signal.ok && paperOk,
+      content: parts.join("\n\n"),
+      summary: paper ? "巡检快照（状态 + 信号 + 模拟盘）" : "巡检快照（状态 + 信号）",
+    };
+  },
+};
+
 export const btcTools: ToolDefinition[] = [
   priceTool,
   statusTool,
+  briefTool,
   syncTool,
   signalTool,
   backtestTool,

@@ -270,9 +270,21 @@ export function aInfoLines(data: APanelData): string[] {
       );
     }
   }
-  lines.push(
-    `  收盘选股：每个交易日 16:00${service.state?.lastSelectDay ? ` · 上次 ${service.state.lastSelectDay}` : ""}`,
-  );
+  // 固定选股在 16:00 后由 60 秒 tick 触发，且全市场选股要跑 2–3 分钟；
+  // 这期间 lastSelectDay 还是旧的，面板只显示「上次 X」会让人以为今天没启动。
+  // 有今日 attempt 但还没完成时明确写「已尝试，尚未完成」。
+  const selectAttempt = service.state?.lastSelectAttemptAt;
+  const todayKey = formatLocalTime(new Date(), "date");
+  const attemptToday =
+    Boolean(selectAttempt) &&
+    formatLocalTime(selectAttempt, "date") === todayKey;
+  const completedToday = service.state?.lastSelectDay === todayKey;
+  const selectNote = attemptToday && !completedToday
+    ? ` · 今日 ${formatLocalTime(selectAttempt, "time")} 已尝试，尚未完成`
+    : service.state?.lastSelectDay
+      ? ` · 上次 ${service.state.lastSelectDay}`
+      : "";
+  lines.push(`  收盘选股：每个交易日 16:00${selectNote}`);
   if (service.state?.lastAction) {
     // 结论上限已放宽到 2000 字（要完整推到微信），面板/`/info` 这里只留一行摘要
     const oneLine = service.state.lastAction.replace(/\s+/g, " ").trim();

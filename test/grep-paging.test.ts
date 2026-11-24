@@ -27,13 +27,18 @@ describe("grep 翻页", () => {
 
     const first = await grepTool.execute({ pattern: "^hit" }, ctx);
     expect(first.content).toContain("hit 0");
-    expect(first.content).toContain("用 offset=200 继续");
+    expect(first.content).toContain("用 offset=100 继续");
 
-    const second = await grepTool.execute({ pattern: "^hit", offset: 200 }, ctx);
-    expect(second.content).toContain("hit 200");
+    const second = await grepTool.execute({ pattern: "^hit", offset: 100 }, ctx);
+    expect(second.content).toContain("hit 100");
     // 翻页是跳过前面的，不是重头再来
     expect(second.content).not.toContain("hit 0\n");
-    expect(second.content).toContain("已跳过前 200 条");
+    // 后面还有，继续给出下一个 offset
+    expect(second.content).toContain("用 offset=200 继续");
+
+    const third = await grepTool.execute({ pattern: "^hit", offset: 200 }, ctx);
+    expect(third.content).toContain("hit 200");
+    expect(third.content).toContain("已跳过前 200 条");
   });
 
   it("offset 越过末尾时明确说没有更多，而不是返回空内容", async () => {

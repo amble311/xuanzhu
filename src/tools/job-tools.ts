@@ -155,3 +155,49 @@ export function jobCompletionMessage(
     `请据此继续或收尾；需要完整输出用 bash_output job_id=${job.id}。`
   );
 }
+
+/**
+ * `bash_job` —— 查看 / 终止后台任务。
+ *
+ * 合并后 schema 只占一份；kill 的确认改为**动作级**判断（`action=kill` 且未自动批准时
+ * 走 ctx.confirm），避免查看输出也要弹确认框。
+ */
+export const bashJobTool: ToolDefinition = {
+  name: "bash_job",
+  smallProfile: true,
+  description:
+    "查看或终止后台任务。action=output（默认）：不传 job_id 列出全部；传 job_id 返回该任务状态与最近输出。" +
+    "action=kill：终止指定任务（连同子进程）。",
+  aliases: [
+    { name: "bash_output", args: { action: "output" } },
+    { name: "bash_kill", args: { action: "kill" } },
+  ],
+  parameters: {
+    type: "object",
+    properties: {
+      action: {
+        type: "string",
+        enum: ["output", "kill"],
+        description: "output=查看（默认）；kill=终止",
+      },
+      job_id: { type: "string", description: "后台任务 id（如 job-1）；output 省略时列出全部" },
+      max_chars: { type: "integer", description: "output 最多返回多少字符（默认 4000，最大 20000）" },
+    },
+    required: ["action"],
+  },
+  async execute(args, ctx): Promise<ToolResult> {
+    if (args.action !== "kill") return bashOutputTool.execute(args, ctx);
+    const jobId = typeof args.job_id === "string" ? args.job_id.trim() : "";
+    if (!jobId) return { ok: false, content: "错误：kill 需要 job_id。" };
+    if (!ctx.autoApprove && ctx.confirm) {
+      const approved = await ctx.confirm({
+        tool: "bash_job",
+        title: `终止后台任务 ${jobId}？`,
+        detail: "该任务及其派生的子进程会被终止。",
+        danger: true,
+      });
+      if (!approved) return { ok: false, content: "已取消终止后台任务。" };
+    }
+    return bashKillTool.execute(args, ctx);
+  },
+};

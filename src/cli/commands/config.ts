@@ -17,6 +17,8 @@ import { ensureDir, getConfigSubdir, getConfigPath } from "../../utils/paths";
  * `xzh config path`   打印配置文件路径
  * `xzh config init`   生成默认配置文件
  * `xzh config inspect [分钟|off]`  查看 / 设置巡检总时长上限（默认不限）
+ * `xzh config privileged [on|off]` 查看 / 设置是否允许使用 sudo / SSH 密码（默认开启）
+ * `xzh config watchdog [秒|off]`   查看 / 设置同步卡死看门狗（默认 180 秒）
  */
 export async function configCommand(args: string[]): Promise<void> {
   const sub = args[0];
@@ -41,12 +43,16 @@ export async function configCommand(args: string[]): Promise<void> {
     }
     case "inspect":
       return inspectSettings(args[1]);
+    case "privileged":
+      return privilegedSettings(args[1]);
+    case "watchdog":
+      return watchdogSettings(args[1]);
     case undefined:
       return showConfig();
     default:
       process.stdout.write(
         `${ansi.red}未知子命令：${sub}${ansi.reset}\n` +
-          `${ansi.gray}用法：xzh config [edit|path|init|inspect [分钟|off]]${ansi.reset}\n`,
+          `${ansi.gray}用法：xzh config [edit|path|init|inspect [分钟|off]|privileged [on|off]|watchdog [秒|off]]${ansi.reset}\n`,
       );
       process.exitCode = 1;
       return;
@@ -84,6 +90,80 @@ function inspectSettings(raw?: string): void {
     value > 0
       ? `${ansi.green}✓ 巡检总时长上限已设为 ${Math.floor(value)} 分钟${ansi.reset}${ansi.gray}（超时会中止并写日志）${ansi.reset}\n`
       : `${ansi.green}✓ 已取消巡检总时长上限${ansi.reset}${ansi.gray}（只受空闲 3 分钟约束）${ansi.reset}\n`,
+  );
+}
+
+/**
+ * `xzh config privileged [on|off]`：是否允许使用 sudo / SSH 等特权密码。
+ *
+ * 默认开启（全自动 agent 需要提权时不应被一刀切拦住）；关闭后提示词会禁止索取密码，
+ * `bash` 也只放行 `sudo -n`。
+ */
+function privilegedSettings(raw?: string): void {
+  if (raw === undefined) {
+    const enabled = loadConfig().allowPrivilegedAuth !== false;
+    process.stdout.write(
+      enabled
+        ? `${ansi.gray}sudo / SSH 密码：${ansi.reset}允许${ansi.gray}（xzh config privileged off 关闭）${ansi.reset}\n`
+        : `${ansi.gray}sudo / SSH 密码：${ansi.reset}禁止${ansi.gray}（只允许 sudo -n；xzh config privileged on 开启）${ansi.reset}\n`,
+    );
+    return;
+  }
+  const normalized = raw.trim().toLowerCase();
+  const enabled =
+    normalized === "on" || normalized === "true" || normalized === "1";
+  const disabled =
+    normalized === "off" || normalized === "false" || normalized === "0";
+  if (!enabled && !disabled) {
+    process.stdout.write(
+      `${ansi.red}用法：xzh config privileged [on|off]${ansi.reset}\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  const config = loadConfig();
+  config.allowPrivilegedAuth = enabled;
+  saveConfig(config);
+  process.stdout.write(
+    enabled
+      ? `${ansi.green}✓ 已允许使用 sudo / SSH 密码${ansi.reset}${ansi.gray}（密码只用于当次命令，不会写入记忆）${ansi.reset}\n`
+      : `${ansi.green}✓ 已禁止使用 sudo / SSH 密码${ansi.reset}${ansi.gray}（提权只允许 sudo -n）${ansi.reset}\n`,
+  );
+}
+
+/**
+ * `xzh config watchdog [秒|off]`：TUI 同步卡死看门狗。
+ *
+ * 只兜底事件循环被同步代码占满的情况（模型慢 / 网络挂起时心跳正常，不会误杀）。
+ * 默认 180 秒；下限 30 秒，避免把正常的同步大任务误判成卡死。
+ */
+function watchdogSettings(raw?: string): void {
+  const current = loadConfig().hangWatchdogSeconds ?? 180;
+  if (raw === undefined) {
+    process.stdout.write(
+      current > 0
+        ? `${ansi.gray}同步卡死看门狗：${ansi.reset}${current} 秒${ansi.gray}（xzh config watchdog off 关闭）${ansi.reset}\n`
+        : `${ansi.gray}同步卡死看门狗：${ansi.reset}已关闭${ansi.gray}（xzh config watchdog 180 开启）${ansi.reset}\n`,
+    );
+    return;
+  }
+  const normalized = raw.trim().toLowerCase();
+  const value =
+    normalized === "off" || normalized === "0" ? 0 : Number(normalized);
+  if (!Number.isFinite(value) || value < 0 || (value > 0 && value < 30)) {
+    process.stdout.write(
+      `${ansi.red}用法：xzh config watchdog [秒|off]（秒数 ≥ 30，或 off）${ansi.reset}\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  const config = loadConfig();
+  config.hangWatchdogSeconds = Math.floor(value);
+  saveConfig(config);
+  process.stdout.write(
+    value > 0
+      ? `${ansi.green}✓ 同步卡死看门狗已设为 ${Math.floor(value)} 秒${ansi.reset}${ansi.gray}（无心跳即强制退出）${ansi.reset}\n`
+      : `${ansi.green}✓ 已关闭同步卡死看门狗${ansi.reset}\n`,
   );
 }
 

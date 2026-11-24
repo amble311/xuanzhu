@@ -345,16 +345,6 @@ export function openDailyBarStore(home = getAShareHome()): DailyBarStore | null 
   return store;
 }
 
-/** 仅供测试：关闭并重置连接（换 home / 删库后重新打开） */
-export function resetDailyBarStore(): void {
-  try {
-    cached?.store?.close();
-  } catch {
-    // ignore
-  }
-  cached = null;
-}
-
 /** 内存实现：单测用（不依赖 node:sqlite，也不留文件） */
 export function createMemoryBarStore(): DailyBarStore {
   const bars = new Map<string, Bar[]>();

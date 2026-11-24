@@ -7,10 +7,12 @@ import {
   type InspectEventItem,
 } from "../btc/inspect-stream";
 import { aActionsPath } from "../a/monitor";
+import { loadWatchlist } from "../a/watchlist";
 import {
   currentAInspectOffset,
-  readAInspectEvents,
+  readAInspectEventItems,
   type AInspectEvent,
+  type AInspectEventItem,
 } from "../a/inspect-stream";
 import { getAShareHome, getBtcHome } from "../utils/paths";
 
@@ -24,21 +26,29 @@ import { getAShareHome, getBtcHome } from "../utils/paths";
  * 刻意的取舍：
  * - 首次接入只从「当前文件末尾」开始，不回放历史（避免用户被积压内容刷屏）；
  * - btc 的 reasoning / tool 过程**不转发**（那是 TUI /feed 的职责），只推结论 / 错误；
- * - btc 的结论**按轮聚合**：一轮巡检的结论只在 `round-end`（或该轮报错 / 下一轮开始 /
- *   超过 `ROUND_STALE_MS`）之后才推一次，标题带轮次开始时间。以前按「每次读到 4 条事件」
- *   切批，一轮里模型分段输出 3 遍结论就会变成 3 组 `1/2`、`2/2`，看起来像跑了三轮；
- * - 发送失败（微信未绑定 / 网络抖动）时不丢内容：已完整送达的轮次推进偏移，当前轮
- *   记住「已发到第几条气泡」（`BTC_BATCH_KEY`），下一轮只补发没送达的部分。
+ * - **按轮聚合 + 一轮一条气泡**：btc 按 `round`、A 股按 `start`…`end` 分轮，等这一轮
+ *   结束（`round-end` / `end` / `error` / 下一轮开始 / 超过 `ROUND_STALE_MS`）才整轮推一次，
+ *   标题带轮次开始时间。以前按「每次读到 4 条事件」切批 + 超长分片，一轮能变成 3–5 条
+ *   `1/2`、`2/2`，既像跑了三轮，又白耗 iLink 极小的推送额度（实测多一条就更容易被
+ *   `ret=-2` 拒收）；
+ * - 发送失败（微信未绑定 / 网络抖动 / 服务端拒收）时不丢内容、也不推进偏移：
+ *   下一轮从同一位置整轮重推（`btc-batch` / `a-stream-batch` 仅为兼容旧数据保留，恒 0）。
  */
 
 /** A 股动作账本单次推送里最多带几条，多的拆成多条消息 */
 const MAX_EVENTS_PER_PUSH = 4;
-/** 单条推送的字符上限：尽量压进一个微信气泡，避免多块发送时丢后一条 */
-const MAX_PUSH_CHARS = 900;
-/** 标题（标签 + 轮次时间 + 分片序号）预留的字符数，正文按剩余长度切 */
+/**
+ * 单条推送的字符上限：**一轮只发一个气泡**。
+ *
+ * 以前是 900 字并允许拆 5 条（`· 1/2`、`· 2/2`）。2026-11-24 实测 iLink 的主动推送
+ * 会整段被拒收（`ret=-2`），每次能发出去的额度只有几条 —— 气泡越少，一轮结论
+ * 越有机会完整送达。微信文本气泡本身能装几千字，2000 字远在安全范围内。
+ */
+const MAX_PUSH_CHARS = 2_000;
+/** 标题（标签 + 轮次时间）预留的字符数，正文按剩余长度切 */
 const HEADER_RESERVE = 40;
-/** 一轮最多推几条气泡：再多就省略中间部分（完整内容还在巡检日志里） */
-const MAX_BUBBLES_PER_ROUND = 5;
+/** 超长时省略中间部分，保留开头与结尾（结论通常在最后）；完整内容在巡检日志里 */
+const OMIT_MARK = "…（中间省略 {n} 字，完整内容见巡检日志）…";
 /**
  * 一轮超过这么久没有任何新事件，就当作「已结束」。
  *
@@ -172,61 +182,36 @@ function appendDelta(body: string, delta: string): string {
   return `${body}${delta}`;
 }
 
-/** 在标点处切分，避免把一句话从中间劈开 */
-function cutAt(text: string, limit: number): number {
-  const window = text.slice(0, limit);
-  const point = Math.max(
-    window.lastIndexOf("。"),
-    window.lastIndexOf("；"),
-    window.lastIndexOf("\n"),
-    window.lastIndexOf("，"),
-  );
-  return point > limit * 0.6 ? point + 1 : limit;
-}
-
-/** 按长度切成多条气泡（优先在换行 / 标点处断开） */
-export function splitWechatBody(body: string, limit: number): string[] {
-  const size = Math.max(80, Math.floor(limit));
-  const chunks: string[] = [];
-  let buffer = "";
-  for (const line of body.split("\n")) {
-    const candidate = buffer ? `${buffer}\n${line}` : line;
-    if (candidate.length <= size) {
-      buffer = candidate;
-      continue;
-    }
-    if (buffer) {
-      chunks.push(buffer);
-      buffer = "";
-    }
-    let rest = line;
-    while (rest.length > size) {
-      const cut = cutAt(rest, size);
-      chunks.push(rest.slice(0, cut));
-      rest = rest.slice(cut);
-    }
-    buffer = rest;
-  }
-  if (buffer) chunks.push(buffer);
-  return chunks;
-}
-
 /**
- * 一段正文 → 一条或多条气泡（带标题与序号），**只切不砍**。
+ * 一段正文 → **一个**带标题的气泡（超长时省略中间，保留开头与结尾）。
  *
- * 这是 A 股推送的公共出口。以前两条路径都在「切」之前先 `slice(0, 300)`：
- * 600 字的收盘总结只剩 300 字，客户端看到的是半张表 + 一行孤零零的 `6`
- * （`601939` 的前半个字符）。长度超限的正确做法是多发一条，而不是把内容丢掉。
+ * 为什么不再拆成 `· 1/2`、`· 2/2`：iLink 的主动推送额度很少（实测每次会话
+ * 刷新后只能连发几条），一条结论拆成 2 条就多占一次额度、更多机会撞 `ret=-2`。
+ * 因此一轮 = 一次 `sendmessage`。
+ *
+ * 内容取舍：2000 字以内**逐字保留**；超长时保留开头与最后一屏（结论、排期、
+ * 监控规则都在末尾），中间用一行说明省略了多少字并指向巡检日志 ——
+ * 不再出现「只剩半张表 + 一个孤零零的 `6`」这种无提示截断。
  */
 export function formatStreamPush(title: string, body: string): string[] {
+  return singleBubble(title, body);
+}
+
+function singleBubble(title: string, body: string): string[] {
   const text = body.trim();
   if (!text) return [];
-  const chunks = splitWechatBody(text, MAX_PUSH_CHARS - HEADER_RESERVE - title.length);
-  const total = chunks.length;
-  return chunks.map((chunk, index) => {
-    const head = total > 1 ? `${title} · ${index + 1}/${total}` : title;
-    return `[${head}]\n${chunk}`;
-  });
+  const limit = Math.max(200, MAX_PUSH_CHARS - HEADER_RESERVE - title.length);
+  if (text.length <= limit) return [`[${title}]\n${text}`];
+
+  const omitted = text.length - limit;
+  const note = `\n${OMIT_MARK.replace("{n}", String(omitted))}\n`;
+  const keep = limit - note.length;
+  // 结论通常在末尾：尾部占 40%，至少 200 字
+  const tailLen = Math.max(200, Math.floor(keep * 0.4));
+  const headLen = Math.max(0, keep - tailLen);
+  const head = text.slice(0, headLen).replace(/\n+$/, "");
+  const tail = text.slice(text.length - tailLen).replace(/^\n+/, "");
+  return [`[${title}]\n${head}${note}${tail}`];
 }
 
 /**
@@ -249,13 +234,77 @@ export function composeAStreamText(events: AInspectEvent[]): string {
   return parts.join("\n\n").trim();
 }
 
-/** 气泡太多时保留开头与结尾（结论通常在最后），中间省略并说明去处 */
-function collapseChunks(chunks: string[]): string[] {
-  if (chunks.length <= MAX_BUBBLES_PER_ROUND) return chunks;
-  const omitted = chunks.length - MAX_BUBBLES_PER_ROUND;
-  const note = `…（中间省略 ${omitted} 段，完整内容见巡检日志 inspect.log）\n`;
-  const tail = chunks[chunks.length - 1].slice(0, MAX_PUSH_CHARS - note.length - HEADER_RESERVE);
-  return [...chunks.slice(0, MAX_BUBBLES_PER_ROUND - 1), `${note}${tail}`];
+/** 超长正文只保留开头与结尾（见 `singleBubble`），因此不再需要分片函数 */
+
+/**
+ * A 股一轮巡检在事件流里的一段。
+ *
+ * A 股的过程流没有 btc 的 `round` 字段，只有 `start` / `end` 包裹：
+ * 巡检开始时写 `start`，正常收尾写 `end`，异常只写 `error`。
+ * 因此「一轮」= 一个 `start` 到 `end`（或下一轮 `start`）之间的事件。
+ */
+export interface ARoundBlock {
+  /** 轮次开始时间（`start` 事件的 ts） */
+  round: string;
+  events: AInspectEvent[];
+  /** 这一块最后一条事件读完后的文件偏移 */
+  end: number;
+}
+
+export function groupARounds(items: AInspectEventItem[]): ARoundBlock[] {
+  // 新生产者显式写 `round`：直接按它归组，跨轮边界不会被 kill / error 打断猜错
+  if (items.some((item) => Boolean(item.event.round))) {
+    const blocks: ARoundBlock[] = [];
+    for (const item of items) {
+      const round = item.event.round ?? item.event.ts;
+      const last = blocks[blocks.length - 1];
+      if (last && last.round === round) {
+        last.events.push(item.event);
+        last.end = item.end;
+        continue;
+      }
+      blocks.push({ round, events: [item.event], end: item.end });
+    }
+    return blocks;
+  }
+
+  // 老日志（没有 round 字段）：`start` 开启一轮，其余事件续到最后一块
+  const blocks: ARoundBlock[] = [];
+  for (const item of items) {
+    const last = blocks[blocks.length - 1];
+    if (last && item.event.kind !== "start") {
+      last.events.push(item.event);
+      last.end = item.end;
+      continue;
+    }
+    blocks.push({ round: item.event.ts, events: [item.event], end: item.end });
+  }
+  return blocks;
+}
+
+/** 这一轮是否已经结束（`end` / `error` / 下一轮开始 / 静默超时） */
+export function isARoundFinished(
+  block: ARoundBlock,
+  next: ARoundBlock | undefined,
+  now = Date.now(),
+): boolean {
+  if (next) return true;
+  if (block.events.some((event) => event.kind === "end" || event.kind === "error")) {
+    return true;
+  }
+  const last = block.events[block.events.length - 1];
+  const at = Date.parse(last?.ts ?? "");
+  return Number.isFinite(at) && now - at > ROUND_STALE_MS;
+}
+
+/** 一轮 A 股巡检结论 → 一条微信消息（标题带轮次开始时间） */
+export function formatARoundPush(block: ARoundBlock, now = Date.now()): string[] {
+  const body = composeAStreamText(
+    block.events.filter((event) => event.kind === "text" || event.kind === "error"),
+  );
+  if (!body) return [];
+  const stamp = roundStamp(block.round, now);
+  return singleBubble(stamp ? `A 股巡检结论 ${stamp}` : "A 股巡检结论", body);
 }
 
 /** 轮次时间标签（本地时间 HH:mm；跨天补 MM-DD），让用户看出「这是哪一轮」 */
@@ -274,10 +323,10 @@ export function roundStamp(round: string, now = Date.now()): string {
 }
 
 /**
- * 一轮巡检 → 一到多条微信消息。
+ * 一轮巡检 → **一条**微信消息。
  *
- * 标题带**轮次开始时间**（`BTC 模拟盘巡检 20:03`），只有正文确实超长时才带 `1/2`；
- * 序号是「这一轮的第几段」，不再随每次读取重新从 1 开始 —— 以前那样看起来像重复巡检。
+ * 标题带**轮次开始时间**（`BTC 模拟盘巡检 20:03`）。一轮只占一次 `sendmessage`：
+ * iLink 主动推送额度很小，分片会让一轮占掉 2–5 次额度，反而整轮发不出去。
  */
 export function formatRoundPush(
   label: string,
@@ -288,14 +337,7 @@ export function formatRoundPush(
   if (!body) return [];
   const stamp = roundStamp(block.round, now);
   const title = stamp ? `${label} ${stamp}` : label;
-  const chunks = collapseChunks(
-    splitWechatBody(body, MAX_PUSH_CHARS - HEADER_RESERVE - title.length),
-  );
-  const total = chunks.length;
-  return chunks.map((chunk, index) => {
-    const head = total > 1 ? `${title} · ${index + 1}/${total}` : title;
-    return `[${head}]\n${chunk}`;
-  });
+  return singleBubble(title, body);
 }
 
 export interface AActionEntry {
@@ -306,23 +348,52 @@ export interface AActionEntry {
   codes?: string[];
 }
 
-export function formatAEntry(entry: AActionEntry): string | null {
+/**
+ * 账本条目 → 一行推送文案。
+ *
+ * `nameOf` 用于把只有代码的老记录补上名称（微信里单看 `600519` 认不出是哪只）。
+ * 名称来源是自选池 `watchlist.json`；池外的代码保持原样，不编造。
+ */
+export function formatAEntry(
+  entry: AActionEntry,
+  nameOf?: (code: string) => string | undefined,
+): string | null {
   if (entry.kind === "select") {
     // 新版选股会写详情（名称 / 分数 / 理由 / 换入换出）；老记录只有 codes，退回代码列表
     const message = entry.message?.trim();
     if (message && message.includes("\n")) return message;
     const codes = entry.codes ?? [];
-    return codes.length > 0 ? `选股 ${codes.length} 只：${codes.join("、")}` : (message ?? null);
+    if (codes.length === 0) return message ?? null;
+    const labeled = codes.map((code) => {
+      const name = nameOf?.(code);
+      return name && name !== code ? `${code} ${name}` : code;
+    });
+    return `选股 ${codes.length} 只：${labeled.join("、")}`;
   }
   if (entry.kind === "buy" || entry.kind === "sell") {
     const verb = entry.kind === "buy" ? "买入" : "卖出";
+    const name = entry.code ? nameOf?.(entry.code) : undefined;
     if (entry.ok === false) {
       const message = entry.message ?? "";
-      return message ? `${verb}失败：${message}` : null;
+      if (!message) return null;
+      return `${verb}失败：${withName(message, entry.code, name)}`;
     }
-    return entry.message ?? null;
+    const text = entry.message ?? null;
+    return text ? withName(text, entry.code, name) : null;
   }
   return null;
+}
+
+/** 文案里只出现代码时补上名称（`买入 600519 100 股` → `买入 600519 贵州茅台 100 股`） */
+function withName(
+  message: string,
+  code?: string,
+  name?: string,
+): string {
+  if (!code || !name || name === code) return message;
+  if (message.includes(name)) return message;
+  if (!message.includes(code)) return message;
+  return message.replace(code, `${code} ${name}`);
 }
 
 interface JsonlTail {
@@ -362,15 +433,26 @@ function readJsonlTail(file: string, sinceOffset: number): JsonlTail {
       // 坏行跳过
     }
   }
-  return { entries, offset: start + cut + 1 };
+  // `cut` 是**字符**下标，而 start 是**字节**偏移。中文 JSON 里 1 字符 = 3 字节，
+  // 直接 `start + cut + 1` 会把偏移推进到行中间，下一轮从半个汉字开始解析，
+  // 表现为「动作偶尔漏推 / 重复推」。必须按 UTF-8 字节数推进。
+  return {
+    entries,
+    offset: start + Buffer.byteLength(text.slice(0, cut + 1), "utf8"),
+  };
 }
 
 export interface FeedTickDeps {
   /**
-   * 发送成功返回 true；返回 false（微信未绑定 / 发送失败）时该条不算送达，
-   * 下一轮从这条重试（已送达的不会重发）。
+   * 投递一条消息。
+   *
+   * `kind` 决定投递策略（见 `outbox.ts`）：成交 / 风控是 `trade`（必达），
+   * 巡检结论与选股是 `inspect`（窗口关闭时可降级成摘要）。默认 `inspect`。
+   *
+   * 返回 false 表示**这一条没有被接收**（队列满 / 未登录），此时不推进偏移，
+   * 下一轮重试。
    */
-  send: (text: string) => Promise<boolean>;
+  send: (text: string, kind?: "inspect" | "trade") => Promise<boolean>;
   offsetsFile: string;
   log?: (message: string) => void;
 }
@@ -391,6 +473,7 @@ export async function runFeedTick(deps: FeedTickDeps): Promise<void> {
       // 首次接入：从当前末尾开始，不回放历史
       updates[key] = currentInspectOffset(getBtcHome());
       updates[BTC_BATCH_KEY] = 0;
+      deps.log?.(`巡检转发：${label} 首次接入，从当前末尾开始（不回放历史）`);
     } else {
       const { items } = readInspectEventItems(offsets[key], getBtcHome());
       const blocks = groupInspectRounds(items);
@@ -400,6 +483,9 @@ export async function runFeedTick(deps: FeedTickDeps): Promise<void> {
       let consumed = offsets[key];
       let batch = resume;
       let ok = true;
+      /** 本轮 tick 实际入队了几轮 / 几条气泡（日志用：没有这条，用户问「微信怎么没收到」时无从查起） */
+      let rounds = 0;
+      let bubbles = 0;
       for (let index = 0; index < blocks.length; index += 1) {
         const block = blocks[index];
         // 还在进行的轮次先不推：模型是分段输出结论的，读到一半就推会让同一轮
@@ -408,6 +494,7 @@ export async function runFeedTick(deps: FeedTickDeps): Promise<void> {
         const messages = formatRoundPush(label, block);
         // 只有「紧接上次未送达位置」的那一轮要跳过已送达的气泡，后面的轮次从头推
         batch = index === 0 ? Math.min(resume, messages.length) : 0;
+        const from = batch;
         for (let at = batch; at < messages.length; at += 1) {
           if (!(await deps.send(messages[at]))) {
             ok = false;
@@ -416,8 +503,13 @@ export async function runFeedTick(deps: FeedTickDeps): Promise<void> {
           batch = at + 1;
         }
         if (!ok) break;
+        rounds += 1;
+        bubbles += messages.length - from;
         consumed = block.end;
         batch = 0;
+      }
+      if (rounds > 0) {
+        deps.log?.(`巡检转发：${label} ${rounds} 轮 / ${bubbles} 条已入队`);
       }
       // 失败也要落进度：已完整送达的轮次推进偏移，当前轮记住已发到第几条 ——
       // 否则下一个 tick 会把已经送达的气泡全部重发，用户看到重复内容。
@@ -437,64 +529,85 @@ export async function runFeedTick(deps: FeedTickDeps): Promise<void> {
     }
   } else {
     const { entries, offset } = readJsonlTail(aFile, offsets[aKey]);
+    // 老账本里只有代码：用自选池补名称，微信里才认得出是哪只（池外的原样保留）
+    const names = new Map(
+      loadWatchlist().items.map((item) => [item.code, item.name] as const),
+    );
     const formatted = entries
-      .map(formatAEntry)
-      .filter((line): line is string => line !== null);
+      .map((entry) => {
+        const line = formatAEntry(entry, (code) => names.get(code));
+        if (line === null) return null;
+        // 买卖是「钱动了」，不能降级成摘要；选股等可延迟
+        const kind: "inspect" | "trade" =
+          entry.kind === "buy" || entry.kind === "sell" ? "trade" : "inspect";
+        return { line, kind };
+      })
+      .filter((item): item is { line: string; kind: "inspect" | "trade" } => item !== null);
     if (formatted.length === 0) {
       updates[aKey] = offset;
     } else {
       const total = Math.ceil(formatted.length / MAX_EVENTS_PER_PUSH);
       let ok = true;
+      let bubbles = 0;
       for (let index = 0; index < total && ok; index += 1) {
         const chunk = formatted.slice(
           index * MAX_EVENTS_PER_PUSH,
           (index + 1) * MAX_EVENTS_PER_PUSH,
         );
         const title = total > 1 ? `A 股巡检 ${index + 1}/${total}` : "A 股巡检";
-        const messages = formatStreamPush(title, chunk.map((line) => `- ${line}`).join("\n"));
+        const messages = formatStreamPush(title, chunk.map((item) => `- ${item.line}`).join("\n"));
+        // 一条消息里只要掺了成交，就整条按必达处理
+        const kind = chunk.some((item) => item.kind === "trade") ? "trade" : "inspect";
         for (const message of messages) {
-          if (!(await deps.send(message))) {
+          if (!(await deps.send(message, kind))) {
             ok = false;
             break;
           }
+          bubbles += 1;
         }
       }
-      if (ok) updates[aKey] = offset;
-      else failed = true;
+      if (ok) {
+        updates[aKey] = offset;
+        deps.log?.(`巡检转发：A 股动作 ${formatted.length} 条 / ${bubbles} 条已入队`);
+      } else failed = true;
     }
   }
 
   // A 股巡检结论（过程流里的 text / error；工具调用不推）
+  //
+  // **按轮聚合**：A 股一次巡检会写多段 text（模型分段输出）+ 一条总结，
+  // 以前每 30 秒读到什么就推什么，一次巡检能变成 3–5 条「A 股巡检结论」，
+  // 既刷屏又白耗 iLink 的推送额度。现在等这一轮 `end`（或 error / 下一轮 start /
+  // 静默 15 分钟）之后再整轮推一条。
   const aStreamKey = "a-stream";
   if (!(aStreamKey in offsets)) {
     updates[aStreamKey] = currentAInspectOffset();
     updates[A_STREAM_BATCH_KEY] = 0;
   } else {
-    const { events, offset } = readAInspectEvents(offsets[aStreamKey]);
-    const important = events.filter(
-      (event) => event.kind === "text" || event.kind === "error",
-    );
-    const messages = formatStreamPush("A 股巡检结论", composeAStreamText(important));
-    // 上次停在第几条气泡（0 = 这批还没开始推）：失败重试只补发没送达的部分
-    const resume = Math.max(0, Math.floor(offsets[A_STREAM_BATCH_KEY] ?? 0));
-    let batch = Math.min(resume, messages.length);
+    const { items } = readAInspectEventItems(offsets[aStreamKey]);
+    const blocks = groupARounds(items);
+    // 一轮一条气泡，失败后从同一偏移重读整轮即可，不需要记「已发到第几条」
+    let consumed = offsets[aStreamKey];
+    let pushed = 0;
     let ok = true;
-    for (let at = batch; at < messages.length; at += 1) {
-      if (!(await deps.send(messages[at]))) {
-        ok = false;
-        break;
+    for (let index = 0; index < blocks.length; index += 1) {
+      const block = blocks[index];
+      if (!isARoundFinished(block, blocks[index + 1])) break;
+      const messages = formatARoundPush(block);
+      for (const message of messages) {
+        if (!(await deps.send(message))) {
+          ok = false;
+          break;
+        }
+        pushed += 1;
       }
-      batch = at + 1;
+      if (!ok) break;
+      consumed = block.end;
     }
-    if (ok) {
-      updates[aStreamKey] = offset;
-      updates[A_STREAM_BATCH_KEY] = 0;
-    } else {
-      // 偏移不前进，但记住已送达的气泡数，避免下个 tick 重发前面几条
-      updates[aStreamKey] = offsets[aStreamKey];
-      updates[A_STREAM_BATCH_KEY] = batch;
-      failed = true;
-    }
+    updates[aStreamKey] = consumed;
+    updates[A_STREAM_BATCH_KEY] = 0;
+    if (!ok) failed = true;
+    else if (pushed > 0) deps.log?.(`巡检转发：A 股巡检结论 ${pushed} 轮已入队`);
   }
 
   const merged: FeedOffsets = { ...offsets, ...updates };
@@ -509,7 +622,7 @@ export interface FeedForwarder {
 /** gateway 启动一个 30 秒的转发定时器（微信未登录时静默跳过） */
 export function startFeedForwarder(options: {
   gatewayHome: string;
-  send: (text: string) => Promise<boolean>;
+  send: (text: string, kind?: "inspect" | "trade") => Promise<boolean>;
   log?: (message: string) => void;
   intervalMs?: number;
 }): FeedForwarder {

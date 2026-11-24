@@ -54,7 +54,7 @@ xzh                 # 启动
   一轮里并列发出多个 `task` 时会**并发执行**（默认最多 4 个，见 `maxParallelAgents`）。
   子代理定义集中在 `src/subagents/`，可继续扩展。
 - **长期记忆按主题整理**：`MEMORY.md` 是**结论库**而不是流水账 —— 同一主题的新结论并进已有
-  小节（`memory_compact`），只写稳定事实 + 依据（`file::func` / 命令）+ 原因与解法，细节留在
+  小节（`memory` 的 `compact` 动作），只写稳定事实 + 依据（`file::func` / 命令）+ 原因与解法，细节留在
   项目文档里只留指针。**达到阈值（默认 12000 字符）自动精简**：先去重，仍超限就裁剪最旧的
   **追加块**（最新结论优先保留）；按主题整理的稳定小节不会被自动删，那种情况会要求模型压缩。
 - **图片输入**：`Ctrl+V`（或 `/image`）读取系统剪贴板里的图片作为附件发给模型，
@@ -179,6 +179,8 @@ xzh
 | `xzh config edit` | 使用 `nano` 编辑配置文件 |
 | `xzh config path` | 打印配置文件路径 |
 | `xzh config init` | 生成默认配置文件 |
+| `xzh config privileged [on\|off]` | 是否允许使用 sudo / SSH 密码（默认开启） |
+| `xzh config watchdog [秒\|off]` | 同步卡死看门狗（默认 180 秒，0 关闭） |
 | `xzh vpn` | 交互式设置 / 探测 / 测试 / 启停全局 HTTP(S)/SOCKS5 代理 |
 | `xzh gateway` | 启动常驻 gateway 服务（工作目录 `~/.xzh_gateway`，首次启动自动开机自启） |
 | `xzh gateway stop\|restart\|status` | 停止 / 重启 / 查看 gateway |
@@ -484,16 +486,12 @@ API Key 也可以来自环境变量，优先级低于配置文件：
 | --- | --- | --- |
 | `list_skills` | 列出玄猪可用的全部技能 | 否 |
 | `load_skill` | 加载指定技能的完整指南 | 否 |
-| `memory_read` | 读取项目 / 全局记忆（`target=project\|global\|all`；长期记忆 + 最近日志） | 否 |
-| `memory_write` | 写入项目 / 全局记忆（`target` + `scope`），支持 `source=user/tool/model`；来源为工具输出且写项目记忆时需确认；凭据值自动 AES-GCM 加密 | 否 |
-| `memory_compact` | 用精简后的完整内容重写项目 / 全局长期记忆（凭据值自动加密；支持来源确认；把新结论并入主题小节 / 语义压缩） | 否 |
+| `memory` | `action=read` 读取项目 / 全局记忆（`target=project\|global\|all`）；`write` 写入（`target` + `scope`，来源为工具输出且写项目记忆时需确认）；`compact` 用完整新版重写长期记忆。凭据值自动 AES-GCM 加密 | 否 |
 | `todo_write` | 创建 / 更新任务列表（每次提交完整列表） | 否 |
 | `goal_complete` | 目标模式（`/goal`）下声明目标已全部完成（仅主代理可用） | 否 |
 | `report_status` | 结构化上报受阻 / 需要用户决定 / 置信度低（仅主代理可用） | 否 |
 | `task` | 派生子代理（默认 `code-explorer`）执行子任务，只返回结论；一轮内多个调用**并行**执行 | 否 |
-| `repo_map` | 仓库地图：按查询返回相关文件 / 符号，或目录概览 | 否 |
-| `find_symbol` | 按名称查找函数 / 类 / 类型定义，返回 `文件:行号` 与签名 | 否 |
-| `read_symbol` | 只读某个符号的代码范围（比整文件更省上下文） | 否 |
+| `code_nav` | `action=map` 仓库地图（按查询返回相关文件 / 符号或目录概览）；`find` 按名称查找定义（`文件:行号` + 签名）；`read` 只读某个符号的代码范围 | 否 |
 | `read_file` | 读取文件（带行号，支持偏移与行数限制） | 否 |
 | `list_dir` | 列出目录内容 | 否 |
 | `glob` | 按 `**` / `*` / `?` 模式查找文件 | 否 |
@@ -502,8 +500,7 @@ API Key 也可以来自环境变量，优先级低于配置文件：
 | `write_file` | 覆盖写入文件 | 是 |
 | `edit_file` | 精确文本替换 | 是 |
 | `bash` | 执行 shell 命令；`run_in_background: true` 则转后台、立刻返回 job id | 是 |
-| `bash_output` | 查看后台任务状态与最近输出（不带 `job_id` 时列出全部） | 否 |
-| `bash_kill` | 终止后台任务（连同它派生的子进程） | 是 |
+| `bash_job` | `action=output` 查看后台任务状态与最近输出（不带 `job_id` 时列出全部）；`kill` 终止任务及其子进程（需确认） | 否 |
 | `device_list` | 列出已连接的手机设备 | 否 |
 | `device_push` | 把脚本保存到手机（不运行） | 是 |
 | `device_run` | 把脚本推到手机并立即运行 | 是 |
@@ -724,20 +721,23 @@ xzh prompt reset core         # 取消覆盖
 
 ## 仓库地图与符号检索
 
-大项目里「先读整文件」是最贵的操作。第三期提供三个确定性工具（不调用模型）：
+大项目里「先读整文件」是最贵的操作。`code_nav` 提供三种确定性动作（不调用模型）：
 
 ```text
-repo_map query="agent loop"   # 相关文件/符号，或目录概览
-find_symbol name="buildConversation"  # 文件:行号 + 签名
-read_symbol name="buildConversation"  # 只读该符号的代码范围
+code_nav action=map query="agent loop"      # 相关文件/符号，或目录概览
+code_nav action=find name="buildConversation"  # 文件:行号 + 签名
+code_nav action=read name="buildConversation"  # 只读该符号的代码范围
 ```
 
 索引按文件扩展名解析函数 / 类 / 类型 / 变量 / Markdown 标题，跳过
 `node_modules`、`.git`、`dist` 等目录；进程内缓存 60 秒，`refresh: true` 可重建。
-适合先用 `repo_map` / `find_symbol` 定位，再 `read_symbol` 或 `read_file offset/limit`。
+适合先用 `map` / `find` 定位，再 `read` 或 `read_file offset/limit`。
+
+> 旧名 `memory_read` / `memory_write` / `memory_compact`、`repo_map` / `find_symbol` /
+> `read_symbol`、`bash_output` / `bash_kill` 仍可调用（执行期别名），但新会话只下发上表的规范名。
 
 子代理报告也有统一约束：结论最前、引用用 `文件:行号`、不贴完整文件/日志；
-报告进入主上下文时按档位截断（small 档 4000 字符，full 档默认 12000）。
+报告进入主上下文时按档位截断（small 档 4000 字符，full 档默认 6000）。
 
 ## 基准（bench）
 
@@ -770,15 +770,17 @@ TUI `/usage` 显示服务端真实 input/output 与缓存命中；缓存统计�
 模型窗口 ≤ 32k（或配置 `contextProfile: "small"`）时自动切精简档：
 
 - **提示词更短**：只保留「先读后改、改完验证、只做最新消息、少轮次」等硬规则；
-- **工具更少**：只下发读写 / 检索（含 `repo_map` / `find_symbol` / `read_symbol`）/
-  执行 / 计划 / 状态 / 记忆等核心工具，隐藏 `task`、`load_skill`、`memory_compact`
-  等低频 schema；
+- **工具更少**：只下发读写 / 检索（含 `code_nav`）/ 执行 / 计划 / 状态 / 记忆
+  （`memory` 与 `load_skill` 保留）等核心工具，隐藏 `task`、`list_skills` 等低频 schema；
 - **读取更小**：`read_file` 默认且最多 300 行，大文件用 `offset/limit` 分段；
-- **输出有上限**：默认 2048 tokens（`maxOutputTokens` 可覆盖）；
+- **输出有上限**：默认 2048 tokens（`maxOutputTokens` 可覆盖）；窗口 ≤ 20k 时再压到 1024；
+- **极小窗口（8k / 16k）**：工具描述截到一句话、AGENTS / 记忆节选更短、
+  `read_file` 150 行、单条工具结果更小。8k 窗口下固定开销约 5.2k，仍留约 3k 给对话；
 - **大输出落盘**：`bash` 结果超过 6000 字符时，完整内容保存到
   `.xuanzhu/artifacts/`，上下文只留头尾摘要与文件路径，需要时再用 `read_file` 回查；
 - **预算可视化**：`/context` 显示系统提示词、工具 schema、历史、状态块各占多少，
-  以及是否已裁剪。
+  以及是否已裁剪；
+- **自动摘要**：历史用到预算 85% 时自动压缩一次（`autoCompact`，可关）。
 
 配置：
 

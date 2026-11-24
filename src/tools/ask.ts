@@ -15,30 +15,25 @@ import type { ToolDefinition, ToolResult } from "./types";
  */
 export const askUserTool: ToolDefinition = {
   name: "ask_user",
+  smallProfile: true,
   description:
-    "向用户提**一个**具体问题并等待回答（会暂停本轮直到用户回答或跳过）。" +
-    "适用：必须由用户决定的选择（方案 A/B、覆盖还是新建、改哪个目录）、" +
-    "缺少只有用户才知道的信息（路径、账号、业务口径）。" +
-    "**不要**用它确认自己能用工具查清的事，也不要把多个问题塞进一次调用。" +
-    "能给出 2–4 个候选答案时务必给出 options —— 用户可以用数字键直接选。",
+    "向用户提一个问题并等待回答（暂停本轮）。只用于必须由用户决定、或只有用户知道的信息；" +
+    "不要问自己能查清的事，一次一个。有 2–4 个候选时给 options。",
   parameters: {
     type: "object",
     properties: {
       question: {
         type: "string",
-        description:
-          "一句话问题，必须能独立看懂（不要写「上面那个」「刚才说的」）",
+        description: "一句话问题，必须能独立看懂（不要写「上面那个」）",
       },
       options: {
         type: "array",
         items: { type: "string" },
-        description:
-          "2–4 个候选答案（可选）。给出时界面用单选浮层，用户按数字即可回答",
+        description: "2–4 个候选答案（可选），用户按数字选择",
       },
       detail: {
         type: "string",
-        description:
-          "可选：已尝试什么、为什么必须由用户决定、各选项的差别（多行可接受）",
+        description: "可选：已尝试什么、为什么必须由用户决定、各选项差别",
       },
     },
     required: ["question"],

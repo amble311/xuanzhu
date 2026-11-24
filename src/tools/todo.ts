@@ -70,30 +70,27 @@ function summarize(items: TodoItem[]): string {
  */
 export const todoWriteTool: ToolDefinition = {
   name: "todo_write",
+  smallProfile: true,
   description:
-    "创建或更新当前会话的任务列表（todo list），用于把复杂任务拆成可跟踪的步骤。" +
-    "**当任务需要 3 步以上、或用户给出多项要求时，应先调用它列出计划**，" +
-    "并在每完成一步后更新列表（把该项标为 completed、把下一项标为 in_progress）。" +
-    "每次提交**完整列表**（覆盖旧列表），而不是增量。同一时间只能有一项 in_progress。" +
-    "简单的一两步任务（读一个文件、改一行）不必使用。",
+    "创建/更新任务列表（全量覆盖）。3 步以上或多项要求时先列计划，每步完成后更新；" +
+    "同时只能有一个 in_progress。",
   parameters: {
     type: "object",
     properties: {
       todos: {
         type: "array",
-        description: "完整的任务列表（全量覆盖），按执行顺序排列",
+        description: "完整任务列表（全量覆盖），按执行顺序排列",
         items: {
           type: "object",
           properties: {
             content: {
               type: "string",
-              description: "任务内容，一句话，动词开头（如「修改 agent.ts 的 runTool」）",
+              description: "一句话，动词开头",
             },
             status: {
               type: "string",
               enum: STATUS_VALUES,
-              description:
-                "pending=待办；in_progress=进行中（同时只能有一个）；completed=已完成；cancelled=已取消",
+              description: "pending / in_progress（只能一个）/ completed / cancelled",
             },
           },
           required: ["content", "status"],

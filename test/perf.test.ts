@@ -142,8 +142,8 @@ describe("系统提示词按需包含设备说明", () => {
       undefined,
       true,
     );
-    expect(withDevice).toContain("device_list");
     expect(withDevice).toContain("device_read_screen");
+    expect(withDevice).toContain("device_screenshot");
     // 连接设备后提示词只多出这一段，基础部分仍在
     expect(withDevice.length).toBeGreaterThan(without.length);
   });

@@ -64,7 +64,7 @@ describe("微信频道", () => {
     const lines = Array.from({ length: 200 }, (_, i) => `第 ${i} 行，内容大概二十来个字符`);
     const chunks = splitChunks(lines.join("\n"));
     expect(chunks.length).toBeGreaterThan(1);
-    for (const chunk of chunks) expect(chunk.length).toBeLessThanOrEqual(1_500);
+    for (const chunk of chunks) expect(chunk.length).toBeLessThanOrEqual(2_000);
     // 拼回去要把每行都带上（切块不能吃内容）
     const joined = chunks.join("\n");
     for (const line of lines) expect(joined).toContain(line);
@@ -72,7 +72,7 @@ describe("微信频道", () => {
 
   it("超长单行硬切（否则一条消息会被 iLink 拒）", () => {
     const chunks = splitChunks("x".repeat(4_000));
-    expect(chunks.length).toBe(3);
-    expect(chunks.every((chunk) => chunk.length <= 1_500)).toBe(true);
+    expect(chunks.length).toBe(2);
+    expect(chunks.every((chunk) => chunk.length <= 2_000)).toBe(true);
   });
 });

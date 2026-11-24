@@ -35,12 +35,15 @@ function isCandidateLine(line: string): boolean {
   if (/^```/.test(text)) return false;
 
   const question = QUESTION_END.test(text);
+
+  // 问句基本不写；只有「记住 / 保存 / 记录」这种明确指令才继续。
+  // 这一步必须在凭据扫描**之前**：「密码是什么？」会被凭据正则匹配到，
+  // 值为「什么」时又不是真凭据 —— 既白扫一遍，也最容易踩到正则死循环。
+  if (question && !/^(记住|保存|记录)/.test(text)) return false;
+
   const global = GLOBAL_INTENT.test(text);
   const credential = hasCredentialAssignment(text);
   const proxy = PROXY_ENDPOINT.test(text) && /(代理|端口|proxy)/i.test(text);
-
-  // 问句基本不写；只有「记住 / 保存 / 记录」这种明确指令才继续
-  if (question && !/^(记住|保存|记录)/.test(text)) return false;
   if (global && (PREFERENCE.test(text) || credential || proxy)) return true;
   if (credential && SUDO_OR_LOCAL.test(text)) return true;
   return proxy;

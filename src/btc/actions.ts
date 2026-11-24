@@ -168,8 +168,3 @@ export function renewActionTtls(
   writeAll(home, actions);
   return { renewed, expiresAt };
 }
-
-/** 还没结算的动作（主要是未成交的限价开仓单） */
-export function pendingActions(home = getBtcHome()): BtcAction[] {
-  return readActions(home).filter((item) => item.status === "pending");
-}

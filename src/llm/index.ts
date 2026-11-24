@@ -253,6 +253,9 @@ export function createProvider(
     throw new Error(`provider "${meta.label}" 未指定模型。运行 \`xzh model\` 选择模型。`);
   }
 
+  // 说明：Provider 实现（及其 SDK）是静态导入，但 `src/cli/index.ts` 只在
+  // startChat() 里动态加载 `../llm` —— 因此 `xzh --version` / `config` 这类命令
+  // 仍然不会为三个 SDK 付启动成本，而测试与同步的 createProvider 语义保持不变。
   switch (meta.kind) {
     case "anthropic":
       return new AnthropicProvider({

@@ -76,36 +76,40 @@ describe("btc 事件筛选与按轮聚合", () => {
     expect(messages[0]).not.toContain("1/2");
   });
 
-  it("正文超长才分片，且分片序号属于同一轮", () => {
+  it("一轮只发一条气泡：超长时省略中间，但保留结尾结论", () => {
     const round = "2026-11-14T12:03:44.397Z";
-    const long = Array.from({ length: 3 }, () => ({
-      ts: "t",
-      round,
-      kind: "text" as const,
-      text: "结论".repeat(300),
-    }));
+    // 2026-11-24 起 iLink 主动推送额度极小：一轮 = 一次 sendmessage，
+    // 不再有 `· 1/2`、`· 2/2` 这种分片
+    const long = [
+      { ts: "t", round, kind: "text" as const, text: `开头：${"甲".repeat(1_500)}` },
+      { ts: "t", round, kind: "text" as const, text: `结尾：${"乙".repeat(1_000)}结论：观望` },
+    ];
     // 传固定的 now：轮次时间标签跨天会补 MM-DD，用例不能随运行日期变化
     const messages = formatRoundPush(
       "BTC 实盘巡检",
       { round, events: long, end: 9 },
       Date.parse("2026-11-14T12:10:00Z"),
     );
-    expect(messages.length).toBeGreaterThan(1);
-    expect(messages[0]).toContain("· 1/");
-    expect(messages[0]).toMatch(/\[BTC 实盘巡检 \d{2}:\d{2} · 1\/\d\]/);
-    for (const message of messages) {
-      expect(message.length).toBeLessThanOrEqual(900);
-    }
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatch(/^\[BTC 实盘巡检 \d{2}:\d{2}\]\n/);
+    expect(messages[0]).not.toContain("1/2");
+    expect(messages[0].length).toBeLessThanOrEqual(2_000);
+    expect(messages[0]).toContain("开头：");
+    // 结论在末尾，必须保留；中间省略要说明出处
+    expect(messages[0]).toContain("结论：观望");
+    expect(messages[0]).toContain("中间省略");
+    expect(messages[0]).toContain("巡检日志");
   });
 
-  it("单轮正文按 900 字切分时优先在标点处断开", () => {
+  it("2000 字以内的单轮正文逐字保留（不再分条）", () => {
     const body = `${"甲".repeat(700)}。${"乙".repeat(400)}。${"丙".repeat(400)}`;
     const chunks = formatRoundPush(
       "BTC 实盘巡检",
       { round: "r", events: [{ ts: "t", round: "r", kind: "text", text: body }], end: 1 },
     );
-    expect(chunks.length).toBeGreaterThan(1);
-    expect(chunks[0].endsWith("。")).toBe(true);
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]).toContain(body);
+    expect(chunks[0]).not.toContain("中间省略");
   });
 });
 
@@ -138,19 +142,25 @@ describe("A 股推送只切不砍", () => {
     expect(body).toContain("· 巡检异常：行情超时");
   });
 
-  it("超长正文分条，拼回去与原文完全一致", () => {
-    const body = `${conclusion}\n${"补充说明。".repeat(300)}`;
-    const messages = formatStreamPush("A 股巡检结论", body);
-    expect(messages.length).toBeGreaterThan(1);
-    for (const message of messages) {
-      expect(message.length).toBeLessThanOrEqual(900);
-      expect(message).toMatch(/^\[A 股巡检结论( · \d+\/\d+)?\]\n/);
-    }
-    // 气泡边界上会丢掉一个换行（切点落在两行之间），其余字符必须逐字一致
-    const restored = messages
-      .map((message) => message.replace(/^\[[^\]]*\]\n/, ""))
-      .join("");
-    expect(restored.replace(/\s/g, "")).toBe(body.replace(/\s/g, ""));
+  it("2000 字以内逐字保留，超长时保留开头与结尾并注明省略", () => {
+    const short = `${conclusion}\n${"补充说明。".repeat(100)}`;
+    expect(short.length).toBeLessThan(2_000);
+    const one = formatStreamPush("A 股巡检结论", short);
+    expect(one).toHaveLength(1);
+    expect(one[0]).toMatch(/^\[A 股巡检结论\]\n/);
+    expect(one[0].replace(/^\[[^\]]*\]\n/, "").replace(/\s/g, "")).toBe(
+      short.replace(/\s/g, ""),
+    );
+
+    const long = `${conclusion}\n${"补充说明。".repeat(400)}`;
+    const clipped = formatStreamPush("A 股巡检结论", long);
+    expect(clipped).toHaveLength(1);
+    expect(clipped[0].length).toBeLessThanOrEqual(2_000);
+    expect(clipped[0]).toContain("中间省略");
+    expect(clipped[0]).toContain("巡检日志");
+    // 开头与结尾都必须在：结论表格不会只剩半行
+    expect(clipped[0]).toContain("结论（2026-11-19 收盘总结）");
+    expect(clipped[0]).toContain("补充说明");
   });
 
   it("空正文不发空气泡", () => {
@@ -227,6 +237,21 @@ describe("转发循环", () => {
     expect(sent2).toEqual([]);
   });
 
+  it("推送成功要留日志（「微信没收到」才有得查）", async () => {
+    // 首次 tick 只初始化偏移
+    await runFeedTick({ offsetsFile, send: async () => true });
+    appendBtc("text", "结论：观望");
+    appendBtc("round-end", "结论：观望");
+
+    const logs: string[] = [];
+    await runFeedTick({
+      offsetsFile,
+      send: async () => true,
+      log: (message) => logs.push(message),
+    });
+    expect(logs.some((line) => line.includes("巡检转发") && line.includes("1 轮"))).toBe(true);
+  });
+
   it("同一轮未结束不推，结束后整轮只推一次", async () => {
     await runFeedTick({ offsetsFile, send: async () => true });
     const before = readFeedOffsets(offsetsFile).btc;
@@ -292,30 +317,25 @@ describe("转发循环", () => {
     expect(sent2[0]).toContain("结论 B");
   });
 
-  it("一轮拆成多条气泡时，重试只补发没送达的那条", async () => {
+  it("一轮只发一条气泡；失败时不推进偏移，下轮整轮重发一次", async () => {
     await runFeedTick({ offsetsFile, send: async () => true });
 
-    // 正文约 1200 字 → 2 条气泡
+    // 正文约 1200 字：以前是 2 条气泡，现在压成 1 条
     appendBtc("text", `${"甲".repeat(400)}。${"乙".repeat(400)}。${"丙".repeat(400)}`);
     appendBtc("round-end", "长结论");
 
+    const before = readFeedOffsets(offsetsFile).btc;
     const sent: string[] = [];
-    let count = 0;
-    await runFeedTick({
-      offsetsFile,
-      // 第 1 条成功、第 2 条失败
-      send: async (text) => (sent.push(text), count++, count === 1),
-    });
-    expect(sent).toHaveLength(2);
-    expect(readFeedOffsets(offsetsFile)["btc-batch"]).toBe(1);
+    await runFeedTick({ offsetsFile, send: async (text) => (sent.push(text), false) });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain("甲");
+    expect(readFeedOffsets(offsetsFile).btc).toBe(before);
 
     const sent2: string[] = [];
     await runFeedTick({ offsetsFile, send: async (text) => (sent2.push(text), true) });
-    // 只补发第 2 条：第 1 条不会再发一遍
     expect(sent2).toHaveLength(1);
     expect(sent2[0]).toContain("丙");
-    expect(sent2[0]).not.toContain("甲");
-    expect(readFeedOffsets(offsetsFile)["btc-batch"]).toBe(0);
+    expect(readFeedOffsets(offsetsFile).btc).toBeGreaterThan(before);
 
     const sent3: string[] = [];
     await runFeedTick({ offsetsFile, send: async (text) => (sent3.push(text), true) });
@@ -366,6 +386,32 @@ describe("转发循环", () => {
     expect(sent2[0]).toContain("移出：莱美药业 300006");
   });
 
+  it("A 股中文动作的偏移按字节推进，不能停在行中间", async () => {
+    const actionsFile = path.join(aHome, "monitor", "actions.jsonl");
+    fs.mkdirSync(path.dirname(actionsFile), { recursive: true });
+    const entry = (entry: Record<string, unknown>): void => {
+      fs.appendFileSync(actionsFile, `${JSON.stringify(entry)}\n`, "utf8");
+    };
+
+    entry({ kind: "buy", message: "买入 贵州茅台 100 股 @ 10.00（费用 5.00）" });
+    await runFeedTick({ offsetsFile, send: async () => true }); // 初始化偏移
+
+    entry({ kind: "sell", message: "卖出 贵州茅台 100 股 @ 11.00（费用 5.50）" });
+    const sent: string[] = [];
+    await runFeedTick({ offsetsFile, send: async (text) => (sent.push(text), true) });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain("卖出 贵州茅台");
+
+    // 回归：以前 offset = start + 字符数，中文行会少推进约 2/3 的字节，
+    // 下一轮从行中间开始 → 动作漏推或重复。
+    expect(readFeedOffsets(offsetsFile).a).toBe(
+      fs.statSync(actionsFile).size,
+    );
+    const again: string[] = [];
+    await runFeedTick({ offsetsFile, send: async (text) => (again.push(text), true) });
+    expect(again).toEqual([]);
+  });
+
   it("A 股巡检结论不再被砍成 300 字（表格最后几行必须送达）", async () => {
     // 首次调用初始化 a-stream 偏移（从当前末尾开始，不回放）
     await runFeedTick({ offsetsFile, send: async () => true });
@@ -385,16 +431,45 @@ describe("转发循环", () => {
     const body = rows.join("\n");
     // 必须有内容落在旧的 300 字切点之外，否则这条用例证明不了什么
     expect(body.length).toBeGreaterThan(400);
+    // 一轮 = start … end；现在要等 end 才整轮推一条
+    appendAInspectEvent("start", "收盘总结");
     appendAInspectEvent("text", body);
+    appendAInspectEvent("end", "工具 3 次");
 
     const sent: string[] = [];
     await runFeedTick({ offsetsFile, send: async (text) => (sent.push(text), true) });
 
+    expect(sent).toHaveLength(1);
     const all = sent.join("\n");
-    expect(all).toContain("[A 股巡检结论]");
+    expect(all).toContain("[A 股巡检结论");
     // 最后两行以前正好落在那 300 字之外
     expect(all).toContain("601939");
     expect(all).toContain("监控规则更新");
-    expect(sent.every((message) => message.length <= 900)).toBe(true);
+    expect(sent.every((message) => message.length <= 2_000)).toBe(true);
+  });
+
+  it("A 股结论按轮聚合：未结束不推，结束后整轮只推一次", async () => {
+    await runFeedTick({ offsetsFile, send: async () => true }); // 初始化 a-stream 偏移
+    const before = readFeedOffsets(offsetsFile)["a-stream"];
+
+    appendAInspectEvent("start", "盘中巡检");
+    appendAInspectEvent("text", "第一段：601988 中国银行 持有");
+    const pending: string[] = [];
+    await runFeedTick({ offsetsFile, send: async (text) => (pending.push(text), true) });
+    expect(pending).toEqual([]);
+    expect(readFeedOffsets(offsetsFile)["a-stream"]).toBe(before);
+
+    appendAInspectEvent("text", "第二段：结论 观望，排期 13:45");
+    appendAInspectEvent("end", "工具 2 次");
+    const sent: string[] = [];
+    await runFeedTick({ offsetsFile, send: async (text) => (sent.push(text), true) });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain("第一段");
+    expect(sent[0]).toContain("第二段");
+    expect(sent[0]).toMatch(/^\[A 股巡检结论 \d{2}:\d{2}\]\n/);
+
+    const again: string[] = [];
+    await runFeedTick({ offsetsFile, send: async (text) => (again.push(text), true) });
+    expect(again).toEqual([]);
   });
 });

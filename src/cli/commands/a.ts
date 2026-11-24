@@ -615,8 +615,22 @@ async function statusCommand(parsed: ParsedArgs): Promise<void> {
         : `${ansi.yellow}未运行${ansi.reset}${ansi.gray}（xzh a start）${ansi.reset}`
     }\n`,
   );
+  // 16:00 后由 60 秒 tick 触发，选股本身要 2–3 分钟；期间 lastSelectDay 还是旧的。
+  // 只显示「上次 X」会让用户以为今天没启动，这里补上「今日已尝试，尚未完成」。
+  const selectAttempt = service.state?.lastSelectAttemptAt;
+  const todayKey = formatLocalTime(new Date(), "date");
+  const attemptToday =
+    Boolean(selectAttempt) &&
+    formatLocalTime(selectAttempt, "date") === todayKey;
+  const completedToday = service.state?.lastSelectDay === todayKey;
+  const selectNote =
+    attemptToday && !completedToday
+      ? ` · 今日 ${formatLocalTime(selectAttempt, "time")} 已尝试，尚未完成`
+      : service.state?.lastSelectDay
+        ? ` · 上次 ${service.state.lastSelectDay}`
+        : "";
   process.stdout.write(
-    `  ${padEnd("收盘选股", 10)}每交易日 16:00${service.state?.lastSelectDay ? ` · 上次 ${service.state.lastSelectDay}` : ""}\n`,
+    `  ${padEnd("收盘选股", 10)}每交易日 16:00${selectNote}\n`,
   );
   process.stdout.write(
     `  ${padEnd("监控规则", 10)}${readRules().length} 条` +

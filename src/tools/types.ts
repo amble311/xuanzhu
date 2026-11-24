@@ -105,11 +105,40 @@ export interface SubAgentInput {
  * 小窗口模型（8k/16k）一次读 2000 行或一条 30k 输出的 bash 就会把上下文打满，
  * 因此由 Agent 按档位注入更紧的默认值；工具不自己猜模型大小。
  */
+/** 看门狗运行时状态（由 TUI 注入；非 TUI 会话没有控制句柄） */
+export interface WatchdogStatus {
+  active: boolean;
+  /** 当前生效的超时（秒） */
+  timeoutSeconds: number;
+  /** 配置里的默认超时（秒） */
+  defaultSeconds: number;
+  /** 是否处于临时放宽状态 */
+  extended: boolean;
+}
+
+/**
+ * 看门狗运行时控制。
+ *
+ * 只允许**临时放宽**和恢复默认；不提供关闭 / 写配置 —— 安全网不能被模型自己拆掉。
+ */
+export interface WatchdogControl {
+  status(): WatchdogStatus;
+  extend(seconds: number): WatchdogStatus;
+  restore(): WatchdogStatus;
+}
+
 export interface ToolLimits {
   /** read_file 默认 / 最大读取行数 */
   maxReadLines?: number;
   /** bash 单次结果进入上下文的字符上限，超出则落 artifact */
   maxOutputChars?: number;
+  /**
+   * 单条工具结果进入上下文的 **token** 上限（由 Agent 按本轮剩余预算计算）。
+   *
+   * 字符上限无法反映真实占用：30k 字符的英文约 8.6k token，30k 中文字符约 30k token。
+   * 工具在字符截断之后再用它做一次 token 维度的兜底，避免一条输出吃掉半个窗口。
+   */
+  maxResultTokens?: number;
   /** artifact 存放目录（完整输出落盘，上下文只留摘要） */
   artifactDir?: string;
 }
@@ -145,6 +174,14 @@ export interface ToolContext {
   globalMemoryMaxChars?: number;
   /** 上下文档位对应的工具限额（由 Agent 注入） */
   limits?: ToolLimits;
+  /**
+   * 是否允许使用 sudo / SSH 等特权密码（由 Agent 从配置注入，默认 true）。
+   *
+   * false 时 `bash` 只放行 `sudo -n`（NOPASSWD），并在错误里说明原因。
+   */
+  allowPrivilegedAuth?: boolean;
+  /** 看门狗运行时控制（由 TUI 注入；非 TUI 会话为 undefined） */
+  watchdog?: WatchdogControl;
   /** 派生子代理执行子任务（由 Agent 注入），未提供时 task 工具不可用 */
   spawnAgent?: (input: SubAgentInput) => Promise<ToolResult>;
   /**
@@ -231,6 +268,28 @@ export interface ToolDefinition {
    * 而模型在普通项目里也用不上它们。
    */
   modes?: string[];
+  /**
+   * 旧工具名的**执行期别名**（不下发 schema）。
+   *
+   * 合并工具后旧会话里仍留有 `memory_write(...)` 这类调用记录；模型恢复会话时
+   * 可能照着调用。别名让这些调用继续可用，并补上 `action` 之类的默认参数，
+   * 避免「升级后旧会话里的工具突然未知」。schema 只发规范名，所以不增加每轮开销。
+   */
+  aliases?: Array<{ name: string; args?: Record<string, unknown> }>;
+  /**
+   * 小上下文档（small）是否保留。
+   *
+   * 以前是 Agent 里的一份 `SMALL_TOOL_NAMES` 名单，改工具名时很容易漏；现在跟着工具定义走，
+   * `requestTools()` 直接读这个标记（模式专属工具另有例外，见该函数）。
+   */
+  smallProfile?: boolean;
+  /**
+   * 是否算「只读调研」：本轮这类调用累积到阈值时，Agent 会提醒改用子代理。
+   *
+   * 同样从 Agent 的名单移到这里 —— 合并出 `code_nav` 后旧名单没跟上，
+   * 导致用 `code_nav` 大面积调研不再触发提醒。
+   */
+  exploration?: boolean;
   /** 执行前是否需要用户确认 */
   requiresConfirmation?: boolean;
   /**

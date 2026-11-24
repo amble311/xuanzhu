@@ -28,6 +28,16 @@ import { readPolicy } from "./policy";
 
 const MAX_TOOL_ROUNDS = 12;
 /**
+ * 叫醒复核的工具预算：`btc_brief` + 决策（可能撤单 + 开仓两次）+ `btc_trigger` + `btc_schedule` = 5。
+ *
+ * 复核的价值在「快」：让它能做完该做的事（含反手：先撤旧单再开新单），
+ * 但不给「再查一次就好」「回测一下」的空间。
+ */
+const REVIEW_TOOL_ROUNDS = 5;
+
+/** `full` = 常规巡检；`review` = 被叫醒条件触发的复核 */
+export type InspectMode = "full" | "review";
+/**
  * 超时拆成两档（与 A 股巡检 `src/a/inspect.ts` 对齐）：
  * - **空闲超时**：模型停止输出（思考 / 工具 / 正文）超过 3 分钟才中止；
  * - **总时长上限**：15 分钟硬顶，避免工具异常轮询把后台拖死。
@@ -42,6 +52,24 @@ const MAX_TOOL_ROUNDS = 12;
 const IDLE_TIMEOUT_MS = 3 * 60_000;
 /** 巡检结论写进状态/日志时截断到这个长度，避免把整段分析塞进 state */
 export const SUMMARY_LIMIT = 600;
+
+/**
+ * 慢轮心跳阈值：一轮超过这个时长还没结束，就往过程流补一条 notice。
+ *
+ * 本地 64K 上下文 + 十来次工具调用时，一轮 8–10 分钟是常态；这期间微信端
+ * 一点动静都没有（结论要等 `round-end` 才整轮推送），用户只能以为「卡死了」。
+ * 心跳只发一次，不会把结论变成一堆碎片。
+ */
+const SLOW_ROUND_MS = 8 * 60_000;
+
+/** 毫秒 → `42s` / `9m34s`，日志里的耗时统一用它 */
+function formatElapsed(startedAt: number): string {
+  const seconds = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return rest === 0 ? `${minutes}m` : `${minutes}m${rest}s`;
+}
 
 const INSPECT_PROMPT = `你现在处于**后台巡检 / 无人值守**：没有用户在终端前，也没有人会回答你的提问。
 这一轮你必须**自主决策到底** —— 该开就开、该平就平、该撤就撤，直接调用工具执行；
@@ -60,8 +88,10 @@ const INSPECT_PROMPT = `你现在处于**后台巡检 / 无人值守**：没有�
   并把下次巡检排近一点；**不要假装执行过**（结论里不能出现没调用过的成交）。
 
 步骤（btc_* 工具可用）：
-1. 先 \`btc_status\` 看环境与数据新鲜度；数据落后就 \`btc_sync\`。
-2. \`btc_signal\` 拿两层结论：\`side_filter\`（三周期允许的方向）与
+1. **先调一次 \`btc_brief\`**：它一次返回环境 / 数据新鲜度 / 三周期方向 / 1h 择时 / 模拟盘账本
+   （模拟盘后端才带）。数据落后再 \`btc_sync\`；需要单看某一项的明细时才单独调
+   \`btc_status\` / \`btc_signal\` / \`btc_paper_status\`，**不要三个都调一遍**。
+2. \`btc_signal\`（或 \`btc_brief\` 里的同一段）给两层结论：\`side_filter\`（三周期允许的方向）与
    \`stage4_1h\`（1 小时线机会评分 / 形态 / 失效条件）。\`side_filter\` 为 none / unknown、
    或 \`stage4_1h.entry=wait\` 时不做；1h 不足会 degraded，先补 1h 再判断。
 3. 需要评估参数时才用 \`btc_backtest\`，不要为了"更全面"反复回测。
@@ -84,7 +114,7 @@ const INSPECT_PROMPT = `你现在处于**后台巡检 / 无人值守**：没有�
 - 你**有真实下单能力**（\`btc_order\` / \`btc_close\` / \`btc_cancel\`），动的是真钱：
   没有明确信号不得开仓，也不得声称成交 —— 以工具返回为准。
 - 后台无人确认，需要用户批准的操作不可用；不要尝试绕过。
-- 工具轮数由代码限制（约 8 轮），不要重复取同一份数据；能一次拿到的就别分多次。
+- 工具轮数由代码限制（见文末预算），不要重复取同一份数据；能一次拿到的就别分多次。
 - **日线收盘、资金费结算、价格剧烈波动由代码自动触发额外巡检**，
   你排期时不必刻意去覆盖这些时点；但仍要根据信号状态决定下次时间。
 - 拿不到数据就如实说，不要编造价格或指标。
@@ -94,17 +124,69 @@ const INSPECT_PROMPT = `你现在处于**后台巡检 / 无人值守**：没有�
 - 有未成交挂单时：到本轮巡检/信号变化仍未成交，判断「继续等」还是「撤单」；
   结论反向就 \`btc_cancel all=true\` 撤掉，别让旧方向的单子留在盘上。`;
 
+/**
+ * 叫醒复核用的提示词（与常规巡检分开）。
+ *
+ * 为什么单独一套：叫醒条件命中时，用户要的是「现在到底成不成立、要不要立刻动」，
+ * 而不是把周/日/4h/1h/回测/账户全部重跑一遍。共用长提示词时，模型会照章节从头做，
+ * 一轮又要 8–10 分钟 —— 响应速度比不过行情变化，等于白叫。
+ * 复核只允许走最短路径：`btc_brief` 一次 + 决策工具 + 重新注入监控。
+ */
+const REVIEW_PROMPT = `你现在处于**后台巡检 / 无人值守**，这一轮是**叫醒复核**（不是完整巡检）。
+后台在监控里发现某个价位 / 指标到了，把你叫醒。任务只有三件：
+
+1. 确认这条条件**现在还成立吗**：价格可能已经回头，指标可能只是插针；
+2. 成立就立刻决断（开仓 / 平仓 / 撤单 / 续期），不成立就明确写「条件已失效」并删掉它；
+3. 重新注入监控：\`btc_schedule\`（必填，说明下次什么时候看）+ 必要时更新 \`btc_trigger\`。
+
+**不要重跑全量分析**：
+- 默认只调 \`btc_brief\` 一次（数据新鲜度 + 三周期方向 + 1h 择时 + 模拟盘账本）；
+  只有它显示数据过期时才 \`btc_sync\`；需要单看明细时再调 \`btc_status\` / \`btc_signal\` /
+  \`btc_paper_status\` 中的**一个**，不要三个都调；
+- **不要 \`btc_backtest\`**，也不要逐条重复取同一份数据 —— 本地模型每次工具往返 30–60 秒，
+  多调两次就把「及时响应」拖成了「十分钟后才动」。
+
+纪律（与常规巡检相同）：
+- 交易动作（btc_order / btc_close / btc_cancel / btc_renew / 排期 / 叫醒条件）已授权，直接执行；
+- 开头若带了「上次动作的落地情况」，**先处理 critical 项**（持仓无止损、距强平过近），
+  再复核本次叫醒条件 —— 别在裸奔的持仓上讨论要不要开新仓；
+- 硬性风控、三周期方向闸门是代码强制：被拒绝就看懂原因，不要反复重试同一条操作；
+- 1h 线不单独决定方向：\`side_filter\` 为 none / unknown 时只能观望，操作范围限定在
+  已有持仓的处理（减仓 / 平仓 / 撤单），不要新开仓；
+- 结论写进**正文**：「条件是否成立 + 做了什么 + 下次什么时候看」，不要只留在思考里；
+- 工具预算见下方（代码强制），别把一次复核跑成一次完整巡检。`;
+
 /** 模拟盘巡检追加的段落：放开虚拟开平仓，但纪律与实盘一致 */
 const PAPER_PROMPT_SECTION = `
 
-**本次是模拟盘巡检**：用 \`btc_paper_status\` 看虚拟账本（权益 / 持仓 / 绩效），
+**本次是模拟盘巡检**：虚拟账本（权益 / 持仓 / 绩效）已经包含在 \`btc_brief\` 里，
+要看更细的成交明细再用 \`btc_paper_status\`；
 需要时用 \`btc_paper_open\` / \`btc_paper_close\` 执行模拟开平仓。
 纪律与实盘相同（方向、仓位、止损、依据都要讲清），但**不涉及真钱**，
 不要说成实盘成交。已有持仓时先判断该持有还是该平，不要重复开同向仓。`;
 
+/**
+ * 拼出本轮提示词：常规巡检 / 叫醒复核两套 + 明确的工具预算。
+ *
+ * 预算写在提示词里只是「告知」，真正的硬限制在 `Agent` 的 `maxToolRounds`；
+ * 两者必须同源，否则模型会以为还能多调几次、被中止后结论变成空。
+ */
+export function buildInspectPrompt(mode: InspectMode, budget: number): string {
+  const base = mode === "review" ? REVIEW_PROMPT : INSPECT_PROMPT;
+  return (
+    `${base}\n\n工具预算：本轮最多 ${budget} 次工具调用（代码强制）。` +
+    "取数默认走 `btc_brief`（一次拿全），能一次拿到的不要分多次。"
+  );
+}
+
 export interface InspectOptions {
   log?: (line: string) => void;
   maxToolRounds?: number;
+  /**
+   * 本轮类型：`review` 用短提示词 + 4 次工具预算（被叫醒条件 / 挂单超时触发）。
+   * 不传等于 `full`（常规巡检 / 市场事件 / 清仓复盘）。
+   */
+  mode?: InspectMode;
   /** 模拟盘后端：允许提示词里放开 `btc_paper_*` 的虚拟开平仓 */
   paper?: boolean;
   /**
@@ -140,6 +222,8 @@ export async function runInspectCycle(
 ): Promise<InspectResult> {
   const home = getBtcHome();
   const log = options.log ?? (() => undefined);
+  /** 本轮开始时间：耗时同时进 backend.log 与状态，用来判断「是不是变慢了」 */
+  const startedAt = Date.now();
 
   const config = loadConfig();
   const active = activeModelEntry(config);
@@ -246,12 +330,14 @@ export async function runInspectCycle(
     onRoundLimit: async () => false,
   };
 
+  const review = options.mode === "review";
+  const budget = options.maxToolRounds ?? (review ? REVIEW_TOOL_ROUNDS : MAX_TOOL_ROUNDS);
   const agent = new Agent(provider, config, home, events, active, {
     mode: createBtcMode({ paper: options.paper === true }),
     autoMemory: false,
     taskLedger: false,
     backgroundJobs: false,
-    maxToolRounds: options.maxToolRounds ?? MAX_TOOL_ROUNDS,
+    maxToolRounds: budget,
   });
 
   // ── 巡检前置核对：先确认上次动作落地了没有 ──
@@ -323,6 +409,16 @@ export async function runInspectCycle(
     controller.abort();
   }, IDLE_TIMEOUT_MS);
   touch = () => idleTimer.refresh();
+  // 慢轮心跳：跑满 SLOW_ROUND_MS 还没结束就补一条 notice（只发一次）。
+  // 巡检结论仍然等 `round-end` 整轮推送，这条只是告诉用户「还在跑，不是死了」。
+  const slowTimer = setTimeout(() => {
+    const minutes = Math.round((Date.now() - startedAt) / 60_000);
+    log(`巡检偏慢：已 ${minutes} 分钟、${toolCalls} 次工具调用，仍未结束`);
+    emit(
+      "notice",
+      `⏳ 巡检已跑 ${minutes} 分钟（${toolCalls} 次工具调用），仍在进行；跑完会自动推送结论`,
+    );
+  }, SLOW_ROUND_MS);
   // 可选的总时长兜底（默认 0 = 不限，与 A 股同一份配置）
   const maxMinutes = inspectMaxMinutes(config);
   const totalTimer =
@@ -335,7 +431,7 @@ export async function runInspectCycle(
 
   try {
     await agent.run(
-      INSPECT_PROMPT +
+      buildInspectPrompt(review ? "review" : "full", budget) +
         (options.paper ? PAPER_PROMPT_SECTION : "") +
         preflightSection +
         marketSection +
@@ -349,6 +445,7 @@ export async function runInspectCycle(
     flush(true);
     const message = err instanceof Error ? err.message : String(err);
     emit("error", message);
+    log(`巡检失败（耗时 ${formatElapsed(startedAt)}，${toolCalls} 次工具调用）：${message}`);
     return {
       ok: false,
       summary: text.trim().slice(-SUMMARY_LIMIT),
@@ -357,6 +454,7 @@ export async function runInspectCycle(
     };
   } finally {
     clearTimeout(idleTimer);
+    clearTimeout(slowTimer);
     if (totalTimer) clearTimeout(totalTimer);
     touch = () => undefined;
   }
@@ -415,6 +513,9 @@ export async function runInspectCycle(
     }
   }
   emit("round-end", summary || "（本轮没有输出结论）");
+  log(
+    `巡检结束（${toolCalls} 次工具调用，耗时 ${formatElapsed(startedAt)}，结论 ${summary.length} 字）`,
+  );
 
   // 计划不在这一层读：它是「队列」，由后端定时器按到期时间消费
   return {

@@ -1,16 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { activeModelEntry, configExists, loadConfig } from "../config/store";
-import {
-  createProvider,
-  findProvider,
-  validateModelEntry,
-  validateProviderConfig,
-} from "../llm";
 import { friendlyError } from "../llm/http";
-import { applyProxyConfig } from "../network/proxy";
-import { deviceCommand } from "./commands/device";
-import { restoreTerminalSafely, TuiApp } from "../tui/app";
 import { ansi } from "../utils/ansi";
 import {
   expandHome,
@@ -28,40 +19,32 @@ import {
   markSessionStart,
   recordCrash,
 } from "../utils/crash";
-import { aCommand } from "./commands/a";
-import { configCommand } from "./commands/config";
-import { errorsCommand } from "./commands/errors";
-import { initCommand } from "./commands/init";
-import { modelCommand } from "./commands/model";
-import { promptCommand } from "./commands/prompt";
-import { autonomyCommand } from "./commands/autonomy";
-import { setupCommand } from "./commands/setup";
-import { vpnCommand } from "./commands/vpn";
-import { gatewayCommand } from "./gateway";
-import { skillCommand } from "./commands/skill";
 import { recordErrorReport } from "../utils/error-reports";
-import {
-  A_MODE_NAME,
-  allModes,
-  BTC_MODE_NAME,
-  createBtcMode,
-  findMode,
-  modeForHome,
-  type AgentMode,
-} from "../modes";
-import {
-  btcApikeyCommand,
-  btcEnsureCredential,
-  btcFkCommand,
-  btcPlatformCommand,
-  btcSetupCommand,
-  btcRestartCommand,
-  btcStatusCommand,
-  btcStopCommand,
-} from "./commands/btc";
-import { ensureBtcBackend } from "../btc/daemon";
-import { runBtcBackend } from "../btc/daemon-main";
-import { ensureBtcNetwork } from "../btc/network";
+import type { AgentMode } from "../modes";
+
+/**
+ * 模式名常量。
+ *
+ * 刻意不从 `../modes` 里 import：注册表会连带加载 `modes/a` / `modes/btc`
+ * （以及 a 股 / BTC 的全部实现），而 `xzh --version`、`config` 根本用不到它们。
+ * 这里只做字符串比较，真正的模式实现在 `loadMode()` 里按需动态导入。
+ */
+const A_MODE_NAME = "a";
+const BTC_MODE_NAME = "btc";
+
+/** 按名字懒加载模式实现；未注册的名字返回 undefined */
+async function loadMode(name: string | undefined): Promise<AgentMode | undefined> {
+  const normalized = name?.trim().toLowerCase();
+  if (normalized === BTC_MODE_NAME) {
+    const { createBtcMode } = await import("../modes/btc");
+    return createBtcMode();
+  }
+  if (normalized === A_MODE_NAME) {
+    const { createAShareMode } = await import("../modes/a");
+    return createAShareMode();
+  }
+  return undefined;
+}
 
 // 版本号来自构建期注入（见 utils/version.ts），全项目只此一处来源
 
@@ -78,7 +61,15 @@ process.stderr.on("error", () => undefined);
 // SIGTERM / SIGHUP —— SSH 断线时 sshd 关闭 pty，内核会向会话的前台进程组发 SIGHUP，
 // 所以这条路径**必须**走界面的正常退出流程（`requestShutdown`）而不是直接 exit：
 // 右侧终端里的命令是以 detached 进程组起的，直接 exit 会把它们留成孤儿进程。
-let activeApp: TuiApp | undefined;
+let activeApp: { requestShutdown(reason?: string): void } | undefined;
+/**
+ * 终端还原函数。
+ *
+ * TUI 模块（及其带来的 Agent / 工具 / 模式实现）改为在 `startChat()` 里动态加载，
+ * 这样 `xzh --version` / `config` 不必为一个界面付几十 MB。信号处理器只依赖这个
+ * 占位函数：TUI 尚未加载时终端也没进 raw mode，不需要还原。
+ */
+let restoreTerminal = (): void => {};
 for (const signal of ["SIGTERM", "SIGHUP"] as const) {
   process.on(signal, () => {
     if (activeApp) {
@@ -86,13 +77,13 @@ for (const signal of ["SIGTERM", "SIGHUP"] as const) {
       // 兜底：界面清理卡住（例如设备桥在关连接）时强制退出，不能挂在这里
       setTimeout(() => {
         markSessionEnd();
-        restoreTerminalSafely();
+        restoreTerminal();
         process.exit(0);
       }, 1500).unref();
       return;
     }
     markSessionEnd(); // 用户/系统主动结束，不算崩溃
-    restoreTerminalSafely();
+    restoreTerminal();
     process.exit(0);
   });
 }
@@ -105,7 +96,7 @@ process.on("uncaughtException", (err) => {
     error: err,
     cwd: process.cwd(),
   });
-  restoreTerminalSafely();
+  restoreTerminal();
   process.stderr.write(`\n未捕获异常：${err?.stack ?? String(err)}\n`);
   process.stderr.write(`详情已写入 ${crashLogPath()}\n`);
   if (report) process.stderr.write(`错误报告：${report}\n`);
@@ -119,7 +110,7 @@ process.on("unhandledRejection", (reason) => {
     error: reason,
     cwd: process.cwd(),
   });
-  restoreTerminalSafely();
+  restoreTerminal();
   process.stderr.write(`\n未处理的 Promise 拒绝：${String(reason)}\n`);
   process.stderr.write(`详情已写入 ${crashLogPath()}\n`);
   if (report) process.stderr.write(`错误报告：${report}\n`);
@@ -134,6 +125,8 @@ process.on("unhandledRejection", (reason) => {
  */
 async function startBtcService(role: "live" | "paper"): Promise<void> {
   const label = role === "paper" ? "模拟盘" : "实盘";
+  // 只有 btc 后台命令才加载常驻进程模块（它带着 daemon-main 的整套调度）
+  const { ensureBtcBackend } = await import("../btc/daemon");
   const backend = await ensureBtcBackend({ role });
   if (backend.running) {
     const next = backend.state?.nextCheckAt;
@@ -186,13 +179,14 @@ async function main(): Promise<void> {
 
   // 专用模式（`xzh btc`）：模式名优先于「同名目录」——
   // 想打开当前目录下名为 btc 的文件夹请写 `xzh ./btc`。
-  const mode = findMode(command);
+  const mode = await loadMode(command);
   if (mode) {
     const sub = args[1];
     // A 股：有子命令交给数据探针（quote / bars / snapshot / screen / sync …），
     // 没有则进入模式本体。模式内的工具与提示词在 src/modes/a.ts。
     if (mode.name === A_MODE_NAME) {
       if (sub) {
+        const { aCommand } = await import("./commands/a");
         await aCommand(args.slice(1));
         return;
       }
@@ -201,6 +195,7 @@ async function main(): Promise<void> {
     }
     if (mode.name === BTC_MODE_NAME) {
       if (sub === "setup") {
+        const { btcSetupCommand } = await import("./commands/btc");
         await btcSetupCommand(args.slice(2));
         return;
       }
@@ -208,6 +203,7 @@ async function main(): Promise<void> {
       if (sub === "start") {
         // 内部标记：detached 出来的常驻进程才跑前台循环（见 src/btc/daemon.ts）
         if (args.includes("--foreground")) {
+          const { runBtcBackend } = await import("../btc/daemon-main");
           await runBtcBackend({ role: "live" });
           return;
         }
@@ -216,27 +212,33 @@ async function main(): Promise<void> {
       }
       if (sub === "stop") {
         // 默认只停实盘；模拟盘用 `xzh btc moni stop`
+        const { btcStopCommand } = await import("./commands/btc");
         await btcStopCommand(args.slice(2));
         return;
       }
       if (sub === "restart") {
         // 先停再起，等同 stop + start；模拟盘用 `xzh btc moni restart`
+        const { btcRestartCommand } = await import("./commands/btc");
         await btcRestartCommand(args.slice(2));
         return;
       }
       if (sub === "status") {
+        const { btcStatusCommand } = await import("./commands/btc");
         await btcStatusCommand();
         return;
       }
       if (sub === "apikey") {
+        const { btcApikeyCommand } = await import("./commands/btc");
         await btcApikeyCommand(args.slice(2));
         return;
       }
       if (sub === "fk") {
+        const { btcFkCommand } = await import("./commands/btc");
         await btcFkCommand();
         return;
       }
       if (sub === "platform") {
+        const { btcPlatformCommand } = await import("./commands/btc");
         await btcPlatformCommand(args.slice(2));
         return;
       }
@@ -244,6 +246,7 @@ async function main(): Promise<void> {
       if (sub === "moni") {
         if (args[2] === "start") {
           if (args.includes("--foreground")) {
+            const { runBtcBackend } = await import("../btc/daemon-main");
             await runBtcBackend({ role: "paper" });
             return;
           }
@@ -251,14 +254,17 @@ async function main(): Promise<void> {
           return;
         }
         if (args[2] === "stop") {
+          const { btcStopCommand } = await import("./commands/btc");
           await btcStopCommand(["--paper"]);
           return;
         }
         if (args[2] === "restart") {
+          const { btcRestartCommand } = await import("./commands/btc");
           await btcRestartCommand(["--paper"]);
           return;
         }
         process.env.XZH_BTC_ROLE = "paper";
+        const { createBtcMode } = await import("../modes/btc");
         await startChat(mode.home, intentOverride, createBtcMode({ paper: true }));
         return;
       }
@@ -277,6 +283,7 @@ async function main(): Promise<void> {
         return;
       }
       // 实盘启动前确认凭据：没有就进交互式管理（用户选过「跳过」就不再问）
+      const { btcEnsureCredential } = await import("./commands/btc");
       await btcEnsureCredential();
       await startChat(mode.home, intentOverride, mode);
       return;
@@ -300,42 +307,66 @@ async function main(): Promise<void> {
       return;
     // A 股：数据/巡检子命令走 aCommand（serve / watch / monitor / quote / bars / …），
     // 无子命令时进入模式本体（工具与提示词在 src/modes/a.ts）。
-    case "a":
+    case "a": {
+      const { aCommand } = await import("./commands/a");
       await aCommand(args.slice(1));
       return;
-    case "model":
+    }
+    case "model": {
+      const { modelCommand } = await import("./commands/model");
       await modelCommand(args.slice(1));
       return;
-    case "config":
+    }
+    case "config": {
+      const { configCommand } = await import("./commands/config");
       await configCommand(args.slice(1));
       return;
-    case "setup":
+    }
+    case "setup": {
+      const { setupCommand } = await import("./commands/setup");
       await setupCommand();
       return;
-    case "init":
+    }
+    case "init": {
+      const { initCommand } = await import("./commands/init");
       await initCommand(args.slice(1));
       return;
-    case "skill":
+    }
+    case "skill": {
+      const { skillCommand } = await import("./commands/skill");
       await skillCommand(args.slice(1));
       return;
-    case "prompt":
+    }
+    case "prompt": {
+      const { promptCommand } = await import("./commands/prompt");
       await promptCommand(args.slice(1));
       return;
-    case "autonomy":
+    }
+    case "autonomy": {
+      const { autonomyCommand } = await import("./commands/autonomy");
       autonomyCommand(args.slice(1));
       return;
-    case "errors":
+    }
+    case "errors": {
+      const { errorsCommand } = await import("./commands/errors");
       await errorsCommand(args.slice(1));
       return;
-    case "vpn":
+    }
+    case "vpn": {
+      const { vpnCommand } = await import("./commands/vpn");
       await vpnCommand(args.slice(1));
       return;
-    case "gateway":
+    }
+    case "gateway": {
+      const { gatewayCommand } = await import("./gateway");
       await gatewayCommand(args.slice(1));
       return;
-    case "device":
+    }
+    case "device": {
+      const { deviceCommand } = await import("./commands/device");
       await deviceCommand(args.slice(1));
       return;
+    }
     case "help":
     case "-h":
     case "--help":
@@ -357,12 +388,36 @@ async function main(): Promise<void> {
       // 保证「同一个目录不管从哪条路径进来，约束都一样」。
       const dir = resolveDirectory(command);
       if (dir) {
+        const { modeForHome } = await import("../modes");
         await startChat(dir, intentOverride, modeForHome(dir));
         return;
       }
       if (looksLikePath(command)) {
         process.stdout.write(
           `${ansi.red}目录不存在或不是目录：${command}${ansi.reset}\n`,
+        );
+        process.exitCode = 1;
+        return;
+      }
+
+      // 0.8.4 已移除 `xzh sudo` / `xzh secret`（改为加密凭据 + bash.stdin_secret）。
+      // 模型偶尔会从旧 changelog / 记忆里翻出这两个名字，直接给出正确做法，
+      // 避免用户看到「未知命令：sudo」却不知道下一步该干什么。
+      if (command === "sudo") {
+        process.stdout.write(
+          `${ansi.yellow}xzh 没有 sudo 子命令${ansi.reset}\n` +
+            `${ansi.gray}提权直接运行 ${ansi.reset}sudo <命令>${ansi.gray}；` +
+            `需要密码时把凭据保存为 ${ansi.reset}sec_xxx${ansi.gray}，` +
+            `再用 bash 的 ${ansi.reset}stdin_secret${ansi.gray} 注入。${ansi.reset}\n`,
+        );
+        process.exitCode = 1;
+        return;
+      }
+      if (command === "secret") {
+        process.stdout.write(
+          `${ansi.yellow}xzh 没有 secret 子命令${ansi.reset}\n` +
+            `${ansi.gray}凭据由 memory 写入时自动加密到 ${ansi.reset}~/.xzh/vault/${ansi.gray}，` +
+            `记忆里只保留 ${ansi.reset}[加密凭据 sec_xxx]${ansi.gray} 引用。${ansi.reset}\n`,
         );
         process.exitCode = 1;
         return;
@@ -420,6 +475,19 @@ async function startChat(
     return;
   }
 
+  // 要到真正进界面时才加载 TUI（连带 Agent / 工具 / 模式实现）与代理层。
+  // `xzh --version`、`xzh config` 这类命令不该为一个用不到的界面付启动成本。
+  const [
+    { TuiApp, restoreTerminalSafely },
+    { applyProxyConfig },
+    { createProvider, findProvider, validateModelEntry, validateProviderConfig },
+  ] = await Promise.all([
+    import("../tui/app"),
+    import("../network/proxy"),
+    import("../llm"),
+  ]);
+  restoreTerminal = restoreTerminalSafely;
+
   // 模式的固定目录必须存在：首次 `xzh btc` 时 `~/.xzh_btc` 还没有。
   // 这里只建空目录（记忆与会话会在启动流程里初始化），不联网、不落业务数据 ——
   // 计算脚本与行情库由模式自己的 bootstrap 负责，不能拖慢每次启动。
@@ -453,6 +521,7 @@ async function startChat(
     // 必须在 ensureService 之前 —— 后端是独立进程，会自己做一次；这里做是为了
     // 让**当前会话**的工具调用也能立刻取到行情，并把结论告诉用户。
     if (mode.name === BTC_MODE_NAME) {
+      const { ensureBtcNetwork } = await import("../btc/network");
       const network = await ensureBtcNetwork({ config: loadConfig() });
       for (const note of network.notes) {
         process.stdout.write(`${ansi.gray}${note}${ansi.reset}\n`);

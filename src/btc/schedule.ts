@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { getBtcHome } from "../utils/paths";
+import { currentBtcRole } from "./role";
 
 /**
  * 巡检排期队列（`~/.xzh_btc/run/schedules.json`）。
@@ -56,9 +57,14 @@ interface QueueFile {
 /** 队列归属：观察模式与模拟盘各一份，避免两个后端抢同一条计划 */
 export type ScheduleRole = "live" | "paper";
 
-/** 当前进程属于哪个角色（CLI 在进入模式 / 拉起后端时设置） */
+/**
+ * 当前任务属于哪个角色。
+ *
+ * 走 `currentBtcRole()`（AsyncLocalStorage 优先、env 兜底）：gateway 允许不同对端
+ * 并发，同一进程里可能同时跑实盘与模拟盘会话，单靠环境变量会串账本。
+ */
 export function currentScheduleRole(): ScheduleRole {
-  return process.env.XZH_BTC_ROLE === "paper" ? "paper" : "live";
+  return currentBtcRole();
 }
 
 /** `live` → schedules.json；`paper` → schedules-paper.json */

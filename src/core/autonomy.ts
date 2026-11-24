@@ -34,7 +34,6 @@ export const OBSERVE_BLOCKED_TOOLS = new Set([
   "write_file",
   "edit_file",
   "bash",
-  "bash_kill",
   "device_run",
   "device_push",
   "device_stop",
@@ -109,8 +108,8 @@ function summarizeArgs(toolName: string, args: Record<string, unknown>): string 
   let detail: string;
   if (toolName === "bash") {
     detail = pick("command");
-  } else if (toolName === "bash_kill") {
-    detail = pick("job_id");
+  } else if (toolName === "bash_job" || toolName === "bash_kill") {
+    detail = `${pick("action") ? `${pick("action")} ` : ""}${pick("job_id")}`;
   } else if (toolName === "device_push" || toolName === "device_run") {
     detail = `${pick("file")}${pick("path")}`;
   } else if (toolName === "write_file" || toolName === "edit_file") {

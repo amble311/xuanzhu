@@ -1,6 +1,7 @@
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
+import { estimateTokens, sliceToTokenBudget } from "../llm/context";
 import type { ToolContext, ToolDefinition, ToolResult } from "./types";
 
 /**
@@ -413,7 +414,7 @@ function clip(text: string, max: number): string {
 }
 
 function outputLimit(ctx: ToolContext): number {
-  return Math.max(1000, ctx.limits?.maxOutputChars ?? 12_000);
+  return Math.max(1000, ctx.limits?.maxOutputChars ?? 6_000);
 }
 
 function renderRepoMap(index: RepoIndex, query: string, limit: number): string {
@@ -490,10 +491,15 @@ export const repoMapTool: ToolDefinition = {
     const query = typeof args.query === "string" ? args.query.trim() : "";
     const limit = Math.min(40, Math.max(1, Number(args.limit) || 15));
     const index = buildRepoIndex(ctx.cwd, args.refresh === true);
-    const text = renderRepoMap(index, query, limit);
+    let text = renderRepoMap(index, query, limit).slice(0, outputLimit(ctx));
+    // 目录概览在符号很多的仓库里仍可能很长，再按 token 兜底
+    const tokenCap = ctx.limits?.maxResultTokens;
+    if (tokenCap && estimateTokens(text) > tokenCap) {
+      text = sliceToTokenBudget(text, tokenCap) + "\n…（已按上下文预算截断）";
+    }
     return {
       ok: true,
-      content: text.slice(0, outputLimit(ctx)),
+      content: text,
       summary: `仓库地图：${index.files.length} 文件 / ${index.symbols.length} 符号`,
     };
   },
@@ -653,5 +659,56 @@ export const readSymbolTool: ToolDefinition = {
         `${body}${note}`,
       summary: `读取 ${symbol.name}`,
     };
+  },
+};
+
+/**
+ * `code_nav` —— 仓库地图 / 找符号 / 读符号三合一。
+ *
+ * 三者共享同一份仓库索引，合并后每轮少发两份 schema；旧名通过 aliases 继续可用。
+ * `find` / `read` 也接受 `query` 作为 `name` 的别名（合并参数后模型容易混用）。
+ */
+export const codeNavTool: ToolDefinition = {
+  name: "code_nav",
+  smallProfile: true,
+  exploration: true,
+  description:
+    "代码导航。action=map：仓库地图（文件 + 符号概览，query 可为空）；" +
+    "action=find：按名称找定义，返回 文件:行号 与签名；" +
+    "action=read：只读某个符号的代码范围（比 read_file 省上下文）。",
+  aliases: [
+    { name: "repo_map", args: { action: "map" } },
+    { name: "find_symbol", args: { action: "find" } },
+    { name: "read_symbol", args: { action: "read" } },
+  ],
+  parameters: {
+    type: "object",
+    properties: {
+      action: {
+        type: "string",
+        enum: ["map", "find", "read"],
+        description: "map=仓库地图；find=按名称找定义；read=读符号代码",
+      },
+      name: { type: "string", description: "find / read：符号名或名称片段" },
+      query: { type: "string", description: "map：任务关键词；为空时返回目录概览" },
+      path: { type: "string", description: "read：限定在某个文件（相对项目根）" },
+      limit: { type: "integer", description: "map / find 最多返回条数" },
+      max_lines: { type: "integer", description: "read 最多返回行数（默认 200）" },
+      refresh: { type: "boolean", description: "map：忽略缓存重新扫描" },
+    },
+    required: ["action"],
+  },
+  async execute(args, ctx): Promise<ToolResult> {
+    if (args.action === "find" || (args.action !== "map" && args.action !== "read" && args.name)) {
+      const merged = { ...args };
+      if (!merged.name && typeof merged.query === "string") merged.name = merged.query;
+      return findSymbolTool.execute(merged, ctx);
+    }
+    if (args.action === "read") {
+      const merged = { ...args };
+      if (!merged.name && typeof merged.query === "string") merged.name = merged.query;
+      return readSymbolTool.execute(merged, ctx);
+    }
+    return repoMapTool.execute(args, ctx);
   },
 };

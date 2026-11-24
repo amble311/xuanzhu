@@ -205,6 +205,43 @@ export function loadSecret(id: string): string | null {
   }
 }
 
+/**
+ * 按 id 或 label 解析凭据，供内部工具使用（**绝不要把 value 返回给模型**）。
+ *
+ * label 必须唯一：多个同名凭据时返回 null，逼调用方用 `sec_xxx` id。
+ */
+export function resolveSecret(
+  ref: string,
+): (SecretEntryMeta & { value: string }) | null {
+  // 允许直接粘记忆里的 `[加密凭据 sec_xxx]`（含反引号 / 方括号）
+  const clean = ref
+    .trim()
+    .replace(/^`?\[加密凭据\s+/, "")
+    .replace(/\]`?$/, "")
+    .replace(/`/g, "")
+    .trim();
+  if (!clean) return null;
+
+  const entries = listSecrets();
+  let meta: SecretEntryMeta | undefined;
+  if (clean.startsWith("sec_")) {
+    meta = entries.find((entry) => entry.id === clean);
+  } else {
+    const exact = entries.filter((entry) => entry.label === clean);
+    const matches =
+      exact.length > 0
+        ? exact
+        : entries.filter(
+            (entry) => entry.label.toLowerCase() === clean.toLowerCase(),
+          );
+    if (matches.length === 1) meta = matches[0];
+  }
+  if (!meta) return null;
+
+  const value = loadSecret(meta.id);
+  return value === null ? null : { ...meta, value };
+}
+
 /** 只返回元数据，不返回值 */
 export function listSecrets(): SecretEntryMeta[] {
   return Object.values(readVault().entries)
@@ -262,9 +299,20 @@ export function protectSecretsInText(text: string): {
 
 /** 文本里是否有“看起来像真的”凭据赋值（用于自动捕获判断） */
 export function hasCredentialAssignment(text: string): boolean {
-  const pattern = new RegExp(CREDENTIAL_ASSIGNMENT.source, "i");
+  // 必须带 `g`：否则 `exec` 的 lastIndex 永远停在 0，遇到「密码是什么？」这类
+  // 值是占位符的匹配时会无限返回同一个 match —— 表现为 TUI 100% CPU 卡死。
+  const pattern = new RegExp(CREDENTIAL_ASSIGNMENT.source, "gi");
   let match: RegExpExecArray | null;
+  let scanned = 0;
   while ((match = pattern.exec(text)) !== null) {
+    // 硬上限：一段用户输入里真有 1000 个凭据赋值也远超正常范围；
+    // 万一以后正则再写错，也只扫一遍有限次数，不会把事件循环卡死。
+    if (++scanned > 1000) break;
+    // 防御零长度匹配：正则理论上至少要吃掉一个值字符，但手改时别让它变成死循环
+    if (match[0].length === 0) {
+      pattern.lastIndex += 1;
+      continue;
+    }
     if (!isPlaceholder(match[2] ?? "")) return true;
   }
   return false;

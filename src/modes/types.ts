@@ -1,3 +1,5 @@
+import type { ToolDefinition } from "../tools/types";
+
 /**
  * 专用模式（`xzh btc` 这类子命令）。
  *
@@ -31,6 +33,13 @@ export interface AgentMode {
   promptSection: string;
   /** 进入模式时在输出区显示的一行提示 */
   startupHint: string;
+  /**
+   * 该模式的专属工具（如 `btc_*` / `a_*`）。
+   *
+   * 普通模式**不加载**它们：`TOOLS` 只放通用工具，Agent 在 `mode.tools` 存在时才合并。
+   * 这样 `xzh` 普通会话不必为几十个用不到的工具及其业务层（A 股 / 交易所）付内存。
+   */
+  tools?: ToolDefinition[];
   /**
    * 启动时释放随包资产（同步、无网络）；失败**不阻止启动**。
    *

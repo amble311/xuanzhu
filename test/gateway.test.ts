@@ -9,6 +9,7 @@ import {
 } from "../src/gateway/paths";
 import { commandHelpLines } from "../src/core/help-text";
 import { createDeduper, DEDUP_TTL_MS, TEXT_DEDUP_MS } from "../src/gateway/weixin/channel";
+import { assertSendOk } from "../src/gateway/weixin/client";
 import {
   gatewayModeFile,
   isPidAlive,
@@ -67,6 +68,16 @@ describe("gateway", () => {
     const state = readGatewayState(home);
     expect(state?.pid).toBe(process.pid);
     expect(state?.port).toBe(17890);
+  });
+
+  it("iLink 发送必须检查业务码，HTTP 200 也可能失败", () => {
+    // 回归：sendmessage 返回 HTTP 200 + ret/errcode 非 0，曾被视为已送达
+    expect(() => assertSendOk({})).not.toThrow();
+    expect(() => assertSendOk({ ret: 0, errcode: 0 })).not.toThrow();
+    expect(() => assertSendOk({ ret: -2, errmsg: "rate limited" })).toThrow(
+      /ret=-2/,
+    );
+    expect(() => assertSendOk({ errcode: -14 })).toThrow(/errcode=-14/);
   });
 
   it("pid 存活判断：自己活着，0/负数/非法值一律当死", () => {
@@ -180,5 +191,118 @@ describe("微信消息去重", () => {
     expect(remember("id:42", DEDUP_TTL_MS)).toBe(false);
     now += 5 * 60_000;
     expect(remember("id:42", DEDUP_TTL_MS)).toBe(true);
+  });
+});
+
+describe("摘要箱与本地令牌", () => {
+  // 每个用例自己建/删临时目录：共用一个父目录时，第一个用例的 afterEach
+  // 会把父目录删掉，第二个用例 mkdtemp 就 ENOENT。
+  let home = "";
+  afterEach(() => {
+    if (home) fs.rmSync(home, { recursive: true, force: true });
+    home = "";
+  });
+
+  it("摘要按条累加、渲染最近 N 条、清空后提示消失", async () => {
+    const dig = await import("../src/gateway/digest");
+    home = fs.mkdtempSync(path.join(os.tmpdir(), "xzh-digest-"));
+    expect(dig.digestCount(home)).toBe(0);
+    expect(dig.digestHint(home)).toBe("");
+
+    dig.appendDigest(home, { source: "巡检", text: "601988 中国银行 持有" });
+    dig.appendDigest(home, { source: "巡检", text: "601398 工商银行 持有" });
+    expect(dig.digestCount(home)).toBe(2);
+    expect(dig.digestHint(home)).toContain("2 轮");
+
+    const rendered = dig.formatDigest(home, 1);
+    expect(rendered).toContain("未推送的巡检摘要 2 条");
+    expect(rendered).toContain("601398");
+    expect(rendered).not.toContain("601988"); // 只显示最近 1 条
+
+    dig.clearDigest(home);
+    expect(dig.digestCount(home)).toBe(0);
+    expect(dig.digestHint(home)).toBe("");
+  });
+
+  it("令牌落盘 0600，缺失时重建；请求头解析支持两种写法", async () => {
+    const auth = await import("../src/gateway/auth");
+    home = fs.mkdtempSync(path.join(os.tmpdir(), "xzh-auth-"));
+    const token = auth.ensureHttpToken(home);
+    expect(token.length).toBeGreaterThan(20);
+    expect(auth.readHttpToken(home)).toBe(token);
+    expect(fs.statSync(auth.httpTokenPath(home)).mode & 0o777).toBe(0o600);
+    // 幂等：再取一次还是同一个，不会把已在用的令牌换掉
+    expect(auth.ensureHttpToken(home)).toBe(token);
+
+    const make = (headers: Record<string, string>): import("node:http").IncomingMessage =>
+      ({ headers } as unknown as import("node:http").IncomingMessage);
+    expect(auth.authorizeRequest(make({ authorization: `Bearer ${token}` }), token)).toBe(true);
+    expect(auth.authorizeRequest(make({ "x-xzh-token": token }), token)).toBe(true);
+    expect(auth.authorizeRequest(make({}), token)).toBe(false);
+    expect(auth.authorizeRequest(make({ authorization: "Bearer wrong" }), token)).toBe(false);
+  });
+});
+
+describe("对端并发与 btc 角色上下文", () => {
+  it("同一个对端严格串行，不同对端可以并发", async () => {
+    const { createPeerQueues } = await import("../src/gateway/queues");
+    const queues = createPeerQueues();
+    const events: string[] = [];
+    const first = queues.run("a", async () => {
+      events.push("a1-start");
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      events.push("a1-end");
+    });
+    const second = queues.run("a", async () => {
+      events.push("a2");
+    });
+    const other = queues.run("b", async () => {
+      events.push("b-start");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      events.push("b-end");
+    });
+    await Promise.all([first, second, other]);
+
+    // 同对端：第二条必须等第一条结束
+    expect(events.indexOf("a2")).toBeGreaterThan(events.indexOf("a1-end"));
+    // 不同对端：B 不必等 A 的 60ms
+    expect(events.indexOf("b-end")).toBeLessThan(events.indexOf("a1-end"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(queues.pending("a")).toBe(false);
+  });
+
+  it("一条任务失败不会堵住同对端的后续任务", async () => {
+    const { createPeerQueues } = await import("../src/gateway/queues");
+    const queues = createPeerQueues();
+    const failed = queues.run("x", async () => {
+      throw new Error("boom");
+    });
+    await expect(failed).rejects.toThrow("boom");
+    await expect(queues.run("x", async () => "ok")).resolves.toBe("ok");
+  });
+
+  it("btc 角色按任务隔离：并发时互不串，任务外回到 env 兜底", async () => {
+    const { withBtcRole, currentBtcRole } = await import("../src/btc/role");
+    const before = process.env.XZH_BTC_ROLE;
+    process.env.XZH_BTC_ROLE = "live";
+    try {
+      const seen: string[] = [];
+      await Promise.all([
+        withBtcRole("paper", async () => {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          seen.push(`paper:${currentBtcRole()}`);
+        }),
+        withBtcRole("live", async () => {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          seen.push(`live:${currentBtcRole()}`);
+        }),
+      ]);
+      expect(seen.sort()).toEqual(["live:live", "paper:paper"]);
+      // 上下文外仍读 env（CLI / 后端守护进程是单角色进程）
+      expect(currentBtcRole()).toBe("live");
+    } finally {
+      if (before === undefined) delete process.env.XZH_BTC_ROLE;
+      else process.env.XZH_BTC_ROLE = before;
+    }
   });
 });

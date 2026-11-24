@@ -31,7 +31,7 @@ export interface SubAgentDefinition {
   /** 子代理的系统提示词 */
   systemPrompt(ctx: SubAgentContext): string;
   /**
-   * 报告进入主上下文的字符上限（默认 12000；small 档会再收紧到 4000）。
+   * 报告进入主上下文的字符上限（默认 6000；small 档会再收紧到 4000）。
    * 子代理可以读到大量中间内容，但回灌必须是有界的。
    */
   maxReportChars?: number;

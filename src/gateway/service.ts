@@ -2,7 +2,6 @@ import { spawn, spawnSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { VERSION } from "../utils/version";
 import { gatewayHome, gatewayPaths } from "./paths";
 
 /** 写入 `run/gateway.json` 的运行状态（面板/`status` 读它） */
@@ -17,6 +16,13 @@ export interface GatewayState {
   model?: string;
   /** 最近一次错误（模型不可用等） */
   lastError?: string;
+  /**
+   * 主动推送被服务端拒收（iLink `ret=-2`）而暂停时的原因。
+   *
+   * 由 outbox 通过 `onBlocked` 上报，`xzh gateway status` 直接显示 ——
+   * 用户报「微信没收到巡检结论」时，不用翻 journal 就知道是队列卡住了。
+   */
+  pushBlocked?: string;
 }
 
 export const DEFAULT_GATEWAY_PORT = 17890;
@@ -701,5 +707,3 @@ export function uninstallAutostart(): { ok: boolean; error?: string } {
   spawnSync("systemctl", ["--user", "daemon-reload"], { encoding: "utf8" });
   return { ok: true };
 }
-
-export const GATEWAY_VERSION = VERSION;

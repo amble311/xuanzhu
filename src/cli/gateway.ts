@@ -14,6 +14,9 @@ import {
   uninstallAutostart,
 } from "../gateway/service";
 import { runGateway, tailGatewayLog } from "../gateway/server";
+import { collectDoctor } from "../gateway/doctor";
+import { formatDigest } from "../gateway/digest";
+import { httpTokenPath } from "../gateway/auth";
 import { weixinCommand } from "./weixin";
 
 function line(text = ""): void {
@@ -44,9 +47,13 @@ function printStatus(): void {
     if (state.lastError) {
       line(`${ansi.yellow}  最近错误：${state.lastError}${ansi.reset}`);
     }
+    if (state.pushBlocked) {
+      line(`${ansi.yellow}  推送暂停：${state.pushBlocked}${ansi.reset}`);
+    }
     line(`${ansi.gray}  健康检查：${ansi.reset}curl -s http://127.0.0.1:${state.port}/health`);
   }
   line(`${ansi.gray}  日志 ${logFile}${ansi.reset}`);
+  line(`${ansi.gray}  排查：${ansi.reset}xzh gateway doctor`);
   const auto = status.autostart;
   if (!auto.supported) {
     line(`${ansi.gray}  开机自启：${ansi.reset}${ansi.gray}${auto.reason ?? "不支持"}${ansi.reset}`);
@@ -57,6 +64,32 @@ function printStatus(): void {
           ? `${ansi.green}已启用${ansi.reset}${ansi.gray}（${auto.path}）${ansi.reset}`
           : `${ansi.yellow}未启用${ansi.reset}${ansi.gray}（xzh gateway autostart on）${ansi.reset}`),
     );
+  }
+}
+
+/**
+ * `xzh gateway doctor`：一句话结论 + 关键状态 + 最近日志。
+ *
+ * 结论在最上面：用户报「微信没收到」时，看第一行就知道是进程、登录态、
+ * 长轮询、推送窗口还是队列的问题。
+ */
+function printDoctor(): void {
+  const report = collectDoctor();
+  line(`${report.ok ? ansi.green : ansi.red}${report.verdict}${ansi.reset}`);
+  line();
+  const label: Record<string, string> = {
+    ok: `${ansi.green}✓${ansi.reset}`,
+    warn: `${ansi.yellow}!${ansi.reset}`,
+    bad: `${ansi.red}✗${ansi.reset}`,
+    info: `${ansi.gray}·${ansi.reset}`,
+  };
+  for (const item of report.lines) {
+    line(`${label[item.level] ?? "·"} ${item.text}`);
+  }
+  if (report.log) {
+    line("");
+    line(`${ansi.gray}最近日志：${ansi.reset}`);
+    for (const row of report.log.split("\n")) line(`${ansi.gray}  ${row}${ansi.reset}`);
   }
 }
 
@@ -155,9 +188,20 @@ export async function gatewayCommand(args: string[]): Promise<void> {
     return;
   }
 
+  if (sub === "doctor") {
+    printDoctor();
+    return;
+  }
+
+  if (sub === "digest") {
+    line(formatDigest(gatewayHome(), Math.min(10, Math.max(1, Number(args[1]) || 3))));
+    return;
+  }
+
   if (sub && sub !== "start") {
     line(
-      `${ansi.gray}用法：xzh gateway（启动）· stop · restart · status · autostart [on|off] · weixin [login|logout|status]${ansi.reset}`,
+      `${ansi.gray}用法：xzh gateway（启动）· stop · restart · status · doctor · digest [N] · ` +
+        `autostart [on|off] · weixin [login|logout|status]${ansi.reset}`,
     );
     return;
   }
@@ -172,10 +216,12 @@ export async function gatewayCommand(args: string[]): Promise<void> {
     `${ansi.green}✓ gateway ${result.started ? "已启动" : "已在运行"}${ansi.reset}` +
       `${ansi.gray} pid ${result.state?.pid} · 端口 ${result.state?.port} · 目录 ${gatewayHome()}${ansi.reset}`,
   );
+  line(`${ansi.gray}  健康检查 curl -s http://127.0.0.1:${result.state?.port}/health${ansi.reset}`);
   line(
-    `${ansi.gray}  健康检查 curl -s http://127.0.0.1:${result.state?.port}/health   ` +
-      `消息 POST /message {"text":"..."}${ansi.reset}`,
+    `${ansi.gray}  发消息 POST /message 需要令牌：` +
+      `-H "Authorization: Bearer $(cat ${httpTokenPath(gatewayHome())})"${ansi.reset}`,
   );
+  line(`${ansi.gray}  排查 xzh gateway doctor · 未推送的巡检摘要 xzh gateway digest${ansi.reset}`);
 
   // 首次启动顺手装开机自启（用户要求默认开启）；失败只提示，不影响服务。
   // 只在默认目录时才装：自定义目录（调试/多实例）不该改写 systemd。

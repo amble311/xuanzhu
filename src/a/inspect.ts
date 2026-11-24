@@ -6,6 +6,7 @@ import { createProvider } from "../llm";
 import type { AgentMode } from "../modes";
 import { getAShareHome } from "../utils/paths";
 import type { ExecuteToolResult } from "../tools";
+import { aShareTools } from "../tools/a-share";
 import { accountSummary, loadPaperAccount } from "./paper";
 import { maxPositions, poolSize } from "./settings";
 import { inWorkWindow, WORK_WINDOW_LABEL } from "./window";
@@ -328,9 +329,11 @@ function inspectPrompt(): string {
       每只最多 5 条；过时或已无意义的用 \`a_remove_trigger\` 删掉；
    c. 有未成交挂单时：判断继续等就 \`a_renew\` 续期并说明理由，不该等就 \`a_cancel_order\` 撤掉。
       **不要放任挂单过期**（过期后代码会叫醒你，但那是兜底，不是常规）。
-5. 最后用一段话总结本轮结论（会写进巡检日志供复盘）：**按遍历顺序逐只列 代码 / 方向 / 15m 分 / 动作**，
-   没动的写「观望」，不要只写“全部正常”。末尾再列一次**本轮落盘的叫醒条件**（代码 + 条件），
+5. 最后用一段话总结本轮结论（会写进巡检日志供复盘）：**按遍历顺序逐只列 代码 / 名称 / 方向 / 15m 分 / 动作**，
+   没动的写「观望」，不要只写“全部正常”。末尾再列一次**本轮落盘的叫醒条件**（代码 + 名称 + 条件），
    让用户一眼看出除了止损价还盯了什么。
+   **提个股一律写成「代码 名称」（如 \`601988 中国银行\`），不要只发六位代码** ——
+   这段结论会被推到微信，用户那边没有行情软件对照；名称取工具返回值，不要自己编。
 
 硬约束：
 - **不做选股**：禁止 \`a_select\` / \`a_screen\` 重新筛选股票，禁止买入池外股票；
@@ -576,6 +579,8 @@ export async function runAInspect(
       cwdLocked: true,
       promptSection: "",
       startupHint: "",
+      // 巡检只构造最小 mode，必须显式带上 a_* 工具 —— 它们已不在通用 TOOLS 里
+      tools: aShareTools,
     } satisfies AgentMode,
     autoMemory: false,
     taskLedger: false,

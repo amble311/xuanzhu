@@ -221,7 +221,7 @@ export class JobRegistry {
         error:
           `后台任务已达上限（${this.maxJobs} 个）：${running
             .map((job) => job.id)
-            .join("、")}。请先 bash_kill 掉不需要的再试。`,
+            .join("、")}。请先用 bash_job（action=kill）终止不需要的再试。`,
       };
     }
 

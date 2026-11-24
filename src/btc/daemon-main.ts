@@ -635,8 +635,15 @@ export async function runBtcBackend(
       /** 行情获取连续失败的说明（注入提示词，要求排查原因） */
       marketNote?: string;
     } | null,
+    /**
+     * `review` = 叫醒复核（叫醒条件命中 / 挂单超时）：短提示词 + 4 次工具预算，
+     * 只看「条件还成不成立」，不重跑全量。市场事件与常规排期仍走 `full`。
+     */
+    mode: "full" | "review" = "full",
   ): Promise<boolean> => {
     lastAttemptAt = Date.now();
+    /** 本轮耗时：面板要能看出「最近是不是变慢了」，只记在日志里没人会去翻 */
+    const inspectStartedAt = Date.now();
     log(trigger ? `触发巡检：${trigger.reason}` : "队列为空，按兜底规则巡检");
 
     // 风控告警只送一次：送来送去会让每轮巡检都在「重估」，反而没人做事
@@ -649,12 +656,20 @@ export async function runBtcBackend(
     const result = await runInspectCycle({
       log,
       paper,
+      mode,
       riskAlert,
       triggerNote: trigger?.triggerNote,
       orderNote: trigger?.orderNote,
       marketNote: trigger?.marketNote,
     });
     if (result.ok && riskAlert) markRiskDelivered(home);
+    const elapsedMs = Date.now() - inspectStartedAt;
+    const elapsedText =
+      elapsedMs >= 60_000
+        ? `${Math.floor(elapsedMs / 60_000)}m${Math.round((elapsedMs % 60_000) / 1000)}s`
+        : `${Math.round(elapsedMs / 1000)}s`;
+    state.lastInspectMs = elapsedMs;
+    state.lastInspectTools = result.toolCalls;
     state.riskTriggered = riskState.triggered;
     state.riskReason = riskState.reason;
     state.cycles = (state.cycles ?? 0) + 1;
@@ -685,7 +700,7 @@ export async function runBtcBackend(
         ].join("\n"),
       );
       log(
-        `巡检完成（${result.toolCalls} 次工具调用）；` +
+        `巡检完成（${result.toolCalls} 次工具调用，耗时 ${elapsedText}）；` +
           (next ? `下一条计划 ${next.at}` : "队列已空，等待兜底"),
       );
       return true;
@@ -707,7 +722,7 @@ export async function runBtcBackend(
         role,
       );
       log(
-        `巡检失败：${state.lastError}；${backoff} 分钟后重试（${pushed.entry.at}）`,
+        `巡检失败（耗时 ${elapsedText}）：${state.lastError}；${backoff} 分钟后重试（${pushed.entry.at}）`,
       );
       appendInspectLog(
         home,
@@ -935,7 +950,7 @@ export async function runBtcBackend(
       running = true;
       let ok = false;
       try {
-        ok = await runInspect(ttlTrigger);
+        ok = await runInspect(ttlTrigger, "review");
       } catch (err) {
         state.lastError = err instanceof Error ? err.message : String(err);
         log(`巡检异常：${state.lastError}`);
@@ -959,7 +974,7 @@ export async function runBtcBackend(
       running = true;
       let ok = false;
       try {
-        ok = await runInspect(triggerHit);
+        ok = await runInspect(triggerHit, "review");
       } catch (err) {
         state.lastError = err instanceof Error ? err.message : String(err);
         log(`巡检异常：${state.lastError}`);
