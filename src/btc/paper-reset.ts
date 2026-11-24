@@ -38,6 +38,45 @@ export interface PaperResetData {
 
 export type PaperResetSource = "command" | "tool";
 
+/** 当前会话的模式（只取判断所需字段，gateway / TUI / 工具都能传） */
+export interface PaperResetMode {
+  name: "btc" | "a" | null;
+  /** 仅 `name === "btc"` 时有意义 */
+  paper?: boolean;
+}
+
+/**
+ * `/reset moni` 是否允许执行：**只允许在 BTC 模拟盘会话里**。
+ *
+ * 以前不校验模式，于是：
+ * - A 股模式下 `/reset moni` 会去重置 BTC 模拟盘账本（跨模式副作用，用户根本没想动 BTC）；
+ * - BTC 实盘会话里也能重置模拟盘账本，与「实盘 / 模拟盘各管各的」相悖。
+ * 重置是破坏性操作，宁可拒绝并说明，也不要「顺手把另一个模式的账本清了」。
+ */
+export function canResetPaperLedger(
+  mode: PaperResetMode | null,
+): { ok: true } | { ok: false; reason: string } {
+  if (mode?.name === "btc") {
+    if (mode.paper === true) return { ok: true };
+    return {
+      ok: false,
+      reason: "当前是 BTC 实盘模式：/reset moni 只重置模拟盘账本，请先 /btc moni 再重置。",
+    };
+  }
+  if (mode?.name === "a") {
+    return {
+      ok: false,
+      reason:
+        "当前是 A 股模式：/reset moni 属于 BTC 模拟盘，不会去动 BTC 账本。" +
+        "要清空对话上下文请直接用 /reset。",
+    };
+  }
+  return {
+    ok: false,
+    reason: "当前是普通模式：/reset moni 只在 /btc moni（BTC 模拟盘）下可用；清空对话用 /reset。",
+  };
+}
+
 function money(value: number): string {
   return value.toLocaleString("en-US", {
     minimumFractionDigits: 2,

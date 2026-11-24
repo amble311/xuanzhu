@@ -45,7 +45,7 @@ export function commandHelpLines(): string[] {
     `  /pause [resume|status]  暂停/恢复 btc / a 巡检与交易（进程仍在）`,
     `  /prompt [list|show <段落>|reset <段落|--all>]  查看 / 重置系统提示词的分段覆盖`,
     `  /reset         重置对话上下文`,
-    `  /reset moni [初始资金]  重置模拟盘账本并记入记忆（仅 xzh btc moni 下有意义）`,
+    `  /reset moni [初始资金]  重置模拟盘账本并记入记忆（只在 BTC 模拟盘可用，其他模式会拒绝）`,
     `  /restart       重启当前模式的后台进程`,
     `  /resume [编号]  列出 / 恢复历史会话（对话历史会自动保存）`,
     `  /start         启动当前模式的后台进程`,

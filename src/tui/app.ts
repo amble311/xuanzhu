@@ -58,7 +58,7 @@ import {
   type Trigger,
 } from "../btc/triggers";
 import { readPause, setPaused } from "../btc/pause";
-import { resetPaperLedger } from "../btc/paper-reset";
+import { canResetPaperLedger, resetPaperLedger } from "../btc/paper-reset";
 import {
   currentInspectOffset,
   readInspectEvents,
@@ -3087,6 +3087,19 @@ export class TuiApp {
       case "reset":
         // `/reset moni [初始资金]` 重置模拟盘账本；不带参数仍是重置对话
         if (arg.trim().toLowerCase().startsWith("moni")) {
+          // 只在 BTC 模拟盘会话里允许：A 股模式下重置会去动一个跟当前模式无关的账本
+          const allowed = canResetPaperLedger({
+            name:
+              this.mode?.name === "btc" || this.mode?.name === "a"
+                ? this.mode.name
+                : null,
+            paper: process.env.XZH_BTC_ROLE === "paper",
+          });
+          if (!allowed.ok) {
+            this.lines.push(`${ansi.yellow}${allowed.reason}${ansi.reset}`);
+            this.scheduleRender();
+            break;
+          }
           void this.resetPaperAccount(arg.trim());
           break;
         }

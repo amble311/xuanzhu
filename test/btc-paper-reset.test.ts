@@ -68,3 +68,32 @@ describe("模拟盘重置记忆", () => {
     expect(text).toContain("现金 100,000.00 → 100,000.00");
   });
 });
+
+describe("重置模拟盘的模式闸门", () => {
+  it("只在 BTC 模拟盘会话里允许", async () => {
+    const { canResetPaperLedger } = await import("../src/btc/paper-reset");
+    expect(canResetPaperLedger({ name: "btc", paper: true }).ok).toBe(true);
+  });
+
+  it("BTC 实盘模式拒绝：不能顺手把模拟盘账本清了", async () => {
+    const { canResetPaperLedger } = await import("../src/btc/paper-reset");
+    const result = canResetPaperLedger({ name: "btc", paper: false });
+    expect(result.ok).toBe(false);
+    expect(result.ok ? "" : result.reason).toContain("/btc moni");
+  });
+
+  it("A 股模式拒绝，并说明该用 /reset 清对话", async () => {
+    const { canResetPaperLedger } = await import("../src/btc/paper-reset");
+    const result = canResetPaperLedger({ name: "a" });
+    expect(result.ok).toBe(false);
+    expect(result.ok ? "" : result.reason).toContain("A 股");
+    expect(result.ok ? "" : result.reason).toContain("/reset");
+  });
+
+  it("普通模式拒绝", async () => {
+    const { canResetPaperLedger } = await import("../src/btc/paper-reset");
+    const result = canResetPaperLedger(null);
+    expect(result.ok).toBe(false);
+    expect(result.ok ? "" : result.reason).toContain("/btc moni");
+  });
+});

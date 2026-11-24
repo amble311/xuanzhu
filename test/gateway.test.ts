@@ -306,3 +306,23 @@ describe("对端并发与 btc 角色上下文", () => {
     }
   });
 });
+
+describe("systemd 托管判定", () => {
+  it("只有 Linux + 默认目录 + 单元已安装且 enabled 才交给 systemctl", async () => {
+    const { shouldDelegateToSystemd } = await import("../src/gateway/service");
+    const base = {
+      platform: "linux" as NodeJS.Platform,
+      defaultHome: true,
+      unitInstalled: true,
+      unitEnabled: true,
+    };
+    expect(shouldDelegateToSystemd(base)).toBe(true);
+    // 非 Linux（Windows 用注册表 + VBS / macOS 用 launchd）
+    expect(shouldDelegateToSystemd({ ...base, platform: "win32" })).toBe(false);
+    // 自定义目录 = 多实例调试，不能去动默认单元的 systemd
+    expect(shouldDelegateToSystemd({ ...base, defaultHome: false })).toBe(false);
+    // 没装单元 / 装了但没 enable：自己 spawn 才是对的
+    expect(shouldDelegateToSystemd({ ...base, unitInstalled: false })).toBe(false);
+    expect(shouldDelegateToSystemd({ ...base, unitEnabled: false })).toBe(false);
+  });
+});

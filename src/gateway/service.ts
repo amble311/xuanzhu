@@ -89,6 +89,68 @@ function cliEntry(): string {
   return process.argv[1] ?? path.join(__dirname, "cli.js");
 }
 
+// ─────────────────── systemd 托管判定（2026-11-24） ───────────────────
+//
+// 背景：装了开机自启（`xzh-gateway.service`，`Restart=always`）之后，如果再用
+// `xzh gateway` 手动起一个实例：
+// - 它绕过 systemd，systemd 那个版本拿不到 pid 锁 → 反复「已在运行，本次退出」，
+//   状态显示 `activating (auto-restart)`，看起来像服务起不来；
+// - 两个版本可能同时存在（一个仓库版、一个全局安装版），谁在服务用户全看谁先抢到锁。
+// 2026-11-24 发布 0.19.0 后就踩到了这个坑：手动起的 0.18.1 一直占着锁，
+// `systemctl restart` 反复失败，`gateway.json` 里的版本号停在旧版。
+//
+// 所以：默认目录 + 单元已 enable 时，start/stop/restart 一律交给 systemctl，
+// 不再自己 spawn。自定义目录（`XZH_GATEWAY_HOME`，多实例/调试）不受影响。
+
+/** 纯判定函数：便于离线测试，不碰真实 systemd */
+export function shouldDelegateToSystemd(input: {
+  platform: NodeJS.Platform;
+  /** 是否使用默认的 `~/.xzh_gateway`（自定义目录通常意味着多实例调试） */
+  defaultHome: boolean;
+  unitInstalled: boolean;
+  unitEnabled: boolean;
+}): boolean {
+  return (
+    input.platform === "linux" &&
+    input.defaultHome &&
+    input.unitInstalled &&
+    input.unitEnabled
+  );
+}
+
+function unitEnabled(): boolean {
+  const result = spawnSync("systemctl", ["--user", "is-enabled", UNIT_NAME], {
+    encoding: "utf8",
+  });
+  return (result.stdout ?? "").trim() === "enabled";
+}
+
+/** 当前是否由 systemd 托管（Linux + 默认目录 + 单元已安装且 enabled） */
+export function systemdManaged(home = gatewayHome()): boolean {
+  if (process.platform !== "linux") return false;
+  // 先做不需要 systemctl 的判断：自定义目录 / 没装单元时不要白白 spawn 一个 systemctl
+  if (home !== path.join(os.homedir(), ".xzh_gateway")) return false;
+  if (!fs.existsSync(systemdUnitPath())) return false;
+  return shouldDelegateToSystemd({
+    platform: process.platform,
+    defaultHome: true,
+    unitInstalled: true,
+    unitEnabled: unitEnabled(),
+  });
+}
+
+function systemctl(args: string[]): { ok: boolean; error?: string } {
+  const result = spawnSync("systemctl", ["--user", ...args], { encoding: "utf8" });
+  if (result.error) return { ok: false, error: result.error.message };
+  if (result.status !== 0) {
+    return {
+      ok: false,
+      error: (result.stderr ?? "").trim() || `systemctl ${args.join(" ")} 退出码 ${result.status}`,
+    };
+  }
+  return { ok: true };
+}
+
 // ─────────────────────── Windows 登录自启 ───────────────────────
 //
 // Windows 没有 systemd：用 HKCU\...\Run 注册一个 **wscript 隐藏启动器**。
@@ -159,6 +221,8 @@ export interface StartGatewayResult {
   started: boolean;
   state?: GatewayState;
   error?: string;
+  /** 由 systemd 托管、本次操作走的是 systemctl（而不是自己 spawn） */
+  viaSystemd?: boolean;
 }
 
 /**
@@ -180,9 +244,12 @@ export async function startGateway(
   // 这里不能删它 —— 否则 `stop` 后立刻 `restart` 时，尚未退出的 VBS 循环会看到
   // 标记消失，再拉起第二个 node（端口冲突、反复重试）。
 
+  // 只算一次：既用于「已在运行」时告诉 CLI 是托管状态，也用于下面的委托判断
+  const managed = systemdManaged(home);
+
   const existing = readGatewayState(home);
   if (existing && isPidAlive(existing.pid)) {
-    return { ok: true, started: false, state: existing };
+    return { ok: true, started: false, viaSystemd: managed, state: existing };
   }
   // 残留状态（进程已死）先清掉，避免新进程写状态时被误判
   if (existing) {
@@ -191,6 +258,36 @@ export async function startGateway(
     } catch {
       // 读不到/删不掉都不是致命问题
     }
+  }
+
+  // 由 systemd 托管时交给 systemctl：自己 spawn 会绕过 systemd，导致它拿不到锁、
+  // 陷入 `activating (auto-restart)` 并把版本钉在旧版（2026-11-24 实测）。
+  if (managed) {
+    const started = systemctl(["start", UNIT_NAME]);
+    if (!started.ok) {
+      return {
+        ok: false,
+        started: false,
+        viaSystemd: true,
+        error: `${UNIT_NAME} 由 systemd 托管，systemctl start 失败：${started.error ?? "未知原因"}`,
+      };
+    }
+    const deadline = Date.now() + (options.waitMs ?? 8_000);
+    while (Date.now() < deadline) {
+      const state = readGatewayState(home);
+      if (state && isPidAlive(state.pid)) {
+        return { ok: true, started: true, viaSystemd: true, state };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return {
+      ok: false,
+      started: true,
+      viaSystemd: true,
+      error:
+        `systemctl 已提交启动，但 ${Math.round((options.waitMs ?? 8_000) / 1000)} 秒内没有写出状态；` +
+        `用 systemctl --user status ${UNIT_NAME} 查看`,
+    };
   }
 
   let logFd: number;
@@ -257,6 +354,7 @@ export interface StopGatewayResult {
   ok: boolean;
   stopped: boolean;
   error?: string;
+  viaSystemd?: boolean;
 }
 
 /** 停止常驻进程：SIGTERM → 等 5 秒 → SIGKILL（只对确认是自己拉起的 pid） */
@@ -266,6 +364,41 @@ export async function stopGateway(
   const home = options.home ?? gatewayHome();
   const paths = gatewayPaths(home);
   const state = readGatewayState(home);
+  const alive = Boolean(state && isPidAlive(state.pid));
+
+  // systemd 托管时必须用 `systemctl stop`：直接 SIGTERM 会被 `Restart=always`
+  // 立刻拉回来（用户看到的是「stop 了又自己起来」）。
+  if (systemdManaged(home)) {
+    const stopped = systemctl(["stop", UNIT_NAME]);
+    if (!stopped.ok) {
+      return {
+        ok: false,
+        stopped: false,
+        viaSystemd: true,
+        error: `${UNIT_NAME} 由 systemd 托管，systemctl stop 失败：${stopped.error ?? "未知原因"}`,
+      };
+    }
+    const deadline = Date.now() + (options.waitMs ?? 8_000);
+    while (Date.now() < deadline) {
+      const current = readGatewayState(home);
+      if (!current || !isPidAlive(current.pid)) {
+        try {
+          fs.rmSync(paths.stateFile, { force: true });
+        } catch {
+          // ignore
+        }
+        return { ok: true, stopped: alive, viaSystemd: true };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return {
+      ok: false,
+      stopped: false,
+      viaSystemd: true,
+      error: `systemctl stop 已提交，但进程 ${state?.pid ?? "?"} 未退出；用 systemctl --user status ${UNIT_NAME} 查看`,
+    };
+  }
+
   if (!state) {
     return { ok: true, stopped: false };
   }

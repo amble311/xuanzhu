@@ -15,7 +15,7 @@ import { setPaused } from "../btc/pause";
 import { ensureBtcBackend, stopBtcBackend } from "../btc/daemon";
 import { startAService, stopAService } from "../a/monitor";
 import { readPause as readAPause, setPaused as setAPaused } from "../a/pause";
-import { resetPaperLedger } from "../btc/paper-reset";
+import { canResetPaperLedger, resetPaperLedger } from "../btc/paper-reset";
 import { expandHome, getDataSubdir } from "../utils/paths";
 import { readRules, describeRule } from "../a/rules";
 import { readRuleAudits } from "../a/rule-audit";
@@ -397,6 +397,9 @@ export async function runGateway(): Promise<void> {
       }
       case "reset": {
         if (arg.trim().toLowerCase().startsWith("moni")) {
+          // 只在 BTC 模拟盘会话里允许：其他模式下重置会「顺手清掉另一个模式的账本」
+          const allowed = canResetPaperLedger(rt().mode);
+          if (!allowed.ok) return allowed.reason;
           const capitalText = arg.trim().split(/\s+/)[1];
           const capital = capitalText === undefined ? undefined : Number(capitalText);
           if (capital !== undefined && (!Number.isFinite(capital) || capital <= 0)) {

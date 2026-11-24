@@ -7,6 +7,20 @@
 
 ## [未发布]
 
+## [0.19.1] — 2026-11-24
+
+### 修复
+
+- **`/reset moni` 跨模式重置**：以前不校验当前模式 —— A 股模式 / 普通模式 / BTC 实盘会话里
+  发 `/reset moni` 都会去重置 **BTC 模拟盘账本**（破坏性操作，用户根本没想动那个模式的账本）。
+  现在由 `canResetPaperLedger()` 统一把关（gateway 与 TUI 共用），只在 BTC 模拟盘会话里执行，
+  其余模式明确拒绝并说明该用 `/reset` 清对话。
+- **`xzh gateway start|stop|restart` 在装了开机自启时会绕过 systemd**：Linux + 默认目录 +
+  单元已 `enabled` 时改为走 `systemctl --user`。以前手动启的实例会占住 `run/gateway.lock`，
+  systemd 反复「已在运行，本次退出」（状态停在 `activating (auto-restart)`），
+  `gateway.json` 里的版本号也停在旧版；而且 `stop` 直接 SIGTERM 会被 `Restart=always`
+  立刻拉回来（表现为「停了又自己起来」）。自定义目录（多实例调试）仍是 detached 启动。
+
 ## [0.19.0] — 2026-11-24
 
 ### 重构

@@ -126,6 +126,9 @@ export async function gatewayCommand(args: string[]): Promise<void> {
         ? `${ansi.green}✓ gateway 已停止${ansi.reset}`
         : `${ansi.gray}gateway 本来就没在运行${ansi.reset}`,
     );
+    if (result.viaSystemd) {
+      line(`${ansi.gray}  （由 systemd 托管：systemctl --user stop xzh-gateway 同样有效）${ansi.reset}`);
+    }
     return;
   }
 
@@ -139,6 +142,9 @@ export async function gatewayCommand(args: string[]): Promise<void> {
       `${ansi.green}✓ gateway 已重启${ansi.reset}` +
         `${ansi.gray} pid ${result.state?.pid} · 端口 ${result.state?.port}${ansi.reset}`,
     );
+    if (result.viaSystemd) {
+      line(`${ansi.gray}  （由 systemd 托管：xzh-gateway.service）${ansi.reset}`);
+    }
     return;
   }
 
@@ -216,6 +222,14 @@ export async function gatewayCommand(args: string[]): Promise<void> {
     `${ansi.green}✓ gateway ${result.started ? "已启动" : "已在运行"}${ansi.reset}` +
       `${ansi.gray} pid ${result.state?.pid} · 端口 ${result.state?.port} · 目录 ${gatewayHome()}${ansi.reset}`,
   );
+  if (result.viaSystemd) {
+    // 装了开机自启就必须走 systemd：自己 spawn 会绕过它、抢不到锁，
+    // 表现为「systemctl 一直 restarting、版本停在旧版」。
+    line(
+      `${ansi.gray}  由 systemd 托管（xzh-gateway.service）：停止/重启请用 ` +
+        `xzh gateway stop|restart 或 systemctl --user ...${ansi.reset}`,
+    );
+  }
   line(`${ansi.gray}  健康检查 curl -s http://127.0.0.1:${result.state?.port}/health${ansi.reset}`);
   line(
     `${ansi.gray}  发消息 POST /message 需要令牌：` +
