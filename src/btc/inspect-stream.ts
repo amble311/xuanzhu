@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { getBtcHome } from "../utils/paths";
+import { currentBtcRole } from "./role";
 
 /**
  * 后台巡检的**过程流**（`~/.xzh_btc/logs/inspect-stream.log`，JSONL）。
@@ -35,6 +36,13 @@ export interface InspectEvent {
   round: string;
   kind: InspectEventKind;
   text: string;
+  /**
+   * 产出这一轮的角色。
+   *
+   * 实盘与模拟盘**写同一个 inspect-stream 文件**，gateway 转发时只能靠这个字段区分
+   * 「BTC 实盘巡检」与「BTC 模拟盘巡检」。老日志没有它，读端回落到 env / 默认实盘。
+   */
+  role?: "live" | "paper";
 }
 
 /** 单条事件最多存这么多字符：思考可能很长，但前端一次显示不了 */
@@ -70,6 +78,8 @@ export function appendInspectEvent(
       round: event.round,
       kind: event.kind,
       text: event.text.slice(0, MAX_EVENT_CHARS),
+      // 显式写出角色：gateway 要靠它区分实盘 / 模拟盘（两者共用一个过程流文件）
+      role: event.role ?? currentBtcRole(),
     };
     fs.appendFileSync(file, `${JSON.stringify(record)}\n`, "utf8");
   } catch {

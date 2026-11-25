@@ -165,27 +165,31 @@ describe("微信出站漏斗", () => {
     expect(readOutbox(home)).toHaveLength(0);
   });
 
-  it("窗口关闭时巡检结论转摘要，不占推送额度", async () => {
-    const home = fs.mkdtempSync(path.join(root, "digest-"));
+  it("窗口关闭时巡检结论也照常入队（不再降级成 /digest），恢复后自动补发", async () => {
+    const home = fs.mkdtempSync(path.join(root, "window-closed-"));
     const digested: Array<{ kind: string; text: string; reason: string }> = [];
-    let sends = 0;
+    let allow = false;
     const queue = startOutbox({
       gatewayHome: home,
       capabilities: caps,
-      send: async () => {
-        sends += 1;
-        return true;
-      },
+      send: async () => (allow ? true : REFUSED),
       onDigest: (message) => digested.push(message),
       intervalMs: 10,
     });
     queue.enqueue({ text: "[A 股巡检结论]\n601988 中国银行 持有", kind: "inspect", peer: PEER });
     await sleep(80);
+    // 不转摘要，也不丢：消息留在队列里，peer 进入 10 分钟探测退避
+    expect(digested).toHaveLength(0);
+    expect(readOutbox(home)).toHaveLength(1);
+    expect(readOutboxState(home).peers[PEER].rejectStreak).toBe(1);
+
+    // 用户发言（会话窗口刷新）→ 立即补发
+    allow = true;
+    queue.markInbound(PEER);
+    await sleep(80);
     queue.stop();
-    expect(sends).toBe(0);
-    expect(digested).toHaveLength(1);
-    expect(digested[0].text).toContain("601988");
     expect(readOutbox(home)).toHaveLength(0);
+    expect(digested).toHaveLength(0);
   });
 
   it("窗口打开时巡检结论立即推送", async () => {

@@ -93,6 +93,8 @@ export interface BtcPanelData {
   /** 行情连续失败次数（后端 health check 上报） */
   marketFailures?: number;
   lastMarketError?: string;
+  /** 后端最近一次成功取到行情的时间（ISO）：实时取价失败时用来标注缓存价的新鲜度 */
+  lastMarketOkAt?: string;
   /** 最近几条真实交易动作（实盘用；模拟盘看 paper.recent_trades） */
   actions: BtcAction[];
   /** 采集时的 btc home（= TUI cwd / 后端工作目录） */
@@ -132,6 +134,7 @@ export async function collectBtcPanelData(
     backendRunning: backend !== null,
     marketFailures: backend?.marketFailures ?? 0,
     lastMarketError: backend?.lastMarketError,
+    lastMarketOkAt: backend?.lastMarketOkAt,
     actions: readActions(home).slice(-4).reverse(),
     home,
   };
@@ -168,6 +171,16 @@ export async function collectBtcPanelData(
   };
 }
 
+/** 「3 分钟」这种新鲜度描述；时间缺失返回空串 */
+function describeAge(iso?: string): string {
+  const at = Date.parse(iso ?? "");
+  if (!Number.isFinite(at)) return "";
+  const minutes = Math.max(0, Math.round((Date.now() - at) / 60_000));
+  if (minutes < 1) return "刚刚";
+  if (minutes < 60) return `${minutes} 分钟前 `;
+  return `${Math.round(minutes / 60)} 小时前 `;
+}
+
 function fmt(value: number, digits = 2): string {
   return value.toLocaleString("en-US", {
     minimumFractionDigits: digits,
@@ -195,7 +208,19 @@ export function btcInfoLines(data: BtcPanelData): string[] {
   if (data.ticker) {
     lines.push(`价格 ${fmt(data.ticker.price)}（${signed(data.ticker.changePct)}%）`);
   } else {
-    lines.push(`价格 —（行情接口不可用${data.tickerError ? `：${data.tickerError}` : ""}）`);
+    // 实时取价失败（网关常因没有代理而直连超时）：退回后端缓存价 / 库内收盘价，
+    // 并**标明来源与新鲜度**，不要只甩一句「不可用」——终端里看到的也是这份数据。
+    const cached = data.role === "paper" ? data.paper?.price : undefined;
+    const source = data.paper?.price_source === "close" ? "库内收盘价" : "后端缓存价";
+    const age = describeAge(data.lastMarketOkAt);
+    if (cached && cached > 0) {
+      lines.push(
+        `价格 ${fmt(cached)}（${source}${age ? `，后端 ${age}取到` : ""}）` +
+          ` · 实时行情不可用${data.tickerError ? `：${data.tickerError}` : ""}`,
+      );
+    } else {
+      lines.push(`价格 —（行情接口不可用${data.tickerError ? `：${data.tickerError}` : ""}）`);
+    }
   }
 
   lines.push(divider);

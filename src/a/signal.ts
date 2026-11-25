@@ -14,6 +14,8 @@ import {
   type CycleTrend,
 } from "./trend";
 import { orderedPool, type PoolEntry } from "./watchlist";
+import { openingContext, type OpeningContext } from "./opening";
+import { dropIncomplete15m, dropIncompleteMonth } from "./window";
 
 /**
  * 单只 A 股的「三周期 + 15 分钟」打分 —— 对齐 btc 的 `btc_signal`。
@@ -39,6 +41,8 @@ export interface StockSignal {
   daily: CycleTrend;
   trend: CombinedTrend;
   intraday: { score: number; reason: string } | null;
+  /** 今天开盘后的真实态势（高开/低开、相对开盘、量比、缺口）—— 决策必须结合它 */
+  opening?: OpeningContext;
   /** 方向闸门：`long` 才允许开新仓；`none` 不做；`unknown` 数据不足 */
   sideFilter: "long" | "none" | "unknown";
   /** 15 分钟择时：`now` 可以现在动手，`wait` 继续等 */
@@ -177,11 +181,20 @@ export async function scoreStock(
     dailyIndicatorsFor(code, { indicators: options.indicators }),
   ]);
 
-  const weekly = weeklyBars ? weeklyTrend(dropIncompleteWeek(weeklyBars)) : failed("周线获取失败");
-  const monthly = monthlyBars ? monthlyTrend(monthlyBars) : failed("月线获取失败");
+  const now = new Date();
+  const weekly = weeklyBars
+    ? weeklyTrend(dropIncompleteWeek(weeklyBars, now))
+    : failed("周线获取失败");
+  // 月线同样剔除「本月还没走完」的那根：月初几天用半根月线算 MA/ADX 会失真
+  const monthly = monthlyBars
+    ? monthlyTrend(dropIncompleteMonth(monthlyBars, now))
+    : failed("月线获取失败");
   const daily = dailyTrend(cachedDaily ?? undefined);
   const trend = combineTrend(monthly, weekly, daily);
-  const intraday = shortBars ? score15m(shortBars) : null;
+  // 15m 评分只用**已走完**的 K 线（结构/量能要稳定）；
+  // 「当前这一根 + 开盘缺口 + 量比」由 opening 补上，避免拿昨晚的日线给今天的开盘下单。
+  const intraday = shortBars ? score15m(dropIncomplete15m(shortBars, now)) : null;
+  const opening = openingContext(quote, cachedDaily ?? undefined, now);
 
   // 方向闸门与 btc 的 side_filter 同义：数据不足 = unknown，趋势不过 = none（不开新仓）
   const sideFilter: StockSignal["sideFilter"] = [monthly.score, weekly.score, daily.score].some(
@@ -220,7 +233,9 @@ export async function scoreStock(
   const reason =
     `${trend.reason}` +
     `（月 ${monthly.score ?? "?"} / 周 ${weekly.score ?? "?"} / 日 ${daily.score ?? "?"}）` +
-    ` · ${intraday?.reason ?? "15m 数据不足"}${cappedNote}`;
+    ` · ${intraday?.reason ?? "15m 数据不足"}` +
+    ` · ${opening.text}` +
+    `${cappedNote}`;
 
   return {
     code,
@@ -241,6 +256,7 @@ export async function scoreStock(
     daily,
     trend,
     intraday,
+    opening,
     sideFilter,
     entry,
     suggestion,
@@ -277,6 +293,60 @@ export async function scanPool(
   );
 }
 
+/**
+ * 全池横评（按**本轮实时** 15m 分排序 + 换仓参考）。
+ *
+ * 为什么要单独一块：`a_signal` 的遍历顺序来自 `orderedPool()`，用的是**收盘选股时**
+ * 写入的静态分（`watchlist.json` 的 `score`）。巡检期间池子不变，但强弱是变化的 ——
+ * 只看逐只明细，模型容易「每只都还行」就都不动，或者让最弱的持仓一直占着名额。
+ *
+ * 这里不替模型做决定，只把比较摆出来：排名、最弱持仓 vs 最强候选、分差与建议阈值。
+ */
+export function formatPoolRanking(signals: StockSignal[]): string {
+  if (signals.length === 0) return "";
+  const scoreOf = (signal: StockSignal): number => signal.intraday?.score ?? -1;
+  const shown = (signal: StockSignal): string =>
+    signal.intraday ? String(signal.intraday.score) : "?";
+  const tagOf = (signal: StockSignal): string => {
+    if (signal.sideFilter === "long") {
+      return signal.entry === "now"
+        ? "方向多·可买"
+        : signal.entry === "wait"
+          ? "方向多·等时机"
+          : "方向多·15m 数据不足";
+    }
+    return signal.sideFilter === "none" ? "方向不做" : "数据不足";
+  };
+
+  const sorted = [...signals].sort((a, b) => scoreOf(b) - scoreOf(a));
+  const lines = ["全池横评（按本轮实时 15m 分排序，顺序与上面的逐只明细可能不同）："];
+  sorted.forEach((signal, index) => {
+    lines.push(
+      `  ${index + 1}. ${signal.code} ${signal.name}${signal.held ? "（持仓）" : ""}` +
+        ` 15m ${shown(signal)} · ${tagOf(signal)}`,
+    );
+  });
+
+  const weakness = sorted.filter((signal) => signal.held).sort((a, b) => scoreOf(a) - scoreOf(b))[0];
+  const best = sorted
+    .filter((signal) => !signal.held && signal.sideFilter === "long")
+    .sort((a, b) => scoreOf(b) - scoreOf(a))[0];
+  if (weakness && best) {
+    const gap = scoreOf(best) - scoreOf(weakness);
+    lines.push(
+      `  换仓参考：最弱持仓 ${weakness.code} ${weakness.name} ${shown(weakness)} 分` +
+        ` vs 最强候选 ${best.code} ${best.name} ${shown(best)} 分` +
+        `（差 ${gap >= 0 ? "+" : ""}${gap}）` +
+        (gap >= 20
+          ? " → 差 ≥20：若候选 entry=now 且持仓方向已破坏，本轮应考虑换仓"
+          : " → 差 <20：差额通常不足以覆盖手续费与滑点，倾向不换仓"),
+    );
+  } else if (weakness && !best) {
+    lines.push("  换仓参考：池内暂无「方向可做」的非持仓候选，本轮不考虑换仓。");
+  }
+  return lines.join("\n");
+}
+
 /** 一只股票的多行明细（`a_signal` 与巡检结论共用） */
 export function formatSignal(signal: StockSignal): string {
   const score = (value: CycleTrend["score"]): string =>
@@ -291,6 +361,7 @@ export function formatSignal(signal: StockSignal): string {
     `  周线：${signal.weekly.reason}`,
     `  日线：${signal.daily.reason}`,
     `  15 分钟：${signal.intraday?.reason ?? "数据不足"} → 择时 ${signal.entry}`,
+    ...(signal.opening ? [`  开盘态势：${signal.opening.text}`] : []),
   ];
   if (signal.position) {
     lines.push(

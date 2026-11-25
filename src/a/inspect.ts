@@ -9,7 +9,8 @@ import type { ExecuteToolResult } from "../tools";
 import { aShareTools } from "../tools/a-share";
 import { accountSummary, loadPaperAccount } from "./paper";
 import { maxPositions, poolSize } from "./settings";
-import { inWorkWindow, WORK_WINDOW_LABEL } from "./window";
+import { dropIncomplete15m, inWorkWindow, WORK_WINDOW_LABEL } from "./window";
+import { openingContext } from "./opening";
 import {
   fetch15mBars,
   fetchQuote,
@@ -291,7 +292,15 @@ function inspectPrompt(): string {
 
 步骤（a_* 工具可用）：
 1. \`a_account\` 看账本（总资产 / 可用 / 持仓 / 可卖数量），\`a_orders\` 看挂单时效。
-2. \`a_signal\`（不传 code）拿**全池速览**：每只的月 / 周 / 日三周期方向 + 15 分钟择时评分。
+2. \`a_signal\`（不传 code）拿**全池速览 + 全池横评**：每只的月 / 周 / 日三周期方向、
+   15 分钟择时评分与开盘态势；横评块按**本轮实时 15m 分**排序（逐只明细的顺序是
+   持仓优先 + 选股时的静态分，**不能当作强弱排名**）。
+   **先做全池横评，再逐只动作**：
+   a) 找出「最弱持仓」与「最强候选」（非持仓且 side_filter=long）；
+   b) 已持 ${cap} 只时：若候选 15m 比最弱持仓高 **≥20 分**、候选 \`entry=now\`、
+      而最弱持仓方向已破坏（side_filter≠long 或 15m<40）→ 本轮应换仓
+      （先减/清最弱，再买候选），结论里写出比较的两个分数；
+   c) **不换仓也要写明**「不换仓：候选 X 分 vs 持仓 Y 分，差 Z」——不允许跳过这一步。
    需要深挖的单只再用 \`a_signal(code=…)\` 看一次明细。
 3. **逐只遍历（这是本模式与 btc 唯一的差别：btc 一次看一个标的，A 股一次看一整池）**：
    按顺序（持仓优先）一只一只过，**不允许跳过**。每只给出：
@@ -307,6 +316,9 @@ function inspectPrompt(): string {
    - 持仓：三周期出现 -1、15 分钟跌破 MA20 或前 10 根低点、触及 ATR 止损 / 移动止盈 → 减或清；
      T+1 当日买入不可卖，只能记录并用 \`a_trigger\` 盯住下一交易日；
    - 买点：\`side_filter=long\` 且 \`entry=now\`、非涨停、当日涨幅 ≤5%、非停牌、消息面无硬风险；
+     **还要看开盘态势**（预检行里的「高开/低开 x%、较开盘 ±y%、量比 z、缺口是否回补」）：
+     高开后跌破昨收、或低开无力收复昨收 → 观望；开盘 30 分钟内量比与形态标「待确认」。
+     买入依据里必须写出当前开盘情况，不能只凭昨晚的日线与 15m 分数下单；
      100 股整手；**持仓最多 ${cap} 只**（池内 ${size} 只是候选），每仓 ≤20% 权益；
      已持 ${cap} 只时只能加仓现有持仓，或先减/清一只再换（代码会拒绝超限）。
    - 结论依赖消息面时先 \`a_news\`；硬风险（立案 / 退市 / 暴雷）禁止买入，持仓则考虑减。
@@ -329,7 +341,9 @@ function inspectPrompt(): string {
       每只最多 5 条；过时或已无意义的用 \`a_remove_trigger\` 删掉；
    c. 有未成交挂单时：判断继续等就 \`a_renew\` 续期并说明理由，不该等就 \`a_cancel_order\` 撤掉。
       **不要放任挂单过期**（过期后代码会叫醒你，但那是兜底，不是常规）。
-5. 最后用一段话总结本轮结论（会写进巡检日志供复盘）：**按遍历顺序逐只列 代码 / 名称 / 方向 / 15m 分 / 动作**，
+5. 最后用一段话总结本轮结论（会写进巡检日志供复盘）：
+   **开头先写全池实时排名**（代码 名称 15m 分，从高到低）+ 换仓结论（换 / 不换及依据），
+   再**按遍历顺序逐只列 代码 / 名称 / 方向 / 15m 分 / 动作**，
    没动的写「观望」，不要只写“全部正常”。末尾再列一次**本轮落盘的叫醒条件**（代码 + 名称 + 条件），
    让用户一眼看出除了止损价还盯了什么。
    **提个股一律写成「代码 名称」（如 \`601988 中国银行\`），不要只发六位代码** ——
@@ -393,6 +407,8 @@ export interface PreflightRow {
   deepScore?: number;
   /** 日线指标 asOf（最后一根日线日期） */
   indicatorAsOf?: string;
+  /** 开盘 / 盘中态势（高开低开、相对开盘、量比、缺口） */
+  opening?: string;
   /** 数据问题（缺行情 / 缺 15m / 指标缺失 / 时间过旧） */
   problems: string[];
 }
@@ -418,7 +434,8 @@ export function formatPreflight(
     const indicator = row.indicatorAsOf ? `日线指标 asOf ${row.indicatorAsOf}` : "日线指标缺失";
     lines.push(
       `- ${row.code} ${row.name}${row.held ? "（持仓）" : ""} ${price}` +
-        ` · 行情时间 ${row.quoteTime ?? "未知"} · ${bars} · ${deep} · ${indicator}`,
+        ` · 行情时间 ${row.quoteTime ?? "未知"} · ${bars} · ${deep} · ${indicator}` +
+        (row.opening ? ` · ${row.opening}` : ""),
     );
   }
   for (const note of extra.notes ?? []) lines.push(`- ${note}`);
@@ -460,7 +477,7 @@ async function preflightSection(now = new Date()): Promise<string> {
         fetchQuote(item.code).catch(() => null),
         fetch15mBars(item.code, 160).catch(() => null),
       ]);
-      const deep = bars ? score15m(bars) : null;
+      const deep = bars ? score15m(dropIncomplete15m(bars)) : null;
       const indicator = indicators.get(item.code);
       const problems: string[] = [];
       if (!quote) problems.push("行情取不到");
@@ -480,6 +497,7 @@ async function preflightSection(now = new Date()): Promise<string> {
         barTime: bars?.[bars.length - 1]?.time,
         deepScore: deep?.score,
         indicatorAsOf: indicator?.asOf,
+        opening: quote ? openingContext(quote, indicator, now).text : undefined,
         problems,
       };
     },

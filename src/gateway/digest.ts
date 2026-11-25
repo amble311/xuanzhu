@@ -86,6 +86,29 @@ function compactDigest(gatewayHome: string): void {
   fs.renameSync(tmp, file);
 }
 
+/**
+ * 把兜底摘要并成若干段正文（每段 ≤ `limit` 字），启动时自动补发与 `/digest` 共用。
+ *
+ * 为什么合并：摘要箱里可能同时躺着十几轮巡检（每轮几百字），逐条发会把微信刷屏、
+ * 也更容易撞 iLink 的推送额度。合并后按「补发·未推送巡检 1/N」发几条即可。
+ */
+export function batchDigestEntries(entries: DigestEntry[], limit = 1_800): string[] {
+  const batches: string[] = [];
+  let buffer = "";
+  for (const entry of entries) {
+    const time = entry.at.slice(0, 16).replace("T", " ");
+    const block = `— ${entry.source} ${time} —\n${entry.text}`;
+    if (buffer && buffer.length + block.length > limit) {
+      batches.push(buffer);
+      buffer = block;
+    } else {
+      buffer = buffer ? `${buffer}\n\n${block}` : block;
+    }
+  }
+  if (buffer) batches.push(buffer);
+  return batches;
+}
+
 /** 用户看过 `/digest` 后清空：否则回复尾部的提示会一直挂着 */
 export function clearDigest(gatewayHome: string): void {
   try {

@@ -34,8 +34,14 @@ const PRIORITY: Record<OutboundKind, number> = {
   inspect: 3,
 };
 
-/** 只有这些类别可以「降级成摘要」；成交与回复不允许丢 */
-const DIGESTIBLE: ReadonlySet<OutboundKind> = new Set(["inspect", "notice"]);
+/**
+ * 没有任何类别可以因为「窗口关闭」被降级 —— 推送一律入队、按探测节奏补发。
+ *
+ * 2026-11-25 用户明确要求：微信侧不要依赖 `/digest`，三个模式的后台内容都要自动推过来。
+ * 会话窗口关闭时硬发会被 iLink 以 `ret=-2` 拒收，但那只是「这次没成」：
+ * `nextProbeAt` 会兜住节奏（10/20/30 分钟探测一次），用户一说话 `markInbound()` 立即补发。
+ * 摘要箱只保留一个用途 —— 队列超限时把最老的消息存起来，避免静默丢弃。
+ */
 
 export interface OutboundMessage {
   id: string;
@@ -334,25 +340,29 @@ export function startOutbox(options: {
       }
     }
 
+    // 巡检推送不再因为「窗口关闭」被降级成摘要，只记录一句排队说明：
+    // 窗口内会立刻发；窗口外按探测节奏补发，用户一发言 markInbound 立即全部补发。
+    if (
+      message.kind === "inspect" &&
+      !windowOpen(message.peer, peers, caps, ts)
+    ) {
+      options.log?.("巡检推送入队（会话窗口关闭，先排队；下次发言会立即补发）");
+    }
+
     items.push(message);
     if (items.length > MAX_ITEMS) {
-      const dropped = items.length - MAX_ITEMS;
+      // 超限时**不静默丢弃**：最老的转进摘要箱（内容仍可取回），队列继续滚动
+      const overflow = items.slice(0, items.length - MAX_ITEMS);
       items = items.slice(-MAX_ITEMS);
-      counters.dropped += dropped;
-      options.log?.(`出站队列超限，丢弃最老 ${dropped} 条`);
+      counters.dropped += overflow.length;
+      for (const item of overflow) {
+        options.onDigest?.({ kind: item.kind, text: item.text, reason: "出站队列超限" });
+        settle(item.id, false);
+      }
+      options.log?.(`出站队列超限，最老 ${overflow.length} 条转入摘要箱`);
     }
     persist();
     return message.id;
-  };
-
-  /** 把不可推的 `inspect` / `notice` 转进摘要箱（不占推送额度） */
-  const digestItem = (message: OutboundMessage, reason: string): void => {
-    options.onDigest?.({ kind: message.kind, text: message.text, reason });
-    counters.dropped += 1;
-    items = items.filter((item) => item.id !== message.id);
-    settle(message.id, false);
-    options.log?.(`巡检内容转入摘要（${reason}，${message.text.length} 字）`);
-    persist();
   };
 
   const markPeerError = (
@@ -405,11 +415,6 @@ export function startOutbox(options: {
         if (Date.parse(message.nextAt) > at) continue;
         const probeAt = probeBlockedAt(message.peer, peers, at);
         if (probeAt !== null) continue;
-
-        if (DIGESTIBLE.has(message.kind) && !windowOpen(message.peer, peers, caps, at)) {
-          digestItem(message, "会话窗口已关闭，改由 /digest 拉取");
-          continue;
-        }
 
         const chunks = chunkText(message.text, caps.maxLen);
         let failed = false;

@@ -472,4 +472,38 @@ describe("转发循环", () => {
     await runFeedTick({ offsetsFile, send: async (text) => (again.push(text), true) });
     expect(again).toEqual([]);
   });
+
+  it("同一过程流里实盘 / 模拟盘按各自角色标注（不跟网关 env 走）", async () => {
+    await runFeedTick({ offsetsFile, send: async () => true }); // 初始化偏移
+    const savedRole = process.env.XZH_BTC_ROLE;
+    process.env.XZH_BTC_ROLE = "live"; // 网关进程是实盘，但模拟盘那一轮也要标对
+    try {
+      appendInspectEvent(
+        { round: "r-paper", kind: "text", text: "模拟盘结论", role: "paper" },
+        btcHome,
+      );
+      appendInspectEvent(
+        { round: "r-paper", kind: "round-end", text: "模拟盘结论", role: "paper" },
+        btcHome,
+      );
+      appendInspectEvent(
+        { round: "r-live", kind: "text", text: "实盘结论", role: "live" },
+        btcHome,
+      );
+      appendInspectEvent(
+        { round: "r-live", kind: "round-end", text: "实盘结论", role: "live" },
+        btcHome,
+      );
+      const sent: string[] = [];
+      await runFeedTick({ offsetsFile, send: async (text) => (sent.push(text), true) });
+      expect(sent).toHaveLength(2);
+      expect(sent[0]).toMatch(/^\[BTC 模拟盘巡检\]/);
+      expect(sent[0]).toContain("模拟盘结论");
+      expect(sent[1]).toMatch(/^\[BTC 实盘巡检\]/);
+      expect(sent[1]).toContain("实盘结论");
+    } finally {
+      if (savedRole === undefined) delete process.env.XZH_BTC_ROLE;
+      else process.env.XZH_BTC_ROLE = savedRole;
+    }
+  });
 });

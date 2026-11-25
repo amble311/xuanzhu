@@ -48,11 +48,19 @@ import { startWeixinChannel, type WeixinChannel } from "./weixin/channel";
 import { startFeedForwarder, type FeedForwarder } from "./feed";
 import { startOutbox, type Outbox } from "./outbox";
 import { WEIXIN_CAPABILITIES } from "./channels";
-import { appendDigest, clearDigest, digestHint, formatDigest } from "./digest";
+import {
+  appendDigest,
+  batchDigestEntries,
+  clearDigest,
+  digestHint,
+  formatDigest,
+  readDigest,
+} from "./digest";
 import { authorizeRequest, ensureHttpToken } from "./auth";
 import { createPeerQueues } from "./queues";
 import { withBtcRole, type BtcRole } from "../btc/role";
 import { loadSessionMessages } from "../core/sessions";
+import { applyProxyConfig } from "../network/proxy";
 
 /**
  * `xzh gateway run`：常驻后台进程。
@@ -141,6 +149,18 @@ export async function runGateway(): Promise<void> {
   // 本机任意进程都能 POST。首次启动生成令牌（0600），客户端要带 Bearer。
   const httpToken = ensureHttpToken(home);
 
+  // 代理：网关是 systemd 拉起的，**不会继承 shell 的 HTTP(S)_PROXY**（~/.bashrc 里的
+  // export 只对交互式 shell 生效）。不应用配置代理的话，币安行情会直连失败，
+  // 微信 `/info` 就显示「行情接口不可用」，而终端里（继承了 shell env）一切正常。
+  const bootConfig = loadConfig();
+  try {
+    const applied = applyProxyConfig(bootConfig);
+    if (applied.error) log(`代理：${applied.error}`);
+    else if (applied.active) log(`代理：已启用 ${applied.proxy}`);
+  } catch (err) {
+    log(`代理初始化失败：${err instanceof Error ? err.message : String(err)}`);
+  }
+
   const port = gatewayPort();
   const startedAt = new Date().toISOString();
   const state: GatewayState = {
@@ -227,6 +247,27 @@ export async function runGateway(): Promise<void> {
       return { mode, cwd: mode.home, label: mode.label };
     }
     return { cwd: home, label: "xzh 普通模式" };
+  };
+
+  /**
+   * btc 的网络引导（直连交易所不通 → 自动找本机代理），进程内只做一次。
+   *
+   * 与 TUI 的 `xzh btc` 走同一条路径（`src/btc/network.ts`）：网关由 systemd 拉起，
+   * **不继承 `~/.bashrc` 里的 HTTP(S)_PROXY** —— 不跑这一步，`fetchTicker` 会直连超时，
+   * 面板与 `/info` 就只剩「行情接口不可用」，而终端里一切正常。
+   */
+  let btcNetworkReady: Promise<void> | undefined;
+  const ensureBtcNetworkOnce = (): Promise<void> => {
+    btcNetworkReady ??= import("../btc/network")
+      .then(({ ensureBtcNetwork }) => ensureBtcNetwork({ config: loadConfig() }))
+      .then((result) => {
+        if (result.notes.length > 0) log(`网络：${result.notes.join("；")}`);
+        else if (result.proxy) log(`网络：经代理 ${result.proxy}`);
+      })
+      .catch((err: unknown) => {
+        log(`网络引导失败：${err instanceof Error ? err.message : String(err)}`);
+      });
+    return btcNetworkReady;
   };
 
   /**
@@ -733,6 +774,7 @@ export async function runGateway(): Promise<void> {
     }
 
     if (command.kind === "btc") {
+      await ensureBtcNetworkOnce();
       const mode = rt().mode;
       if (mode?.name === "btc" && (mode.paper === true) === command.paper) {
         const serviceMessage = await ensureBackend(createBtcMode({ paper: command.paper }));
@@ -935,6 +977,9 @@ export async function runGateway(): Promise<void> {
     rt().deniedNote = "";
     rt().lastToolNote = "";
 
+    // btc 模式：先确保网络引导跑完（首次会探直连 / 找本机代理，之后立即返回）
+    if (session.mode?.name === "btc") await ensureBtcNetworkOnce();
+
     // 微信：恢复该对端上次使用的模式；没有记录时沿用当前模式并记住
     if (peer) {
       const saved = readPeerModes(home).modes[peer];
@@ -1120,6 +1165,24 @@ export async function runGateway(): Promise<void> {
           return true;
         },
       });
+
+      // 历史兜底摘要自动补发：旧逻辑会把「窗口关闭」的巡检结论塞进 digest 箱，
+      // 用户抱怨「老是要 /digest 查看」。现在启动时把它们并成几条转入出站队列，
+      // 按正常推送节奏（用户开口即补发）送达，然后清空摘要箱。
+      const pendingDigest = readDigest(home);
+      if (pendingDigest.length > 0) {
+        const batches = batchDigestEntries(pendingDigest);
+        batches.forEach((body, index) => {
+          outbox!.enqueue({
+            text: `[补发·未推送巡检 ${index + 1}/${batches.length}]\n${body}`,
+            kind: "inspect",
+          });
+        });
+        clearDigest(home);
+        log(
+          `已把 ${pendingDigest.length} 条兜底摘要转入出站队列（${batches.length} 条消息，自动补发）`,
+        );
+      }
     } else {
       log("微信未登录（要接微信请运行 xzh gateway weixin login）");
     }

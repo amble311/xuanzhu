@@ -491,7 +491,15 @@ export async function runFeedTick(deps: FeedTickDeps): Promise<void> {
         // 还在进行的轮次先不推：模型是分段输出结论的，读到一半就推会让同一轮
         // 变成好几条「巡检」消息（每段还各自重新编号）。等它 round-end 再整轮推一次。
         if (!isRoundFinished(block, blocks[index + 1])) break;
-        const messages = formatRoundPush(label, block);
+        // 实盘与模拟盘写同一个过程流：标题按**该轮自己的角色**取，
+        // 不能跟着网关进程的 env 走（两个后端可能同时在跑，env 只有一个值）
+        const roundLabel =
+          block.events.find((event) => event.role)?.role === "paper"
+            ? "BTC 模拟盘巡检"
+            : block.events.some((event) => event.role === "live")
+              ? "BTC 实盘巡检"
+              : label;
+        const messages = formatRoundPush(roundLabel, block);
         // 只有「紧接上次未送达位置」的那一轮要跳过已送达的气泡，后面的轮次从头推
         batch = index === 0 ? Math.min(resume, messages.length) : 0;
         const from = batch;

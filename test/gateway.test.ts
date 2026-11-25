@@ -326,3 +326,27 @@ describe("systemd 托管判定", () => {
     expect(shouldDelegateToSystemd({ ...base, unitEnabled: false })).toBe(false);
   });
 });
+
+describe("兜底摘要批量补发", () => {
+  it("按长度合并成若干段，保留来源与时间", async () => {
+    const { batchDigestEntries } = await import("../src/gateway/digest");
+    const entries = [
+      { at: "2026-11-25T09:00:00.000Z", source: "巡检", text: "A".repeat(1_000) },
+      { at: "2026-11-25T09:15:00.000Z", source: "巡检", text: "B".repeat(1_000) },
+      { at: "2026-11-25T09:30:00.000Z", source: "巡检", text: "C".repeat(500) },
+    ];
+    const batches = batchDigestEntries(entries);
+    // 1000 + 1000 超过 1800 → 分两段；第三段能并进第二段
+    expect(batches).toHaveLength(2);
+    expect(batches[0]).toContain("— 巡检 2026-11-25 09:00 —");
+    const all = batches.join("\n");
+    expect(all).toContain("A");
+    expect(all).toContain("C");
+    for (const batch of batches) expect(batch.length).toBeLessThanOrEqual(2_100);
+  });
+
+  it("空输入返回空数组", async () => {
+    const { batchDigestEntries } = await import("../src/gateway/digest");
+    expect(batchDigestEntries([])).toEqual([]);
+  });
+});

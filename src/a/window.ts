@@ -1,3 +1,5 @@
+import type { Bar } from "../exchange/ashare";
+
 /**
  * A 股**可巡检时段**：正常交易时段 09:30–11:30 / 13:00–15:00（工作日）。
  *
@@ -30,6 +32,70 @@ export const WORK_WINDOW_LABEL = "09:30–11:30、13:00–15:00";
 
 function minutesOf(now: Date): number {
   return now.getHours() * 60 + now.getMinutes();
+}
+
+/** 上海时区的「日期 + 分钟 + 日/月/年」，用于和 K 线时间（交易所本地时间）比较 */
+function shanghaiClock(now: Date): {
+  date: string;
+  minutes: number;
+  year: number;
+  month: number;
+  day: number;
+  lastDayOfMonth: number;
+  weekday: number;
+} {
+  const local = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Shanghai" }));
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  const year = local.getFullYear();
+  const month = local.getMonth() + 1;
+  const day = local.getDate();
+  return {
+    date: `${year}-${pad(month)}-${pad(day)}`,
+    minutes: local.getHours() * 60 + local.getMinutes(),
+    year,
+    month,
+    day,
+    // 下个月的第 0 天 = 本月最后一天
+    lastDayOfMonth: new Date(year, month, 0).getDate(),
+    weekday: local.getDay(),
+  };
+}
+
+/**
+ * 剔除**还没走完**的 15 分钟 K 线。
+ *
+ * `bar.time` 是这根 K 线的**开始时间**（新浪返回 `2026-11-25 09:30:00`），
+ * 只有「开始 + 15 分钟 ≤ 现在」才是完整的一根。不剔除的话，09:30 的巡检会拿
+ * 一根只有几十秒的 K 线算结构/量能，结论失真。
+ */
+export function dropIncomplete15m(bars: Bar[], now = new Date()): Bar[] {
+  if (bars.length === 0) return bars;
+  const last = bars[bars.length - 1];
+  const match = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}):(\d{2})/.exec(last.time);
+  if (!match) return bars;
+  const clock = shanghaiClock(now);
+  // 最后一根不是今天的 → 早就收完了
+  if (match[1] !== clock.date) return bars;
+  const endMinutes = Number(match[2]) * 60 + Number(match[3]) + 15;
+  return clock.minutes < endMinutes ? bars.slice(0, -1) : bars;
+}
+
+/**
+ * 剔除**还没走完**的月线。
+ *
+ * 周线有 `dropIncompleteWeek`，月线以前没做同样的处理：每月头几天，最后一根月线
+ * 只有几天的数据（收盘价≈现价），MA10 斜率与 ADX 都会被这根半成品带偏。
+ * 判定：最后一根属于本月，且本月还没到最后一天 15:05 → 剔除。
+ */
+export function dropIncompleteMonth(bars: Bar[], now = new Date()): Bar[] {
+  if (bars.length === 0) return bars;
+  const last = bars[bars.length - 1];
+  const key = last.time.slice(0, 7);
+  const clock = shanghaiClock(now);
+  if (key !== clock.date.slice(0, 7)) return bars;
+  const complete =
+    clock.day >= clock.lastDayOfMonth && clock.minutes >= 15 * 60 + 5;
+  return complete ? bars : bars.slice(0, -1);
 }
 
 function isWeekend(now: Date): boolean {

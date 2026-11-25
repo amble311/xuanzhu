@@ -237,3 +237,47 @@ describe("a_signal 输出口径", () => {
     expect(text).toContain("建议：持有");
   });
 });
+
+describe("全池横评", () => {
+  const base = (patch: Partial<import("../src/a/signal").StockSignal>): import("../src/a/signal").StockSignal => ({
+    code: "000001",
+    name: "测试股",
+    held: false,
+    monthly: { score: 1, reason: "" },
+    weekly: { score: 1, reason: "" },
+    daily: { score: 1, reason: "" },
+    trend: { pass: true, reason: "", sum: 3, monthly: 1, weekly: 1, daily: 1 },
+    intraday: { score: 50, reason: "" },
+    sideFilter: "long",
+    entry: "wait",
+    suggestion: "观望",
+    reason: "",
+    ...patch,
+  });
+
+  it("按实时 15m 分排序，并给出最弱持仓 vs 最强候选的分差", async () => {
+    const { formatPoolRanking } = await import("../src/a/signal");
+    const text = formatPoolRanking([
+      base({ code: "601328", name: "交通银行", held: true, intraday: { score: 55, reason: "" } }),
+      base({ code: "601398", name: "工商银行", intraday: { score: 80, reason: "" }, entry: "now" }),
+      base({ code: "600919", name: "江苏银行", intraday: { score: 30, reason: "" }, sideFilter: "none" }),
+    ]);
+    // 顺序按实时分：80 / 55 / 30
+    const order = ["601398", "601328", "600919"].map((code) => text.indexOf(code));
+    expect(order[0]).toBeLessThan(order[1]);
+    expect(order[1]).toBeLessThan(order[2]);
+    // 换仓参考：最强候选 - 最弱持仓 = 25 → 提示可考虑换仓
+    expect(text).toContain("换仓参考");
+    expect(text).toContain("差 +25");
+    expect(text).toContain("≥20");
+  });
+
+  it("没有可买候选时明确写「不考虑换仓」", async () => {
+    const { formatPoolRanking } = await import("../src/a/signal");
+    const text = formatPoolRanking([
+      base({ code: "601328", name: "交通银行", held: true }),
+      base({ code: "600919", name: "江苏银行", sideFilter: "none" }),
+    ]);
+    expect(text).toContain("暂无「方向可做」的非持仓候选");
+  });
+});

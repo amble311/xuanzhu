@@ -11,6 +11,7 @@ import { applyNewsAdjustments } from "./news";
 import { score15m } from "./deep15";
 import { combineTrend, dailyTrend, monthlyTrend, weeklyTrend, type CycleTrend } from "./trend";
 import { poolSize } from "./settings";
+import { dropIncomplete15m, dropIncompleteMonth } from "./window";
 import type { WatchItem } from "./watchlist";
 
 /**
@@ -141,14 +142,16 @@ export async function scoreHeldItems(
           indicators?.get(position.code) ??
           (dailyBars ? computeIndicators(position.code, dailyBars) : undefined);
         const daily = dailyTrend(dailyIndicators ?? undefined);
+        const now = new Date();
         const weekly = weekBars
-          ? weeklyTrend(dropIncompleteWeek(weekBars))
+          ? weeklyTrend(dropIncompleteWeek(weekBars, now))
           : { score: null, reason: "周线获取失败" };
         const monthly = monthBars
-          ? monthlyTrend(monthBars)
+          ? monthlyTrend(dropIncompleteMonth(monthBars, now))
           : { score: null, reason: "月线获取失败" };
         const trend = combineTrend(monthly, weekly, daily);
-        const deep = shortBars ? score15m(shortBars) : null;
+        // 15m 只用走完的 K 线（否则 09:30 拿几十秒的 K 线打分）
+        const deep = shortBars ? score15m(dropIncomplete15m(shortBars, now)) : null;
 
         return {
           code: position.code,
@@ -251,7 +254,7 @@ export async function selectTopWatchlist(
             adjust: "backward",
             limit: 60,
           });
-          const monthly = monthlyTrend(bars);
+          const monthly = monthlyTrend(dropIncompleteMonth(bars));
           if (monthly.score === null || monthly.score === -1) return null;
           return { ...item, monthly };
         } catch {
@@ -297,7 +300,7 @@ export async function selectTopWatchlist(
     shortlist,
     async (item) => {
       const deep = await fetch15mBars(item.row.code, 160)
-        .then((bars) => score15m(bars))
+        .then((bars) => score15m(dropIncomplete15m(bars)))
         .catch(() => null);
       done += 1;
       if (done % 5 === 0) onProgress?.(`15 分钟分析 ${done}/${shortlist.length}…`);

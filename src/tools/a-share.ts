@@ -36,6 +36,7 @@ import {
   replacePolicy,
   clearPolicy,
   formatSignal,
+  formatPoolRanking,
   readCachedIndicators,
   scanPool,
   scoreStock,
@@ -361,7 +362,9 @@ const signalTool: ToolDefinition = {
     "不传 code 时按**持仓优先**的顺序轮询自选池（5 只，含持仓），每只给出方向闸门" +
     "（long=可开新仓 / none=不做 / unknown=数据不足）、15 分钟评分与建议；传 code 只看这一只的明细。" +
     "方向闸门要求三周期都 ≥0 **且日线=+1**（最短周期必须同向；月 0/周 +1/日 0 只观望），" +
-    "巡检和选股共用同一套评分口径：三周期只定方向，15 分钟才决定「现在有没有机会」。",
+    "巡检和选股共用同一套评分口径：三周期只定方向，15 分钟才决定「现在有没有机会」。" +
+    "不传 code 时额外给出**全池横评**：按本轮实时 15m 分排序，并列出最弱持仓 vs 最强候选的分差，" +
+    "用来判断「满仓时要不要换仓」（逐只明细的顺序是持仓优先 + 选股时的静态分，不要拿它当强弱排名）。",
   parameters: {
     type: "object",
     properties: {
@@ -395,9 +398,11 @@ const signalTool: ToolDefinition = {
       const buys = signals.filter((item) => item.suggestion === "买入候选").map((item) => item.code);
       return {
         ok: true,
-        content: signals.map(formatSignal).join("\n\n"),
+        // 横评放最前面：先给「谁强谁弱、要不要换」，再看逐只明细
+        content: `${formatPoolRanking(signals)}\n\n${signals.map(formatSignal).join("\n\n")}`,
         summary:
-          `池内 ${signals.length} 只` + (buys.length > 0 ? ` · 买入候选 ${buys.join("/")}` : ""),
+          `池内 ${signals.length} 只 · 实时排名已给出` +
+          (buys.length > 0 ? ` · 买入候选 ${buys.join("/")}` : ""),
       };
     } catch (err) {
       return {

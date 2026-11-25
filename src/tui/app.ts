@@ -5961,7 +5961,15 @@ export class TuiApp {
       const reason = data.tickerError
         ? `：${truncate(data.tickerError, Math.max(12, width - 18))}`
         : "";
-      push(`${ansi.gray} 价格 —（行情接口不可用${reason}）${ansi.reset}`);
+      // 与微信 `/info` 保持一致：实时取价失败时显示后端缓存价（标来源），
+      // 不要只显示「不可用」—— 同一条数据在 `/info` 与面板里必须一致。
+      const cached = data.role === "paper" ? data.paper?.price : undefined;
+      if (cached && cached > 0) {
+        const source = data.paper?.price_source === "close" ? "库内收盘价" : "后端缓存价";
+        push(`${ansi.gray} ${amount(cached)}（${source}）${reason}${ansi.reset}`);
+      } else {
+        push(`${ansi.gray} 价格 —（行情接口不可用${reason}）${ansi.reset}`);
+      }
     }
     divider();
 

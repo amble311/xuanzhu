@@ -173,3 +173,104 @@ describe("三周期趋势与 15m 评分", () => {
     expect(result?.score).toBeGreaterThan(0);
   });
 });
+
+describe("未完成的 K 线与开盘冷静期", () => {
+  const bar = (time: string): { time: string; open: number; high: number; low: number; close: number; volume: number; amount: number } => ({
+    time,
+    open: 10,
+    high: 10.2,
+    low: 9.9,
+    close: 10.1,
+    volume: 100,
+    amount: 1010,
+  });
+
+  it("剔除正在走的 15m K 线，走完后保留", async () => {
+    const { dropIncomplete15m } = await import("../src/a/window");
+    const bars = [bar("2026-11-25T09:15:00"), bar("2026-11-25T09:30:00")];
+    // 09:35：09:30 这根还没走完 → 剔除
+    expect(dropIncomplete15m(bars, new Date("2026-11-25T09:35:00+08:00"))).toHaveLength(1);
+    // 09:45：已走完 → 保留
+    expect(dropIncomplete15m(bars, new Date("2026-11-25T09:45:00+08:00"))).toHaveLength(2);
+    // 不是今天的最后一根（历史数据）→ 不动
+    const old = [bar("2026-11-24T14:45:00")];
+    expect(dropIncomplete15m(old, new Date("2026-11-25T09:35:00+08:00"))).toHaveLength(1);
+  });
+
+  it("剔除本月未走完的月线，月末收盘后保留", async () => {
+    const { dropIncompleteMonth } = await import("../src/a/window");
+    const bars = [bar("2026-10-01"), bar("2026-11-01")];
+    expect(dropIncompleteMonth(bars, new Date("2026-11-25T10:00:00+08:00"))).toHaveLength(1);
+    expect(dropIncompleteMonth(bars, new Date("2026-11-30T15:10:00+08:00"))).toHaveLength(2);
+    // 历史月份（最后一根不是本月）→ 不动
+    const old = [bar("2026-09-01"), bar("2026-10-01")];
+    expect(dropIncompleteMonth(old, new Date("2026-11-25T10:00:00+08:00"))).toHaveLength(2);
+  });
+
+  it("开盘态势：高开跌破昨收算回补，量比按已交易分钟归一化", async () => {
+    const { openingContext } = await import("../src/a/opening");
+    const quote = {
+      code: "601328",
+      name: "交通银行",
+      price: 9.95,
+      preClose: 10,
+      open: 10.2,
+      high: 10.25,
+      low: 9.9,
+      change: -0.05,
+      changePct: -0.5,
+      volume: 1_000_000,
+      amount: 20_000_000,
+      board: "main" as const,
+      st: false,
+    };
+    const indicators = {
+      code: "601328",
+      asOf: "2026-11-24",
+      close: 10,
+      bars: 140,
+      // 近 5 日平均成交额 2.4 亿 → 每分钟 100 万；今天 10 分钟成交 2000 万 → 量比 2.0
+      avgAmount5: 240_000_000,
+    };
+    const opening = openingContext(quote, indicators, new Date("2026-11-25T09:40:00+08:00"));
+    expect(opening.gapPct).toBeGreaterThan(1.9);
+    expect(opening.fromOpenPct).toBeLessThan(-2);
+    expect(opening.gapFilled).toBe(true);
+    expect(opening.volumeRatio).toBeCloseTo(2, 1);
+    expect(opening.text).toContain("高开");
+    expect(opening.text).toContain("回补");
+    expect(opening.text).toContain("今日量比 2.00");
+  });
+
+  it("开盘态势：低开收复昨收也算回补；未开盘 / 缺行情有明确文案", async () => {
+    const { openingContext } = await import("../src/a/opening");
+    const lowOpen = {
+      code: "601398",
+      name: "工商银行",
+      price: 10.05,
+      preClose: 10,
+      open: 9.8,
+      high: 10.06,
+      low: 9.79,
+      change: 0.05,
+      changePct: 0.5,
+      volume: 100,
+      amount: 1000,
+      board: "main" as const,
+      st: false,
+    };
+    const filled = openingContext(lowOpen, undefined, new Date("2026-11-25T09:35:00+08:00"));
+    expect(filled.gapFilled).toBe(true);
+    expect(filled.text).toContain("低开");
+    expect(filled.text).toContain("收复昨收");
+    // 没有日线指标 → 不编量比
+    expect(filled.volumeRatio).toBeUndefined();
+
+    const before = openingContext(lowOpen, undefined, new Date("2026-11-25T09:10:00+08:00"));
+    expect(before.elapsedMinutes).toBe(0);
+    expect(before.text).toContain("未开盘");
+
+    const missing = openingContext(null, undefined, new Date("2026-11-25T10:00:00+08:00"));
+    expect(missing.text).toContain("取不到");
+  });
+})

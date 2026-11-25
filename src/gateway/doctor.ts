@@ -168,7 +168,10 @@ export function collectDoctor(home = gatewayHome()): DoctorReport {
     );
   }
   if (pending > 0) {
-    push("info", `摘要箱：${pending} 轮巡检结论未推送（微信里发 /digest 查看；窗口打开时会自动改推）`);
+    push(
+      "warn",
+      `摘要箱：${pending} 条兜底消息（只应在队列超限时出现；网关下次启动会自动补发，也可 /digest 取回）`,
+    );
   }
 
   // ── 转发进度 ──
@@ -212,7 +215,7 @@ export function collectDoctor(home = gatewayHome()): DoctorReport {
   } else if (blockedPeers.length > 0) {
     verdict =
       "推送通道被 iLink 拒收（ret=-2）—— 在微信里给 bot 发任意消息即可恢复，" +
-      "期间巡检结论进摘要箱（/digest）。";
+      "期间消息全部排队，按 10/20/30 分钟探测重试；你发一条消息即立即补发。";
     ok = false;
   } else if (depth > 0 && oldest !== null && oldest > 10 * MINUTE) {
     verdict = `出站队列堵住了 ${depth} 条（最早 ${humanAge(oldest)}）—— 看「最近发送错误」。`;
@@ -222,7 +225,7 @@ export function collectDoctor(home = gatewayHome()): DoctorReport {
       depth > 0
         ? `一切正常，队列里 ${depth} 条正在发。`
         : pending > 0
-          ? `通道正常；有 ${pending} 轮巡检摘要没推（窗口关闭时按设计改走 /digest）。`
+          ? `通道正常；有 ${pending} 条兜底消息待补发（重启网关或 /digest 可取回）。`
           : "一切正常：进程、登录态、长轮询、出站队列都健康。";
   }
 
